@@ -9,6 +9,11 @@ REM ============================================================================
 set "SCRIPT_DIR=%~dp0"
 set "BUILD_DIR=%SCRIPT_DIR%build"
 
+if not defined NOTEPADSAFE_VS_ROOT (
+    set "NOTEPADSAFE_VS_ROOT=C:\Program Files\Microsoft Visual Studio\18\Insiders"
+)
+set "VS_CTEST=%NOTEPADSAFE_VS_ROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\ctest.exe"
+
 if not exist "%BUILD_DIR%\test_textencoding.exe" (
     echo ERROR: Tests not built. Run build.bat first.
     exit /b 1
@@ -78,8 +83,13 @@ echo.
 
 echo ============ Running CTest ============
 pushd "%BUILD_DIR%"
-ctest --output-on-failure
-set CTEST_RC=%errorlevel%
+if exist "%VS_CTEST%" (
+    "%VS_CTEST%" --output-on-failure
+    set CTEST_RC=!errorlevel!
+) else (
+    ctest --output-on-failure
+    set CTEST_RC=!errorlevel!
+)
 popd
 
 echo.
