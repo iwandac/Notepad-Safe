@@ -25,6 +25,7 @@
 #include <QSettings>
 #include <QFont>
 #include <QPalette>
+#include <QIcon>
 #include <QApplication>
 #include <QShortcut>
 #include <QKeySequence>
