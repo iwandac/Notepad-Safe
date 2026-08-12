@@ -1,0 +1,44 @@
+# ====== Build ======
+build/
+build_*/
+out/
+cmake-build-*/
+
+# ====== CMake / Ninja / CTest ======
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+*.ninja
+.ninja_deps
+.ninja_logs
+Testing/
+
+# ====== 编辑器 / IDE ======
+.vscode/
+.vs/
+.idea/
+*.swp
+*.swo
+*~
+
+# ====== 系统 / 桌面 ======
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ====== 临时 & 日志 ======
+*.log
+*.tmp
+*.bak
+
+# ====== Python 辅助脚本产物（app.ico 已生成，保留） ======
+# 不排除 resources/app.ico 和 resources/notepad_safe.png（这些是仓库必需品）
+__pycache__/
+*.py[cod]
+
+# ====== 测试生成临时目录 ======
+tests\tmp_*
+tests\_tmp_*
+_temp_*

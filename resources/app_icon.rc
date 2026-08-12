@@ -1,0 +1,33 @@
+#include <windows.h>
+// EXE 图标（资源 ID=1，Windows 约定首个图标用于 EXE 文件）
+1 ICON "app.ico"
+
+// 应用程序版本信息
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    0,3,1,0
+PRODUCTVERSION 0,3,1,0
+FILEFLAGSMASK  0x3fL
+FILEFLAGS      0x0L
+FILEOS         0x40004L
+FILETYPE       0x1L
+FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "CompanyName",      "NotepadSafe\0"
+            VALUE "FileDescription",  "Notepad Safe - 加密笔记本编辑器\0"
+            VALUE "FileVersion",      "0.3.1.0\0"
+            VALUE "InternalName",     "notepad-safe\0"
+            VALUE "LegalCopyright",   "2025 NotepadSafe Authors (GPL v3)\0"
+            VALUE "OriginalFilename", "notepad-safe.exe\0"
+            VALUE "ProductName",      "Notepad Safe\0"
+            VALUE "ProductVersion",   "0.3.1.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END
