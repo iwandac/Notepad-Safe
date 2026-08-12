@@ -11,7 +11,7 @@
 //   3. 修复后的 loadUtf8Chunked 逻辑路径（不调用 setReadOnly）能正确加载大文件
 //
 // 注意：不使用 Qt Test 框架（QTEST_MAIN），因为它与静态 Qt 构建冲突；
-//       直接用 main() + QApplication，与 qt-notepad.exe 主程序相同的初始化方式。
+//       直接用 main() + QApplication，与 notepad-safe.exe 主程序相同的初始化方式。
 
 #include <QApplication>
 #include <QByteArray>
@@ -295,7 +295,7 @@ static void test_readonly_vs_nonreadonly_chunked()
 
 int main(int argc, char *argv[])
 {
-    // 与 qt-notepad.exe 相同的初始化方式：QApplication 而非 QCoreApplication，
+    // 与 notepad-safe.exe 相同的初始化方式：QApplication 而非 QCoreApplication，
     // 因为 QsciScintilla 是 QWidget 派生类，需要 GUI 子系统。
     // 不调用 widget->show()，避免弹出窗口干扰测试。
     QApplication app(argc, argv);
