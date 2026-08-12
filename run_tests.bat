@@ -1,10 +1,10 @@
 @echo off
 setlocal enabledelayedexpansion
 
-:: ============================================================================
-::  Notepad Safe — 运行所有 CTest & 直接 exe 双保险
-::  路径相对化：基于 %~dp0（脚本自身所在目录）
-:: ============================================================================
+REM ============================================================================
+REM  Notepad Safe - run all tests (direct exe + CTest double check)
+REM  Paths are relative to the script dir (%~dp0)
+REM ============================================================================
 
 set "SCRIPT_DIR=%~dp0"
 set "BUILD_DIR=%SCRIPT_DIR%build"
