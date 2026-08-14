@@ -4,6 +4,9 @@
 #include "SearchResultsDock.h"
 #include "SessionManager.h"
 #include "TextEncoding.h"
+#include "DynamicThresholds.h"
+#include "VirtualFileView.h"
+#include "StatusBarTaskWidget.h"
 
 #include <QTabWidget>
 #include <QMenuBar>
@@ -30,6 +33,7 @@
 #include <QShortcut>
 #include <QKeySequence>
 #include <QDateTime>
+#include <QElapsedTimer>
 
 // 前向：同步编码菜单勾选状态
 static void syncEncodingMenuTo(QMenu *menu, TextEncoding enc)
@@ -45,6 +49,26 @@ static void syncEncodingMenuTo(QMenu *menu, TextEncoding enc)
             a->setChecked(false);
         }
     }
+}
+
+// L1/L2 自动分流打开文件（DESIGN §5.2 动态阈值）：
+//   size < L1_EDIT_LIMIT → EditorTab::loadFile (QsciScintilla 完整编辑)
+//   size ≥ → 先 try openLargeFileL2，失败回退到 loadFile（避免用户无法打开）
+// 返回是否成功（与 loadFile 返回一致）
+static bool openTabAutoMode(EditorTab *tab, const QString &path)
+{
+    if (!tab) return false;
+    QFileInfo fi(path);
+    qint64 size = fi.exists() ? fi.size() : 0;
+    qint64 limit = DynamicThresholds::instance().L1_EDIT_LIMIT;
+    if (size >= limit) {
+        QString err;
+        if (tab->openLargeFileL2(path, &err))
+            return true;
+        // L2 失败（mmap 不支持/编码不是 UTF-8 兼容字节？）：回退到 L1 分块加载
+        // 不弹 warning：交给 caller 统一处理失败提示
+    }
+    return tab->loadFile(path);
 }
 
 MainWindow::MainWindow(QWidget *parent)
@@ -72,6 +96,8 @@ MainWindow::MainWindow(QWidget *parent)
     addDockWidget(Qt::BottomDockWidgetArea, m_searchDock);
     m_searchDock->hide();
     connect(m_searchDock, &SearchResultsDock::jumpTo, this, &MainWindow::onJumpTo);
+    connect(m_searchDock, &SearchResultsDock::jumpToByteOffset,
+            this, &MainWindow::onJumpToByteOffset);
 
     // 查找/替换对话框
     m_findDialog = new FindReplaceDialog(this);
@@ -96,12 +122,21 @@ MainWindow::MainWindow(QWidget *parent)
     syncGlobalMenuCheckStates(); // 关键：把恢复后的设置同步回菜单勾选状态（解决UI不同步bug）
     applyDarkMode(m_darkMode);
 
-    // 恢复上次会话
-    restoreSession();
+    // ============================================================
+    //  启动阶段会话恢复触发权移交给 main.cpp !!
+    //  原做法 v1：构造内同步 restoreSession() → 构造阻塞 → w.show() 永远执行不到
+    //  原做法 v2：构造内 QTimer::singleShot(0, deferredRestoreSession)
+    //             → main.cpp 的 processEvents 派发时，zero-timer 比 Paint 事件先运行
+    //             → 会话恢复先跑完 916ms 才开始绘制窗口 → 用户依然感觉「双击没反应/静默」
+    //  新做法 v3：main.cpp 在 w.show() + sync() + 双 processEvents + 打日志确认可见后，
+    //             再用 QTimer::singleShot(30ms) 触发 deferredRestoreSession。
+    //             30ms 延时 + DWM 已合成首帧 → 窗口标题栏/空客户区必然先对用户可见，
+    //             之后才开始状态栏显示「正在恢复会话 0/N」异步加载 tab。
+    // ============================================================
+    //   【此处不允许再注册任何启动会话恢复的 timer / 调用】
 
-    // 如果没有标签，创建一个新标签
-    if (m_tabs->count() == 0)
-        addNewTab();
+    // "没有标签就创建新标签"—— 同样延后到 deferredRestoreSession 结束后再判断
+    // （否则空 tab + 异步恢复叠加导致多 1 个空白 tab）
 
     // 自动保存定时器（每 30 秒保存未保存内容）
     connect(&m_autosaveTimer, &QTimer::timeout, this, [this]() {
@@ -180,25 +215,25 @@ void MainWindow::createMenus()
     auto *cutAct = editMenu->addAction(QStringLiteral("剪切(&T)"));
     cutAct->setShortcut(QKeySequence::Cut);
     connect(cutAct, &QAction::triggered, this, [this]() {
-        if (auto *t = currentTab()) t->editor()->cut();
+        if (auto *t = currentTab()) t->cut();
     });
 
     auto *copyAct = editMenu->addAction(QStringLiteral("复制(&C)"));
     copyAct->setShortcut(QKeySequence::Copy);
     connect(copyAct, &QAction::triggered, this, [this]() {
-        if (auto *t = currentTab()) t->editor()->copy();
+        if (auto *t = currentTab()) t->copy();
     });
 
     auto *pasteAct = editMenu->addAction(QStringLiteral("粘贴(&P)"));
     pasteAct->setShortcut(QKeySequence::Paste);
     connect(pasteAct, &QAction::triggered, this, [this]() {
-        if (auto *t = currentTab()) t->editor()->paste();
+        if (auto *t = currentTab()) t->paste();
     });
 
     auto *selectAllAct = editMenu->addAction(QStringLiteral("全选(&A)"));
     selectAllAct->setShortcut(QKeySequence::SelectAll);
     connect(selectAllAct, &QAction::triggered, this, [this]() {
-        if (auto *t = currentTab()) t->editor()->selectAll();
+        if (auto *t = currentTab()) t->selectAll();
     });
 
     editMenu->addSeparator();
@@ -222,9 +257,11 @@ void MainWindow::createMenus()
     editMenu->addSeparator();
 
     auto *sortAscAct = editMenu->addAction(QStringLiteral("行升序排序"));
+    m_actSortAsc = sortAscAct;
     connect(sortAscAct, &QAction::triggered, this, &MainWindow::sortLinesAsc);
 
     auto *sortDescAct = editMenu->addAction(QStringLiteral("行降序排序"));
+    m_actSortDesc = sortDescAct;
     connect(sortDescAct, &QAction::triggered, this, &MainWindow::sortLinesDesc);
 
     // 搜索菜单
@@ -235,7 +272,9 @@ void MainWindow::createMenus()
     connect(findAct, &QAction::triggered, this, &MainWindow::showFindDialog);
 
     auto *replaceAct = searchMenu->addAction(QStringLiteral("替换(&R)..."));
-    replaceAct->setShortcut(QKeySequence::Replace);
+    // 用户强制：菜单显示 (&R) → 全局快捷键必须为 Ctrl+R 显示一致（Notepad++ 习惯），禁止 Ctrl+H
+    // 见 QA SR02-COMFORT 3 条硬断言：text 含 &R + shortcut==QKeySequence("Ctrl+R") 精确 + Alt+S+R 访问键可打开
+    replaceAct->setShortcut(QKeySequence("Ctrl+R"));
     connect(replaceAct, &QAction::triggered, this, &MainWindow::showReplaceDialog);
 
     searchMenu->addSeparator();
@@ -310,6 +349,16 @@ void MainWindow::createMenus()
     m_actEdgeVisible->setChecked(m_edgeVisible);
     connect(m_actEdgeVisible, &QAction::triggered, this, &MainWindow::toggleEdgeLine);
 
+    viewMenu->addSeparator();
+
+    m_actHexViewMode = viewMenu->addAction(QStringLiteral("16 进制编辑模式"));
+    m_actHexViewMode->setCheckable(true);
+    m_actHexViewMode->setChecked(false);
+    m_actHexViewMode->setShortcut(QKeySequence("Ctrl+Shift+H"));
+    connect(m_actHexViewMode, &QAction::triggered, this, &MainWindow::toggleHexViewMode);
+
+    viewMenu->addSeparator();
+
     auto *edgeColMenu = viewMenu->addMenu(QStringLiteral("长行标尺列数"));
     m_edgeColGroup = new QActionGroup(this);
     QList<int> edgeCols = {72, 80, 100, 120, 150, 200};
@@ -347,12 +396,33 @@ void MainWindow::createMenus()
         {QStringLiteral("转为 UCS-2 Little Endian"),  TextEncoding::Utf16LE},
         {QStringLiteral("转为 UCS-2 Big Endian"),     TextEncoding::Utf16BE},
     };
+    m_convertEncodingActions.clear();
     for (const auto &item : encItems) {
         auto *a = m_encodingMenu->addAction(item.first);
         a->setCheckable(true);
         a->setData(static_cast<int>(item.second));
         encGroup->addAction(a);
+        m_convertEncodingActions.append(a);
         connect(a, &QAction::triggered, this, &MainWindow::convertEncodingFromAction);
+    }
+
+    // "以编码显示"子菜单（Notepad++ 风格：不修改文件内容，仅改变显示解码方式）
+    m_encodingMenu->addSeparator();
+    m_displayEncodingMenu = m_encodingMenu->addMenu(QStringLiteral("以编码显示"));
+    auto *dispEncGroup = new QActionGroup(this);
+    QVector<QPair<QString, TextEncoding>> dispEncItems = {
+        {QStringLiteral("以 ANSI (GBK) 显示"),        TextEncoding::GBK},
+        {QStringLiteral("以 UTF-8 显示"),             TextEncoding::Utf8},
+        {QStringLiteral("以 UTF-8 (含 BOM) 显示"),    TextEncoding::Utf8Bom},
+        {QStringLiteral("以 UCS-2 Little Endian 显示"), TextEncoding::Utf16LE},
+        {QStringLiteral("以 UCS-2 Big Endian 显示"),    TextEncoding::Utf16BE},
+    };
+    for (const auto &item : dispEncItems) {
+        auto *a = m_displayEncodingMenu->addAction(item.first);
+        a->setCheckable(true);
+        a->setData(static_cast<int>(item.second));
+        dispEncGroup->addAction(a);
+        connect(a, &QAction::triggered, this, &MainWindow::displayEncodingFromAction);
     }
     // 注意：菜单勾选在 onTabChanged / onTabEncodingChanged 中同步
 
@@ -403,6 +473,12 @@ void MainWindow::createStatusBar()
     m_statusModified = new QLabel(QStringLiteral(""));
     m_statusModified->setMinimumWidth(40);
     statusBar()->addPermanentWidget(m_statusModified);
+
+    // ============ 通用异步任务：状态栏右下角永久 widget ============
+    //  显示：线程占用（活跃/并发上限）+ 后台任务数量按钮
+    //  点击按钮：弹出 AsyncTaskPanelDialog（非模态，查看全部任务/进度/取消/异常堆栈）
+    auto *taskWidget = new StatusBarTaskWidget(this);
+    statusBar()->addPermanentWidget(taskWidget);
 }
 
 void MainWindow::createDock()
@@ -452,9 +528,40 @@ EditorTab *MainWindow::addNewTab()
     connect(tab, &EditorTab::syntaxChanged, this, [this](Syntax) {
         updateStatusBar();
     });
+    // 秒开：L2 后台行索引构建进度 → 非模态状态栏显示（只更新当前激活 tab 的进度）
+    connect(tab, &EditorTab::l2LineBuildProgress,
+            this, [this, tab](qint64 done, qint64 total) {
+        if (currentTab() != tab) return;
+        if (total <= 0) {
+            statusBar()->clearMessage();
+            return;
+        }
+        int pct = qBound(0, int(done * 100 / total), 100);
+        QString msg = QObject::tr("正在建立行索引… %1%  (%2 / %3 MB)")
+            .arg(pct)
+            .arg(static_cast<double>(done) / (1024.0 * 1024.0), 0, 'f', 1)
+            .arg(static_cast<double>(total) / (1024.0 * 1024.0), 0, 'f', 1);
+        statusBar()->showMessage(msg, 0);
+    });
+    connect(tab, &EditorTab::l2LineBuildFinished, this, [this, tab](bool ok) {
+        if (currentTab() != tab) return;
+        if (ok) statusBar()->showMessage(QObject::tr("行索引构建完成"), 3000);
+        else    statusBar()->clearMessage();
+    });
+
+    // ============== L2 禁用不适配菜单：同一 tab 内部 L1↔L2 切换时立即同步（关键：addTab/currentChanged 不触发）==============
+    // 最小侵入：直接用 sender() 转 EditorTab* 当 tab 参数（精准指向信号发射源，避免无参
+    // syncL2SensitiveActions() → currentTab() 在 currentIndex 未切好时查到旧 tab → 新 tab 的
+    // L2 状态被旧 tab 覆盖（enabled=true 不变灰的 D001/D003/D007 根因）。
+    connect(tab, &EditorTab::l2ModeStatusChanged, this, [this]() {
+        auto* src = qobject_cast<EditorTab*>(sender());
+        syncL2SensitiveActions(src ? src : currentTab());
+    });
 
     m_tabs->setCurrentIndex(index);
     m_findDialog->setActiveTab(tab);
+    // 新建后立刻同步一次 L2 敏感动作（覆盖新 tab 还没收到任何信号的早期空状态）
+    syncL2SensitiveActions(tab);
     return tab;
 }
 
@@ -476,7 +583,7 @@ void MainWindow::openFile()
         if (file.isEmpty())
             continue;
         auto *tab = addNewTab();
-        if (!tab->loadFile(file)) {
+        if (!openTabAutoMode(tab, file)) {
             QMessageBox::warning(this, QStringLiteral("错误"),
                                  QStringLiteral("无法打开文件: %1").arg(file));
             // 关闭空标签
@@ -497,9 +604,11 @@ bool MainWindow::saveFile()
         return false;
     if (tab->isUntitled())
         return saveAsFile();
-    if (!tab->saveFile()) {
+    QString err;
+    if (!tab->saveFile(&err)) {
+        QString detail = err.isEmpty() ? tab->filePath() : QStringLiteral("%1\n\n详细信息：%2").arg(tab->filePath(), err);
         QMessageBox::warning(this, QStringLiteral("错误"),
-                             QStringLiteral("无法保存文件: %1").arg(tab->filePath()));
+                             QStringLiteral("无法保存文件：\n%1").arg(detail));
         return false;
     }
     return true;
@@ -515,9 +624,11 @@ bool MainWindow::saveAsFile()
         QStringLiteral("所有文件 (*);;文本文件 (*.txt);;C/C++ (*.cpp);;Python (*.py);;JSON (*.json)"));
     if (fileName.isEmpty())
         return false;
-    if (!tab->saveAsFile(fileName)) {
+    QString err;
+    if (!tab->saveAsFile(fileName, &err)) {
+        QString detail = err.isEmpty() ? fileName : QStringLiteral("%1\n\n详细信息：%2").arg(fileName, err);
         QMessageBox::warning(this, QStringLiteral("错误"),
-                             QStringLiteral("无法保存文件: %1").arg(fileName));
+                             QStringLiteral("无法保存文件：\n%1").arg(detail));
         return false;
     }
     updateRecentFiles(fileName);
@@ -543,7 +654,7 @@ void MainWindow::openRecentFile()
         return;
     }
     auto *tab = addNewTab();
-    if (!tab->loadFile(path)) {
+    if (!openTabAutoMode(tab, path)) {
         QMessageBox::warning(this, QStringLiteral("错误"),
                              QStringLiteral("无法打开文件: %1").arg(path));
         int idx = m_tabs->indexOf(tab);
@@ -735,6 +846,23 @@ void MainWindow::toggleWordWrap()
     saveSettings();
 }
 
+// ============================================================================
+//  16 进制视图模式切换（仅对当前 L2 VirtualFileView tab 生效；L1/QScintilla tab 忽略）
+// ============================================================================
+void MainWindow::toggleHexViewMode()
+{
+    auto *tab = currentTab();
+    if (!tab || !tab->isL2Active()) {
+        // L1 tab：提示用户 16 进制模式仅支持大文件 L2 视图
+        if (m_actHexViewMode) m_actHexViewMode->setChecked(false);
+        return;
+    }
+    ViewMode now = tab->viewModeL2();
+    ViewMode next = (now == ViewMode::Hex) ? ViewMode::Text : ViewMode::Hex;
+    tab->setViewModeL2(next);
+    if (m_actHexViewMode) m_actHexViewMode->setChecked(next == ViewMode::Hex);
+}
+
 // 统一把 m_darkMode/m_wordWrap/m_edgeVisible/m_edgeColumn 同步到视图菜单的勾选
 // 这是解决"恢复设置后菜单勾选未同步显示"的核心函数
 void MainWindow::syncGlobalMenuCheckStates()
@@ -742,6 +870,11 @@ void MainWindow::syncGlobalMenuCheckStates()
     if (m_actDarkMode)  m_actDarkMode->setChecked(m_darkMode);
     if (m_actWordWrap)  m_actWordWrap->setChecked(m_wordWrap);
     if (m_actEdgeVisible) m_actEdgeVisible->setChecked(m_edgeVisible);
+    if (m_actHexViewMode) {
+        auto *tab = currentTab();
+        bool checked = tab && tab->isL2Active() && tab->viewModeL2() == ViewMode::Hex;
+        m_actHexViewMode->setChecked(checked);
+    }
     if (m_edgeColGroup) {
         for (QAction *a : m_edgeColGroup->actions()) {
             a->setChecked(a->data().toInt() == m_edgeColumn);
@@ -796,7 +929,7 @@ void MainWindow::openFilesFromExternal(const QStringList &paths)
             tab = addNewTab();
         }
         if (!tab) continue;
-        if (tab->loadFile(p)) {
+        if (openTabAutoMode(tab, p)) {
             updateRecentFiles(p);
             m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
         } else {
@@ -854,6 +987,17 @@ void MainWindow::convertEncodingFromAction()
         tab->setModified(true);
 }
 
+void MainWindow::displayEncodingFromAction()
+{
+    auto *act = qobject_cast<QAction *>(sender());
+    if (!act) return;
+    auto enc = static_cast<TextEncoding>(act->data().toInt());
+    auto *tab = currentTab();
+    if (!tab) return;
+    // Notepad++ "以编码显示"：不修改文件内容，仅改变显示解码方式
+    tab->setDisplayEncoding(enc);
+}
+
 void MainWindow::applyDarkMode(bool dark)
 {
     QPalette pal;
@@ -907,18 +1051,30 @@ EditorTab *MainWindow::currentTab() const
     return qobject_cast<EditorTab *>(m_tabs->currentWidget());
 }
 
+void MainWindow::syncL2SensitiveActions(EditorTab *tab)
+{
+    if (!tab) tab = currentTab();
+    // 无 tab 时：所有这些动作一律禁用，避免误点
+    const bool enabled = (tab != nullptr) && !tab->isL2Active();
+    if (m_actSortAsc) m_actSortAsc->setEnabled(enabled);
+    if (m_actSortDesc) m_actSortDesc->setEnabled(enabled);
+    for (auto *a : m_convertEncodingActions) {
+        if (a) a->setEnabled(enabled);
+    }
+    // 注："以编码显示..."组不在 m_convertEncodingActions 里，它始终可点（只改显示解码不改字节流，L2 允许）
+}
+
 void MainWindow::onTabChanged(int index)
 {
-    if (index < 0) {
-        m_findDialog->setActiveTab(nullptr);
-        return;
-    }
-    auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(index));
-    if (!tab)
-        return;
-    m_findDialog->setActiveTab(tab);
+    EditorTab *tab = nullptr;
+    if (index >= 0) tab = qobject_cast<EditorTab *>(m_tabs->widget(index));
+    if (m_findDialog) m_findDialog->setActiveTab(tab);
+    // 统一同步不适配 L2 的菜单项（含 index<0 无 tab → 全部变灰）
+    syncL2SensitiveActions(tab);
+    if (!tab) return;
     // 同步编码菜单勾选到当前标签
     syncEncodingMenuTo(m_encodingMenu, tab->encoding());
+    syncEncodingMenuTo(m_displayEncodingMenu, tab->displayEncoding());
     // 应用全局设置（保持所有标签一致）
     tab->setEdgeVisible(m_edgeVisible);
     tab->setEdgeColumn(m_edgeColumn);
@@ -957,10 +1113,17 @@ bool MainWindow::maybeSaveTab(int index, bool closingApp)
 
     // ===== 关闭整个应用的 Notepad++ 逻辑 =====
     if (closingApp) {
-        // 对"未命名+有内容"：不提示用户，由后续 saveSession 写入 autosave（下次恢复）
+        // ① "未命名+有内容"：不提示用户，由后续 saveSession 写入 autosave（下次恢复）
         if (tab->isUntitled())
             return true;
-        // 已存在文件修改：提示保存/丢弃/取消
+        // ② 从 autosave 会话恢复的 tab + autosave 文件还存在：
+        //    数据已在 autosave 里，closeEvent 紧接着的 saveSessionNow() 会再落盘一次，
+        //    下次启动还能完整恢复（等价于 ① 的"未命名 autosave"语义，只是对用户显示原名）。
+        //    若每次恢复后关闭都弹「是否保存」，用户会被"我没改过东西也弹窗"困惑。
+        const QString &asp = tab->autosavePath();
+        if (!asp.isEmpty() && QFileInfo::exists(asp))
+            return true;
+        // ③ 已存在文件+用户修改过+没有 autosave 兜底：必须提示保存/丢弃/取消
     }
 
     // ===== 单标签关闭：未命名且有内容也要提示 =====
@@ -1016,7 +1179,15 @@ void MainWindow::onJumpTo(int line, int index)
     if (!tab)
         return;
     tab->setCursorPosition(line, index);
-    tab->editor()->setFocus();
+    tab->setFocusEditor();
+}
+
+void MainWindow::onJumpToByteOffset(qint64 byteOffset, int length)
+{
+    auto *tab = currentTab();
+    if (!tab) return;
+    tab->gotoByteOffset(byteOffset, length);
+    tab->setFocusEditor();
 }
 
 void MainWindow::updateStatusBar()
@@ -1042,7 +1213,14 @@ void MainWindow::updateStatusBar()
         m_statusSyntax->setText(syntaxNames[s]);
 
     // 文件大小
-    qint64 size = tab->editor()->text().size();
+    qint64 size = 0;
+    if (tab->isL2Mode() && tab->l2View()) {
+        size = tab->l2View()->fileSize();
+    } else if (tab->filePath().isEmpty()) {
+        size = tab->editor()->length();
+    } else {
+        size = QFileInfo(tab->filePath()).size();
+    }
     QString sizeStr;
     if (size < 1024)
         sizeStr = QStringLiteral("%1 B").arg(size);
@@ -1233,6 +1411,179 @@ void MainWindow::saveSessionNow()
     m_session->saveSession(tabs, m_tabs->currentIndex());
 }
 
+// ============================================================================
+//  PendingSessionRestore：MainWindow 私有结构体（会话恢复队列状态）
+//  头文件用前置声明避免拖慢编译；完整定义只在此 cpp 中。
+// ============================================================================
+struct MainWindow::PendingSessionRestore {
+    QVector<SessionTab> tabs;
+    int activeTab = 0;
+    int currentIndex = 0;   // 已处理到第几个 tab
+    bool hasUnsaved = false;
+    QString sessionJsonPathToRemove;
+};
+
+// ============================================================================
+//  异步会话恢复：deferredRestoreSession + restoreNextSessionTab
+//  设计目的：
+//   · 构造函数返回前不读任何大文件（避免 main.cpp 的 w.show() 被延后）
+//   · 每个 tab 恢复之间 QApplication::processEvents 让窗口重绘
+//   · 走 openTabAutoMode ≥32MB 强制 L2 mmap 秒开，不再 L1 主线程阻塞读
+// ============================================================================
+void MainWindow::deferredRestoreSession()
+{
+    // 此时 main.cpp 的 w.show() 已调用；但首次 paint 需要事件循环派发。
+    // 主动 AllEvents 派发一次，确保窗口立刻可见（用户不会"双击后以为没启动"）。
+    QApplication::processEvents(QEventLoop::AllEvents);
+
+    SessionData data = m_session->loadSession();
+    if (data.tabs.isEmpty()) {
+        // 没有会话记录：补一个空 tab（对应原构造函数中的空 tab 兜底）
+        if (m_tabs->count() == 0)
+            addNewTab();
+        return;
+    }
+
+    // 构造排队上下文（使用 new，因为恢复过程跨多个事件循环 tick）
+    m_pendingRestore = new PendingSessionRestore;
+    m_pendingRestore->tabs                 = data.tabs;   // 拷贝 session 列表
+    m_pendingRestore->activeTab            = data.activeTab;
+    m_pendingRestore->currentIndex         = 0;
+    m_pendingRestore->hasUnsaved           = false;
+    m_pendingRestore->sessionJsonPathToRemove = m_session->sessionFilePath();
+
+    // 立刻给用户看到 "正在恢复会话… 0/M"（StatusBar 永久可见，同时窗口已绘制）
+    statusBar()->showMessage(
+        QStringLiteral("正在恢复会话… 0/%1 个标签页").arg(m_pendingRestore->tabs.size()),
+        0);
+
+    // 第 1 个 tab：singleShot(0) 入队，确保 deferredRestoreSession 返回后事件循环再跑它
+    QTimer::singleShot(0, this, &MainWindow::restoreNextSessionTab);
+}
+
+void MainWindow::restoreNextSessionTab()
+{
+    if (!m_pendingRestore) return;
+
+    const int total = m_pendingRestore->tabs.size();
+
+    // --- 收尾：全部 tab 已处理完 ---
+    if (m_pendingRestore->currentIndex >= total) {
+        if (m_pendingRestore->activeTab >= 0 && m_pendingRestore->activeTab < m_tabs->count())
+            m_tabs->setCurrentIndex(m_pendingRestore->activeTab);
+
+        if (!m_pendingRestore->sessionJsonPathToRemove.isEmpty())
+            QFile::remove(m_pendingRestore->sessionJsonPathToRemove);
+
+        if (m_pendingRestore->hasUnsaved) {
+            statusBar()->showMessage(
+                QStringLiteral("已恢复 %1 个标签页（含未保存修改）").arg(total), 5000);
+        } else {
+            statusBar()->showMessage(
+                QStringLiteral("已恢复 %1 个标签页").arg(total), 3000);
+        }
+
+        delete m_pendingRestore;
+        m_pendingRestore = nullptr;
+        // 安全兜底：一个 tab 都没恢复成功（比如文件全部被删除）→ 补一个空 tab
+        if (m_tabs->count() == 0)
+            addNewTab();
+        return;
+    }
+
+    QElapsedTimer tabTimer; tabTimer.start();
+    const SessionTab &st = m_pendingRestore->tabs[m_pendingRestore->currentIndex];
+    EditorTab *tab = addNewTab();
+    qDebug("[STARTUP][RESTORE tab %d/%d] addNewTab 完成, 耗时=%lld ms | filePath='%s' autosave='%s'",
+           m_pendingRestore->currentIndex + 1, total, tabTimer.elapsed(),
+           qUtf8Printable(st.filePath), qUtf8Printable(st.autosavePath));
+    tabTimer.restart();
+
+    bool loaded = false;
+
+    if (!st.autosavePath.isEmpty() && QFileInfo::exists(st.autosavePath)) {
+        // ====== 关键修复（BUG C：大文件 autosave 阻塞启动）======
+        //   旧做法：直接 tab->loadAutosave(st.autosavePath)
+        //     · 100MB autosave：file.readAll() 主线程同步读 1~3s，窗口不显示、无提示
+        //   新做法：tab->openAutosaveAutoMode(autosave, real)
+        //     · 尺寸 < L1_EDIT_LIMIT：走原 loadAutosave（毫秒级）
+        //     · 尺寸 ≥ 限制：L2 mmap autosave 文件 → incomplete LineIndex → 秒开返回
+        //       后台 AsyncTaskManager 增量构建行索引，用户可见窗口 + 状态栏进度
+        //   参数：autosavePath = 实际数据源，filePath = 对用户显示的原名/未来保存路径
+        const qint64 asSize = QFileInfo(st.autosavePath).size();
+        const qint64 limit  = DynamicThresholds::instance().L1_EDIT_LIMIT;
+        qDebug("[STARTUP][RESTORE tab %d/%d] → 走 autosave 分支: size=%lld KB, limit=%lld KB (L1_EDIT_LIMIT=%lld MB)",
+               m_pendingRestore->currentIndex + 1, total,
+               asSize / 1024, limit / 1024, limit / (1024 * 1024));
+        if (asSize >= limit) {
+            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 L2 mmap 秒开 (asSize >= L1_EDIT_LIMIT)，"
+                   "应 < 50ms 返回；若之后 >= 500ms 才返回，说明 openAutosaveAutoMode 内部阻塞了！",
+                   m_pendingRestore->currentIndex + 1, total);
+        } else {
+            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 L1 同步 loadAutosave (asSize < 限制)，"
+                   "一般毫秒级。", m_pendingRestore->currentIndex + 1, total);
+        }
+
+        if (st.filePath.isEmpty()) {
+            loaded = tab->openAutosaveAutoMode(st.autosavePath);
+            if (loaded) m_pendingRestore->hasUnsaved = true;
+        } else {
+            loaded = tab->openAutosaveAutoMode(st.autosavePath, st.filePath);
+            if (loaded) m_pendingRestore->hasUnsaved = true;
+        }
+        qDebug("[STARTUP][RESTORE tab %d/%d]   openAutosaveAutoMode 返回 ok=%d, 耗时=%lld ms（关键：如果这里 > 500ms 就是阻塞启动的根因！）",
+               m_pendingRestore->currentIndex + 1, total, loaded ? 1 : 0, tabTimer.elapsed());
+        tab->setSyntax(static_cast<Syntax>(st.syntax));
+    } else if (!st.filePath.isEmpty() && QFileInfo::exists(st.filePath)) {
+        // ===== 关键修复：不再直接 tab->loadFile(st.filePath) =====
+        //   原 bug：即便 100MB 也走 L1 全量 readAll + 主线程分块；
+        //   新逻辑：openTabAutoMode → ≥ 32MB 自动 openLargeFileL2 (mmap + 后台 AsyncTaskManager)
+        const qint64 realSize = QFileInfo(st.filePath).size();
+        const qint64 limit    = DynamicThresholds::instance().L1_EDIT_LIMIT;
+        qDebug("[STARTUP][RESTORE tab %d/%d] → 走真实文件路径分支: size=%lld KB, limit=%lld KB (L1_EDIT_LIMIT=%lld MB)",
+               m_pendingRestore->currentIndex + 1, total,
+               realSize / 1024, limit / 1024, limit / (1024 * 1024));
+        if (realSize >= limit) {
+            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 L2 mmap 秒开 (size >= L1_EDIT_LIMIT)，应 < 50ms 返回。",
+                   m_pendingRestore->currentIndex + 1, total);
+        } else {
+            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 L1 同步 loadFile (< 限制)。",
+                   m_pendingRestore->currentIndex + 1, total);
+        }
+        loaded = openTabAutoMode(tab, st.filePath);
+        qDebug("[STARTUP][RESTORE tab %d/%d]   openTabAutoMode 返回 ok=%d, 耗时=%lld ms（关键：如果 > 500ms 就是阻塞启动的根因！）",
+               m_pendingRestore->currentIndex + 1, total, loaded ? 1 : 0, tabTimer.elapsed());
+    } else {
+        qDebug("[STARTUP][RESTORE tab %d/%d] → 文件不存在或路径为空，保持空标签页",
+               m_pendingRestore->currentIndex + 1, total);
+    }
+    tabTimer.restart();
+
+    if (!loaded) {
+        tab->setSyntax(static_cast<Syntax>(st.syntax));
+    } else {
+        tab->setCursorPosition(st.cursorLine, st.cursorIndex);
+    }
+    m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
+
+    m_pendingRestore->currentIndex++;
+    const int done = m_pendingRestore->currentIndex;
+    statusBar()->showMessage(
+        QStringLiteral("正在恢复会话… %1/%2 个标签页").arg(done).arg(total), 0);
+
+    qDebug("[STARTUP][RESTORE tab %d/%d] 收尾(cursor/syntax/title/statusBar)耗时=%lld ms。调用 processEvents 让 UI 重绘…",
+           done, total, tabTimer.elapsed());
+    QElapsedTimer peTimer; peTimer.start();
+    // 仅重绘、不接受新用户输入（避免编辑态冲突），窗口可见性 + 状态栏进度会更新
+    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    qDebug("[STARTUP][RESTORE tab %d/%d] processEvents(ExcludeUserInput) 耗时=%lld ms。"
+           "下一 tab 通过 singleShot(0) 入队，UI 线程先释放给 DWM 合成。",
+           done, total, peTimer.elapsed());
+
+    // 下一个 tab：入队（如果 L2 大文件，AsyncTaskManager 会在后台继续跑不阻塞）
+    QTimer::singleShot(0, this, &MainWindow::restoreNextSessionTab);
+}
+
 // ============ 设置 ============
 
 void MainWindow::loadSettings()
@@ -1291,15 +1642,26 @@ void MainWindow::closeEvent(QCloseEvent *event)
         }
     }
 
-    // Step 2: 所有标签通过检查，保存会话（含 autosave 缓存）
-    // 这一步在 maybeSaveTab 通过后才执行，避免 Cancel 时也写入无用会话
+    // Step 2: 保存会话
     saveSessionNow();
+
+    // Step 2.5（崩溃修复关键）：
+    //    saveSessionNow() 后，所有需要 L2 mmap 的路径（exportToFile → applyAndSave）已完成。
+    //    此时 MainWindow 仍完整（event->accept 还没执行），processEvents 合法。
+    //    对每个 L2 tab 调 shutdownL2BeforeClose()：cancel 后台 LineIndex 构建 +
+    //    processEvents 轮询直到 AsyncTask.state=终态 + unmap mmap。
+    //    之后即使 EditorTab 析构调了 closeFile(false)，isOpen()=false → NOP；
+    //    即使走到 closeFile(false)，内部也不会有 processEvents / emit / viewport update
+    //    （m_inDestruction 守卫），不会触发半析构对象的 slot invoke → 0xC0000005。
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
+        if (tab) tab->shutdownL2BeforeClose();
+    }
 
     // Step 3: 清理已正式保存的文件对应的 autosave（未命名/有修改的不清，下次需要恢复）
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
         if (!tab) continue;
-        // 对已保存/未修改的已有文件，清理 autosave
         if (!tab->isUntitled() && !tab->isModified()) {
             tab->clearAutosaveFile();
         }

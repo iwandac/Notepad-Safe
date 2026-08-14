@@ -11,13 +11,30 @@
 #include <QDateTime>
 #include <QSaveFile>
 #include <QUuid>
+#include <QProcessEnvironment>
+
+static QString resolveDataDir()
+{
+    // 允许通过环境变量 NOTEPADSAFE_DATADIR 覆盖用户数据目录（e2e/自动化测试用）
+    //   - 不设置：默认 %LOCALAPPDATA%\NotepadSafe（用户真实数据，原行为）
+    //   - 设置：直接用该路径（沙箱/CI 指向 %TEMP%\NotepadSafe_E2E\data，不污染真实用户数据）
+    QString env = QProcessEnvironment::systemEnvironment().value("NOTEPADSAFE_DATADIR").trimmed();
+    if (!env.isEmpty()) {
+        // 必须是绝对路径；否则回退默认（避免相对路径歧义）
+        QFileInfo fi(env);
+        if (fi.isAbsolute()) return QDir::cleanPath(fi.absoluteFilePath());
+        qWarning("[SessionManager] NOTEPADSAFE_DATADIR='%s' 不是绝对路径，忽略回退默认",
+                 qUtf8Printable(env));
+    }
+    QString localApp = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+    return localApp + "/NotepadSafe";
+}
 
 SessionManager::SessionManager(QObject *parent)
     : QObject(parent)
 {
-    QString localApp = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
-    // Windows 上 GenericDataLocation 是 %LOCALAPPDATA%
-    m_dataDir = localApp + "/NotepadSafe";
+    // 支持 NOTEPADSAFE_DATADIR 覆盖：便于 e2e 沙箱/CI 在 %TEMP% 下独立运行
+    m_dataDir     = resolveDataDir();
     m_autosaveDir = m_dataDir + "/autosave";
     ensureDirs();
 }
@@ -88,17 +105,18 @@ bool SessionManager::saveSession(const QVector<EditorTab *> &tabs, int activeInd
                 ap = generateAutosavePath();
             }
             st.autosavePath = ap;
-            QSaveFile f(ap);
-            if (f.open(QIODevice::WriteOnly)) {
-                QByteArray data = encodeText(tab->editor()->text(), tab->encoding());
-                f.write(data);
-                if (f.commit()) {
-                    toKeep << ap;
-                    // 回写到 EditorTab 保持关联
-                    tab->setAutosavePath(ap);
-                } else {
-                    st.autosavePath.clear();
-                }
+
+            // ====== 关键修复（BUG A：L2 数据丢失 + BUG B：L1 大文件阻塞）======
+            //   旧做法：encodeText(tab->editor()->text(), tab->encoding())
+            //     · L2 模式：editor() 返回 L1 空/旧 QsciScintilla，内容丢失（用户 L2 patches 全没了）
+            //     · L1 100MB：editor()->text() 转 100MB QString 主线程阻塞 1~2s
+            //   新做法：tab->exportToFile(ap)
+            //     · L1/L2 自动分流：L1 写文档文本，L2 流式 applyAndSave（4MB/块 + 原子写）
+            //     · 零副作用：不改变 isModified、m_filePath、patches 状态
+            if (tab->exportToFile(ap)) {
+                toKeep << ap;
+                // 回写到 EditorTab 保持关联
+                tab->setAutosavePath(ap);
             } else {
                 st.autosavePath.clear();
             }

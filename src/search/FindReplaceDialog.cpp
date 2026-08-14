@@ -1,7 +1,8 @@
 #include "FindReplaceDialog.h"
 #include "EditorTab.h"
 #include "SearchResultsDock.h"
-
+#include "SearchResultsModel.h"
+#include "LargeFileSearch.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QLineEdit>
@@ -10,6 +11,11 @@
 #include <QLabel>
 #include <QRegularExpression>
 #include <QMessageBox>
+#include <QCoreApplication>
+#include <QEventLoop>
+#include <QTimer>
+#include <QMainWindow>
+#include <QStatusBar>
 
 FindReplaceDialog::FindReplaceDialog(QWidget *parent)
     : QDialog(parent)
@@ -74,6 +80,11 @@ void FindReplaceDialog::buildUi()
     btnLayout->addWidget(m_closeBtn);
     layout->addLayout(btnLayout);
 
+    // 异步搜索状态提示（L2 大文件搜索时显示进度；L1 不显示）
+    m_statusLabel = new QLabel(QStringLiteral(""));
+    m_statusLabel->setStyleSheet(QStringLiteral("color:#888;"));
+    layout->addWidget(m_statusLabel);
+
     // 连接
     connect(m_findNextBtn, &QPushButton::clicked, this, &FindReplaceDialog::onFindNext);
     connect(m_findPrevBtn, &QPushButton::clicked, this, &FindReplaceDialog::onFindPrev);
@@ -91,7 +102,26 @@ void FindReplaceDialog::buildUi()
 
 void FindReplaceDialog::setActiveTab(EditorTab *tab)
 {
+    // 切换 tab：先断开上一个 EditorTab 的 L2 搜索信号
+    QObject::disconnect(m_l2ProgressConn);
+    QObject::disconnect(m_l2FinishedConn);
+    m_l2ProgressConn = QMetaObject::Connection{};
+    m_l2FinishedConn = QMetaObject::Connection{};
+
+    if (m_l2SearchInProgress) {
+        // 上一个搜索在进行中：UI 恢复
+        setL2SearchUiBusy(false);
+    }
     m_tab = tab;
+    if (m_tab) {
+        // 连接新 tab 的 L2 异步搜索信号（即使当前是 L1 也连接，切换到 L2 时正常工作）
+        m_l2ProgressConn = QObject::connect(
+            m_tab, &EditorTab::findAllL2Progress,
+            this,  &FindReplaceDialog::onL2FindAllProgress);
+        m_l2FinishedConn = QObject::connect(
+            m_tab, &EditorTab::findAllL2Finished,
+            this,  &FindReplaceDialog::onL2FindAllFinished);
+    }
 }
 
 void FindReplaceDialog::setSearchResultsDock(SearchResultsDock *dock)
@@ -197,6 +227,10 @@ void FindReplaceDialog::onReplaceAll()
                                   m_wordCheck->isChecked());
     QMessageBox::information(this, QStringLiteral("替换完成"),
                              QStringLiteral("已替换 %1 处匹配。").arg(count));
+    if (count > 0 && m_tab->isL2Mode() && m_resultsDock) {
+        // L2 替换后，旧的 SearchResultsModel 内 byteOffset 已失效，清空避免错误跳转
+        m_resultsDock->setResultsModel(nullptr, QString(), QString());
+    }
 }
 
 void FindReplaceDialog::onFindAll()
@@ -206,10 +240,93 @@ void FindReplaceDialog::onFindAll()
     if (pattern.isEmpty()) return;
     emitFindParameters();
 
+    if (m_tab->isL2Mode()) {
+        // L2 大文件：纯异步 → 经 AsyncTaskManager 派发 → findAllL2Finished 设置 Dock
+        setL2SearchUiBusy(true, QObject::tr("准备搜索…"));
+        bool started = m_tab->findAllL2Async(pattern, m_regexCheck->isChecked(),
+                                             m_caseCheck->isChecked(),
+                                             m_wordCheck->isChecked(),
+                                             m_resultsDock);
+        if (!started) {
+            setL2SearchUiBusy(false);
+            m_resultsDock->setResults({}, pattern, m_tab->fileName());
+            m_resultsDock->show();
+            m_resultsDock->raise();
+        }
+        return;
+    }
+
+    // L1 小文件：QsciScintilla 内存扫描 → QTreeWidget
     auto matches = m_tab->findAll(pattern, m_regexCheck->isChecked(),
                                   m_caseCheck->isChecked(),
                                   m_wordCheck->isChecked());
     m_resultsDock->setResults(matches, pattern, m_tab->fileName());
+    m_resultsDock->show();
+    m_resultsDock->raise();
+}
+
+// ============================================================================
+//  L2 异步搜索 UI 辅助
+// ============================================================================
+void FindReplaceDialog::setL2SearchUiBusy(bool busy, const QString& msg)
+{
+    m_l2SearchInProgress = busy;
+    m_findNextBtn->setEnabled(!busy);
+    m_findPrevBtn->setEnabled(!busy);
+    m_replaceBtn->setEnabled(!busy);
+    m_replaceAllBtn->setEnabled(!busy);
+    m_findAllBtn->setEnabled(!busy);
+    m_findEdit->setEnabled(!busy);
+    m_replaceEdit->setEnabled(!busy);
+    m_regexCheck->setEnabled(!busy);
+    m_caseCheck->setEnabled(!busy);
+    m_wordCheck->setEnabled(!busy);
+    m_wrapCheck->setEnabled(!busy);
+    if (m_statusLabel) m_statusLabel->setText(busy ? msg : QString());
+}
+
+void FindReplaceDialog::onL2FindAllProgress(int percent, qint64 done, qint64 total)
+{
+    if (!m_l2SearchInProgress) return;
+    QString msg;
+    if (percent < 0) {
+        msg = QObject::tr("等待行索引构建完成…");
+    } else {
+        QString doneStr, totalStr;
+        if (total >= qint64(1024)*1024*1024) {
+            totalStr = QString::number(double(total)/(1024.0*1024.0*1024.0), 'f', 2) + QObject::tr(" GB");
+            doneStr  = QString::number(double(done) /(1024.0*1024.0*1024.0), 'f', 2) + QObject::tr(" GB");
+        } else if (total >= qint64(1024)*1024) {
+            totalStr = QString::number(double(total)/(1024.0*1024.0), 'f', 2) + QObject::tr(" MB");
+            doneStr  = QString::number(double(done) /(1024.0*1024.0), 'f', 2) + QObject::tr(" MB");
+        } else {
+            totalStr = QString::number(total) + QObject::tr(" B");
+            doneStr  = QString::number(done)  + QObject::tr(" B");
+        }
+        msg = QObject::tr("搜索大文件… %1% (%2 / %3)").arg(percent).arg(doneStr).arg(totalStr);
+    }
+    if (m_statusLabel) m_statusLabel->setText(msg);
+    // 同步刷新 MainWindow 状态栏（如果能拿到）
+    if (auto *mw = qobject_cast<QMainWindow*>(window())) {
+        mw->statusBar()->showMessage(msg, 0);
+    }
+}
+
+void FindReplaceDialog::onL2FindAllFinished(SearchResultsModel* model,
+                                            const QString& pattern,
+                                            const QString& fileName)
+{
+    setL2SearchUiBusy(false);
+    if (!m_resultsDock) {
+        // Dock 不存在：model 的 QObject parent 为空（因为我们传 m_resultsDock=nullptr），此时手动删除
+        if (model && static_cast<const QObject*>(model)->parent() == nullptr) delete model;
+        return;
+    }
+    if (model) {
+        m_resultsDock->setResultsModel(model, pattern, fileName);
+    } else {
+        m_resultsDock->setResults({}, pattern, fileName);
+    }
     m_resultsDock->show();
     m_resultsDock->raise();
 }

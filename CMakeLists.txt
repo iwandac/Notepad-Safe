@@ -20,7 +20,7 @@ elseif(NOT NOTEPADSAFE_QT6_DIR)
 endif()
 set(CMAKE_PREFIX_PATH "${NOTEPADSAFE_QT6_DIR}")
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets PrintSupport Svg SvgWidgets)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets PrintSupport Svg SvgWidgets Concurrent TaskTree Test)
 
 # QScintilla 静态库（相对于产品根，clone 后即可构建）
 set(QSCINTILLA_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/QScintilla_src-2.14.1/src")
@@ -30,27 +30,61 @@ set(QSCINTILLA_LIB "${CMAKE_CURRENT_SOURCE_DIR}/third_party/QScintilla_src-2.14.
 set(APP_RC_FILE    "${CMAKE_CURRENT_SOURCE_DIR}/resources/app_icon.rc")
 set(APP_QRC_FILE   "${CMAKE_CURRENT_SOURCE_DIR}/resources/app_resources.qrc")
 
+# ============================================================================
+#  源码目录结构（按功能模块聚类）
+#    src/main.cpp           — 程序入口
+#    src/editor/            — 编辑器引擎：编码/行索引/补丁/虚拟视图/编辑标签页
+#    src/search/            — 搜索与替换：大文件搜索/结果模型/Dock/查找替换对话框
+#    src/async/             — 异步任务框架：线程池/管理器/加密/状态栏/面板对话框
+#    src/session/           — 会话管理：序列化/恢复
+#    src/window/            — 主窗口
+# ============================================================================
+set(APP_INCLUDE_DIRS
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/editor
+    ${CMAKE_SOURCE_DIR}/src/search
+    ${CMAKE_SOURCE_DIR}/src/async
+    ${CMAKE_SOURCE_DIR}/src/session
+    ${CMAKE_SOURCE_DIR}/src/window
+)
+
+# ============ 主程序 ============
+
 add_executable(notepad-safe WIN32
-    main.cpp
-    MainWindow.cpp
-    EditorTab.cpp
-    TextEncoding.cpp
-    FindReplaceDialog.cpp
-    SearchResultsDock.cpp
-    SessionManager.cpp
+    src/main.cpp
+    src/window/MainWindow.cpp
+    src/editor/EditorTab.cpp
+    src/editor/TextEncoding.cpp
+    src/search/FindReplaceDialog.cpp
+    src/search/SearchResultsDock.cpp
+    src/session/SessionManager.cpp
+    src/editor/DynamicThresholds.cpp
+    src/editor/LineIndex.cpp
+    src/editor/PatchList.cpp
+    src/search/LargeFileSearch.cpp
+    src/search/SearchResultsModel.cpp
+    src/editor/VirtualFileView.cpp
+    src/async/AsyncTask.cpp
+    src/async/AsyncThreadPool.cpp
+    src/async/AsyncTaskManager.cpp
+    src/async/StatusBarTaskWidget.cpp
+    src/async/AsyncTaskPanelDialog.cpp
+    src/async/CryptoTask.cpp
     ${APP_RC_FILE}
     ${APP_QRC_FILE}
 )
 
-target_include_directories(notepad-safe PRIVATE ${QSCINTILLA_INCLUDE_DIR})
+target_include_directories(notepad-safe PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 
 target_link_libraries(notepad-safe PRIVATE
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
+    Qt6::Concurrent
     Qt6::PrintSupport
     Qt6::Svg
     Qt6::SvgWidgets
+    Qt6::TaskTree
     ${QSCINTILLA_LIB}
 )
 
@@ -102,8 +136,9 @@ set(WIN_SYSTEM_LIBS
 # 测试 1: 编码检测（仅需 Qt6::Core）
 add_executable(test_textencoding
     tests/test_textencoding.cpp
-    TextEncoding.cpp
+    src/editor/TextEncoding.cpp
 )
+target_include_directories(test_textencoding PRIVATE ${APP_INCLUDE_DIRS})
 target_link_libraries(test_textencoding PRIVATE Qt6::Core)
 if(WIN32)
     target_link_libraries(test_textencoding PRIVATE ${WIN_SYSTEM_LIBS})
@@ -114,6 +149,7 @@ qt_import_plugins(test_textencoding INCLUDE Qt6::QWindowsIntegrationPlugin)
 add_executable(test_search
     tests/test_search.cpp
 )
+target_include_directories(test_search PRIVATE ${APP_INCLUDE_DIRS})
 target_link_libraries(test_search PRIVATE Qt6::Core)
 if(WIN32)
     target_link_libraries(test_search PRIVATE ${WIN_SYSTEM_LIBS})
@@ -123,16 +159,28 @@ qt_import_plugins(test_search INCLUDE Qt6::QWindowsIntegrationPlugin)
 # 测试 3: 会话序列化（需 Qt6::Core + QScintilla，因为 SessionManager.cpp 依赖 EditorTab）
 add_executable(test_session
     tests/test_session.cpp
-    SessionManager.cpp
-    EditorTab.cpp
-    TextEncoding.cpp
+    src/session/SessionManager.cpp
+    src/editor/EditorTab.cpp
+    src/editor/TextEncoding.cpp
+    src/editor/DynamicThresholds.cpp
+    src/editor/LineIndex.cpp
+    src/editor/PatchList.cpp
+    src/search/LargeFileSearch.cpp
+    src/search/SearchResultsModel.cpp
+    src/editor/VirtualFileView.cpp
+    src/async/AsyncTask.cpp
+    src/async/AsyncThreadPool.cpp
+    src/async/AsyncTaskManager.cpp
+    src/async/CryptoTask.cpp
 )
-target_include_directories(test_session PRIVATE ${QSCINTILLA_INCLUDE_DIR})
+target_include_directories(test_session PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(test_session PRIVATE
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
+    Qt6::Concurrent
     Qt6::PrintSupport
+    Qt6::TaskTree
     ${QSCINTILLA_LIB}
 )
 if(WIN32)
@@ -145,6 +193,7 @@ qt_import_plugins(test_session INCLUDE Qt6::QWindowsIntegrationPlugin)
 add_executable(test_settings_ui
     tests/test_settings_ui.cpp
 )
+target_include_directories(test_settings_ui PRIVATE ${APP_INCLUDE_DIRS})
 target_link_libraries(test_settings_ui PRIVATE
     Qt6::Core
 )
@@ -157,12 +206,23 @@ endif()
 # 使用 QApplication（非 QCoreApplication），与 notepad-safe.exe 主程序相同的初始化方式。
 add_executable(test_largefile
     tests/test_largefile.cpp
+    src/editor/DynamicThresholds.cpp
+    src/editor/LineIndex.cpp
+    src/editor/PatchList.cpp
+    src/search/LargeFileSearch.cpp
+    src/search/SearchResultsModel.cpp
+    src/async/AsyncTask.cpp
+    src/async/AsyncThreadPool.cpp
+    src/async/AsyncTaskManager.cpp
+    src/editor/VirtualFileView.cpp
 )
-target_include_directories(test_largefile PRIVATE ${QSCINTILLA_INCLUDE_DIR})
+target_include_directories(test_largefile PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(test_largefile PRIVATE
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::TaskTree
     ${QSCINTILLA_LIB}
 )
 if(WIN32)
@@ -172,6 +232,36 @@ qt_import_plugins(test_largefile
     INCLUDE Qt6::QWindowsIntegrationPlugin
 )
 
+# 测试 6: 端到端启动秒开验证（100MB 会话恢复 → 主窗口 < 500ms 可见）
+#  方式：QProcess 启动 notepad-safe.exe + Win32 EnumWindows 检测窗口可见时间
+#  注意：此测试必须在 notepad-safe.exe 构建完之后运行，且会临时覆盖用户 session.json（完成后自动还原）
+add_executable(e2e_startup_verify
+    tests/e2e_startup_verify.cpp
+)
+target_include_directories(e2e_startup_verify PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(e2e_startup_verify PRIVATE
+    Qt6::Core
+)
+if(WIN32)
+    target_link_libraries(e2e_startup_verify PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+
+# 测试 7: E2E L2 内容可见性验证（打开 40MB 文件 → PrintWindow 抓客户区 → 像素分析）
+# 目的：regression 历史上"打开大文件没内容显示"的三种根因不再复现：
+#       · vp size=0 导致 Scintilla overlay 0x0
+#       · scrollContentsBy 默认实现 viewport()->scroll 移走 Scintilla
+#       · activeWindowChanged 未 emit 导致 setText 从未被调用
+add_executable(e2e_l2_content_visible
+    tests/e2e_l2_content_visible.cpp
+)
+target_include_directories(e2e_l2_content_visible PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(e2e_l2_content_visible PRIVATE
+    Qt6::Core
+)
+if(WIN32)
+    target_link_libraries(e2e_l2_content_visible PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+
 # 测试目标
 enable_testing()
 add_test(NAME textencoding COMMAND test_textencoding)
@@ -179,3 +269,175 @@ add_test(NAME search       COMMAND test_search)
 add_test(NAME session      COMMAND test_session)
 add_test(NAME settings_ui  COMMAND test_settings_ui)
 add_test(NAME largefile    COMMAND test_largefile)
+
+# ============ 诊断工具 ============
+
+add_executable(diag_lineindex
+    tests/diag_lineindex.cpp
+    src/editor/DynamicThresholds.cpp
+    src/editor/LineIndex.cpp
+)
+target_include_directories(diag_lineindex PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(diag_lineindex PRIVATE
+    Qt6::Core
+    Qt6::Concurrent
+)
+
+add_executable(diag_editops
+    tests/diag_editops.cpp
+    src/editor/DynamicThresholds.cpp
+    src/editor/LineIndex.cpp
+    src/editor/PatchList.cpp
+)
+target_include_directories(diag_editops PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(diag_editops PRIVATE
+    Qt6::Core
+    Qt6::Concurrent
+)
+
+add_executable(diag_scroll_lines
+    tests/diag_scroll_lines.cpp
+    src/editor/DynamicThresholds.cpp
+    src/editor/LineIndex.cpp
+)
+target_include_directories(diag_scroll_lines PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(diag_scroll_lines PRIVATE
+    Qt6::Core
+    Qt6::Concurrent
+)
+
+add_executable(diag_gui_l2_editops
+    tests/diag_gui_l2_editops.cpp
+    src/editor/VirtualFileView.cpp
+    src/editor/PatchList.cpp
+    src/editor/LineIndex.cpp
+    src/search/LargeFileSearch.cpp
+    src/async/AsyncTaskManager.cpp
+    src/async/AsyncTask.cpp
+    src/async/AsyncThreadPool.cpp
+    src/editor/DynamicThresholds.cpp
+)
+target_include_directories(diag_gui_l2_editops PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(diag_gui_l2_editops PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::PrintSupport
+    Qt6::Svg
+)
+
+add_executable(diag_save_l2_chain
+    tests/diag_save_l2_chain.cpp
+    src/editor/PatchList.cpp
+    src/editor/LineIndex.cpp
+    src/editor/DynamicThresholds.cpp
+)
+target_include_directories(diag_save_l2_chain PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(diag_save_l2_chain PRIVATE
+    Qt6::Core
+    Qt6::Concurrent
+)
+
+# ============================================================================
+#  GUI 冒烟测试组件（tests/gui_smoke/）
+#  - 所有 target 走 Qt6 Test（QTEST_MAIN），真实 GUI 事件模拟（QTest::mouseClick 等）
+#  - 不直接 link MainWindow.cpp（避免 WinMain 与 QTEST_MAIN 的 main 冲突）
+#    所有场景直接实例化 EditorTab + FindReplaceDialog 驱动真实 L2 GUI 路径。
+#  - 构建与执行由 run_all_gui_smoke.bat 统一管理
+# ============================================================================
+set(GUI_SMOKE_SHARED_SOURCES
+    tests/gui_smoke/SmokeTestBase.cpp
+    src/editor/VirtualFileView.cpp
+    src/editor/PatchList.cpp
+    src/editor/LineIndex.cpp
+    src/search/LargeFileSearch.cpp
+    src/search/SearchResultsModel.cpp
+    src/search/SearchResultsDock.cpp
+    src/editor/EditorTab.cpp
+    src/search/FindReplaceDialog.cpp
+    src/editor/TextEncoding.cpp
+    src/session/SessionManager.cpp
+    src/editor/DynamicThresholds.cpp
+    src/async/AsyncTaskManager.cpp
+    src/async/AsyncTask.cpp
+    src/async/AsyncThreadPool.cpp
+    src/async/CryptoTask.cpp
+    ${APP_QRC_FILE}
+)
+
+# —— smoke_coord_editops：坐标错乱 / 输入偏移 / 自动换行 / 光标 / 拖选 ——
+add_executable(gui_smoke_coord
+    tests/gui_smoke/smoke_coord_editops.cpp
+    ${GUI_SMOKE_SHARED_SOURCES}
+)
+target_include_directories(gui_smoke_coord PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_coord PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::PrintSupport
+    Qt6::Svg
+    Qt6::SvgWidgets
+    Qt6::TaskTree
+    Qt6::Test
+    ${QSCINTILLA_LIB}
+)
+
+# —— smoke_find_replace：Ctrl+H 快捷键 / 替换内容正确性 / 跳转 / 替换全部 ——
+add_executable(gui_smoke_findreplace
+    tests/gui_smoke/smoke_find_replace.cpp
+    ${GUI_SMOKE_SHARED_SOURCES}
+)
+target_include_directories(gui_smoke_findreplace PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_findreplace PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::PrintSupport
+    Qt6::Svg
+    Qt6::SvgWidgets
+    Qt6::TaskTree
+    Qt6::Test
+    ${QSCINTILLA_LIB}
+)
+
+# —— smoke_smallfixes_menu_ui：§16 组 1 · 小修复组（替换快捷键 Ctrl+R 一致性 + L2 菜单禁用 7 项 + lifecycle）——
+# 本目标是**唯一** link MainWindow.cpp 的 GUI smoke（其他 smoke 不 link 以避免 main 冲突）；
+# MainWindow 引用的 StatusBarTaskWidget / AsyncTaskPanelDialog 也在此单独列出来（不在 GUI_SMOKE_SHARED_SOURCES）。
+add_executable(gui_smoke_smallfixes
+    tests/gui_smoke/smoke_smallfixes_menu_ui.cpp
+    ${GUI_SMOKE_SHARED_SOURCES}
+    src/window/MainWindow.cpp
+    src/async/StatusBarTaskWidget.cpp
+    src/async/AsyncTaskPanelDialog.cpp
+)
+target_include_directories(gui_smoke_smallfixes PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_smallfixes PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::PrintSupport
+    Qt6::Svg
+    Qt6::SvgWidgets
+    Qt6::TaskTree
+    Qt6::Test
+    ${QSCINTILLA_LIB}
+)
+# Windows 静态 Qt：显式链接系统库（与 notepad-safe 一致）
+if(WIN32)
+    target_link_libraries(gui_smoke_smallfixes PRIVATE
+        winmm imm32 ws2_32 ole32 oleaut32 advapi32
+        shell32 gdi32 user32 comdlg32 uuid version
+        netapi32 userenv dwmapi uxtheme d2d1 dwrite
+        d3d11 dxgi dxguid strmiids crypt32
+    )
+endif()
+
+# CTest 注册（可选；日常由 run_all_gui_smoke.bat 直跑更直观）
+add_test(NAME gui_smoke_coord        COMMAND gui_smoke_coord)
+add_test(NAME gui_smoke_findreplace  COMMAND gui_smoke_findreplace)
+add_test(NAME gui_smoke_smallfixes   COMMAND gui_smoke_smallfixes)
