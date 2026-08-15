@@ -40,7 +40,7 @@
 #include <QtCore/QTimer>
 #include <QtCore/QDeadlineTimer>
 #include <QtCore/QMetaType>
-#include <QtCore/QStackedWidget>
+#include <QtWidgets/QStackedWidget>
 
 #include "MainWindow.h"
 #include "EditorTab.h"
@@ -205,7 +205,7 @@ static void closeAllEditorTabs(MainWindow* mw) {
     }
 }
 
-// 写一个小文件到临时目录（内容=sizeMB MB，确保 > DynamicThresholds 的 L1_EDIT_LIMIT → 走 L2 auto mode；
+// 写一个小文件到临时目录（内容=sizeMB MiB，确保超过 FileTierPolicy 的 S1 上限 → 走 S2 auto mode；
 // 路径返回绝对路径，失败返回空字符串。openFile 走 MainWindow::openFilesFromExternal 用户真实入口，
 // 确保真正触发 tab 内部 L1→L2 切换 → emit l2ModeStatusChanged → syncL2SensitiveActions 链路。
 static QString makeL2FixtureFile(QTemporaryDir& td, const QString& name, int sizeMB = 64) {
@@ -312,7 +312,7 @@ private slots:
     void initTestCase() {
         QVERIFY(tmpDir_.isValid());
         // ------ 在 show MainWindow / 占用主线程之前先写大文件（IO 节流时写 120MB 可以很久）
-        // makeL2FixtureFile(40): size > L1_EDIT_LIMIT 硬上限 32MB → 保证走 L2 auto mode
+        // makeL2FixtureFile(40): size > S1 上限 32 MiB → 保证走 S2 auto mode
         l2FixtureD001_ = makeL2FixtureFile(tmpDir_, "d001-l2.bin", 40);
         l2FixtureD003_ = makeL2FixtureFile(tmpDir_, "d003-l2.bin", 40);
         l2FixtureD007_ = makeL2FixtureFile(tmpDir_, "lifecycle-l2-a.bin", 40);

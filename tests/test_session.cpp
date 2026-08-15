@@ -1,7 +1,7 @@
 // 会话序列化单元测试
 // 测试 SessionManager 的 JSON 序列化/反序列化逻辑
-#include "../SessionManager.h"
-#include "../TextEncoding.h"
+#include "SessionManager.h"
+#include "TextEncoding.h"
 
 #include <QCoreApplication>
 #include <QFile>

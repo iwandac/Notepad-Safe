@@ -4,7 +4,8 @@
 
 // ============================================================================
 //  DynamicThresholds — 启动时探测物理 RAM + CPU 核心数，
-//  集中管理 L1/L2 切换、Patch 上限、搜索线程、findAll 结果上限等阈值。
+//  集中管理资源相关的 Patch 上限、搜索线程、findAll 结果上限等阈值。
+//  S1/S2/S3 产品边界统一由 FileTierPolicy 管理，不随机器配置变化。
 //
 //  设计原则（DESIGN.md §5.1）：
 //   1) 不设人为硬上限；32GB 机器自然比 8GB 机器跑得更远。
@@ -12,7 +13,6 @@
 //
 //  典型阈值（探测后动态计算）：
 //          8GB RAM        16GB RAM       32GB RAM
-//  L1_EDIT     2GB(固定)       2GB(固定)       2GB(固定)
 //  PATCH_L1   400MB            800MB           2GB (顶)
 //  MAX_MATCH  10M条           21M条          42M条
 //  SEARCH_THR   4核              8核             8核 (顶)
@@ -22,10 +22,6 @@
 struct DynamicThresholds {
     qint64 RAM_BYTES = 0;       // 物理内存总量（字节）
     int    CPU_CORES = 1;       // 逻辑 CPU 核心数
-
-    // L1 完整编辑（QsciScintilla） vs L2 虚拟视图 切换阈值（字节）
-    // 固定 2GB：≤ 2GB 走 L1 全量加载，> 2GB 走 L2 mmap 秒开
-    qint64 L1_EDIT_LIMIT = 0;
 
     // Patch L1 热内存上限；达到即 spill 25% 到 l2Cold_
     // = min(RAM_BYTES/20, 2GB)

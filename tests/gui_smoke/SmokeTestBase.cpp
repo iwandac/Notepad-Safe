@@ -8,6 +8,7 @@
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
 #include <QtCore/QDebug>
+#include <QtCore/QSaveFile>
 
 #include "EditorTab.h"
 #include "VirtualFileView.h"
@@ -251,5 +252,34 @@ QString SmokeTestBase::createSmallTestFile(const QByteArray& data, const QString
 }
 
 QString SmokeTestBase::defaultLargeFilePath() {
-    return QStringLiteral("F:/projects/credentials/smalltestfile");
+    const QString fromEnv = qEnvironmentVariable("NOTEPADSAFE_GUI_FIXTURE");
+    if (!fromEnv.isEmpty() && QFileInfo::exists(fromEnv)) {
+        return QFileInfo(fromEnv).absoluteFilePath();
+    }
+
+    const QDir appDir(QCoreApplication::applicationDirPath());
+    const QStringList candidates = {
+        appDir.absoluteFilePath(QStringLiteral("../../smalltestfile")),
+        QStringLiteral("F:/projects/notepadsafe/smalltestfile")
+    };
+    for (const QString& candidate : candidates) {
+        if (QFileInfo::exists(candidate)) {
+            return QFileInfo(candidate).absoluteFilePath();
+        }
+    }
+
+    // CI/新 clone 不应依赖开发者机器上的 228 MiB fixture。生成一个包含足够
+    // 行数的确定性文件；openL2() 会显式走 mmap 路径，因此无需伪造巨大体积。
+    const QString generated = QDir::temp().absoluteFilePath(
+        QStringLiteral("notepadsafe-gui-smoke-default.txt"));
+    QSaveFile out(generated);
+    if (!out.open(QIODevice::WriteOnly)) return {};
+    for (int i = 0; i < 4096; ++i) {
+        QByteArray line = QByteArrayLiteral("line-") + QByteArray::number(i) + QByteArrayLiteral(":");
+        while (line.size() < 112) line.append(static_cast<char>('A' + (i % 26)));
+        line.append('\n');
+        if (out.write(line) != line.size()) return {};
+    }
+    if (!out.commit()) return {};
+    return QFileInfo(generated).absoluteFilePath();
 }

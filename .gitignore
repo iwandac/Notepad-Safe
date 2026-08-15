@@ -1,9 +1,11 @@
 # ====== Build / Artifact ======
 build/
 build_*/
+build-*/
 out/
 cmake-build-*/
 dist/
+.deps/
 
 # ====== CMake / Ninja / CTest ======
 CMakeCache.txt

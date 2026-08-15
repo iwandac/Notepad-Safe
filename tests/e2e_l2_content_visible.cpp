@@ -89,7 +89,7 @@ static QString make40MbFile(const QString &dir)
 {
     QDir().mkpath(dir);
     const QString path = dir + "/dummy_40mb.txt";
-    // DynamicThresholds L1_EDIT_LIMIT 硬上限 = 32 MB；40MB > 32MB → 一定走 L2 mmap 路径
+    // FileTierPolicy S1 上限 = 32 MiB；40 MiB 一定走 S2 mmap 路径
     const qint64 TARGET = 40LL * 1024 * 1024;
     if (QFileInfo(path).exists() && QFileInfo(path).size() == TARGET) {
         qInfo("  40MB 测试文件已存在，复用: %s", qUtf8Printable(path));
@@ -146,8 +146,10 @@ static bool writeSessionJson(const QString &dataDir, const QString &contentPath)
 }
 
 // 抓客户区 HBITMAP。失败返回 NULL。
-// 做法：先尝试 PrintWindow（PW_RENDERFULLCONTENT 兼容 DWM 合成），
-// 失败回退到 GetDC + BitBlt（简单情况也能用）。
+// 做法：窗口已经由测试置前并保持可见，因此先用 GetDC + BitBlt 抓取
+// DWM 实际合成画面。PrintWindow 会要求原生子窗口分别离屏绘制，QScintilla
+// 在该路径下可能忽略 sibling dock 的裁剪，产生编辑区覆盖 Dock 的假截图。
+// BitBlt 失败时才回退到 PrintWindow(PW_RENDERFULLCONTENT)。
 static HBITMAP captureClientArea(HWND hwnd, int *outW, int *outH)
 {
     *outW = 0; *outH = 0;
@@ -169,12 +171,11 @@ static HBITMAP captureClientArea(HWND hwnd, int *outW, int *outH)
     if (!hbm) { DeleteDC(hdcMem); ReleaseDC(hwnd, hdcScreen); return nullptr; }
     auto old = SelectObject(hdcMem, hbm);
 
-    BOOL ok = FALSE;
-    // Win8.1+: PW_RENDERFULLCONTENT = 0x00000002。直接用字面值避免版本宏问题。
-    ok = PrintWindow(hwnd, hdcMem, 0x00000002);
+    BOOL ok = BitBlt(hdcMem, 0, 0, W, H, hdcScreen, 0, 0,
+                     SRCCOPY | CAPTUREBLT);
     if (!ok) {
-        // 回退：BitBlt。注意如果 DWM 合成失败/窗口被遮挡会抓到黑块。
-        ok = BitBlt(hdcMem, 0, 0, W, H, hdcScreen, 0, 0, SRCCOPY | CAPTUREBLT);
+        // Win8.1+: PW_RENDERFULLCONTENT = 0x00000002。直接用字面值避免版本宏问题。
+        ok = PrintWindow(hwnd, hdcMem, 0x00000002);
     }
     SelectObject(hdcMem, old);
     DeleteDC(hdcMem);
@@ -295,10 +296,14 @@ static TextureAnalysis analyzeBitmapTexture(HBITMAP hbm, int W, int H)
 
 int main(int argc, char *argv[])
 {
+    // The harness uses raw Win32 geometry and capture APIs. Without explicit
+    // DPI awareness Windows virtualizes GetClientRect for this non-GUI test
+    // process, cropping the right/bottom of Qt windows on scaled displays.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     QCoreApplication app(argc, argv);
 
-    const QString rootDir  = QFileInfo(QString::fromUtf8(__FILE__)).dir().absolutePath() + "/..";
-    const QString buildDir = QDir(rootDir).absoluteFilePath("build");
+    // CMake 可使用任意独立构建目录；主程序与 E2E 可执行文件是同目录产物。
+    const QString buildDir = QCoreApplication::applicationDirPath();
     const QString exePath  = QDir(buildDir).absoluteFilePath("notepad-safe.exe");
     if (!QFileInfo::exists(exePath)) {
         fprintf(stderr, "找不到 notepad-safe.exe: %s\n", qUtf8Printable(exePath));
@@ -310,7 +315,7 @@ int main(int argc, char *argv[])
     printf("  本启动器PID: %lu\n", (unsigned long)GetCurrentProcessId());
 
     // Step 1: 生成 40MB 文件 + 准备数据目录（每次重跑都新建沙箱，避免残留影响）
-    // 注意：40MB > DynamicThresholds L1_EDIT_LIMIT 硬上限 32MB，保证走 L2 mmap 路径
+    // 注意：40 MiB 超过 FileTierPolicy S1 上限 32 MiB，保证走 S2 mmap 路径
     const QString workDir = QDir::tempPath() + "/NotepadSafe_E2E_L2";
     QDir(workDir).removeRecursively();
     QDir().mkpath(workDir);

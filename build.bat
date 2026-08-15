@@ -11,11 +11,18 @@ REM       1) env var NOTEPADSAFE_QT6_DIR
 REM       2) CMake cache NOTEPADSAFE_QT6_DIR
 REM       3) default: E:\programs\Qt_6.11.1-static-Release_msvc2026_64\msvc2026_64
 REM   - VS install root can be overridden via env NOTEPADSAFE_VS_ROOT (e.g. VS 2022 = 17)
+REM   - Production KDBX backend is enabled by default. Set
+REM       NOTEPADSAFE_WITH_KDBX=OFF
+REM     for a dependency-light editor-only build.
 REM ============================================================================
 
 set "SCRIPT_DIR=%~dp0"
 set "SOURCE_DIR=%SCRIPT_DIR%."
 set "BUILD_DIR=%SCRIPT_DIR%build"
+
+if not defined NOTEPADSAFE_WITH_KDBX (
+    set "NOTEPADSAFE_WITH_KDBX=ON"
+)
 
 if not defined NOTEPADSAFE_VS_ROOT (
     set "NOTEPADSAFE_VS_ROOT=C:\Program Files\Microsoft Visual Studio\18\Insiders"
@@ -30,7 +37,7 @@ if not exist "%VCVARS%" (
     exit /b 1
 )
 
-echo === [1/3] Activating VS environment ===
+echo === [1/4] Activating VS environment ===
 call "%VCVARS%" >nul 2>&1
 if errorlevel 1 (
     echo ERROR: vcvars64.bat failed
@@ -41,22 +48,35 @@ if defined NOTEPADSAFE_QT6_DIR (
     echo Qt path from env NOTEPADSAFE_QT6_DIR = %NOTEPADSAFE_QT6_DIR%
 )
 
+echo === [2/4] Preparing locked dependencies ===
+if /I "%NOTEPADSAFE_WITH_KDBX%"=="ON" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%tools\bootstrap_crypto_deps.ps1"
+    if errorlevel 1 (
+        echo ERROR: KDBX dependency bootstrap failed
+        exit /b 1
+    )
+) else (
+    echo KDBX backend disabled by NOTEPADSAFE_WITH_KDBX=OFF
+)
+
 if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
 mkdir "%BUILD_DIR%"
 
-echo === [2/3] CMake Configure ===
+echo === [3/4] CMake Configure ===
 pushd "%BUILD_DIR%"
 
 if defined NOTEPADSAFE_QT6_DIR (
     "%VS_CMAKE%" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release ^
         -DCMAKE_MAKE_PROGRAM="%VS_NINJA%" ^
+        -DNOTEPADSAFE_ENABLE_KDBX_BACKEND="%NOTEPADSAFE_WITH_KDBX%" ^
         -DNOTEPADSAFE_QT6_DIR="%NOTEPADSAFE_QT6_DIR%" ^
         "%SOURCE_DIR%"
 ) else (
     "%VS_CMAKE%" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release ^
         -DCMAKE_MAKE_PROGRAM="%VS_NINJA%" ^
+        -DNOTEPADSAFE_ENABLE_KDBX_BACKEND="%NOTEPADSAFE_WITH_KDBX%" ^
         "%SOURCE_DIR%"
 )
 
@@ -66,7 +86,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo === [3/3] Building ===
+echo === [4/4] Building ===
 "%VS_CMAKE%" --build . --config Release -j
 if errorlevel 1 (
     echo ERROR: Build failed

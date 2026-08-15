@@ -1,6 +1,6 @@
 #include "EditorTab.h"
 #include "VirtualFileView.h"
-#include "DynamicThresholds.h"
+#include "FileTierPolicy.h"
 #include "SearchResultsModel.h"
 #include "AsyncTaskManager.h"
 
@@ -181,8 +181,8 @@ bool EditorTab::loadFile(const QString &path)
 {
     QElapsedTimer t; t.start();
     const qint64 size = QFileInfo(path).size();
-    const qint64 limit = DynamicThresholds::instance().L1_EDIT_LIMIT;
-    if (size >= limit) {
+    const FileTierDecision tier = FileTierPolicy::classify(size);
+    if (tier.usesMappedPreview()) {
         qCritical("[EditorTab::loadFile] ⚠️  大文件(%lld MB)直接走了 L1 loadFile！"
                   " 这会阻塞 UI 线程 %lld ms+，导致启动时'全程静默无弹窗直到加载完'！"
                   " 正确路径应是 openTabAutoMode → openLargeFileL2 mmap 秒开。"
@@ -197,7 +197,7 @@ bool EditorTab::loadFile(const QString &path)
     QByteArray data = file.readAll();
     file.close();
     const qint64 msReadAll = t.elapsed();
-    if (size >= limit) {
+    if (tier.usesMappedPreview()) {
         qCritical("[EditorTab::loadFile]   ⚠️  readAll(%lld MB) 主线程同步耗时 = %lld ms → "
                   "这就是用户以为'窗口没弹出'的根因（事件循环无法派发 Show/Paint 事件）",
                   size / (1024*1024), msReadAll);
@@ -233,10 +233,13 @@ bool EditorTab::loadFile(const QString &path)
     }
     m_editor->setModified(false);
 
-    // 成功加载文件：切回 L1 显示，关闭 L2 模式（若之前曾打开 L2）
+    // 成功加载文件：切回 L1 显示，关闭 L2 模式（若之前曾打开 L2）。
+    // L2 会把 Scintilla 临时 reparent 到 VirtualFileView 的 viewport；reparent 时
+    // QStackedWidget 会自动移除该页，因此不能假设 L1 永远仍是 index 0。
+    bridgeReparentEditorToStack();
     m_l2Mode = false;
     emit l2ModeStatusChanged();
-    if (m_stack) m_stack->setCurrentIndex(0);
+    if (m_stack) m_stack->setCurrentWidget(m_editor);
 
     // 根据后缀猜测语法
     Syntax s = guessSyntaxFromExtension(path);
@@ -252,8 +255,8 @@ bool EditorTab::loadAutosave(const QString &autosavePath)
 {
     QElapsedTimer t; t.start();
     const qint64 size = QFileInfo(autosavePath).size();
-    const qint64 limit = DynamicThresholds::instance().L1_EDIT_LIMIT;
-    if (size >= limit) {
+    const FileTierDecision tier = FileTierPolicy::classify(size);
+    if (tier.usesMappedPreview()) {
         qCritical("[EditorTab::loadAutosave] ⚠️  大 autosave(%lld MB)直接走了 L1 loadAutosave！"
                   " 这会阻塞 UI 线程 %lld ms+，导致启动时'全程静默无弹窗直到加载完'！"
                   " 正确路径应是 openAutosaveAutoMode → ensureL2View+openFile mmap 秒开。"
@@ -268,7 +271,7 @@ bool EditorTab::loadAutosave(const QString &autosavePath)
     QByteArray data = file.readAll();
     file.close();
     const qint64 msReadAll = t.elapsed();
-    if (size >= limit) {
+    if (tier.usesMappedPreview()) {
         qCritical("[EditorTab::loadAutosave]   ⚠️  readAll(%lld MB) 主线程同步耗时 = %lld ms → "
                   "这就是用户以为'窗口没弹出'的根因（事件循环无法派发 Show/Paint 事件）",
                   size / (1024*1024), msReadAll);
@@ -985,8 +988,11 @@ TextEncoding EditorTab::displayEncodingL2() const
 
 bool EditorTab::isL2Active() const
 {
-    // index 0 = L1 (QsciScintilla), index 1 = L2 (VirtualFileView)
-    return m_stack && m_stack->currentIndex() == 1;
+    // 不能用 currentIndex()==1：进入 L2 后 Scintilla 会被 reparent 到 VFV 的
+    // viewport，QStackedWidget 随即自动移除原 L1 page，VFV 的 index 会从 1 变成 0。
+    // 用稳定的页面对象身份判断，避免菜单状态和实际编辑模式永久错位。
+    return m_l2Mode && m_stack && m_l2View
+        && m_stack->currentWidget() == m_l2View;
 }
 
 // ============================================================================
@@ -1196,8 +1202,9 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg)
     m_lastL2Line = 0;
     m_lastL2Col  = 0;
     m_lastL2Byte = 0;
-    // 重要：先切 stack→index=1，再 emit l2ModeStatusChanged。
-    if (m_stack) m_stack->setCurrentIndex(1);
+    // 重要：先切到 VFV 页面，再 emit l2ModeStatusChanged。页面索引会在后续
+    // Scintilla reparent 时变化，所以必须按对象选择，不能硬编码 index=1。
+    if (m_stack) m_stack->setCurrentWidget(v);
 
     // ---- VFV 不绘制方案：Scintilla reparent 到 VFV viewport，占满可视区 ----
     //   唯一 UI = Scintilla overlay。VFV viewport 仅作为父容器（scrollbars 仍由 VFV 提供，
@@ -1436,10 +1443,11 @@ bool EditorTab::openAutosaveAutoMode(const QString &autosavePath, const QString 
         return false;
 
     const qint64 size = QFileInfo(autosavePath).size();
-    const qint64 limit = DynamicThresholds::instance().L1_EDIT_LIMIT;
+    const qint64 limit = FileTierPolicy::StandardEditLimitBytes;
+    const FileTierDecision tier = FileTierPolicy::classify(size);
     QElapsedTimer t; t.start();
 
-    if (size < limit) {
+    if (tier.tier == FileTier::StandardEdit) {
         // ---- 小文件 autosave：走原 loadAutosave（同步 L1，毫秒级）----
         qDebug("[openAutosaveAutoMode] 选 L1: autosaveSize=%lld KB < limit=%lld KB. 调用 loadAutosave...",
                size / 1024, limit / 1024);
@@ -1455,7 +1463,7 @@ bool EditorTab::openAutosaveAutoMode(const QString &autosavePath, const QString 
         return ok;
     }
 
-    // ---- 大文件 autosave（≥ L1_EDIT_LIMIT）：mmap 到 L2 VirtualFileView，秒开 ----
+    // ---- S2/S3 autosave：mmap 到 VirtualFileView，秒开 ----
     //   不再主线程 readAll(100MB) → 不再阻塞首帧渲染。
     qDebug("[openAutosaveAutoMode] 选 L2: autosaveSize=%lld KB >= limit=%lld KB. 调 ensureL2View+openFile（mmap 秒开）",
            size / 1024, limit / 1024);
@@ -1489,7 +1497,7 @@ bool EditorTab::openAutosaveAutoMode(const QString &autosavePath, const QString 
     m_lastL2Col  = 0;
     m_lastL2Byte = 0;
     // 同 openLargeFileL2：先切 stack→1，再 emit（保证 isL2Active()=true 时再通知 MainWindow）
-    if (m_stack) m_stack->setCurrentIndex(1);
+    if (m_stack) m_stack->setCurrentWidget(v);
     emit l2ModeStatusChanged();
 
     // 根据 realFilePath 或 autosavePath 猜语法（L2 暂不做词法，但信号保持统一）

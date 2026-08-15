@@ -4,9 +4,10 @@
 #include "SearchResultsDock.h"
 #include "SessionManager.h"
 #include "TextEncoding.h"
-#include "DynamicThresholds.h"
+#include "FileTierPolicy.h"
 #include "VirtualFileView.h"
 #include "StatusBarTaskWidget.h"
+#include "VaultDock.h"
 
 #include <QTabWidget>
 #include <QMenuBar>
@@ -34,6 +35,28 @@
 #include <QKeySequence>
 #include <QDateTime>
 #include <QElapsedTimer>
+#include <QDir>
+
+#include <memory>
+
+namespace {
+
+std::unique_ptr<QSettings> createAppSettings()
+{
+    const QString dataDir = qEnvironmentVariable("NOTEPADSAFE_DATADIR").trimmed();
+    const QFileInfo dataDirInfo(dataDir);
+    if (!dataDir.isEmpty() && dataDirInfo.isAbsolute()) {
+        QDir dir(dataDirInfo.absoluteFilePath());
+        dir.mkpath(QStringLiteral("."));
+        return std::make_unique<QSettings>(dir.filePath(QStringLiteral("settings.ini")),
+                                           QSettings::IniFormat);
+    }
+
+    return std::make_unique<QSettings>(QStringLiteral("NotepadSafe"),
+                                       QStringLiteral("NotepadSafe"));
+}
+
+} // namespace
 
 // 前向：同步编码菜单勾选状态
 static void syncEncodingMenuTo(QMenu *menu, TextEncoding enc)
@@ -51,17 +74,18 @@ static void syncEncodingMenuTo(QMenu *menu, TextEncoding enc)
     }
 }
 
-// L1/L2 自动分流打开文件（DESIGN §5.2 动态阈值）：
-//   size < L1_EDIT_LIMIT → EditorTab::loadFile (QsciScintilla 完整编辑)
-//   size ≥ → 先 try openLargeFileL2，失败回退到 loadFile（避免用户无法打开）
+// S1/S2/S3 自动分流打开文件（DESIGN §5.2 固定产品边界）：
+//   S1 → EditorTab::loadFile (QsciScintilla 完整编辑)
+//   S2/S3 → 先 try openLargeFileL2，失败回退到 loadFile（避免用户无法打开）
+// TODO: S3 的只读交互约束将在 VirtualFileView 分层中强制执行；当前先统一入口决策。
 // 返回是否成功（与 loadFile 返回一致）
 static bool openTabAutoMode(EditorTab *tab, const QString &path)
 {
     if (!tab) return false;
     QFileInfo fi(path);
     qint64 size = fi.exists() ? fi.size() : 0;
-    qint64 limit = DynamicThresholds::instance().L1_EDIT_LIMIT;
-    if (size >= limit) {
+    const FileTierDecision decision = FileTierPolicy::classify(size);
+    if (decision.usesMappedPreview()) {
         QString err;
         if (tab->openLargeFileL2(path, &err))
             return true;
@@ -93,11 +117,17 @@ MainWindow::MainWindow(QWidget *parent)
 
     // 搜索 Dock
     m_searchDock = new SearchResultsDock(this);
+    m_searchDock->setObjectName(QStringLiteral("SearchResultsDock"));
     addDockWidget(Qt::BottomDockWidgetArea, m_searchDock);
     m_searchDock->hide();
     connect(m_searchDock, &SearchResultsDock::jumpTo, this, &MainWindow::onJumpTo);
     connect(m_searchDock, &SearchResultsDock::jumpToByteOffset,
             this, &MainWindow::onJumpToByteOffset);
+
+    // 账号保险箱与加密笔记使用独立 Dock；编辑器只依赖 VaultService
+    // 边界，不接触任何 KeePassXC 类型。
+    m_vaultDock = new VaultDock(this);
+    addDockWidget(Qt::RightDockWidgetArea, m_vaultDock);
 
     // 查找/替换对话框
     m_findDialog = new FindReplaceDialog(this);
@@ -194,6 +224,20 @@ void MainWindow::createMenus()
     connect(exitAct, &QAction::triggered, this, &QMainWindow::close);
 
     rebuildRecentFilesMenu();
+
+    auto *vaultMenu = menuBar()->addMenu(QStringLiteral("保险库(&V)"));
+    auto *newVaultAct = vaultMenu->addAction(QStringLiteral("新建 KDBX 保险库(&N)…"));
+    connect(newVaultAct, &QAction::triggered, m_vaultDock, &VaultDock::newVaultInteractive);
+    auto *openVaultAct = vaultMenu->addAction(QStringLiteral("打开 KDBX 保险库(&O)…"));
+    openVaultAct->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+O")));
+    connect(openVaultAct, &QAction::triggered, m_vaultDock, &VaultDock::openVaultInteractive);
+    auto *lockVaultAct = vaultMenu->addAction(QStringLiteral("锁定保险库(&L)"));
+    lockVaultAct->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+L")));
+    connect(lockVaultAct, &QAction::triggered, m_vaultDock, &VaultDock::lockVault);
+    vaultMenu->addSeparator();
+    auto *showVaultAct = m_vaultDock->toggleViewAction();
+    showVaultAct->setText(QStringLiteral("显示保险库面板(&P)"));
+    vaultMenu->addAction(showVaultAct);
 
     // 编辑菜单
     auto *editMenu = menuBar()->addMenu(QStringLiteral("编辑(&E)"));
@@ -441,6 +485,7 @@ void MainWindow::createMenus()
 void MainWindow::createToolBar()
 {
     auto *toolbar = addToolBar(QStringLiteral("主工具栏"));
+    toolbar->setObjectName(QStringLiteral("MainToolBar"));
     toolbar->setMovable(false);
     toolbar->setIconSize(QSize(16, 16));
 
@@ -450,6 +495,8 @@ void MainWindow::createToolBar()
     toolbar->addSeparator();
     toolbar->addAction(QStringLiteral("查找"), this, &MainWindow::showFindDialog);
     toolbar->addAction(QStringLiteral("替换"), this, &MainWindow::showReplaceDialog);
+    toolbar->addSeparator();
+    toolbar->addAction(QStringLiteral("保险库"), m_vaultDock, &VaultDock::openVaultInteractive);
 }
 
 void MainWindow::createStatusBar()
@@ -1506,17 +1553,18 @@ void MainWindow::restoreNextSessionTab()
         //   旧做法：直接 tab->loadAutosave(st.autosavePath)
         //     · 100MB autosave：file.readAll() 主线程同步读 1~3s，窗口不显示、无提示
         //   新做法：tab->openAutosaveAutoMode(autosave, real)
-        //     · 尺寸 < L1_EDIT_LIMIT：走原 loadAutosave（毫秒级）
+        //     · S1：走原 loadAutosave（毫秒级）
         //     · 尺寸 ≥ 限制：L2 mmap autosave 文件 → incomplete LineIndex → 秒开返回
         //       后台 AsyncTaskManager 增量构建行索引，用户可见窗口 + 状态栏进度
         //   参数：autosavePath = 实际数据源，filePath = 对用户显示的原名/未来保存路径
         const qint64 asSize = QFileInfo(st.autosavePath).size();
-        const qint64 limit  = DynamicThresholds::instance().L1_EDIT_LIMIT;
-        qDebug("[STARTUP][RESTORE tab %d/%d] → 走 autosave 分支: size=%lld KB, limit=%lld KB (L1_EDIT_LIMIT=%lld MB)",
+        const qint64 limit = FileTierPolicy::StandardEditLimitBytes;
+        const FileTierDecision tier = FileTierPolicy::classify(asSize);
+        qDebug("[STARTUP][RESTORE tab %d/%d] → 走 autosave 分支: size=%lld KB, S1-limit=%lld KB",
                m_pendingRestore->currentIndex + 1, total,
-               asSize / 1024, limit / 1024, limit / (1024 * 1024));
-        if (asSize >= limit) {
-            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 L2 mmap 秒开 (asSize >= L1_EDIT_LIMIT)，"
+               asSize / 1024, limit / 1024);
+        if (tier.usesMappedPreview()) {
+            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 mmap 秒开 (S2/S3)，"
                    "应 < 50ms 返回；若之后 >= 500ms 才返回，说明 openAutosaveAutoMode 内部阻塞了！",
                    m_pendingRestore->currentIndex + 1, total);
         } else {
@@ -1539,12 +1587,13 @@ void MainWindow::restoreNextSessionTab()
         //   原 bug：即便 100MB 也走 L1 全量 readAll + 主线程分块；
         //   新逻辑：openTabAutoMode → ≥ 32MB 自动 openLargeFileL2 (mmap + 后台 AsyncTaskManager)
         const qint64 realSize = QFileInfo(st.filePath).size();
-        const qint64 limit    = DynamicThresholds::instance().L1_EDIT_LIMIT;
-        qDebug("[STARTUP][RESTORE tab %d/%d] → 走真实文件路径分支: size=%lld KB, limit=%lld KB (L1_EDIT_LIMIT=%lld MB)",
+        const qint64 limit = FileTierPolicy::StandardEditLimitBytes;
+        const FileTierDecision tier = FileTierPolicy::classify(realSize);
+        qDebug("[STARTUP][RESTORE tab %d/%d] → 走真实文件路径分支: size=%lld KB, S1-limit=%lld KB",
                m_pendingRestore->currentIndex + 1, total,
-               realSize / 1024, limit / 1024, limit / (1024 * 1024));
-        if (realSize >= limit) {
-            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 L2 mmap 秒开 (size >= L1_EDIT_LIMIT)，应 < 50ms 返回。",
+               realSize / 1024, limit / 1024);
+        if (tier.usesMappedPreview()) {
+            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 mmap 秒开 (S2/S3)，应 < 50ms 返回。",
                    m_pendingRestore->currentIndex + 1, total);
         } else {
             qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 L1 同步 loadFile (< 限制)。",
@@ -1588,47 +1637,62 @@ void MainWindow::restoreNextSessionTab()
 
 void MainWindow::loadSettings()
 {
-    QSettings settings("NotepadSafe", "NotepadSafe");
-    m_darkMode = settings.value("darkMode", false).toBool();
-    m_recentFiles = settings.value("recentFiles").toStringList();
+    const auto settings = createAppSettings();
+    m_darkMode = settings->value("darkMode", false).toBool();
+    m_recentFiles = settings->value("recentFiles").toStringList();
     while (m_recentFiles.size() > MAX_RECENT)
         m_recentFiles.removeLast();
 
-    m_edgeVisible = settings.value("edgeVisible", true).toBool();
-    m_edgeColumn = settings.value("edgeColumn", 80).toInt();
+    m_edgeVisible = settings->value("edgeVisible", true).toBool();
+    m_edgeColumn = settings->value("edgeColumn", 80).toInt();
     if (m_edgeColumn < 1) m_edgeColumn = 80;
-    m_wordWrap = settings.value("wordWrap", false).toBool();
+    m_wordWrap = settings->value("wordWrap", false).toBool();
 
-    QSize winSize = settings.value("windowSize", QSize(1200, 800)).toSize();
+    QSize winSize = settings->value("windowSize", QSize(1200, 800)).toSize();
     if (winSize.isValid())
         resize(winSize);
 
-    QByteArray geo = settings.value("windowGeometry").toByteArray();
+    QByteArray geo = settings->value("windowGeometry").toByteArray();
     if (!geo.isEmpty())
         restoreGeometry(geo);
 
-    QByteArray state = settings.value("windowState").toByteArray();
+    QByteArray state = settings->value("windowState").toByteArray();
     if (!state.isEmpty())
         restoreState(state);
+
+    // Older releases saved a dock layout before VaultDock existed. Qt treats
+    // a dock absent from that state as hidden, which would conceal the new
+    // primary feature after upgrade. Persist visibility separately so the
+    // migration defaults to visible once, while later user choices survive.
+    if (m_vaultDock) {
+        const bool vaultVisible = settings->value("vaultDockVisible", true).toBool();
+        m_vaultDock->setVisible(vaultVisible);
+    }
 }
 
 void MainWindow::saveSettings()
 {
-    QSettings settings("NotepadSafe", "NotepadSafe");
-    settings.setValue("darkMode", m_darkMode);
-    settings.setValue("recentFiles", m_recentFiles);
-    settings.setValue("edgeVisible", m_edgeVisible);
-    settings.setValue("edgeColumn", m_edgeColumn);
-    settings.setValue("wordWrap", m_wordWrap);
-    settings.setValue("windowSize", size());
-    settings.setValue("windowGeometry", saveGeometry());
-    settings.setValue("windowState", saveState());
+    const auto settings = createAppSettings();
+    settings->setValue("darkMode", m_darkMode);
+    settings->setValue("recentFiles", m_recentFiles);
+    settings->setValue("edgeVisible", m_edgeVisible);
+    settings->setValue("edgeColumn", m_edgeColumn);
+    settings->setValue("wordWrap", m_wordWrap);
+    settings->setValue("windowSize", size());
+    settings->setValue("windowGeometry", saveGeometry());
+    settings->setValue("windowState", saveState());
+    if (m_vaultDock)
+        settings->setValue("vaultDockVisible", m_vaultDock->isVisible());
 }
 
 // ============ 关闭 ============
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    if (m_vaultDock && !m_vaultDock->prepareToClose()) {
+        event->ignore();
+        return;
+    }
     saveSettings();
 
     // Step 1: 按 Notepad++ 规则检查关闭 (closingApp=true)

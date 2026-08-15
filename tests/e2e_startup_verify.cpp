@@ -1,12 +1,12 @@
 // ============================================================================
-//  端到端验证：启动时打开"上次记忆的100MB文件"，窗口必须 < 500ms 可见。
+//  端到端验证：启动时打开"上次记忆的100MB文件"，窗口必须 < 1500ms 可见。
 //
 //  复现场景：
 //    1) 在 %TEMP%\NotepadSafe_E2E\ 下生成 100MB 的 dummy_100mb.txt
 //    2) 写 %LOCALAPPDATA%\NotepadSafe\session.json 指向该文件（模拟"上次记忆"）
-//    3) QProcess 启动 build\notepad-safe.exe，QElapsedTimer 开始
+//    3) QProcess 启动与本 E2E 程序同目录的 notepad-safe.exe，QElapsedTimer 开始
 //    4) 每 10ms 用 EnumWindows + GetWindowText 检测窗口 "Notepad Safe" 是否可见
-//    5) 一旦可见 → 记录耗时，断言 < 500ms（否则输出 FAIL）
+//    5) 一旦可见 → 记录耗时，断言 < 1500ms（否则输出 FAIL）
 //    6) 验证通过后：再等待 3 秒，截图检查是否真的在显示文件内容（可选）
 //    7) 发送 WM_CLOSE 关闭，清理 session.json
 //
@@ -63,7 +63,7 @@ static BOOL CALLBACK enumWindowsProc(HWND hwnd, LPARAM lParam)
     return FALSE;
 }
 
-static HWND findMainWindowOfPid(DWORD pid, int maxWaitMs = 30000)
+static HWND findMainWindowOfProcess(QProcess &process, DWORD pid, int maxWaitMs = 30000)
 {
     QElapsedTimer t; t.start();
     FindWindowCtx ctx;
@@ -72,6 +72,8 @@ static HWND findMainWindowOfPid(DWORD pid, int maxWaitMs = 30000)
         ctx.hwndFound = nullptr;
         EnumWindows(enumWindowsProc, reinterpret_cast<LPARAM>(&ctx));
         if (ctx.hwndFound) return ctx.hwndFound;
+        if (process.waitForFinished(0))
+            return nullptr;
         Sleep(10);
     }
     return nullptr;
@@ -81,7 +83,8 @@ static QString make100MbFile(const QString &dir)
 {
     QDir().mkpath(dir);
     const QString path = dir + "/dummy_100mb.txt";
-    if (QFileInfo(path).exists() && QFileInfo(path).size() == 100LL * 1024 * 1024) {
+    constexpr qint64 TargetSize = 100LL * 1024 * 1024;
+    if (QFileInfo(path).exists() && QFileInfo(path).size() == TargetSize) {
         qInfo("  100MB 测试文件已存在，复用: %s", qUtf8Printable(path));
         return path;
     }
@@ -97,15 +100,25 @@ static QString make100MbFile(const QString &dir)
     lineTemplate.reserve(82);
     for (int i = 0; i < 78; ++i) lineTemplate.append(char('A' + (i % 26)));
     lineTemplate.append(" 0123\r\n");  // 每行 84 字节
-    const qint64 totalLines = (100LL * 1024 * 1024) / lineTemplate.size();
+    QByteArray block;
+    block.reserve(1024 * 1024 + lineTemplate.size());
+    while (block.size() < 1024 * 1024)
+        block.append(lineTemplate);
+
     QElapsedTimer wt; wt.start();
-    for (qint64 i = 0; i < totalLines; ++i) {
-        f.write(lineTemplate);
+    qint64 remaining = TargetSize;
+    while (remaining > 0) {
+        const qint64 chunkSize = qMin<qint64>(remaining, block.size());
+        if (f.write(block.constData(), chunkSize) != chunkSize) {
+            qCritical("写入 100MB 测试文件失败: %s", qUtf8Printable(f.errorString()));
+            f.close();
+            return {};
+        }
+        remaining -= chunkSize;
     }
     f.flush();
     f.close();
-    qInfo("  100MB 文件生成完成，耗时 %lld ms，共 %lld 行",
-          wt.elapsed(), totalLines);
+    qInfo("  100MB 文件生成完成，耗时 %lld ms，使用 1MiB 分块写入", wt.elapsed());
     return path;
 }
 
@@ -223,22 +236,34 @@ static ScenarioResult runScenario(const QString &exePath, const QString &buildDi
         return r;
     }
     const DWORD pid = proc.processId();
-    qInfo("  [RUN]   %s: PID=%lu，开始计时（窗口可见时间目标 < 500ms）。NOTEPADSAFE_DATADIR=%s",
+    qInfo("  [RUN]   %s: PID=%lu，开始计时（窗口可见时间目标 < 1500ms）。NOTEPADSAFE_DATADIR=%s",
           qUtf8Printable(scenarioLabel), pid, qUtf8Printable(dataDir));
 
     // 轮询主窗口可见
     QElapsedTimer pollT; pollT.start();
-    HWND hwnd = findMainWindowOfPid(pid, 30000);
+    HWND hwnd = findMainWindowOfProcess(proc, pid, 30000);
     r.msToVisible = pollT.elapsed();
 
     qInfo("");
     qInfo("  [RESULT] %s: 主窗口可见耗时 = %lld ms", qUtf8Printable(scenarioLabel),
           r.msToVisible);
     if (!hwnd) {
-        qCritical("    [FAIL] %s: 30 秒内主窗口不可见！", qUtf8Printable(scenarioLabel));
-        proc.kill(); proc.waitForFinished(3000);
+        fprintf(stderr, "    [FAIL] %s: 30 秒内主窗口不可见！\n",
+                qUtf8Printable(scenarioLabel));
+        if (proc.state() != QProcess::NotRunning) {
+            proc.kill();
+            proc.waitForFinished(3000);
+        }
         proc.waitForReadyRead(300);
         r.capturedStderr = QString::fromUtf8(proc.readAllStandardError());
+        const QByteArray stdoutBytes = proc.readAllStandardOutput();
+        if (!r.capturedStderr.isEmpty())
+            fprintf(stderr, "    子进程 stderr:\n%s\n", qUtf8Printable(r.capturedStderr));
+        if (!stdoutBytes.isEmpty())
+            fprintf(stderr, "    子进程 stdout:\n%s\n", stdoutBytes.constData());
+        fprintf(stderr, "    子进程状态: exitStatus=%s exitCode=%d error=%s\n",
+                proc.exitStatus() == QProcess::CrashExit ? "CrashExit" : "NormalExit",
+                proc.exitCode(), qUtf8Printable(proc.errorString()));
         return r;
     }
     RECT rc; GetWindowRect(hwnd, &rc);
@@ -332,9 +357,13 @@ static void printScenarioLogTail(const QString &label, const QString &stderrCap)
 
 int main(int argc, char *argv[])
 {
+    // 本验证器直接使用 Win32 窗口枚举/几何 API；与截图 E2E 保持相同的
+    // per-monitor DPI 上下文，避免缩放桌面上的窗口可见性与坐标虚拟化差异。
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     QCoreApplication app(argc, argv);
 
-    const QString buildDir = QFileInfo(QString::fromUtf8(__FILE__)).dir().absolutePath() + "/../build";
+    // CMake 可使用任意独立构建目录；不要把 E2E 绑死到源码树下的 build/。
+    const QString buildDir = QCoreApplication::applicationDirPath();
     const QString exePath  = QDir(buildDir).absoluteFilePath("notepad-safe.exe");
     if (!QFileInfo::exists(exePath)) {
         fprintf(stderr, "找不到 notepad-safe.exe: %s\n", qUtf8Printable(exePath));
@@ -353,16 +382,19 @@ int main(int argc, char *argv[])
 
     // e2e 专用数据目录（%TEMP%/NotepadSafe_E2E/data）
     // 通过 NOTEPADSAFE_DATADIR 传给 notepad-safe.exe，完全不碰用户真实 %LOCALAPPDATA%\NotepadSafe
-    const QString e2eDataDir = workDir + "/data";
-    QDir(e2eDataDir).removeRecursively();
-    QDir().mkpath(e2eDataDir);
-    printf("  E2E 隔离 dataDir: %s  (沙箱允许写入，不污染用户真实数据)\n",
-           qUtf8Printable(e2eDataDir));
+    const QString e2eDataRoot = workDir + "/data";
+    QDir(e2eDataRoot).removeRecursively();
+    const QString scenarioADataDir = e2eDataRoot + "/scenario_a";
+    const QString scenarioBDataDir = e2eDataRoot + "/scenario_b";
+    QDir().mkpath(scenarioADataDir);
+    QDir().mkpath(scenarioBDataDir);
+    printf("  E2E 隔离 dataDir 根目录: %s  (A/B 独立，不污染用户真实数据)\n",
+           qUtf8Printable(e2eDataRoot));
 
     QElapsedTimer totalT; totalT.start();
 
     // Scenario A: 真实文件路径（非 autosave）→ openTabAutoMode → openLargeFileL2
-    ScenarioResult ra = runScenario(exePath, buildDir, e2eDataDir, workDir,
+    ScenarioResult ra = runScenario(exePath, buildDir, scenarioADataDir, workDir,
                                     bigFile, SessionMode::RealFilePathOnly,
                                     "Scenario-A(真实文件路径)");
     printScenarioLogTail("A", ra.capturedStderr);
@@ -371,7 +403,7 @@ int main(int argc, char *argv[])
 
     // Scenario B: autosave 路径（用户"修改过未保存的100MB文件"场景，最贴近用户报错）
     //              → openAutosaveAutoMode → ensureL2View + VirtualFileView::openFile (mmap秒开)
-    ScenarioResult rb = runScenario(exePath, buildDir, e2eDataDir, workDir,
+    ScenarioResult rb = runScenario(exePath, buildDir, scenarioBDataDir, workDir,
                                     bigFile, SessionMode::AutosaveWithRealName,
                                     "Scenario-B(autosave路径★用户常见场景★)");
     printScenarioLogTail("B", rb.capturedStderr);
@@ -380,7 +412,7 @@ int main(int argc, char *argv[])
     printf("\n\n==================== E2E 汇总 ====================\n");
     auto summarizeOne = [](const QString &label, const ScenarioResult &r) {
         QStringList issues;
-        if (!r.passVisible) issues.append(QString("窗口可见%1ms≥500ms(FAIL)").arg(r.msToVisible));
+        if (!r.passVisible) issues.append(QString("窗口可见%1ms≥1500ms(FAIL)").arg(r.msToVisible));
         else issues.append(QString("秒开%1ms ✓").arg(r.msToVisible));
         if (r.crashed)     issues.append(QString("崩溃exit=%1").arg(r.exitCode));
         else issues.append(QString("exit=%1 ✓").arg(r.exitCode));

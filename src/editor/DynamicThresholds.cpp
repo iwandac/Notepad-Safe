@@ -22,10 +22,6 @@ DynamicThresholds computeFrom(qint64 ramBytes, int cpuCores) {
     t.RAM_BYTES = ramBytes;
     t.CPU_CORES = cpuCores;
 
-    // L1/L2 切换门槛：固定 2GB
-    // ≤ 2GB 直接走 Scintilla (L1 全量加载)；> 2GB 走 L2 mmap 秒开。
-    t.L1_EDIT_LIMIT   = 2LL * 1024 * 1024 * 1024;
-
     // Patch L1：RAM/20，封顶 2GB
     t.PATCH_L1_LIMIT  = clampInt64(ramBytes / 20,
                                    64LL * 1024 * 1024,

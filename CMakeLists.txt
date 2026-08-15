@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.22)
 project(notepad-safe LANGUAGES CXX)
 
+option(NOTEPADSAFE_ENABLE_KDBX_BACKEND
+    "Build the pinned KeePassXC/Botan/Argon2/zlib production vault backend"
+    OFF
+)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -20,7 +25,7 @@ elseif(NOT NOTEPADSAFE_QT6_DIR)
 endif()
 set(CMAKE_PREFIX_PATH "${NOTEPADSAFE_QT6_DIR}")
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets PrintSupport Svg SvgWidgets Concurrent TaskTree Test)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network PrintSupport Svg SvgWidgets Concurrent TaskTree Test)
 
 # QScintilla 静态库（相对于产品根，clone 后即可构建）
 set(QSCINTILLA_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/QScintilla_src-2.14.1/src")
@@ -41,12 +46,57 @@ set(APP_QRC_FILE   "${CMAKE_CURRENT_SOURCE_DIR}/resources/app_resources.qrc")
 # ============================================================================
 set(APP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/domain
     ${CMAKE_SOURCE_DIR}/src/editor
     ${CMAKE_SOURCE_DIR}/src/search
     ${CMAKE_SOURCE_DIR}/src/async
     ${CMAKE_SOURCE_DIR}/src/session
     ${CMAKE_SOURCE_DIR}/src/window
+    ${CMAKE_SOURCE_DIR}/src/vault
 )
+
+# Stable product-domain policies. Keep file tiers and resource admission free of
+# QWidget/QScintilla dependencies so they can be tested at exact byte boundaries.
+add_library(notepadsafe_domain STATIC
+    src/domain/FileTierPolicy.cpp
+)
+target_include_directories(notepadsafe_domain PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/domain
+)
+target_link_libraries(notepadsafe_domain PUBLIC Qt6::Core)
+
+add_library(notepadsafe_vault STATIC
+    src/vault/SecureBuffer.cpp
+    src/vault/VaultService.cpp
+    src/vault/KdbxFormatProbe.cpp
+    src/vault/VaultBackendFactory.cpp
+)
+target_include_directories(notepadsafe_vault PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/vault
+)
+target_link_libraries(notepadsafe_vault PUBLIC Qt6::Core)
+
+if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
+    include(cmake/KeePassXCCore.cmake)
+    target_sources(notepadsafe_vault PRIVATE src/vault/KeePassXCVaultBackend.cpp)
+    set_property(TARGET notepadsafe_vault PROPERTY CXX_STANDARD 20)
+    target_link_libraries(notepadsafe_vault PRIVATE notepadsafe_keepassxc_core)
+    target_compile_definitions(notepadsafe_vault PUBLIC NOTEPADSAFE_HAS_KDBX_BACKEND=1)
+endif()
+
+if(WIN32)
+    find_program(NOTEPADSAFE_POWERSHELL_EXECUTABLE
+        NAMES powershell.exe powershell
+        REQUIRED
+    )
+    add_custom_target(verify_supply_chain
+        COMMAND ${NOTEPADSAFE_POWERSHELL_EXECUTABLE}
+            -NoProfile -ExecutionPolicy Bypass
+            -File ${CMAKE_SOURCE_DIR}/tools/verify_supply_chain.ps1
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        VERBATIM
+    )
+endif()
 
 # ============ 主程序 ============
 
@@ -69,7 +119,7 @@ add_executable(notepad-safe WIN32
     src/async/AsyncTaskManager.cpp
     src/async/StatusBarTaskWidget.cpp
     src/async/AsyncTaskPanelDialog.cpp
-    src/async/CryptoTask.cpp
+    src/vault/VaultDock.cpp
     ${APP_RC_FILE}
     ${APP_QRC_FILE}
 )
@@ -77,6 +127,8 @@ add_executable(notepad-safe WIN32
 target_include_directories(notepad-safe PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 
 target_link_libraries(notepad-safe PRIVATE
+    notepadsafe_domain
+    notepadsafe_vault
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -171,10 +223,10 @@ add_executable(test_session
     src/async/AsyncTask.cpp
     src/async/AsyncThreadPool.cpp
     src/async/AsyncTaskManager.cpp
-    src/async/CryptoTask.cpp
 )
 target_include_directories(test_session PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(test_session PRIVATE
+    notepadsafe_domain
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -218,6 +270,7 @@ add_executable(test_largefile
 )
 target_include_directories(test_largefile PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(test_largefile PRIVATE
+    notepadsafe_domain
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -232,9 +285,44 @@ qt_import_plugins(test_largefile
     INCLUDE Qt6::QWindowsIntegrationPlugin
 )
 
-# 测试 6: 端到端启动秒开验证（100MB 会话恢复 → 主窗口 < 500ms 可见）
+# Test 6: exact S1/S2/S3 boundaries and deterministic promotion admission.
+add_executable(test_filetierpolicy
+    tests/test_filetierpolicy.cpp
+)
+target_include_directories(test_filetierpolicy PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(test_filetierpolicy PRIVATE notepadsafe_domain Qt6::Core)
+if(WIN32)
+    target_link_libraries(test_filetierpolicy PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+
+# Test 7: secret-memory/service-state contract plus pinned KeePassXC fixtures.
+add_executable(test_vault_contract
+    tests/test_vault_contract.cpp
+)
+target_include_directories(test_vault_contract PRIVATE ${APP_INCLUDE_DIRS})
+target_compile_definitions(test_vault_contract PRIVATE
+    NOTEPADSAFE_KDBX_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/kdbx"
+)
+target_link_libraries(test_vault_contract PRIVATE notepadsafe_vault Qt6::Core)
+if(WIN32)
+    target_link_libraries(test_vault_contract PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+
+if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
+    add_executable(test_kdbx_backend tests/test_kdbx_backend.cpp)
+    target_include_directories(test_kdbx_backend PRIVATE ${APP_INCLUDE_DIRS})
+    target_compile_definitions(test_kdbx_backend PRIVATE
+        NOTEPADSAFE_KDBX_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/kdbx"
+    )
+    target_link_libraries(test_kdbx_backend PRIVATE notepadsafe_vault Qt6::Core)
+    if(WIN32)
+        target_link_libraries(test_kdbx_backend PRIVATE ${WIN_SYSTEM_LIBS})
+    endif()
+endif()
+
+# 测试 6: 端到端启动秒开验证（100MB 会话恢复 → 主窗口 < 1500ms 可见）
 #  方式：QProcess 启动 notepad-safe.exe + Win32 EnumWindows 检测窗口可见时间
-#  注意：此测试必须在 notepad-safe.exe 构建完之后运行，且会临时覆盖用户 session.json（完成后自动还原）
+#  注意：此测试使用 NOTEPADSAFE_DATADIR 指向临时目录，不读写用户真实 session.json。
 add_executable(e2e_startup_verify
     tests/e2e_startup_verify.cpp
 )
@@ -269,6 +357,20 @@ add_test(NAME search       COMMAND test_search)
 add_test(NAME session      COMMAND test_session)
 add_test(NAME settings_ui  COMMAND test_settings_ui)
 add_test(NAME largefile    COMMAND test_largefile)
+add_test(NAME filetierpolicy COMMAND test_filetierpolicy)
+add_test(NAME vault_contract COMMAND test_vault_contract)
+if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
+    add_test(NAME kdbx_backend COMMAND test_kdbx_backend)
+    set_tests_properties(kdbx_backend PROPERTIES LABELS "vault;integration" TIMEOUT 120)
+endif()
+if(WIN32)
+    add_test(NAME supply_chain_lock
+        COMMAND ${NOTEPADSAFE_POWERSHELL_EXECUTABLE}
+            -NoProfile -ExecutionPolicy Bypass
+            -File ${CMAKE_SOURCE_DIR}/tools/verify_supply_chain.ps1
+    )
+    set_tests_properties(supply_chain_lock PROPERTIES LABELS "supply-chain")
+endif()
 
 # ============ 诊断工具 ============
 
@@ -362,7 +464,6 @@ set(GUI_SMOKE_SHARED_SOURCES
     src/async/AsyncTaskManager.cpp
     src/async/AsyncTask.cpp
     src/async/AsyncThreadPool.cpp
-    src/async/CryptoTask.cpp
     ${APP_QRC_FILE}
 )
 
@@ -373,6 +474,7 @@ add_executable(gui_smoke_coord
 )
 target_include_directories(gui_smoke_coord PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_coord PRIVATE
+    notepadsafe_domain
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -392,6 +494,7 @@ add_executable(gui_smoke_findreplace
 )
 target_include_directories(gui_smoke_findreplace PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_findreplace PRIVATE
+    notepadsafe_domain
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -413,9 +516,12 @@ add_executable(gui_smoke_smallfixes
     src/window/MainWindow.cpp
     src/async/StatusBarTaskWidget.cpp
     src/async/AsyncTaskPanelDialog.cpp
+    src/vault/VaultDock.cpp
 )
 target_include_directories(gui_smoke_smallfixes PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_smallfixes PRIVATE
+    notepadsafe_domain
+    notepadsafe_vault
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -437,7 +543,43 @@ if(WIN32)
     )
 endif()
 
+# 保险库真实控件 smoke：注入内存后端，驱动解锁、账号/笔记编辑、保存、筛选与锁定。
+add_executable(gui_smoke_vault
+    tests/gui_smoke/smoke_vault.cpp
+    src/vault/VaultDock.cpp
+)
+target_include_directories(gui_smoke_vault PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(gui_smoke_vault PRIVATE
+    notepadsafe_vault
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Test
+)
+if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
+    target_compile_definitions(gui_smoke_vault PRIVATE
+        NOTEPADSAFE_KDBX_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/kdbx"
+    )
+endif()
+if(WIN32)
+    target_link_libraries(gui_smoke_vault PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+qt_import_plugins(gui_smoke_vault INCLUDE Qt6::QWindowsIntegrationPlugin)
+
 # CTest 注册（可选；日常由 run_all_gui_smoke.bat 直跑更直观）
 add_test(NAME gui_smoke_coord        COMMAND gui_smoke_coord)
 add_test(NAME gui_smoke_findreplace  COMMAND gui_smoke_findreplace)
 add_test(NAME gui_smoke_smallfixes   COMMAND gui_smoke_smallfixes)
+add_test(NAME gui_smoke_vault        COMMAND gui_smoke_vault)
+
+# 真实进程 E2E：启动完整 notepad-safe.exe，并通过 Win32 获取窗口/像素。
+# 串行执行，避免两个测试同时抢占前台窗口、DWM 和同机磁盘吞吐导致误判。
+if(WIN32)
+    add_test(NAME e2e_startup_verify     COMMAND e2e_startup_verify)
+    add_test(NAME e2e_l2_content_visible COMMAND e2e_l2_content_visible)
+    set_tests_properties(e2e_startup_verify e2e_l2_content_visible PROPERTIES
+        RUN_SERIAL TRUE
+        TIMEOUT 60
+        LABELS "gui;e2e"
+    )
+endif()

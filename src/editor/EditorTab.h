@@ -189,7 +189,7 @@ public:
     //   不 remap。用于 SessionManager::saveSession 周期性 autosave。
     bool exportToFile(const QString &destPath) const;
     // · openAutosaveAutoMode：恢复 autosave 时按文件尺寸自动选 L1/L2：
-    //   尺寸 < L1_EDIT_LIMIT → 走原 loadAutosave (L1 sync，毫秒级)
+    //   S1（< 32 MiB）→ 走原 loadAutosave (Scintilla sync，毫秒级)
     //   尺寸 ≥ 限制 → mmap autosave 文件到 L2 VirtualFileView（秒开），
     //                 然后对用户伪装为 realFilePath（标题栏/保存路径）并标记 modified。
     //   返回 true = 成功加载（L1 或 L2 均可）
@@ -270,7 +270,8 @@ private:
     };
     PendingL2Search m_pendingL2Search;
 
-    // 确保 VirtualFileView 存在（懒创建）；同时把 m_l2View 加入 m_stack（index=1）
+    // 确保 VirtualFileView 存在（懒创建）；同时把 m_l2View 加入 m_stack。
+    // 不依赖固定索引：Scintilla 在 L2 期间会被 reparent，Qt 会重排 stack 页面。
     VirtualFileView *ensureL2View();
     // findAllL2Async 的内部启动：LineIndex 已完整 → 实际调 LargeFileSearch::findAllViaTaskManager
     void startPendingL2Search();

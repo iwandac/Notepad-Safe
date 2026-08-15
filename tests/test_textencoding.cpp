@@ -1,5 +1,5 @@
 // 编码检测单元测试
-#include "../TextEncoding.h"
+#include "TextEncoding.h"
 
 #include <QCoreApplication>
 #include <QByteArray>

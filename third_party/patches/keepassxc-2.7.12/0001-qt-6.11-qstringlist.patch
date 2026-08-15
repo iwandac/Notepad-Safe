@@ -1,0 +1,290 @@
+Subject: [PATCH] Update removed Qt APIs for Qt 6.11 compatibility
+
+Keep the selected KeePassXC 2.7.12 core building against Qt 6.11 without
+changing its KDBX semantics. The changes replace removed Qt APIs, add direct
+includes that were previously transitive, keep optional KeeShare code out of
+the headless core, and preserve KDBX4's 32-bit variant-map length fields now
+that Qt container sizes use 64-bit qsizetype.
+
+--- a/src/core/EntryAttachments.h
++++ b/src/core/EntryAttachments.h
+@@ -25,8 +25,7 @@
+ #include <QMap>
+ #include <QObject>
+ #include <QSharedPointer>
+-
+-class QStringList;
++#include <QStringList>
+ 
+ class EntryAttachments : public ModifiableObject
+ {
+--- a/src/core/Clock.cpp
++++ b/src/core/Clock.cpp
+@@ -32,8 +32,7 @@ QDateTime Clock::currentDateTime()
+ 
+ uint Clock::currentSecondsSinceEpoch()
+ {
+-    // TODO: change to toSecsSinceEpoch() when min Qt >= 5.8
+-    return instance().currentDateTimeImpl().toTime_t();
++    return static_cast<uint>(instance().currentDateTimeImpl().toSecsSinceEpoch());
+ }
+ 
+ qint64 Clock::currentMilliSecondsSinceEpoch()
+--- a/src/core/Database.cpp
++++ b/src/core/Database.cpp
+@@ -334,7 +334,7 @@ bool Database::saveAs(const QString& filePath, SaveAction action, const QString&
+ 
+ #ifdef Q_OS_WIN
+         if (isHidden) {
+-            SetFileAttributes(realFilePath.toStdString().c_str(), FILE_ATTRIBUTE_HIDDEN);
++            SetFileAttributesW(reinterpret_cast<LPCWSTR>(realFilePath.utf16()), FILE_ATTRIBUTE_HIDDEN);
+         }
+ #endif
+         m_ignoreFileChangesUntilSaved = false;
+--- a/src/core/Entry.cpp
++++ b/src/core/Entry.cpp
+@@ -1143,11 +1143,11 @@ QString Entry::resolveMultiplePlaceholdersRecursive(const QString& str, int maxD
+     int capEnd = 0;
+     while (matches.hasNext()) {
+         const auto match = matches.next();
+-        result += str.midRef(capEnd, match.capturedStart() - capEnd);
++        result += str.mid(capEnd, match.capturedStart() - capEnd);
+         result += resolvePlaceholderRecursive(match.captured(), maxDepth);
+         capEnd = match.capturedEnd();
+     }
+-    result += str.rightRef(str.length() - capEnd);
++    result += str.right(str.length() - capEnd);
+     return result;
+ }
+ 
+--- a/src/core/Group.cpp
++++ b/src/core/Group.cpp
+@@ -862,7 +862,9 @@ QList<QString> Group::usernamesRecursive(int topN) const
+ 
+     // Take first topN usernames if set
+     QList<QString> usernames;
+-    int actualUsernames = topN < 0 ? sortedUsernames.size() : std::min(topN, sortedUsernames.size());
++    int actualUsernames = topN < 0
++                              ? static_cast<int>(sortedUsernames.size())
++                              : std::min(topN, static_cast<int>(sortedUsernames.size()));
+     for (int i = 0; i < actualUsernames; i++) {
+         usernames.append(sortedUsernames[i].first);
+     }
+--- a/src/core/Metadata.cpp
++++ b/src/core/Metadata.cpp
+@@ -22,7 +22,6 @@
+ #include "core/Entry.h"
+ #include "core/Group.h"
+ 
+-#include <QApplication>
+ #include <QCryptographicHash>
+ #include <QJsonDocument>
+ 
+--- a/src/core/SignalMultiplexer.h
++++ b/src/core/SignalMultiplexer.h
+@@ -18,6 +18,8 @@
+ #ifndef KEEPASSX_SIGNALMULTIPLEXER_H
+ #define KEEPASSX_SIGNALMULTIPLEXER_H
+ 
++#include <QList>
++#include <QObject>
+ #include <QPointer>
+ 
+ class SignalMultiplexer
+--- a/src/core/SignalMultiplexer.cpp
++++ b/src/core/SignalMultiplexer.cpp
+@@ -19,6 +19,8 @@
+ 
+ #include "core/Global.h"
+ 
++#include <QMutableListIterator>
++
+ SignalMultiplexer::SignalMultiplexer()
+ {
+ }
+--- a/src/core/Tools.cpp
++++ b/src/core/Tools.cpp
+@@ -221,11 +221,11 @@ namespace Tools
+     bool isBase64(const QByteArray& ba)
+     {
+         constexpr auto pattern = R"(^(?:[a-z0-9+/]{4})*(?:[a-z0-9+/]{3}=|[a-z0-9+/]{2}==)?$)";
+-        QRegExp regexp(pattern, Qt::CaseInsensitive, QRegExp::RegExp2);
++        QRegularExpression regexp(pattern, QRegularExpression::CaseInsensitiveOption);
+ 
+         QString base64 = QString::fromLatin1(ba.constData(), ba.size());
+ 
+-        return regexp.exactMatch(base64);
++        return regexp.match(base64).hasMatch();
+     }
+ 
+     bool isAsciiString(const QString& str)
+--- a/src/crypto/Crypto.cpp
++++ b/src/crypto/Crypto.cpp
+@@ -25,6 +25,8 @@
+ 
+ #include <botan/version.h>
+ 
++#include <QObject>
++
+ namespace
+ {
+     QString g_cryptoError;
+--- a/src/crypto/SymmetricCipher.cpp
++++ b/src/crypto/SymmetricCipher.cpp
+@@ -65,7 +65,7 @@ bool SymmetricCipher::init(Mode mode, Direction direction, const QByteArray& key
+ 
+ bool SymmetricCipher::isInitalized() const
+ {
+-    return m_cipher;
++    return !m_cipher.isNull();
+ }
+ 
+ bool SymmetricCipher::process(char* data, int len)
+--- a/src/format/KdbxXmlReader.h
++++ b/src/format/KdbxXmlReader.h
+@@ -93,7 +93,7 @@ protected:
+     virtual Group* getGroup(const QUuid& uuid);
+     virtual Entry* getEntry(const QUuid& uuid);
+ 
+-    virtual bool isTrueValue(const QStringRef& value);
++    virtual bool isTrueValue(QStringView value);
+     virtual void raiseError(const QString& errorMessage);
+ 
+     const quint32 m_kdbxVersion;
+--- a/src/format/KdbxXmlReader.cpp
++++ b/src/format/KdbxXmlReader.cpp
+@@ -187,9 +187,10 @@ QString KdbxXmlReader::errorString() const
+     return QString();
+ }
+ 
+-bool KdbxXmlReader::isTrueValue(const QStringRef& value)
++bool KdbxXmlReader::isTrueValue(QStringView value)
+ {
+-    return value.compare(QLatin1String("true"), Qt::CaseInsensitive) == 0 || value == "1";
++    return value.compare(QLatin1String("true"), Qt::CaseInsensitive) == 0
++           || value.compare(QLatin1String("1")) == 0;
+ }
+ 
+ void KdbxXmlReader::raiseError(const QString& errorMessage)
+--- a/src/format/KdbxXmlWriter.cpp
++++ b/src/format/KdbxXmlWriter.cpp
+@@ -24,8 +24,10 @@
+ #include "core/Endian.h"
+ #include "crypto/CryptoHash.h"
+ #include "format/KeePass2RandomStream.h"
++#ifdef WITH_XC_KEESHARE
+ #include "keeshare/KeeShare.h"
+ #include "keeshare/KeeShareSettings.h"
++#endif
+ #include "streams/qtiocompressor.h"
+ 
+ /**
+@@ -57,7 +59,6 @@ void KdbxXmlWriter::writeDatabase(QIODevice* device,
+ 
+     m_xml.setAutoFormatting(true);
+     m_xml.setAutoFormattingIndent(-1); // 1 tab
+-    m_xml.setCodec("UTF-8");
+ 
+     if (m_kdbxVersion < KeePass2::FILE_VERSION_4) {
+         fillBinaryIdxMap();
+--- a/src/format/Kdbx4Writer.cpp
++++ b/src/format/Kdbx4Writer.cpp
+@@ -263,7 +263,7 @@ KdbxXmlWriter::BinaryIdxMap Kdbx4Writer::writeAttachments(QIODevice* device, Dat
+ bool Kdbx4Writer::serializeVariantMap(const QVariantMap& map, QByteArray& outputBytes)
+ {
+     QBuffer buf(&outputBytes);
+-    buf.open(QIODevice::WriteOnly);
++    CHECK_RETURN_FALSE(buf.open(QIODevice::WriteOnly));
+     CHECK_RETURN_FALSE(buf.write(Endian::sizedIntToBytes(KeePass2::VARIANTMAP_VERSION, KeePass2::BYTEORDER)) == 2);
+ 
+     bool ok;
+@@ -312,8 +312,10 @@ bool Kdbx4Writer::serializeVariantMap(const QVariantMap& map, QByteArray& output
+         QByteArray typeBytes;
+         typeBytes.append(static_cast<char>(fieldType));
+         QByteArray nameBytes = k.toUtf8();
+-        QByteArray nameLenBytes = Endian::sizedIntToBytes(nameBytes.size(), KeePass2::BYTEORDER);
+-        QByteArray dataLenBytes = Endian::sizedIntToBytes(data.size(), KeePass2::BYTEORDER);
++        QByteArray nameLenBytes =
++            Endian::sizedIntToBytes(static_cast<quint32>(nameBytes.size()), KeePass2::BYTEORDER);
++        QByteArray dataLenBytes =
++            Endian::sizedIntToBytes(static_cast<quint32>(data.size()), KeePass2::BYTEORDER);
+ 
+         CHECK_RETURN_FALSE(buf.write(typeBytes) == 1);
+         CHECK_RETURN_FALSE(buf.write(nameLenBytes) == 4);
+--- a/src/keys/CompositeKey.h
++++ b/src/keys/CompositeKey.h
+@@ -19,6 +19,7 @@
+ #ifndef KEEPASSX_COMPOSITEKEY_H
+ #define KEEPASSX_COMPOSITEKEY_H
+ 
++#include <QList>
+ #include <QSharedPointer>
+ 
+ #include "keys/Key.h"
+--- a/src/keys/CompositeKey.cpp
++++ b/src/keys/CompositeKey.cpp
+@@ -27,6 +27,7 @@
+ 
+ #include <QDataStream>
+ #include <QDebug>
++#include <QIODevice>
+ 
+ QUuid CompositeKey::UUID("76a7ae25-a542-4add-9849-7c06be945b94");
+ 
+--- a/src/keys/FileKey.cpp
++++ b/src/keys/FileKey.cpp
+@@ -362,7 +362,9 @@ bool FileKey::loadXml(QIODevice* device, QString* errorMsg)
+ 
+     bool ok = false;
+     if (!xmlReader.error() && !keyFileData.data.isEmpty()) {
+-        std::memcpy(m_key.data(), keyFileData.data.data(), std::min(SHA256_SIZE, keyFileData.data.size()));
++        std::memcpy(m_key.data(),
++                    keyFileData.data.data(),
++                    static_cast<std::size_t>(std::min<qsizetype>(SHA256_SIZE, keyFileData.data.size())));
+         ok = true;
+     }
+ 
+@@ -421,7 +423,9 @@ bool FileKey::loadHex(QIODevice* device)
+         return false;
+     }
+ 
+-    std::memcpy(m_key.data(), data.data(), std::min(SHA256_SIZE, data.size()));
++    std::memcpy(m_key.data(),
++                data.data(),
++                static_cast<std::size_t>(std::min<qsizetype>(SHA256_SIZE, data.size())));
+     Botan::secure_scrub_memory(data.data(), static_cast<std::size_t>(data.capacity()));
+ 
+     m_type = FixedBinaryHex;
+@@ -447,7 +451,9 @@ bool FileKey::loadHashed(QIODevice* device)
+     } while (!buffer.isEmpty());
+ 
+     buffer = cryptoHash.result();
+-    std::memcpy(m_key.data(), buffer.data(), std::min(SHA256_SIZE, buffer.size()));
++    std::memcpy(m_key.data(),
++                buffer.data(),
++                static_cast<std::size_t>(std::min<qsizetype>(SHA256_SIZE, buffer.size())));
+     Botan::secure_scrub_memory(buffer.data(), static_cast<std::size_t>(buffer.capacity()));
+ 
+     m_type = Hashed;
+--- a/src/keys/PasswordKey.cpp
++++ b/src/keys/PasswordKey.cpp
+@@ -20,6 +20,7 @@
+ #include "crypto/CryptoHash.h"
+ 
+ #include <QDataStream>
++#include <QIODevice>
+ #include <QSharedPointer>
+ 
+ QUuid PasswordKey::UUID("77e90411-303a-43f2-b773-853b05635ead");
+--- a/src/keys/ChallengeResponseKey.cpp
++++ b/src/keys/ChallengeResponseKey.cpp
+@@ -20,6 +20,9 @@
+ 
+ #include "core/AsyncTask.h"
+ 
++#include <QDataStream>
++#include <QIODevice>
++
+ QUuid ChallengeResponseKey::UUID("e092495c-e77d-498b-84a1-05ae0d955508");
+ 
+ ChallengeResponseKey::ChallengeResponseKey(YubiKeySlot keySlot)

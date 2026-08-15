@@ -1,503 +1,488 @@
-# Notepad Safe — 设计文档
+# Notepad Safe 架构设计
 
-> 基于 Qt 6.11 静态库 + QScintilla 2.14.1 的独立 Windows 加密笔记本编辑器。
-> 目标：Notepad++ 级编辑体验 + 加密存储，单 exe 无 DLL 依赖。
-> 项目已从原 Credential Vault 仓库独立为本产品仓库。
+> 状态：已决策，作为后续开发的唯一架构基线
+> 版本：1.0
+> 更新日期：2026-08-14
+> 产品许可证：GPLv3
 
-## 1. 技术栈 & 产物
+本文替代旧版“L1/L2 + mmap + Patch 编辑”方案。旧代码仍可用于回归和迁移，但不再代表目标架构。
 
-| 项 | 值 |
+## 1. 产品目标与边界
+
+Notepad Safe 是 Windows 优先的 Qt 桌面产品，提供两组核心体验：
+
+1. 接近 Notepad++ 的多标签文本编辑、编码、搜索、替换和会话体验。
+2. 基于 KeePass/KDBX 生态的加密笔记与账号保险库。
+
+大文件能力分为三档：
+
+| 档位 | 判定 | 产品能力 |
+|---|---:|---|
+| S1 标准编辑 | 小于 32 MiB | Scintilla 完整编辑，全部编辑功能 |
+| S2 大文件编辑 | 32 MiB 至 2 GiB（含） | mmap 立即只读预览；后台准备完整 Scintilla 文档；资源允许后晋升为完整编辑 |
+| S3 超大文件分析 | 大于 2 GiB | mmap/分段 mmap 只读查看、导航、字面搜索和正则搜索；不编辑、不替换 |
+
+边界统一使用二进制单位：32 MiB = 32 × 1024² 字节，2 GiB = 2 × 1024³ 字节。编码转换可能扩大文本时，以 max(文件字节数, 预计 UTF-8 编辑字节数) 进行编辑档位判定。
+
+### 1.1 当前阶段不做
+
+- 不从零开发文本编辑内核。
+- 不再扩展 mmap + PatchList 为通用编辑器。
+- 不修改 Scintilla 的存储内核以直接编辑 mmap。
+- 不设计自有密码学算法或自有加密文件格式。
+- 不在 MVP 中实现云同步、浏览器自动填充、移动端和 2 GiB+ 编辑。
+- 不承诺任意硬件都能把接近 2 GiB 的文件完整装入编辑器；资源不足时保持可用的只读分析模式。
+
+## 2. 架构决策
+
+| 编号 | 决策 | 原因 |
+|---|---|---|
+| ADR-001 | Qt/C++ 是正式桌面主线 | 与现有 Qt/QScintilla UI 一致，减少跨语言秘密数据和 IPC 边界 |
+| ADR-002 | Scintilla 是编辑内核供应商，QScintilla 是可替换 Qt 适配层 | 保留成熟编辑体验，同时避免被包装层版本锁死 |
+| ADR-003 | KeePassXC Core + Botan 是 KDBX 生产实现 | 写入、历史、附件、KDF 和兼容性成熟；不自行实现密码学 |
+| ADR-004 | Rust/Tauri 保险库保留为原型，不进入正式桌面构建 | 当前 keepass-rs 写入成熟度和现有 Qt 产品边界不匹配 |
+| ADR-005 | S2 使用“mmap 预览 + ILoader 后台装载 + 单向晋升” | 兼得快速打开和成熟编辑，避免 Patch 编辑器复杂度 |
+| ADR-006 | S3 永久只读 | 保留十几 GiB 日志分析价值，不承担编辑器内核重写成本 |
+| ADR-007 | 正则统一为 PCRE2 | 三档语义一致；不混用 Scintilla 正则、QRegularExpression 和自制分块语义 |
+| ADR-008 | 加密笔记是标准 KDBX Entry，不发明第二种保险库格式 | 保持 KeePass/KeePassXC 互操作和可恢复性 |
+
+## 3. 总体分层
+
+```mermaid
+flowchart TB
+    UI["Qt Widgets 表现层"] --> APP["应用服务层"]
+    APP --> DOC["DocumentService"]
+    APP --> SEARCH["SearchService"]
+    APP --> VAULT["VaultService"]
+    APP --> SESSION["SessionService"]
+
+    DOC --> EDITOR["EditorProvider"]
+    EDITOR --> SCI["QScintilla / Scintilla"]
+    EDITOR --> MAP["MappedTextSource + WindowedReadOnlyView"]
+
+    SEARCH --> SNAP["SearchSnapshot / TextSource"]
+    SEARCH --> PCRE["PCRE2 RegexEngine"]
+
+    VAULT --> ADAPTER["KeePassXcStorageAdapter"]
+    ADAPTER --> KPXC["Pinned KeePassXC Core"]
+    KPXC --> BOTAN["Pinned Botan"]
+
+    DOC --> PLATFORM["Windows 文件与内存映射适配"]
+    VAULT --> PLATFORM
+    SESSION --> PLATFORM
+```
+
+依赖只能从上向下。UI 不得直接访问 QFile mmap 指针、Scintilla 文档指针、KeePassXC Database/Entry 或密码字节。
+
+### 3.1 目标构建目标
+
+| CMake target | 职责 |
 |---|---|
-| 语言 | C++ 17（MSVC） |
-| UI 框架 | Qt 6.11.x 静态库（/MT） |
-| 编辑器控件 | QScintilla 2.14.1（Scintilla for Qt） |
-| 构建系统 | CMake 3.22+ / Ninja |
-| 编译器 | MSVC 2022+（或兼容 vcvars64） |
-| 产物 | `notepad-safe.exe`（单文件，静态链接 ~24MB，无 DLL 依赖） |
-| 应用名 / 组织名 | QSettings / QStandardPaths 统一使用 `NotepadSafe` |
+| notepadsafe_domain | 无 UI 的文档、搜索、保险库领域类型 |
+| notepadsafe_editor | ScintillaGateway、编辑文档、窗口化只读视图 |
+| notepadsafe_search | TextSource、搜索快照、PCRE2、结果存储 |
+| notepadsafe_vault | VaultService、KeePassXC 适配器、安全剪贴板 |
+| notepadsafe_platform | mmap、原子替换、文件身份、进程安全设置 |
+| notepadsafe_app | Qt Widgets、命令、菜单、Dock 和组合根 |
 
-## 2. 模块结构
+## 4. 供应链与版本治理
 
-```
-notepad-safe/
-├── CMakeLists.txt              # 项目根：目标 notepad-safe + 5 个测试
-├── build.bat                   # 一键构建（vcvars64 → cmake → ninja）
-├── run_tests.bat               # 一键运行全部 CTest
-├── main.cpp                    # 入口：QApplication + NotepadSafe 组织/应用名
-├── MainWindow.h/cpp            # 主窗口：QTabWidget + 菜单 + 工具栏 + 状态栏 + Dock
-├── EditorTab.h/cpp             # 单个编辑器标签：QsciScintilla + 文件状态 + 编码
-├── TextEncoding.h/cpp          # 编码检测（UTF-8/GBK/UTF-16 BOM + 启发式）
-├── FindReplaceDialog.h/cpp     # 查找/替换对话框（正则、大小写、整词）
-├── SearchResultsDock.h/cpp     # 搜索结果 Dock（QDockWidget + QTreeWidget）
-├── SessionManager.h/cpp        # 会话管理（自动缓存未保存文件 + 启动恢复）
-├── notepad_safe.png            # 产品根原始图标（1254×1254）
-├── resources/
-│   ├── notepad_safe.png        # 拷贝：供 qrc 运行时 setWindowIcon 使用
-│   ├── app.ico                 # 6 尺寸 16/32/48/64/128/256，EXE 图标资源
-│   ├── app_icon.rc             # RC：IDI_APPLICATION + VS_VERSION_INFO
-│   ├── app_resources.qrc       # QRC：运行时 PNG 图标
-│   └── make_ico.py             # 由 notepad_safe.png 重新生成 app.ico 的辅助脚本
-├── third_party/
-│   └── QScintilla_src-2.14.1/  # QScintilla 源码 + 静态库 qscintilla2_qt6.lib
-├── tests/
-│   ├── test_textencoding.cpp   # 编码检测单元测试
-│   ├── test_search.cpp         # 正则搜索逻辑测试
-│   ├── test_session.cpp        # 会话序列化测试
-│   ├── test_settings_ui.cpp    # 设置持久化 & 菜单 UI 勾选同步（防回归）
-│   └── test_largefile.cpp      # 大文件分块加载回归测试
-└── docs/
-    ├── DESIGN.md               # 本文件
-    └── README.md               # 使用 & 构建说明（根 README.md 也有）
+### 4.1 战略上游
+
+| 上游 | 角色 | 2026-08 基线 | 策略 |
+|---|---|---|---|
+| Qt | UI、线程、平台抽象 | 当前构建 6.11.x | 固定补丁版本；Qt 与编译器 ABI 成套升级 |
+| QScintilla | Qt 编辑器适配 | 2.14.1 | 过渡性锁定；只通过 ScintillaGateway 使用底层指针 API |
+| Scintilla | 编辑器内核 | 当前随 QScintilla vendoring；未来独立锁定稳定版 | 作为真正战略上游；后续可替换为直接 Qt 端口 |
+| KeePassXC | KDBX 读写和领域实现 | 2.7.12 为首个集成候选 | 固定 release tag/commit；只通过适配器访问 |
+| Botan | KeePassXC 密码学依赖 | 由固定 KeePassXC 版本约束后锁定 | 不单独抢跑大版本；Botan 2 已 EOL，不新增 Botan 2 基线 |
+| PCRE2 | 统一正则引擎 | 10.47，与 Qt 6.11.1 内置版本对齐 | 直接静态链接同版本的 8/16 位库，统一搜索语义 |
+| zlib/minizip 等 | KDBX 传递依赖 | 随 KeePassXC 基线确定 | 在锁文件中展开记录，不视为“隐式依赖” |
+
+“最新版本”不是构建输入。所有生产构建只读取仓库中的供应链锁文件。
+
+### 4.2 供应链锁文件
+
+仓库中的 `third_party/dependencies.lock.json` 是机器可读的唯一锁文件，每个组件至少记录：
+
+```yaml
+- name: keepassxc
+  version: 2.7.12
+  revision: refs/tags/2.7.12
+  source: https://github.com/keepassxreboot/keepassxc
+  archive_sha256: TBD
+  signature: verified
+  license: GPL-2.0-or-later
+  patches: []
+  build_options: [static, core-only]
 ```
 
-## 3. 功能清单（Notepad++ 对标）
+同时保存上游源码归档或只读 subtree，支持离线、可重复构建。禁止构建时从 develop/master 或网络自动拉取源码。所有本地补丁放在 third_party/patches/<component>/<version>/，附原因、上游 issue 和删除条件。
 
-### M1 — 已实现
+当前 QScintilla 包的版本是明确的，但其内嵌 Scintilla 的文档版本与实际 API 集合不能作为可靠的独立版本标识；首次治理时必须补充源树 hash、接口清单和编译选项，不能只写“Scintilla 版本未知”。
 
-| 功能 | 实现方式 | 状态 |
-|---|---|---|
-| 多标签页 | QTabWidget + EditorTab，关闭按钮、中键关闭 | ✅ |
-| 文件拖放 | QMainWindow::dropEvent + QsciScintilla::dropEvent | ✅ |
-| 编码检测 | BOM 检测 + UTF-8 启发式 + GBK 回退 | ✅ |
-| 原子保存 | 写 .tmp → rename（防崩溃损坏） | ✅ |
-| 查找/替换 | FindReplaceDialog（正则、大小写、整词、向前/向后） | ✅ |
-| 搜索结果 Dock | QDockWidget + QTreeWidget，双击跳转 | ✅ |
-| 会话恢复 | SessionManager 序列化未保存标签到 JSON | ✅ |
-| 状态栏 | 行/列、编码、文件大小、修改状态、语法类型 | ✅ |
-| 语法高亮 | C++/Python/JSON/HTML/SQL/XML/YAML/Markdown/纯文本 | ✅ |
-| 行操作 | 复制行、删除行、上移/下移行、行排序 | ✅ |
-| 书签 | Scintilla marker + 快捷键切换/导航 | ✅ |
-| 行号 + 当前行高亮 | QsciScintilla 内置 | ✅ |
-| 自动缩进 + 智能缩进 | QsciScintilla autoIndent | ✅ |
-| 80 列标尺 | QsciScintilla EdgeLine | ✅ |
-| 最近文件列表 | QSettings 存储，最多 10 个 | ✅ |
-| Dark Mode | 跟随系统主题 + 手动切换 | ✅ |
-| 字体一致性 | 全局 Consolas 10pt，可配置 | ✅ |
-| 高 DPI | Qt 6 自动缩放 + manifest 声明 | ✅ |
-| 按需滚动条 | 内容未溢出窗口时不显示横/纵滚动条（防回归） | ✅ |
-| 设置-菜单勾选同步 | 设置恢复后强制同步菜单勾选（防回归） | ✅ |
-| 大文件分块加载 | 进度对话框 + QsciScintilla 只读先关再追加 | ✅ |
+### 4.3 更新流程
 
-### M2 — 规划
+```mermaid
+flowchart LR
+    A["发现新版本/CVE"] --> B["单依赖更新分支"]
+    B --> C["验证签名、hash、许可证和发布说明"]
+    C --> D["生成依赖差异与 SBOM"]
+    D --> E["干净构建 + 单元/模糊/兼容测试"]
+    E --> F["大文件性能基线与 GUI 回归"]
+    F --> G["候选版本试用与可回滚包"]
+    G --> H["更新锁文件和升级记录"]
+```
 
-| 功能 | 说明 |
+规则：
+
+- Qt/QScintilla/Scintilla 与 KeePassXC/Botan 不在同一常规变更中升级。
+- KeePassXC 升级必须通过双向 KDBX golden corpus：旧版本创建、新版本打开保存、KeePass/KeePassXC 再次打开。
+- Scintilla 升级必须通过编辑命令、IME、编码、撤销、32 MiB 边界、ILoader 和性能基线。
+- PCRE2 升级必须通过三档同语义正则语料和 ReDoS 资源限制测试。
+- 例行依赖每季度评估；严重安全问题立即评估，不能等待季度窗口。
+- 发布产物生成 SPDX/CycloneDX SBOM、源代码对应物、构建器版本和 SHA-256。
+- 任一升级都保留上一套锁文件和可安装包，数据库格式升级默认保持向后可读，不静默进行不可逆迁移。
+
+### 4.4 退出策略
+
+- QScintilla：EditorProvider 和 ScintillaGateway 隔离后，可迁移到上游 Scintilla Qt 控件。
+- KeePassXC：VaultService 不暴露上游类型，可替换 KDBX adapter；KDBX 文件仍是用户的退出格式。
+- PCRE2：SearchQuery/SearchResult 不暴露 pcre2_code 指针，允许替换实现，但产品正则语义必须保持。
+
+## 5. 文档状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> Probing
+    Probing --> EditableReady: S1 装载完成
+    Probing --> PreviewReady: S2/S3 mmap 完成
+    PreviewReady --> PreparingEditor: S2 且资源准入
+    PreparingEditor --> EditableReady: ILoader 文档附加成功
+    PreparingEditor --> PreviewReady: 取消/失败/资源不足
+    PreviewReady --> ReadOnlyReady: S3 或取消晋升
+    EditableReady --> Dirty: 用户编辑
+    Dirty --> Saving: 保存
+    Saving --> EditableReady: 原子提交成功
+    Saving --> Dirty: 失败，原文不变
+```
+
+每个异步结果携带 DocumentId、Revision 和 CancellationToken。结果到达时 revision 不一致则丢弃，禁止旧搜索或旧装载覆盖新状态。
+
+## 6. S1：小于 32 MiB 的标准编辑
+
+- 使用后台 Scintilla ILoader 装载，完成后在 UI 线程通过 pointer-sized ScintillaGateway 附加文档。
+- 不再执行 QFile::readAll → QString → QByteArray → SCI_APPENDTEXT 的多重复制和 UI 串行追加。
+- 默认启用完整撤销、语法高亮、折叠、换行、多选和书签。
+- 文件读取、编码识别和 UTF-8 流式转换在 worker 完成；Scintilla UI 对象只在主线程使用。
+- ILoader 由单个 worker 顺序 AddData。一个文件不使用多个线程向同一个 loader 写入。
+
+## 7. S2：32 MiB 至 2 GiB 的大文件编辑
+
+### 7.1 打开流程
+
+1. FileProbe 读取文件身份、大小、BOM、编码样本和可用内存。
+2. MappedTextSource 立即映射文件；全量映射失败则使用 1 GiB 对齐的分段映射。
+3. WindowedReadOnlyView 将光标附近窗口装入只读 Scintilla，先显示内容，不等待全量行索引。
+4. SparseLineIndex 在后台单线程顺序扫描；滚动条以字节位置工作，因此索引未完成也可自由滚动。
+5. 通过资源准入后，后台 ILoader 构建完整 Scintilla 文档。
+6. 完成后 UI 保存当前全局 byte offset/选择，附加新文档并恢复到对应位置；切换是单向的。
+
+预览期间可以滚动、复制、跳转、字面搜索和正则搜索，但编辑、粘贴和替换保持禁用。用户可以取消“准备编辑”，继续只读分析。
+
+### 7.2 资源准入
+
+2 GiB 是功能上限，不是无条件内存承诺。ResourceAdmission 估计：
+
+- 解码后文本容量。
+- Scintilla 文本、行结构和最小样式开销。
+- 保存/搜索临时预算。
+- 撤销预算和系统保留内存。
+
+只有预计峰值不超过物理内存的 60%，且系统仍能保留至少 2 GiB 可提交空间时自动晋升。用户可在 2 GiB 内请求强制准备，但仍不能越过会导致系统失稳的硬性保留线。推荐 64 位系统、16 GiB 起步，接近 2 GiB 文件推荐 32 GiB RAM。
+
+### 7.3 分级关闭昂贵功能
+
+| 预计编辑字节 | 默认能力 |
+|---:|---|
+| 32–128 MiB | 完整编辑；语法高亮可用 |
+| 128–256 MiB | 高亮只按可见区/增量进行；关闭全文重着色 |
+| 256 MiB–2 GiB | 默认关闭语法高亮、折叠、自动换行、文档地图和全文件变化历史 |
+
+用户可以手动开启部分功能，但 UI 必须显示内存影响。撤销内存使用独立预算，默认 min(512 MiB, 物理内存 10%)；达到预算后建立保存点并明确提示，不允许静默耗尽系统内存。
+
+### 7.4 Scintilla 接入约束
+
+- 使用 SCI_CREATELOADER / ILoader::AddData / ConvertToDocument / SCI_SETDOCPOINTER。
+- loader worker 不访问 QWidget，不发送普通 QScintilla long 返回值承载指针。
+- ScintillaGateway 使用 SCI_GETDIRECTFUNCTION + SCI_GETDIRECTPOINTER，所有位置和指针采用 intptr_t、uintptr_t、Sci_Position。
+- 装载阶段使用 SC_DOCUMENTOPTION_STYLES_NONE；需要高亮时再创建样式数据。
+- 装载完成前禁用 undo，附加后清空装载历史并建立 save point。
+
+### 7.5 保存与外部冲突
+
+- 从 Scintilla 按固定窗口流式读取，按原编码流式编码到同目录随机临时文件，不构造整文件副本。
+- FlushFileBuffers 后使用 ReplaceFileW/等价原子替换；失败保留临时文件并保持原文件不变。
+- 打开时记录文件 ID、大小、mtime 和首尾采样 hash；保存前变化则进入冲突状态，不静默覆盖。
+- 大规模替换如果预计撤销成本超预算，使用“离线流式替换 → 备份 → 原子提交 → 重新加载”，并明确说明不能用 Ctrl+Z、只能从备份恢复。
+
+## 8. S3：大于 2 GiB 的超大文件只读分析
+
+S3 复用 MappedTextSource、WindowedReadOnlyView、SparseLineIndex 和 SearchService，但永不创建完整 Scintilla 文档。
+
+支持：
+
+- 立即打开、按字节比例滚动、行号逐步精确化。
+- 跳转 byte offset、已知行号、文件头尾和搜索结果。
+- 有界复制、导出选择、导出匹配行。
+- 字面搜索、完整 PCRE2 正则、结果 Dock、取消和进度。
+- 日志 tail/follow 可作为后续增量功能。
+
+不支持：
+
+- 编辑、粘贴、替换、自动保存、撤销。
+- 全文语法高亮、自动换行、代码折叠、文档地图。
+- 单行无限制渲染；超长行按窗口显示，复制/导出仍流式读取完整范围。
+
+### 8.1 窗口化显示
+
+WindowedReadOnlyView 保留 Scintilla 的字体、选择、IME、行号和 indicator 绘制，但只装入光标附近的窗口：
+
+- 默认 16 MiB，可按机器在 8–32 MiB 调整。
+- 光标进入窗口前后 25% 区域时异步预取下一窗口。
+- 窗口边界对齐完整字符和尽量完整的行。
+- 全局位置始终是 64 位原文件 byte offset；局部 Scintilla offset 仅存在于视图内部。
+
+旧 L2ScintillaBridge 的“显示窗口”部分可以迁移；diff 回写 PatchList、虚拟坐标编辑和 patch 保存链全部废止。
+
+### 8.2 稀疏行索引
+
+SparseLineIndex 每固定行数保存一个 64 位锚点，并为可见窗口建立短期行缓存。它不再为每一行永久保存偏移，因此十几 GiB、数亿行文件不会产生同量级索引内存。
+
+- 后台按磁盘顺序单线程扫描，避免多线程争抢页缓存。
+- 索引未完成时滚动使用 byte offset，行号显示“约”或“计算中”。
+- 搜索结果先保存 byte offset，行列号按需由最近锚点计算。
+- 文件变化后旧索引按文件身份失效；稳定格式的索引缓存可在后续版本加入。
+
+## 9. 统一搜索与正则
+
+### 9.1 查询契约
+
+SearchQuery 包含 pattern、Literal/Regex、大小写、整词、方向、范围、编码策略和结果上限。SearchMatch 使用 64 位 startByte/endByte，并携带 DocumentId、Revision；UI 不使用 int 保存文件位置。
+
+三档文件统一经过 SearchService：
+
+| 文档状态 | 搜索快照 |
 |---|---|
-| 分屏视图 | 横向/纵向拆分，同一文件双视图 |
-| 文档地图 | 缩略图侧栏（Scintilla 的 minibuffer） |
-| 列编辑模式 | Scintilla virtual space + 多光标 |
-| 多选多光标 | Scintilla 5.x 多选 API |
-| 代码折叠 | QsciScintilla 折叠开关 |
-| 宏录制 | Scintilla 宏 + QsciMacro |
-| 打印 | QsciPrinter + QPrintDialog |
-| 十六进制编辑 | 独立 HexView 窗口 |
-| 用户定义语法 | JSON 配置 + 动态词法器 |
-| 文件比较 | 双 EditorTab 差异对比 |
-| 拼写检查 | hunspell 集成 |
+| S1 | 小型内存 UTF-8 快照 |
+| S2 预览或未修改 | 原文件 mmap |
+| S2 已编辑 | 按 revision 复用或异步生成只读搜索快照 |
+| S3 | 原文件 mmap/分段 mmap |
+| KDBX 加密笔记 | 仅内存快照，绝不写明文搜索临时文件 |
 
-## 4. 关键设计
+S2 生成快照时，主线程以短小批次从 Scintilla 取数据，后台写入 delete-on-close、仅当前用户 ACL 的临时文件；文档继续变化则取消并丢弃快照。未修改文档直接搜索原 mmap，不复制。
 
-### 4.1 编码处理
+### 9.2 字面搜索
 
-- 打开文件：先读前 4 字节判断 BOM（UTF-8/UTF-16LE/UTF-16BE），无 BOM 则尝试 UTF-8 严格解码，失败回退 GBK
-- 保存文件：默认 UTF-8 无 BOM；用户可在"编码"菜单切换（UTF-8 BOM / UTF-16LE / GBK / 系统默认）
-- 内部统一用 QString（UTF-16），与 QsciScintilla 交互用 `text()` / `setText()`
+- 大小写敏感和 ASCII 不区分大小写可以多线程分块。
+- overlap 精确等于 needleBytes - 1；结果只归属“起点位于本块核心区”的 worker，避免漏报和重复。
+- Unicode 大小写折叠或复杂整词规则无法保证按原始字节独立分块时，自动转入 PCRE2 顺序路径。
+- 线程数默认 min(逻辑核心数, 8, 实际块数)，I/O 慢时允许自适应降低。
 
-### 4.2 会话恢复
+### 9.3 正则搜索
 
-- 路径：`%LOCALAPPDATA%\NotepadSafe\session.json`
-- 内容：每个未保存标签的 {临时文件路径, 原始文件路径, 光标位置, 语法类型}
-- 临时文件：未保存标签的内容定期（30s 或失焦时）写入 `%LOCALAPPDATA%\NotepadSafe\autosave\*.tmp`
-- 启动时：读取 session.json，恢复未保存标签，标签名加 "(已恢复)" 后缀
-- 加密文件不在会话中保存内容（只存路径，需重新解锁）
+产品正则方言固定为 PCRE2 10.47。Qt/QRegularExpression 可用于 UI 校验，但搜索执行统一走 RegexEngine 的 PCRE2 8/16 位接口。
 
-### 4.3 查找/替换
+任意正则不采用固定 overlap 并行分块。原因是 .*、多行模式、可变长度量词、lookaround 和反向引用的最大匹配跨度可能无界，固定 4 KiB/64 KiB overlap 都会产生静默漏报。
 
-- 非模态对话框（可一边编辑一边查找）
-- 正则模式用 QRegularExpression（PCRE 兼容）
-- "查找全部"结果输出到 SearchResultsDock，双击跳转
-- 高亮所有匹配（Scintilla indicator + 持久标记）
-- 替换/全部替换支持回溯引用（`\1`、`$1`）
+默认正确路径：
 
-### 4.4 拖放
+1. 对稳定、逻辑连续的快照编译一次 pattern。
+2. 在 worker 中从起始 offset 顺序 global match，不复制整个 mmap。
+3. 零长度匹配按一个 Unicode code point 前进，防止死循环。
+4. 使用 match/depth/heap limit 和自动 callout 检查取消，约束灾难性回溯。
+5. 达到资源限制时返回“正则资源超限”，不伪装为“没有匹配”；用户可提高单次任务限制后重试。
 
-- 主窗口接受文件 URL 拖放 → 在新标签打开
-- EditorTab 内的 QsciScintilla 接受文本拖放 → 插入光标位置
-- 拖出到桌面：不支持（避免误操作）
+只有静态分析证明不跨行、无回溯引用、无 lookaround 且测试语料验证等价的安全子集，未来才允许并行；优化失败自动回退顺序路径。
 
-### 4.5 原子保存
+### 9.4 结果存储和高亮
 
-```
-1. 写到 currentFile + ".tmp"
-2. flush + fsync
-3. rename .tmp → currentFile（Windows 用 MoveFileEx + REPLACE_EXISTING）
-4. 失败回退：保留 .tmp，提示用户
-```
+- 默认内存保存 offset/length，不复制匹配文本；上下文在可见时按需读取。
+- 结果很多时使用当前用户 ACL、delete-on-close 的二进制 offset spool；不写行文本。
+- 结果数量、内存和磁盘均有可见预算；超限时停止收集但继续维护“至少 N 条”状态，提示用户收窄查询。
+- KDBX 内容不落 spool，只允许内存结果上限。
+- 高亮只应用于当前可见窗口和有限邻域，禁止在 GiB 文件上创建每个匹配的永久 indicator。
 
-### 4.6 设置 & 菜单勾选同步（防回归）
+### 9.5 替换
 
-> 目标："恢复自动换行设置后，菜单勾选 ✔ 必须与实际行为一致"。  
-> 根因：之前只把值写入成员变量，没有回写到 menu action 的 checked 状态。
+- S1/S2 EditableReady 才允许替换；S2 预览和 S3 禁止替换。
+- 替换计划绑定 revision；提交前 revision 变化则作废并重新搜索。
+- 可承受的替换从高 offset 向低 offset 应用，锁定编辑输入并放入一个 Scintilla undo action；取消时回滚整个 action。
+- 超过撤销/时间预算时只提供“预览差异 → 流式生成临时文件 → 备份 → 原子替换 → 重载”。
+- 替换语法规范化为 $1、${name}；UI 可接受 \1 并在提交前转换，避免不同引擎语义漂移。
 
-流程（见 `MainWindow::loadSettings` → `syncGlobalMenuCheckStates`）：
+## 10. 加密笔记与账号保险库
 
-```
-createActions()            // 新建所有 QAction（默认 checked=false 或默认值）
-    ↓
-createMenus()              // action 插入菜单（此时 UI = 默认，非持久化值）
-    ↓
-loadSettings()             // QSettings 读回，覆盖成员 m_wordWrap / m_rulerMode 等
-    ↓
-syncGlobalMenuCheckStates()  // 按成员值反向 setChecked() 到所有 action
-                              // （本函数在任何修改设置的地方都要调用）
-    ↓
-applyDarkMode() / restoreSession()  // 其他 UI 应用
-```
+### 10.1 文件与数据模型
 
-`test_settings_ui.cpp` 模拟 "开程序 → 改设置 → save → 重启程序 → 再读" 的生命周期，
-断言成员值与 action 勾选值始终一致。
+正式存储格式为 KDBX 4.x，首个兼容目标是 KeePassXC 2.7.12。默认 KDF 使用 Argon2id，由上游能力按目标解锁时间校准；默认外层密码算法采用 KeePassXC 推荐的 AES-256 选项。完整性、header authentication 和 protected fields 由 KDBX/KeePassXC 实现，不替换为自制 AES-GCM 容器。
 
-### 4.7 按需滚动条（防回归）
+保险库类型映射：
 
-原则：只有真的需要滚动才显示滚动条。
+| 产品对象 | KDBX 映射 |
+|---|---|
+| 账号密码 | 标准 Entry：Title、UserName、Password、URL、Notes、Tags |
+| 加密笔记 | 标准 Entry；正文写 Notes；属性 NotepadSafe.Type=SecureNote |
+| 分组/笔记本 | 标准 Group |
+| 历史版本 | KDBX Entry History |
+| 自定义字段 | 标准 custom attributes，敏感字段标记 protected |
+| 附件 | KDBX binary/attachment，MVP 先限制体积 |
 
-- 纵向：内容行数 > 可见行数才显示
-- 横向：开启自动换行 → 永远不显示；关闭自动换行 → 最宽行长 > 可见列数才显示
-- 应用：Scintilla 的 `SCI_SETSCROLLWIDTHTRACKING(true)` + `wrapMode` 关联 + `ScrollWidth` 跟踪最长行
-- 空文件：自动换行=关，内容为空 → 两条滚动条都不显示
+即使其他 KeePass 客户端不认识 NotepadSafe.Type，也仍能看到标题和 Notes 正文。单条笔记推荐不超过 4 MiB，MVP 硬上限 32 MiB；超大日志和任意大文件不塞入 KDBX Entry，后续另立经过评审的需求。
 
-### 4.8 大文件分块加载（当前 L1 实现，L2 在 §5 方案中）
+### 10.2 服务边界
 
-当前实现（> 20MB 触发）：
-
-```
-QProgressDialog 打开（模态但 processEvents 不卡 UI）
-    ↓
-分块读 1MB → UTF-8 decode → 将 editor 先 setReadOnly(false) 再 SCI_APPENDTEXT
-                                           ↑
-                           关键修复：Scintilla 在 readOnly 下 InsertString 直接返回 0，
-                                    导致"加载完成后编辑框无内容"。
-    ↓
-close progress → setReadOnly(按文件类型/用户设置) → sendScintilla(Scintilla::SCI_EMPTYUNDOBUFFER)
+```mermaid
+flowchart LR
+    UI["Vault UI / SecureNoteEditor"] --> VS["VaultService"]
+    VS --> CMD["串行命令队列 / VaultSession"]
+    CMD --> KA["KeePassXcStorageAdapter"]
+    KA --> CORE["KeePassXC Core + Botan"]
+    CORE --> KDBX["vault.kdbx"]
 ```
 
-`test_largefile.cpp` 覆盖：
-- readOnly=true 下 SCI_APPENDTEXT 静默失败（基线 bug）
-- readOnly=false 下分块追加 100 万行 ≈ 160MB 正确、行数匹配、光标首位置顶
+- VaultSession 在专用串行执行上下文中独占上游 Database；不跨线程共享 KeePassXC 可变对象。
+- UI 只得到 EntrySummary 或脱敏 EntryDetails，列表 API 永不返回密码。
+- 密码通过短生命周期 SecretLease 按需显示/复制，到期清零并通知 UI 隐藏。
+- 日志、异常、Qt signal、崩溃报告和任务描述禁止包含主密码、Entry 密码、TOTP seed 或笔记正文。
+- KeePassXcStorageAdapter 是唯一可以 include KeePassXC 内部头文件的产品模块。
 
-## 5. 大文件架构方案（L1/L2 分级 + mmap + Patch 分级溢出 + 动态阈值）
+### 10.3 创建、解锁与锁定
 
-> 状态：已评审、方案确定、代码未全部实现（当前 §4.8 仍是 L1 分块加载，L2 VirtualFileView 为下一阶段）。
+创建：
 
-### 5.1 设计原则
+1. 收集主密码；可选 key file/硬件密钥在后续里程碑加入。
+2. 使用 KeePassXC 的 KDBX 配置与 Argon2id 校准创建数据库。
+3. 写同目录临时 KDBX，flush，重新打开验证，再原子替换目标。
+4. 建立默认 Credentials 和 Secure Notes 分组。
 
-1. **优先完成工作**：任何场景下，检测到压力 → 提示 → 保存（落盘）→ 继续执行。
-   不以"内存上限"为由拒绝用户的编辑/替换任务。
-2. **匹配机器性能**：所有阈值在启动时探测物理 RAM 和 CPU 核心数后动态决定，
-   不设人为硬上限；32GB 机器自然比 8GB 机器跑得更远。
-3. **整体考虑**：打开、滚动、复制、粘贴、编辑、搜索、替换、跳转、书签、撤销、语法高亮，
-   所有功能都要在 1GB+ 场景下定义明确行为（含 L1/L2 差异）。
-4. **UI 永不卡**：主线程单次执行 < 50ms；任何 > 500ms 任务显示进度条 + 取消按钮；
-   取消响应 < 100ms；Windows 永不显示"未响应"。
+解锁在高优先级 worker 中执行。成功前 UI 不获得部分解密对象；失败只返回分类错误，不区分足以帮助口令枚举的细节。
 
-### 5.2 分级模式（L1 完整编辑 / L2 虚拟视图）
+以下事件触发锁定：用户命令、空闲超时、Windows 工作站锁定、休眠、退出；最小化锁定由用户设置。锁定会关闭编辑器、清空搜索结果和密码租约、清理剪贴板、销毁 VaultSession，并尽力清零产品持有的秘密缓冲区。
 
-**切换阈值（动态）**：
+### 10.4 加密笔记编辑
 
-```cpp
-struct DynamicThresholds {
-    qint64 RAM_BYTES;    int CPU_CORES;
+- SecureNoteEditor 复用 S1 Scintilla 体验，但属于 VaultSession，不绑定普通文件路径。
+- 禁止普通 SessionManager 把正文写到 session.json、autosave/*.tmp 或搜索 spool。
+- 自动保存通过序列化的 KDBX 保存事务完成，采用修改 debounce；切换条目、锁定和退出前强制完成或明确报告失败。
+- 崩溃恢复依赖最近成功的 KDBX 原子保存和 Entry History，不创建明文恢复文件。
+- Vault 锁定时，编辑 widget 销毁而不是隐藏复用；相关 QByteArray/QString 生命周期尽量缩短。
 
-    // L1/L2 切换阈值：小文件进 Scintilla 完整编辑，大文件进 VirtualFileView
-    qint64 L1_EDIT_LIMIT;    // = min(RAM_BYTES/128, 128*1024*1024)
-                              // 1GB RAM: 8MB, 8GB: 64MB, 16GB+: 128MB（顶）
+### 10.5 KDBX 安全保存
 
-    // Patch L1 热内存上限
-    qint64 PATCH_L1_LIMIT;   // = min(RAM_BYTES/20, 2GB)
-    qint64 PATCH_SOFT_WARN;  // = PATCH_L1_LIMIT * 0.8（达到时非阻塞提示）
+1. 在目标同目录创建随机临时文件，权限仅当前用户。
+2. 由 KeePassXC Core 完整写入 KDBX；禁止 QSaveFile 的直接写回退。
+3. FlushFileBuffers，使用当前 composite key 重新打开临时库并做结构校验。
+4. 使用 ReplaceFileW 原子替换，并保留轮换的加密 .bak。
+5. 替换失败时原数据库不变，临时密文可供恢复；绝不留下明文数据库。
 
-    // findAll 结果内存中上限（超出序列化到溢出文件，Dock 虚拟化读取）
-    qint64 MAX_MATCHES_MEM;  // = (RAM_BYTES/16) / 50  (每条 ~50B)
-                              // 8GB: ~10M 条, 16GB: ~21M, 32GB: ~42M
+保存前检查文件身份和 mtime。检测外部修改时进入冲突 UI；MVP 支持另存为/重新加载，自动合并在有 KDBX merge golden tests 后再开放。
 
-    int    REPLACE_BATCH_SIZE = 1000;
-    qint64 PASTE_LIMIT;      // = min(RAM_BYTES/32, 200MB)
-    int    SEARCH_THREADS;   // = min(CPU_CORES, 8)
-};
-```
+### 10.6 威胁模型
 
-**L1/L2 模式对照表**：
+保护目标：磁盘数据库、备份和云端副本泄露；误把秘密写入日志/会话/临时文件；崩溃中断保存；剪贴板遗留；空闲未锁定。
 
-| 维度 | L1 完整编辑（< L1_EDIT_LIMIT） | L2 虚拟视图（≥ L1_EDIT_LIMIT） |
+非目标：拥有管理员/内核权限并能读取进程内存的恶意软件、已控制的输入法/屏幕录制、用户主动导出明文后的保护。产品应复用 KeePassXC 的内存与 Windows 加固措施并禁用非必要 crash dump，但不作无法兑现的“内存绝对不可读”承诺。
+
+## 11. 异步任务与优先级
+
+现有 AsyncTaskManager 保留为任务展示和取消入口，但业务通过窄接口提交任务，不直接传裸 mmap/Database 指针。
+
+| 优先级 | 任务 |
+|---|---|
+| P0 | 锁定、保存失败恢复、用户取消 |
+| P1 | 保险库解锁/保存、交互式 find next |
+| P2 | S1/S2 文档装载、用户发起 find all |
+| P3 | SparseLineIndex、预取、语法增量高亮 |
+| P4 | 依赖扫描、缓存清理等维护任务 |
+
+主线程单次工作目标小于 16 ms，硬上限 50 ms；超过 500 ms 的任务必须有进度/不确定进度状态和取消。取消是协作式的，worker 每个 I/O 块或可控匹配步骤检查 token。
+
+## 12. 会话、临时数据与隐私分区
+
+| 数据 | 允许持久化 | 位置/规则 |
 |---|---|---|
-| 文件进入方式 | `setText` / `SCI_APPENDTEXT` 完整加载 | `QFile::map()` 内存映射，OS 按需 4KB/页 |
-| 打开耗时（1GB） | N/A（1GB 永远不会进 L1） | **< 2s**（SSD，含 LineIndex） |
-| 内存占用（1GB） | N/A（不会进 L1） | **≤ 150MB**（mmap + LineIndex + patch） |
-| 底层控件 | `QsciScintilla` | `VirtualFileView : QAbstractScrollArea`（自绘） |
-| 滚动帧率（1GB） | N/A | **≥ 55fps**（只绘制可见 50~100 行） |
-| 编辑/粘贴 | Scintilla 完整支持（多光标等） | Patch 系统，原文件只读 + patch 增量 |
-| 代码折叠 | 完整支持 | **不支持**（1GB 成本太高） |
-| 语法高亮 | QsciLexer 全文 | 可见行自定义轻量词法器（<2ms/行） |
-| 书签 | Scintilla marker | `QSet<qint64>`（行首 byteOffset），自绘 |
-| 撤销/重做 | Scintilla Undo | Patch UndoGroup 栈：replaceAll 每 1000 条 = 1 原子 |
-| 搜索/替换 | Scintilla 原生 | 多线程分块搜索（§5.5） + Patch 分段替换 |
-| 保存 | QSaveFile 原子（已有） | PatchList::applyAndSaveThenReset 流式写 |
+| 普通文件标签状态 | 是 | session.json，只存路径、视图和 revision 元数据 |
+| 普通未保存文本 | 是 | 用户可关闭的 autosave；当前用户 ACL |
+| KDBX 路径/最后分组 | 是 | 不含正文和密码 |
+| KDBX 解密正文/密码 | 否 | 仅进程内存 |
+| 普通大文件搜索 offset | 临时 | delete-on-close spool，不含上下文文本 |
+| KDBX 搜索结果 | 否 | 仅内存，锁定时清除 |
 
-### 5.3 VirtualFileView + LineIndex（L2 基础设施）
+临时目录按运行实例使用随机 ID。正常退出和下次启动均清理过期非敏感文件；不能依赖“安全删除”保护 SSD 上曾写入的明文，因此秘密数据从设计上不落盘。
 
-```cpp
-// ---------- LineIndex：行偏移索引（后台构建 + delta 压缩）----------
-class LineIndex {
-    QByteArray deltaEncoded_;             // varint 编码的行偏移差值（约 2B/行 → 1GB 10M 行 ≈ 20MB）
-    QVector<qint64> blockIndex_;          // 每 1000 行一个绝对偏移锚点（加速二分）
-    qint64 totalLines_ = 0;
-public:
-    bool buildFromMmap(const uchar*, qint64, Fn<void(qint64,qint64)> progress, atomic<bool>& cancel);
-    void byteToLineCol(qint64 byteOffset, int* line, int* col) const;
-    qint64 lineToByteOffset(int line) const;
-    qint64 totalLines() const { return totalLines_; }
-};
+## 13. 测试与验收
 
-// ---------- VirtualFileView：自绘滚动视图 ----------
-class VirtualFileView : public QAbstractScrollArea {
-    QFile* mmapFile_ = nullptr;
-    uchar* mmapBase_ = nullptr;  qint64 mmapSize_ = 0;
-    LineIndex lineIndex_;        PatchList patches_;
-    qint64 cursorByte_ = 0;      qint64 selAnchorByte_ = 0;
-    QSet<qint64> bookmarks_;
-public:
-    bool openFile(const QString&);      // mmap + 后台 LineIndex（进度条 + 取消）
-    void remapFile(const QString&);     // 保存后 unmap → mmap → 重建 LineIndex
-    void closeFile();
-    bool applyAndSaveThenReset(const QString& out,
-        std::atomic<bool>& cancel, QString* err);
-    ... paintEvent, drawVisibleLines, resizeEvent, 光标/选中/输入 ...
-};
-```
+### 13.1 必须建立的测试资产
 
-### 5.4 PatchList（分级存储 + UndoGroup 原子 + 自动溢出）
+- editor-golden：编码、EOL、IME、多选、撤销、长行、边界大小和保存往返。
+- search-golden：同一语料在 S1、S2 mmap、S2 编辑快照、S3 上产生相同结果；包括跨 16 MiB 边界和零长度正则。
+- regex-adversarial：灾难性回溯、深层递归、巨大捕获、无界跨行和取消。
+- kdbx-golden：KDBX3/4、AES/ChaCha20、Argon2d/id、key file、历史、附件、自定义字段、Unicode、损坏/截断文件。
+- interoperability：Notepad Safe 创建/修改后由 KeePass 和 KeePassXC 打开；反向亦然。
+- fault-injection：磁盘满、断电点、ReplaceFileW 失败、外部修改、错误密码、取消解锁。
+- fuzz：KDBX 解析入口、编码检测、正则替换解析和 session 元数据。
 
-```cpp
-struct Patch {
-    qint64     byteOffset;   // 原 mmap 字节偏移（升序唯一）
-    qint32     oldLength;    // 0 = 纯插入
-    QByteArray newText;      // 空 = 纯删除
-};
+### 13.2 性能验收基线
 
-struct UndoGroup { QVector<int> patchIndices; bool applied = true; };
+在固定硬件、固定语料和冷/热缓存分别记录，不写无法复现的单一宣传数字。
 
-class PatchList {
-    QVector<Patch> l1Hot_;    // 热内存，按 byteOffset 升序
-    qint64        l1Bytes_ = 0;
-    struct ColdPatchFile {     // 溢出到磁盘的 mmap 只读 patch 段
-        QString filePath; QFile* file; uchar* mmapPtr;
-        qint64 fileSize, minOffset, maxOffset; int count;
-    };
-    QList<ColdPatchFile> l2Cold_;
-    QList<UndoGroup> undoStack_, redoStack_;
-    QUuid patchDirId_;
-public:
-    static qint64 dynamicL1Limit();                  // RAM/20 封顶 2GB
-    bool insert(qint64, const QByteArray&, QString*);
-    bool remove(qint64, qint32, QString*);
-    bool replace(qint64, qint32, const QByteArray&, QString*);
-    void beginUndoGroup(); void endUndoGroup();
-    bool undo(QString*); bool redo(QString*);
-    qint64 l1Bytes() const; qint64 l1Limit() const;
-    bool needSoftWarn() const;                       // 80% 非阻塞提示
-    QByteArray renderRange(const uchar*, qint64 start, qint64 end) const;
-    bool applyAndSave(const uchar*, qint64, const QString& out,
-        Fn<void(qint64,qint64)> progress, atomic<bool>& cancel, QString* err);
-    void resetAfterSave();                           // 保存后全部清零
-private:
-    void spillIfNeeded();                            // 溢出最旧 25% 到 l2
-    struct MergedIter; MergedIter mergedIterator() const;
-};
-```
+| 指标 | 目标 |
+|---|---|
+| S2/S3 首屏可见 | NVMe 常规机器小于 500 ms，不等待全量索引 |
+| UI 最长事件 | 正常小于 16 ms，任何路径小于 50 ms |
+| 取消反馈 | 小于 100 ms；单次受限正则不得无限阻塞 |
+| S2 编辑晋升 | 吞吐和峰值内存纳入版本基线；升级不得退化超过 10% |
+| 10+ GiB 滚动 | 预取命中时保持交互流畅，无全文件复制 |
+| KDBX 保存 | 任意注入失败点均保留一个可验证的旧库或新库 |
 
-**自动溢出策略**：
+2 GiB 编辑验收使用 32 GiB RAM 的 64 位基准机；16 GiB 机器验证资源不足时正确退回只读，而不是交换风暴或进程崩溃。
 
-```
-每次 insert/replace 结束：
-  if (l1Bytes_ > dynamicL1Limit()):
-      spillCount = l1Hot_.size() / 4
-      编码 [0, spillCount) → patch_XXXX.bin（QSaveFile → mmap 只读推入 l2Cold_）
-      l1Hot_.erase(begin, begin + spillCount) → l1Bytes_ -= Σ size
-```
+## 14. 现有代码处置
 
-### 5.5 LargeFileSearch（多线程分块搜索 + Dock 虚拟化溢出）
+| 现有模块 | 处置 |
+|---|---|
+| QsciScintilla 编辑体验 | 保留，收敛到 EditorProvider/ScintillaGateway |
+| VirtualFileView mmap 和窗口显示 | 保留验证成果，重构为只读 WindowedReadOnlyView |
+| LineIndex | 改为 SparseLineIndex；不永久索引每一行 |
+| PatchList 及冷/热溢出 | 冻结，仅保留到迁移测试完成；目标代码删除 |
+| L2ScintillaBridge | 保留下拉显示；删除 diff/flush/坐标编辑链 |
+| LargeFileSearch | 提取 TextSource；字面搜索保留并修正边界；正则改为统一 PCRE2 顺序正确路径 |
+| DynamicThresholds.L1_EDIT_LIMIT | 已由固定 32 MiB/2 GiB 的 FileTierPolicy 替代；动态值只用于资源预算和线程数 |
+| CryptoTask 占位 AES-GCM 方案 | 已删除，替换为 VaultService/IVaultBackend 安全边界；KeePassXC adapter 待接入 |
+| Rust vault-core/Tauri | 不进入 Qt 产品构建；保留在父仓库供参考，后续单独决定归档 |
 
-```
-findAll(pattern, regex, cs, wholeWord):
- Step 1: 按 16MB/块 + 4KB overlap 划分 N 块
- Step 2: QThreadPool 投递 N 个 SearchChunkTask（min(CPU,8) 线程）
-           · re.globalMatch，每 1000 条 → partialMatchBatch 信号
-         主线程：
-           · 前 MAX_MATCHES_MEM 条 → 内存
-           · 超出部分 → matchesOverrun.bin（序列化）
-           · 每批进度条 + 状态栏 + 取消检查
- Step 3: searchFinished(totalMatches)
-         若 >100 万条 → 状态栏软提示"建议精确正则"（不截断）
+迁移准入阶段已经用统一 `FileTierPolicy` 取代运行入口中的 `L1_EDIT_LIMIT`：32 MiB 是 S1/S2 精确边界，2 GiB 是 S2/S3 精确边界；`ResourceAdmission` 已形成无分配、可重复测试的保守估算策略。当前 S2 晋升执行器和 S3 UI 强制只读尚未接入，因此分类完成不等于对应体验已经完成。
 
- Dock 虚拟化（SearchResultsModel : QAbstractItemModel）：
-   · rowCount() 立即返回（O(1)）
-   · data(idx) 若超内存 → overrun.bin 二分读取（<1ms，仅可见行调用）
-   · doubleClicked → view.scrollToByte(match.byteOffset, true, match.length)
-```
+## 15. 开发顺序
 
-### 5.6 replaceAll（分段原子 + 中间保存 + 保存后继续）
-
-```
-Step 1 [后台扫描收集] → 所有匹配 list（内存 + overrun.bin） progress 0→10%
-Step 2 [压力检测 + 用户选择（非阻塞）]
-    if (估算替换大小 > PATCH_L1_LIMIT * 0.5) 弹非阻塞：
-       [立即保存并清空 patch 后继续（推荐）]  [直接执行替换]  [取消替换]
-Step 3 [分段 1000 条 = 1 UndoGroup = 原子]（10%→90%）
-    · 按 byteOffset 从大到小替换（避免前面 patch 影响后面 offset）
-    · 每批 EndUndoGroup → Ctrl+Z 一次撤销本段
-    · 中途压力达 80% → 非阻塞提示中间保存（保存后重映射 + patch 清零 → 继续）
-    · Esc / 取消按钮 → 停止，保留已替换 batch（Ctrl+Z 可逐段撤销）
-Step 4 [收尾]
-    progress 100%，若替换 >10 万条 → 状态栏常驻 [立即保存]
-```
-
-**applyAndSaveThenReset（保存后继续）关键流程**：
-
-```
-A. 4MB/块流式写 outPath.tmp：
-     mergedIterator() 同时推进 mmap 光标 + L1/L2 patch 合并
-     取消 → saveFile.cancelWriting() 回退
-     commit 原子 rename
-B. remapFile：
-     unmap 旧 → 销毁 lineIndex_ (~20MB)
-     patches_.resetAfterSave() → 清空 patch（删临时文件）
-     mmap 新文件 → 后台 LineIndex 重建（进度条 + 取消）
-     1GB 在 SSD 全程 < 10s
-```
-
-### 5.7 量化验收标准
-
-| 指标 | 8GB 笔记本（DDR4 + SATA SSD） | 32GB 工作站（DDR5 + NVMe SSD） |
+| 阶段 | 交付物 | 完成条件 |
 |---|---|---|
-| 1GB 文件打开 | < 2s | < 1.5s |
-| 1GB 滚动帧率 | ≥ 50fps | ≥ 60fps |
-| findAll 1GB UTF-8 | < 15s | < 8s |
-| findNext 首次命中（前 100MB 内） | < 500ms | < 300ms |
-| replaceAll 100 万处 | 可完成（中间自动提示保存 1-2 次 < 2 min） | 内存内 < 1 min |
-| 保存 1GB 文件 + 重映射 | < 30s（SATA）/ < 10s（NVMe） | < 10s（NVMe） |
-| patch L1/L2 能力 | 无上限（磁盘允许）+ 透明溢出 | 无上限 |
-| findAll 结果支持 | ≥ 1000 万条（Dock 虚拟化） | ≥ 4000 万条 |
-| 主线程单次阻塞 | < 50ms | < 30ms |
-| 取消响应（任何时刻） | < 100ms | < 50ms |
-| replaceAll 单段撤销原子性 | 1000 处替换整体撤销无残留 | 同左 |
-| 1GB 编辑内存峰值 | ≤ (150MB + 编辑 patch) | ≤ (150MB + 编辑 patch) |
-| exe 体积增长 | < 300KB | < 300KB |
+| P0 架构与供应链地基 | 本文、依赖锁格式、模块 CMake 边界、FileTierPolicy | 干净构建；旧 Patch 路径冻结 |
+| P1 KDBX 核心 | 固定 KeePassXC/Botan、VaultService、创建/解锁/原子保存、兼容语料 | KeePass/KeePassXC 双向打开；故障保存安全 |
+| P2 保险库核心体验 | 账号 CRUD、加密笔记、历史、自动锁、安全剪贴板、内存搜索 | 无明文 autosave/日志；锁定清理通过测试 |
+| P3 编辑装载重构 | ScintillaGateway + ILoader；S1 后台装载 | 100 MiB 不再通过 UI SCI_APPENDTEXT 串行加载 |
+| P4 S2 大文件编辑 | mmap 首屏、资源准入、后台晋升、流式保存 | 32 MiB/2 GiB 边界和失败回退通过 |
+| P5 S3 分析与统一搜索 | 窗口化只读、SparseLineIndex、PCRE2、结果虚拟化 | 10+ GiB 查看/搜索稳定；跨块正则不漏报 |
+| P6 清理 | 删除 Patch 编辑链和失效测试，补齐 SBOM/升级自动化 | 无生产路径引用 PatchList |
 
-### 5.8 新增模块与实施阶段
+P1/P2 优先于新的超大文件实验。P3–P5 只按本文既定路线实现，不再同时探索多套编辑内核。
 
-**新增文件**（尚未实现，预留）：
+## 16. 上游资料
 
-| 文件 | 估计行数 | 职责 |
-|---|---|---|
-| `VirtualFileView.h/cpp` | ~1000 行 | 自绘滚动视图（paintEvent/滚动/光标/选中/跳转/书签/编辑/语法高亮） |
-| `LineIndex.h/cpp` | ~300 行 | varint delta 压缩行偏移索引 + 后台构建 + 二分 |
-| `PatchList.h/cpp` | ~600 行 | L1/L2 溢出 + UndoGroup 原子 + renderRange + applyAndSave |
-| `LargeFileSearch.h/cpp` | ~500 行 | mmap+patch 分块搜索 + regex 缓存 + 溢出文件 + findAll/findNext/replaceAll |
-| `SearchResultsModel.h/cpp` | ~200 行 | QAbstractItemModel 虚拟化：内存/溢出二分读取 |
-| `DynamicThresholds.h/cpp` | ~100 行 | GlobalMemoryStatusEx 探测，阈值集中管理 |
-
-**实施分阶段（约 8.5 天）**：
-
-| 阶段 | 交付物 | 耗时 |
-|---|---|---|
-| P1 L2 基础视图 | DynamicThresholds + VirtualFileView（mmap + paintEvent + 滚动 + 跳转）+ LineIndex 后台构建 | 2 天 |
-| P2 搜索系统 | LargeFileSearch + SearchResultsModel Dock 虚拟化 + 双击跳转 + findNext | 2 天 |
-| P3 编辑系统 | PatchList（L1/L2 溢出 + renderRange + UndoGroup）+ VirtualFileView 输入/粘贴/删除 + Ctrl+Z/Y | 2 天 |
-| P4 替换 & 保存 | replaceAll 分段原子 + 中间保存提示 + applyAndSaveThenReset + remapFile | 1.5 天 |
-| P5 测试 | test_largefile 扩充（30+ 断言） + 1GB 稀疏场景 + replaceAll 撤销 20 段验证 | 1 天 |
-
-## 6. 构建配置
-
-- Qt 路径（优先级从高到低）：
-  1. 环境变量 `NOTEPADSAFE_QT6_DIR`
-  2. CMake 缓存 `NOTEPADSAFE_QT6_DIR`
-  3. 默认值 `E:/programs/Qt_6.11.1-static-Release_msvc2026_64/msvc2026_64`
-- `CMAKE_MSVC_RUNTIME_LIBRARY`: `MultiThreaded`（/MT，与 Qt 静态库匹配）
-- `qt_import_plugins`: QWindowsIntegrationPlugin、QSvgPlugin、QSvgIconPlugin
-- QScintilla 静态库：`third_party/QScintilla_src-2.14.1/src/release/qscintilla2_qt6.lib`
-- 构建：`build.bat`（vcvars64 + cmake -G Ninja + ninja）
-- 测试：`run_tests.bat`（运行所有 CTest）
-
-## 7. 测试
-
-CMakeLists 中定义 5 个测试目标：
-
-| 目标 | 源文件 | 覆盖 |
-|---|---|---|
-| `test_textencoding` | tests/test_textencoding.cpp | UTF-8/UTF-8 BOM/UTF-16LE/UTF-16BE、往返、overlong、编码名 |
-| `test_search` | tests/test_search.cpp | 普通/大小写/正则/整词/空/多行/Unicode/特殊字符/捕获组 |
-| `test_session` | tests/test_session.cpp | 空会话加载、有效会话、损坏 JSON、清理、autosave 目录、默认值 |
-| `test_settings_ui` | tests/test_settings_ui.cpp | 设置持久化 & 菜单勾选同步（防 UI 状态不同步回归） |
-| `test_largefile` | tests/test_largefile.cpp | 大文件分块加载基线 bug（readOnly 下 AppendText 静默失败）+ 修复验证 |
-
-运行方式：
-
-```bat
-:: 一键
-notepad-safe\run_tests.bat
-
-:: 或通过 CTest
-cd notepad-safe\build
-ctest --output-on-failure
-```
-
-SessionManager 提供测试用构造函数 `SessionManager(const QString &dataDir, ...)`，
-避免访问真实 `%LOCALAPPDATA%\NotepadSafe`。
-
-## 8. 变更日志
-
-### v0.3.2 (产品独立化)
-
-从原 Credential Vault 仓库 `apps/qt-notepad` 独立为本仓库，命名统一为 **Notepad Safe**：
-
-- 目录：产品根从 `apps/qt-notepad/` 提升为 `notepad-safe/`（独立仓库根目录）
-- 名称统一：`qt-notepad` → `notepad-safe`；`Credential Notepad` → `Notepad Safe`；
-  QSettings 组织/应用名从 `CredentialVault/CredentialNotepad` → `NotepadSafe/NotepadSafe`；
-  `%LOCALAPPDATA%\CredentialVault\...` → `%LOCALAPPDATA%\NotepadSafe\...`
-- 第三方：`third_party/QScintilla_src-2.14.1` 复制到产品内，脱离原仓库相对位置
-- 构建：CMakeLists / build.bat / run_tests.bat 路径全部相对产品根；Qt 路径通过环境变量
-  `NOTEPADSAFE_QT6_DIR` 可覆盖，不再硬编码唯一路径
-- 图标：使用 `notepad_safe.png` 生成 6 尺寸 `resources/app.ico`（EXE 图标 + VS_VERSION_INFO）
-  + `resources/app_resources.qrc`（运行时窗口/任务栏图标）
-- 文档：本 DESIGN.md 和根 README.md 独立；原 Credential Vault 全局 DESIGN.md 仅保留链接占位
-- 版本元信息：RC 中 `VS_VERSION_INFO` 填入公司/文件/产品名 `Notepad Safe` v0.3.1.0
-
-### v0.3.1 (L1/L2 大文件方案确立)
-
-根据评审反馈全面重构 v0.3.0 方案。核心变更：v0.3.0 只考虑"搜索异步"且设 100MB 编辑硬上限，
-不符合"优先完成工作、匹配机器性能"原则。v0.3.1 全面改为 L1/L2 分级 + Patch 分级溢出 + 动态阈值。
-
-- 新增 §5.1-5.2 L1/L2 分级：< RAM/128（封顶 128MB）→ Scintilla；≥ → VirtualFileView
-- 新增 §5.3 `VirtualFileView`（QAbstractScrollArea 派生）+ `LineIndex`（delta 压缩）
-- 新增 §5.4 `PatchList`：L1 内存热 patch + L2 磁盘 mmap 透明溢出，无上限
-- 新增 §5.5 `LargeFileSearch` + `SearchResultsModel`（虚拟化 Dock）
-- 新增 §5.6 `replaceAll` 1000 条/UndoGroup 分段、中间自动保存提示、保存后继续
-- 新增 §5.7 量化验收表（8GB / 32GB 两档）
-
-### v0.3.0 （已废弃，见 v0.3.1 重构）
-
-### v0.2.1
-
-修复：
-- `TextEncoding.cpp`：`toSystemCodepage` / `encodeText` 类型转换（char16_t/ushort/WideCharToMultiByte）
-- `EditorTab.cpp`：`findAll` `m.capturedText()` → `m.captured(0)`
-- `MainWindow.cpp`：缺失 `<QActionGroup>` / `<QStyle>` include；syntaxChanged 信号 lambda 参数类型
-- `MainWindow.cpp`：`restoreSession` 重构，新增 `EditorTab::setFilePath`
-- `FindReplaceDialog`：`setReplaceMode` 误改"查找:" 标签文本 → 改为正确隐藏替换控件
-- `FindReplaceDialog`：新增 `findParametersChanged` 信号，供 F3/Shift+F3 使用
-- `MainWindow`：新增 30 秒自动保存定时器，仅在有未保存标签时触发 `saveSessionNow`
-
-新增：
-- `EditorTab::setFilePath(const QString &path)`
-- `SessionManager(const QString &dataDir, ...)` — 测试用构造函数
-- 3 个测试文件：test_textencoding.cpp、test_search.cpp、test_session.cpp
-- run_tests.bat
+- Scintilla 文档与发布历史：https://www.scintilla.org/ScintillaDoc.html
+- QScintilla：https://riverbankcomputing.com/software/qscintilla/
+- KeePass KDBX：https://keepass.info/help/kb/kdbx.html
+- KeePassXC：https://github.com/keepassxreboot/keepassxc
+- Botan：https://botan.randombit.net/
+- Qt QRegularExpression/PCRE2：https://doc.qt.io/qt-6/qregularexpression.html

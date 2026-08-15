@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "regular_update_minimum_age_days": 14,
+    "security_updates_may_bypass_minimum_age": true,
+    "require_primary_source": true,
+    "require_integrity_verification": true
+  },
+  "components": [
+    {
+      "name": "Qt",
+      "status": "active",
+      "version": "6.11.1",
+      "revision": "v6.11.1",
+      "source": "https://download.qt.io/official_releases/qt/6.11/6.11.1/single/qt-everywhere-src-6.11.1.tar.xz",
+      "license": "GPL-3.0-only",
+      "integrity": {
+        "kind": "sha256",
+        "value": "252acef8c5ae68074d91cadba2ee4a83465051bbb970dd26e8f0daa0f3904e03"
+      }
+    },
+    {
+      "name": "QScintilla",
+      "status": "active",
+      "version": "2.14.1",
+      "revision": "QScintilla-2.14.1",
+      "source": "https://www.riverbankcomputing.com/static/Downloads/QScintilla/2.14.1/QScintilla_src-2.14.1.tar.gz",
+      "license": "GPL-3.0-only",
+      "local_path": "third_party/QScintilla_src-2.14.1",
+      "integrity": {
+        "kind": "git-index-manifest-sha256",
+        "value": "075c2e80db99f2c59d2e331acacf9250ea7b0370b26128ffad454b0031c56a4c",
+        "exclude_directories": [
+          "release",
+          "debug"
+        ],
+        "tracked_files": 707
+      }
+    },
+    {
+      "name": "KeePassXC",
+      "status": "active",
+      "version": "2.7.12",
+      "revision": "2.7.12",
+      "source": "https://github.com/keepassxreboot/keepassxc/releases/download/2.7.12/keepassxc-2.7.12-src.tar.xz",
+      "license": "GPL-2.0-only OR GPL-3.0-only",
+      "integration": "fetched-cache-with-replayable-patch",
+      "patch_set": "third_party/patches/keepassxc-2.7.12",
+      "integrity": {
+        "kind": "sha256",
+        "value": "be34eeb297881adea4f894c7c6e4a1835bd7927f8043ddea495040df4792a7de"
+      }
+    },
+    {
+      "name": "Botan",
+      "status": "active",
+      "version": "3.12.0",
+      "revision": "3.12.0",
+      "source": "https://botan.randombit.net/releases/Botan-3.12.0.tar.xz",
+      "license": "BSD-2-Clause",
+      "integration": "fetched-cache-minimized-static-build",
+      "integrity": {
+        "kind": "sha256",
+        "value": "5370f98dc15f8c222ee1ce52cd61c8756a53be0dc57cc4c1b0714d5a09ad74fb"
+      }
+    },
+    {
+      "name": "Argon2 reference library",
+      "status": "active",
+      "version": "20190702",
+      "revision": "62358ba2123abd17fccf2a108a301d4b52c01a7c",
+      "source": "https://github.com/P-H-C/phc-winner-argon2.git",
+      "license": "CC0-1.0 OR Apache-2.0",
+      "integration": "fetched-cache-exact-commit",
+      "integrity": {
+        "kind": "git-commit",
+        "value": "62358ba2123abd17fccf2a108a301d4b52c01a7c"
+      }
+    },
+    {
+      "name": "zlib",
+      "status": "active",
+      "version": "1.3.2",
+      "revision": "v1.3.2",
+      "source": "https://zlib.net/zlib-1.3.2.tar.xz",
+      "license": "Zlib",
+      "integration": "fetched-cache-static-build",
+      "integrity": {
+        "kind": "sha256",
+        "value": "d7a0654783a4da529d1bb793b7ad9c3318020af77667bcae35f95d0e42a792f3"
+      }
+    },
+    {
+      "name": "PCRE2",
+      "status": "planned",
+      "version": "10.47",
+      "revision": "pcre2-10.47",
+      "source": "https://github.com/PCRE2Project/pcre2.git",
+      "license": "BSD-3-Clause WITH PCRE2-exception",
+      "integrity": {
+        "kind": "pgp-signed-tag",
+        "value": "pcre2-10.47",
+        "signer_fingerprint": "A95536204A3BB489715231282A98E77EB6F24CA8"
+      }
+    }
+  ]
+}

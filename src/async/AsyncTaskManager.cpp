@@ -1,7 +1,9 @@
 #include "AsyncTaskManager.h"
 #include "AsyncThreadPool.h"
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QSet>
+#include <QThread>
 #include <algorithm>
 
 #if defined(Q_OS_WIN)
@@ -21,13 +23,27 @@ AsyncTaskManager::AsyncTaskManager(QObject *parent)
     statsTimer_.setInterval(1000);
     connect(&statsTimer_, &QTimer::timeout, this, &AsyncTaskManager::onTickStats);
     statsTimer_.start();
+    // AsyncTaskManager 是函数静态单例，它的析构晚于 main() 栈上的 QApplication。
+    // 若让活动 QTimer 一直活到静态析构，Qt 的主线程事件调度器已销毁，会报
+    // "Timers cannot be stopped from another thread"。在事件循环退出前显式停表。
+    if (auto *app = QCoreApplication::instance()) {
+        connect(app, &QCoreApplication::aboutToQuit, this, [this]() {
+            statsTimer_.stop();
+        });
+    }
     qRegisterMetaType<AsyncTask>("AsyncTask");
     qRegisterMetaType<AsyncTaskState>("AsyncTaskState");
     qRegisterMetaType<AsyncTaskType>("AsyncTaskType");
     qRegisterMetaType<AsyncErrorInfo>("AsyncErrorInfo");
 }
 
-AsyncTaskManager::~AsyncTaskManager() = default;
+AsyncTaskManager::~AsyncTaskManager()
+{
+    // 单元测试等没有进入 app.exec() 的宿主可能不发 aboutToQuit；仅在线程归属
+    // 仍一致时兜底停止，避免跨线程触碰 QObject 定时器。
+    if (QThread::currentThread() == thread())
+        statsTimer_.stop();
+}
 
 qint64 AsyncTaskManager::nextId()
 {

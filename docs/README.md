@@ -1,6 +1,6 @@
 # Notepad Safe
 
-> 基于 Qt 6.11 静态库 + QScintilla 2.14.1 的 Windows 加密笔记本编辑器。
+> 基于 Qt 6.11 静态库 + QScintilla/Scintilla 的 Windows 加密笔记本与账号保险库。
 > 本仓库为**独立产品仓库**，clone 后可直接构建运行。
 > （原 Credential Vault 项目中的 `apps/qt-notepad` 已独立为该仓库，并统一重命名为 **Notepad Safe**）
 
@@ -18,9 +18,9 @@
 - ✅ **语法高亮**：C++/Python/JSON/HTML/SQL/XML/YAML/Markdown/纯文本
 - ✅ **书签 / 行排序 / 复制行 / 删除行 / 上下移行**
 - ✅ **深色模式**（跟随系统 + 手动切换）
-- ✅ **大文件分块加载**（进度条 + 不卡 UI；≥ L2 方案见 docs/DESIGN.md §5）
+- ✅ **mmap 大文件快速查看基础**（目标三档方案见 docs/DESIGN.md §6–§9）
 - ✅ **产品图标**（根目录 `notepad_safe.png` → EXE 图标 + 窗口运行时图标）
-- ✅ **全自动化测试**：CTest 5 个测试套件覆盖编码/搜索/会话/设置同步/大文件
+- ✅ **全自动化测试**：CTest 10 个测试套件覆盖编码、搜索、会话、设置、大文件、GUI 交互与真实进程截图
 
 ## 2. 构建
 
@@ -65,7 +65,7 @@ build.bat
 run_tests.bat
 ```
 
-5 个 CTest 目标：`textencoding` / `search` / `session` / `settings_ui` / `largefile`。
+10 个 CTest 目标：5 个逻辑/组件测试、3 个 Qt GUI 冒烟测试，以及 2 个启动完整应用并检查窗口与像素的 E2E 测试。
 全部通过即视为构建与行为合格。
 
 ## 3. 使用
@@ -92,7 +92,7 @@ build\notepad-safe.exe a.txt      :: 启动并打开指定文件（支持多文�
 
 ```
 notepad-safe/
-├── CMakeLists.txt              # 主目标 notepad-safe + 5 个 CTest
+├── CMakeLists.txt              # 主目标 notepad-safe + 10 个 CTest
 ├── build.bat / run_tests.bat   # 构建 & 测试脚本（相对脚本自身路径）
 ├── main.cpp / MainWindow.*     # 主程序入口 & 主窗口
 ├── EditorTab.*                 # 单个编辑器标签（QsciScintilla）
@@ -109,27 +109,24 @@ notepad-safe/
 │   └── make_ico.py             # 从 notepad_safe.png 重新生成 app.ico（辅助）
 ├── third_party/
 │   └── QScintilla_src-2.14.1/  # QScintilla 源码 + release/qscintilla2_qt6.lib
-├── tests/                      # 5 个测试套件
+├── tests/                      # 逻辑、组件、GUI 冒烟与真实进程 E2E 测试
 └── docs/
     ├── README.md               # 用户文档（本文件）
     └── DESIGN.md               # 设计文档（模块/方案/验收标准）
 ```
 
-## 5. 设计文档 & 大文件方案
+## 5. 目标架构
 
-详见 [docs/DESIGN.md](docs/DESIGN.md)：
+详见 [docs/DESIGN.md](DESIGN.md)。该文档是后续开发的唯一架构基线，主要决策包括：
 
-- 模块设计（§3-§4）
-- **大文件 L1/L2 分级架构方案**（§5），包含：
-  - 动态阈值（RAM/CPU 探测，无硬性人为上限）
-  - `VirtualFileView` 自绘虚拟视图 + `LineIndex` delta 压缩
-  - `PatchList` L1/L2 分级溢出 + UndoGroup 原子分段
-  - `LargeFileSearch` 多线程分块 + Dock 虚拟化结果溢出
-  - `replaceAll` 分段原子 + 中间保存提示 + 保存后继续（`applyAndSaveThenReset`）
-  - 量化验收表（8GB / 32GB 两档明确数值）
-- 构建配置（§6）
-- 测试策略（§7）
-- 变更日志（§8）
+- 供应链版本锁定、更新验证、SBOM 和退出策略（机器锁见 `../third_party/dependencies.lock.json`，操作规程见 `SUPPLY_CHAIN.md`）。
+- 小于 32 MiB：Scintilla 完整编辑。
+- 32 MiB–2 GiB：mmap 立即预览，后台 ILoader 构建，资源允许后晋升完整编辑。
+- 大于 2 GiB：窗口化 Scintilla 只读查看和搜索，不再维护 Patch 编辑器。
+- 字面搜索可并行；完整正则统一 PCRE2，以稳定快照保证跨块正确性。
+- KeePassXC Core + Botan + KDBX 4.x 的加密笔记和账号保险库。
+
+当前仓库仍包含旧 PatchList/L2 编辑链及相关测试，它们是迁移期代码，不再代表目标架构。
 
 ## 6. 许可证 & 第三方
 

@@ -14,6 +14,7 @@ class EditorTab;
 class FindReplaceDialog;
 class SearchResultsDock;
 class SessionManager;
+class VaultDock;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -97,6 +98,7 @@ private:
     QTabWidget *m_tabs = nullptr;
     FindReplaceDialog *m_findDialog = nullptr;
     SearchResultsDock *m_searchDock = nullptr;
+    VaultDock *m_vaultDock = nullptr;
     SessionManager *m_session = nullptr;
 
     // 状态栏

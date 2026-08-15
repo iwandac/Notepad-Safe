@@ -34,14 +34,15 @@
 #include <Qsci/qsciscintilla.h>
 #include <Qsci/qsciscintillabase.h>
 
-#include "../LineIndex.h"
-#include "../PatchList.h"
-#include "../LargeFileSearch.h"
-#include "../SearchResultsModel.h"
-#include "../DynamicThresholds.h"
-#include "../VirtualFileView.h"
-#include "../EditorTab.h"
-#include "../SessionManager.h"
+#include "LineIndex.h"
+#include "PatchList.h"
+#include "LargeFileSearch.h"
+#include "SearchResultsModel.h"
+#include "DynamicThresholds.h"
+#include "FileTierPolicy.h"
+#include "VirtualFileView.h"
+#include "EditorTab.h"
+#include "SessionManager.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -729,7 +730,8 @@ static void test_dynamicthresholds_range()
     const DynamicThresholds& d = DynamicThresholds::instance();
     CHECK(d.RAM_BYTES > 0, "RAM 字节检测正常");
     CHECK(d.CPU_CORES >= 1, "CPU 核数 >= 1");
-    CHECK(d.L1_EDIT_LIMIT >= qint64(32) * 1024 * 1024, "L1_EDIT_LIMIT >= 32MB");
+    CHECK(FileTierPolicy::StandardEditLimitBytes == qint64(32) * 1024 * 1024,
+          "S1 boundary is exactly 32 MiB");
     CHECK(d.PATCH_L1_LIMIT >= qint64(8) * 1024 * 1024, "PATCH_L1_LIMIT >= 8MB");
     CHECK(d.SEARCH_CHUNK_BYTES >= qint64(4) * 1024 * 1024, "SEARCH_CHUNK_BYTES >= 4MB");
     CHECK(d.MAX_MATCHES_MEM >= 100000, "MAX_MATCHES_MEM >= 100000");
@@ -1032,7 +1034,7 @@ static void test_reset_after_save_then_edit_undo()
 //     主线程同步读 3~5s；且 show() 后的首个 zero-timer（deferredRestoreSession）
 //     在 Paint 事件之前运行，阻塞期间 DWM 无首帧 → 用户"以为双击没启动"。
 //   · 修复契约：无论 filePath 直接打开、或 autosave 恢复，
-//     对 ≥ L1_EDIT_LIMIT (硬上限 32MB) 的文件：
+//     对 S2/S3（≥ 32 MiB）的文件：
 //       - EditorTab 调用必须在 500ms 内返回（L2 mmap + incomplete LineIndex 秒开）
 //       - L2 数据（用户 patches）在 SessionManager::saveSession 时不得丢失
 //       - 内容写入 autosave 文件时正确应用字节级 patches（非 editor()->text() 空串）
@@ -1220,10 +1222,10 @@ static void test_session_save_export_l2_correctness()
           "autosave 内包含 L2 插入的 Token（证明 editor()->text() 空串 bug 已修复）");
 }
 
-// 测试：小文件 autosave（< L1_EDIT_LIMIT）仍走原 loadAutosave L1 同步路径，避免破坏现有行为
+// 测试：S1 autosave（< 32 MiB）仍走原 loadAutosave 同步路径，避免破坏现有行为
 static void test_small_file_autosave_prefers_l1()
 {
-    TEST("★ 兼容: 小文件 autosave(< L1_EDIT_LIMIT) 仍走 L1 同步路径");
+    TEST("★ 兼容: S1 autosave(< 32 MiB) 仍走 Scintilla 同步路径");
 
     QTemporaryDir tmpDir;
     const QString autosavePath = makeFixedSizeFile(tmpDir.path(),
