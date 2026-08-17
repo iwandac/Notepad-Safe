@@ -1,15 +1,18 @@
 #pragma once
 
 #include <QDockWidget>
+#include <QPointer>
+#include <QHash>
 #include "EditorTab.h"
 #include "SearchResultsModel.h"
 
-class QTreeWidget;
 class QTreeView;
-class QTreeWidgetItem;
 class QLabel;
+class QPushButton;
 class QStackedWidget;
 class QMouseEvent;
+class MultiSearchResultsModel;
+class FlatL1SearchResultsModel;
 
 // 搜索结果 Dock 窗口
 class SearchResultsDock : public QDockWidget {
@@ -17,40 +20,78 @@ class SearchResultsDock : public QDockWidget {
 public:
     explicit SearchResultsDock(QWidget *parent = nullptr);
 
-    // ---- L1（QsciScintilla）路径：QVector<SearchMatch> → QTreeWidget
+    // ---- L1（QsciScintilla）路径：QVector<SearchMatch> → flat virtual model
     void setResults(const QVector<SearchMatch> &matches, const QString &pattern,
-                    const QString &fileName);
+                    const QString &fileName, EditorTab *target = nullptr,
+                    bool incomplete = false);
 
     // ---- L2 虚拟化路径：SearchResultsModel（内存 + overrun.bin 二分读取）→ QTreeView
-    // model：调用方持有生命周期；Dock 仅使用不拥有。传 nullptr = 清空。
+    // model 通常以 Dock 为 QObject parent；多文件路径会显式接管所有权。
     void setResultsModel(SearchResultsModel *model, const QString &pattern,
-                         const QString &fileName);
+                         const QString &fileName, EditorTab *target = nullptr);
+    void beginSingleFileResults(const QString &pattern, const QString &fileName,
+                                EditorTab *target);
+    void appendSingleFilePreview(EditorTab *target,
+                                 const QVector<LargeFileSearchMatch> &batch);
+    void beginMultiFileResults(const QString &pattern, int targetCount);
+    void beginMultiFileTarget(EditorTab *tab);
+    void appendMultiFilePreview(EditorTab *tab,
+                                const QVector<LargeFileSearchMatch> &batch);
+    void appendMultiFileResults(EditorTab *tab, const QVector<SearchMatch> &matches,
+                                bool incomplete = false);
+    // Transfers model ownership to the dock's virtual multi-file model.
+    void appendMultiFileResults(EditorTab *tab, SearchResultsModel *model);
+    void finishMultiFileResults(bool cancelled = false);
+    void clearResults();
+    void invalidateResultsFor(EditorTab *tab);
+    void decorateResultsFor(EditorTab *tab);
 
 signals:
+    void rerunRequested(EditorTab *preferredTarget);
     // L1 跳转（line, index：Scintilla 的 0-based 行/列）
-    void jumpTo(int line, int index);
+    void jumpTo(int line, int index, int length);
     // L2 跳转（byteOffset：虚拟字节偏移；length：匹配长度用于定位选中）
     void jumpToByteOffset(qint64 byteOffset, int length);
+    void jumpToTab(EditorTab *tab, int line, int index, int length);
+    void jumpToTabByteOffset(EditorTab *tab, qint64 byteOffset, int length);
 
 protected:
     // 事件过滤器：监听 m_treeView viewport 的鼠标事件，用于"点击哪一个匹配词"
     bool eventFilter(QObject *watched, QEvent *event) override;
 
 private slots:
-    void onItemDoubleClicked(QTreeWidgetItem *item, int column);
     void onModelDoubleClicked(const QModelIndex &index);
 
 private:
-    QStackedWidget *m_stack   = nullptr;  // 0: QTreeWidget（L1）, 1: QTreeView（L2）
-    QTreeWidget    *m_tree    = nullptr;  // L1 控件
-    QTreeView      *m_treeView = nullptr; // L2 虚拟化控件
+    QStackedWidget *m_stack   = nullptr;
+    QTreeView      *m_treeView = nullptr; // 全部结果共用的虚拟化控件
     SearchResultsModel *m_model = nullptr; // 当前绑定的 L2 模型（非 owning）
+    MultiSearchResultsModel *m_multiModel = nullptr;
+    FlatL1SearchResultsModel *m_singleL1Model = nullptr;
     QLabel         *m_summary = nullptr;
+    QPushButton    *m_rerunButton = nullptr;
 
     // 上次按下位置对应的"行 / 匹配索引"（用于双击时跳转到指定匹配）
     int m_lastHitMatchIdx = -1;
     int m_lastHitRow = -1;
+    bool m_multiFileMode = false;
+    QString m_multiPattern;
+    qint64 m_multiMatchCount = 0;
+    int m_multiStaleCount = 0;
+    int m_multiIncompleteCount = 0;
+    QHash<QString, QPointer<EditorTab>> m_multiTargets;
+    QHash<QString, quint64> m_multiTargetRevisions;
+    QPointer<EditorTab> m_singleTarget;
+    QPointer<EditorTab> m_rerunTarget;
+    quint64 m_singleTargetRevision = 0;
+    QVector<QMetaObject::Connection> m_targetConnections;
+    QVector<LargeFileSearchMatch> m_singlePreviewMatches;
 
     void updateSummary(const QString &pattern, const QString &fileName,
                        qint64 totalMatches);
+    QString registerTarget(EditorTab *tab);
+    void resetTargetWatches();
+    void watchTarget(EditorTab *tab, const QString &targetId = QString());
+    bool targetRevisionIsCurrent(EditorTab *tab, const QString &targetId = QString()) const;
+    void setRerunAvailable(bool available, EditorTab *preferredTarget = nullptr);
 };

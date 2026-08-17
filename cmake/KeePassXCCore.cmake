@@ -53,7 +53,6 @@ target_include_directories(notepadsafe_argon2 PUBLIC
 if(MSVC)
     target_compile_definitions(notepadsafe_argon2 PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
-
 add_library(notepadsafe_zxcvbn STATIC
     "${NOTEPADSAFE_KEEPASSXC_SOURCE_DIR}/src/thirdparty/zxcvbn/zxcvbn.c"
 )
@@ -90,6 +89,7 @@ set(_keepassxc_core_sources
     core/Metadata.cpp
     core/ModifiableObject.cpp
     core/PasswordHealth.cpp
+    core/PasswordGenerator.cpp
     core/SignalMultiplexer.cpp
     core/TimeDelta.cpp
     core/TimeInfo.cpp

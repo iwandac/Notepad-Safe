@@ -92,11 +92,13 @@
     },
     {
       "name": "PCRE2",
-      "status": "planned",
+      "status": "active",
       "version": "10.47",
       "revision": "pcre2-10.47",
+      "resolved_commit": "f454e231fe5006dd7ff8f4693fd2b8eb94333429",
       "source": "https://github.com/PCRE2Project/pcre2.git",
       "license": "BSD-3-Clause WITH PCRE2-exception",
+      "integration": "fetched-cache-pgp-signed-tag-static-8-bit",
       "integrity": {
         "kind": "pgp-signed-tag",
         "value": "pcre2-10.47",

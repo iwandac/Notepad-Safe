@@ -24,11 +24,15 @@ public slots:
 
 private slots:
     void onCurrentRowChanged(const QModelIndex &current, const QModelIndex &previous);
+    void onCancelSelected();
+    void onCancelAll();
     void onClearHistory();
+    void updateActionStates();
 
 private:
-    QLabel  *m_summaryQueued, *m_summaryRunning, *m_summaryDone, *m_summaryThreads;
-    QPushButton *m_clearBtn, *m_closeBtn;
+    QLabel  *m_summaryQueued, *m_summaryRunning, *m_summaryDone;
+    QLabel  *m_summaryFailed, *m_summaryThreads;
+    QPushButton *m_cancelSelectedBtn, *m_cancelAllBtn, *m_clearBtn, *m_closeBtn;
     QListView *m_listView;
     QPlainTextEdit *m_detailsEdit;
     QStyledItemDelegate *m_delegate;

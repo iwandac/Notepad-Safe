@@ -33,7 +33,8 @@ static QRegularExpression buildPattern(const QString &pattern, bool regex,
         pat = QRegularExpression::escape(pattern);
     }
     if (wholeWord) {
-        pat = QStringLiteral("(?:^|\\W)") + pat + QStringLiteral("(?:$|\\W)");
+        pat = QStringLiteral("(?<![\\p{L}\\p{N}_])(?:") + pat
+              + QStringLiteral(")(?![\\p{L}\\p{N}_])");
     }
     QRegularExpression re(pat, options);
     return re;

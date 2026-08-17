@@ -1,4 +1,5 @@
 #include "VirtualFileView.h"
+#include "SharedReadOnlyFile.h"
 #include "LargeFileSearch.h"
 #include "DynamicThresholds.h"
 #include "AsyncTaskManager.h"
@@ -156,9 +157,9 @@ bool VirtualFileView::openFile(const QString& filePath, QString* errMsg,
                                QWidget* /*progressParent — 秒开不再用模态进度对话框*/)
 {
     closeFile();
-    file_.setFileName(filePath);
-    if (!file_.open(QIODevice::ReadOnly)) {
-        if (errMsg) *errMsg = QObject::tr("无法打开文件：%1").arg(file_.errorString());
+    QString openError;
+    if (!openSharedReadOnlyFile(file_, QFileInfo(filePath).absoluteFilePath(), &openError)) {
+        if (errMsg) *errMsg = QObject::tr("无法打开文件：%1").arg(openError);
         return false;
     }
     qint64 size = file_.size();
@@ -236,6 +237,55 @@ bool VirtualFileView::openFile(const QString& filePath, QString* errMsg,
     return true;
 }
 
+bool VirtualFileView::openMemory(QByteArray bytes, ViewMode mode, QString* errMsg)
+{
+    closeFile();
+    if (mode != ViewMode::Hex) {
+        if (errMsg)
+            *errMsg = QObject::tr("内存安全载荷当前只支持十六进制视图。");
+        if (!bytes.isEmpty())
+            bytes.fill(0);
+        return false;
+    }
+
+    m_memoryBacking = std::move(bytes);
+    m_memoryBacked = true;
+    patches_.setSensitive(true);
+    mmapSize_ = m_memoryBacking.size();
+    mmapBase_ = m_memoryBacking.isEmpty()
+                    ? nullptr
+                    : reinterpret_cast<uchar *>(m_memoryBacking.data());
+    m_viewMode = mode;
+    m_loading = false;
+    lineIndex_.clear();
+    bookmarks_.clear();
+    cursorByte_ = 0;
+    selStartByte_ = selEndByte_ = 0;
+    patches_.resetAfterSave();
+    lastL2Count_ = 0;
+    if (search_)
+        search_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
+
+    m_activeWindowStart = 0;
+    m_activeWindowLen = 0;
+    m_lastComputedW = computeActiveWindowBytes();
+    lruClear();
+    m_previewJumpByteHint = -1;
+    (void)alignActiveWindowTo(0, m_lastComputedW);
+    updateMetrics();
+    updateScrollBarsFromContent();
+    viewport()->update();
+    emit fileOpenedChanged(true);
+    emit saveNeededChanged(false);
+    emit lineBuildProgress(mmapSize_, mmapSize_);
+    emit lineBuildFinished(true);
+    if (!m_inDestruction && m_activeWindowLen > 0) {
+        emit activeWindowChanged(m_activeWindowStart,
+                                 m_activeWindowStart + m_activeWindowLen);
+    }
+    return true;
+}
+
 void VirtualFileView::onMmapReady(quintptr ptr, qint64 size, LineIndex quickIndex) {
     m_loading = false;
     m_mmapTaskId = -1;
@@ -275,10 +325,12 @@ void VirtualFileView::onMmapReady(quintptr ptr, qint64 size, LineIndex quickInde
         (void)alignActiveWindowTo(0, w);
     }
 
-    // ---- 吞吐采样（worker 线程）：扫一次 64MB 得 throughput，完成后再重新算一次 W_active ----
+    // ---- 吞吐采样（worker 线程）：只对真正的大文件采样。小二进制文件
+    // 也会使用 mmap/Hex，但为几百字节的文件创建后台任务只会制造 UI 噪声。 ----
     {
         const qint64 sampleBytes = qMin<qint64>(Q_INT64_C(64) * 1024 * 1024, size);
-        if (sampleBytes > 0 && mmapBase_ != nullptr) {
+        if (size >= Q_INT64_C(32) * 1024 * 1024
+            && sampleBytes > 0 && mmapBase_ != nullptr) {
             QPointer<VirtualFileView> that(this);
             const uchar* basePtr = mmapBase_;
             AsyncTaskManager::instance().submit(
@@ -331,11 +383,19 @@ void VirtualFileView::onMmapReady(quintptr ptr, qint64 size, LineIndex quickInde
     viewport()->update();
     emit fileOpenedChanged(true);
     emit saveNeededChanged(false);
-    emit lineBuildProgress(1024 * 1024, mmapSize_);
+    emit lineBuildProgress(qMin<qint64>(Q_INT64_C(1024) * 1024, mmapSize_), mmapSize_);
 
     // ---- L3（落点）对齐一次：若 activeWindow 变了，发信号让 EditorTab 灌 overlay Scintilla ----
     if (!m_inDestruction && m_activeWindowLen > 0) {
         emit activeWindowChanged(m_activeWindowStart, m_activeWindowStart + m_activeWindowLen);
+    }
+
+    // Hex 按固定 16 字节分行，不依赖文本 LineIndex。到这里 mmap 已经可用，
+    // 直接结束加载状态，避免创建无价值的后台索引任务。
+    if (m_viewMode == ViewMode::Hex) {
+        emit lineBuildProgress(0, 0);
+        emit lineBuildFinished(true);
+        return;
     }
 
     // 后台全量构建（不阻塞 UI，完成后 swap 进真实 anchors）
@@ -343,6 +403,11 @@ void VirtualFileView::onMmapReady(quintptr ptr, qint64 size, LineIndex quickInde
 }
 
 bool VirtualFileView::remapFile(QString* errMsg) {
+    if (m_memoryBacked) {
+        if (errMsg)
+            *errMsg = QObject::tr("内存安全载荷不能通过磁盘 remap。");
+        return false;
+    }
     if (!isOpen() && file_.fileName().isEmpty()) {
         if (errMsg) *errMsg = QObject::tr("remapFile 前请先 openFile 或保存过一次文件");
         return false;
@@ -435,6 +500,12 @@ bool VirtualFileView::openFileSync(const QString& filePath, QString* errMsg) {
 }
 
 void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
+    const bool closingMemoryBacked = m_memoryBacked;
+    // processEvents below may deliver a queued result from the line-index task
+    // being canceled. That result belongs to the old mapping and must not
+    // re-enter task progress updates while closeFile waits for termination.
+    m_closingFile = true;
+    ++m_mappingGeneration;
     // ========================================================================
     //  取消异步 mmap 任务（如果正在加载中）
     // ========================================================================
@@ -460,40 +531,27 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
         if (lineBuildCancel_) lineBuildCancel_->store(true, std::memory_order_release);
 
         if (allowProcessEvents) {
-            // ================================================================
-            //  非析构场景（用户切换文件 / 重开文件 / 关闭单个 tab 等）：
-            //    主线程仍健康，可以 processEvents 让 finishTaskImpl（QueuedConnection）
-            //    运行以将 AsyncTask.state 从 Running 改到 Canceled。
-            // ================================================================
+            // Wait for the worker's own completion flag, not the manager's UI
+            // state. The latter is finalized by a queued callback; pumping the
+            // event loop here can re-enter the old result callback and deadlock
+            // during Save As/backing-store switches.
             QElapsedTimer wt; wt.start();
             constexpr int MAX_WAIT_MS = 10000;
-            bool terminated = false;
-            while (wt.elapsed() < MAX_WAIT_MS) {
-                AsyncTask t = AsyncTaskManager::instance().taskById(m_lineBuildTaskId);
-                auto s = t.state;
-                if (s == AsyncTaskState::Finished ||
-                    s == AsyncTaskState::Canceled ||
-                    s == AsyncTaskState::Failed) {
-                    terminated = true;
-                    break;
-                }
-                // 先派发事件（让 worker 回调 finishTaskImpl/onAsyncLineBuildSwapped 跑掉，
-                // 防止它们还在队列里而对象稍后被析构），再让 1ms 给 worker 线程实际工作。
-                QApplication::processEvents(QEventLoop::AllEvents);
+            const auto done = m_lineBuildWorkerDone;
+            while (done && !done->load(std::memory_order_acquire)
+                   && wt.elapsed() < MAX_WAIT_MS) {
                 QThread::msleep(1);
             }
+            const bool terminated = !done || done->load(std::memory_order_acquire);
             if (!terminated) {
-                qWarning("[VirtualFileView::closeFile] ⚠️ AsyncTaskManager LineIndex task #%lld "
-                         "cancel 后 %d ms 仍未退出！将强制 unmap，可能导致 worker 读野指针（不应该发生）。",
+                qWarning("[VirtualFileView::closeFile] LineIndex worker #%lld "
+                         "cancel 后 %d ms 仍未退出；拒绝继续派发旧映射回调。",
                          m_lineBuildTaskId, MAX_WAIT_MS);
             } else {
-                qDebug("[VirtualFileView::closeFile] AsyncTaskManager LineIndex task #%lld "
-                       "已在 %lld ms 内安全终止 (Canceled/Finished)，可以安全 unmap。",
+                qDebug("[VirtualFileView::closeFile] LineIndex worker #%lld "
+                       "已在 %lld ms 内安全终止，可以安全 unmap。",
                        m_lineBuildTaskId, wt.elapsed());
             }
-            // 最后再 processEvents 一次：把 queued 的 onAsyncLineBuildSwapped 等旧任务回调清掉，
-            // 避免 closeFile() 返回后这些回调访问本对象的半析构状态
-            QApplication::processEvents(QEventLoop::AllEvents);
         } else {
             // ================================================================
             //  析构场景：禁止 processEvents！
@@ -519,15 +577,51 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
                    m_lineBuildTaskId, DESTRUCT_WAIT_MS);
         }
         m_lineBuildTaskId = -1;
+        m_lineBuildWorkerDone.reset();
     }
     // 下面是 legacy 取消（防止还有旧的 QtConcurrent 路径残留）
     if (lineBuildCancel_) lineBuildCancel_->store(true, std::memory_order_relaxed);
     if (lineBuildWatcher_) { lineBuildWatcher_->cancel(); lineBuildWatcher_->disconnect(); }
     if (lineBuildFuture_.isRunning()) lineBuildFuture_.waitForFinished();
 
-    if (mmapBase_) {
+    // Prefetch workers also hold the raw mapping pointer. Cancel and wait for
+    // every generation still in flight before unmapping or scrubbing memory.
+    if (m_scrollDebounceTimer) m_scrollDebounceTimer->stop();
+    if (m_prefetchWatcher && m_prefetchWatcher->isRunning())
+        m_prefetchWatcher->cancel();
+    if (m_prefetchTaskId >= 0) {
+        AsyncTaskManager::instance().cancel(m_prefetchTaskId);
+        m_prefetchTaskId = -1;
+    }
+    if (m_prefetchCancel)
+        m_prefetchCancel->store(true, std::memory_order_release);
+    if (!m_prefetchWorkers.isEmpty()) {
+        QElapsedTimer wait;
+        wait.start();
+        const int maximumWaitMs = allowProcessEvents ? 10000 : 500;
+        const auto allFinished = [this]() {
+            return std::all_of(m_prefetchWorkers.cbegin(), m_prefetchWorkers.cend(),
+                               [](const auto &done) {
+                                   return !done || done->load(std::memory_order_acquire);
+                               });
+        };
+        while (!allFinished() && wait.elapsed() < maximumWaitMs)
+            QThread::msleep(1);
+        m_prefetchWorkers.clear();
+    }
+    m_prefetchCancel.reset();
+
+    if (mmapBase_ && !m_memoryBacked) {
         file_.unmap(mmapBase_);
         mmapBase_ = nullptr;
+    }
+    if (m_memoryBacked) {
+        mmapBase_ = nullptr;
+        if (!m_memoryBacking.isEmpty())
+            m_memoryBacking.fill(0);
+        m_memoryBacking.clear();
+        m_memoryBacking.squeeze();
+        m_memoryBacked = false;
     }
     mmapSize_ = 0;
     m_buildProgressBytes = 0;
@@ -537,19 +631,17 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
     cursorByte_ = 0;
     selStartByte_ = selEndByte_ = 0;
     patches_.resetAfterSave();
+    patches_.setSensitive(false);
     lastL2Count_ = 0;
     if (search_) search_->setSource(nullptr, 0, nullptr, nullptr);
 
     // ---- 关闭文件时一并清理小 chunk 状态 ----
-    if (m_scrollDebounceTimer) m_scrollDebounceTimer->stop();
-    if (m_prefetchWatcher) {
-        if (m_prefetchWatcher->isRunning()) m_prefetchWatcher->cancel();
+    if (closingMemoryBacked) {
+        for (ChunkSlot &slot : m_chunkLru) {
+            if (!slot.bytes.isEmpty())
+                slot.bytes.fill(0);
+        }
     }
-    if (m_prefetchTaskId >= 0) {
-        AsyncTaskManager::instance().cancel(m_prefetchTaskId);
-        m_prefetchTaskId = -1;
-    }
-    m_prefetchCancel.reset();
     lruClear();
     m_activeWindowStart = 0;
     m_activeWindowLen = 0;
@@ -575,6 +667,7 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
         emit fileOpenedChanged(false);
         emit saveNeededChanged(false);
     }
+    m_closingFile = false;
 }
 
 // ============================================================================
@@ -613,7 +706,7 @@ void VirtualFileView::updateMetrics() {
         // gutterWidth_ 用于 paintEvent 地址区宽度（drawGutterLine 复用）：
         //   地址列宽度：8 hex charWidth + 2 (pad) + 14 (bookmark padding)
         gutterWidth_ = 10 * charWidth_ + 2 * 4 + 14;  // 8 hex + 2 space + pad
-        maxLineChars_ = 78;  // 16*(2+1) + 2 + 16 = 66，保守值；用于 hscroll
+        maxLineChars_ = m_hexBytesPerRow * 4 + 14;
         // maxLineDigits_：hex 地址固定 8 位（最多 32 位 = 4GB，够用）；>4GB 时自动扩展
         qint64 lines = hexTotalLines();
         int digits = 1;
@@ -664,7 +757,7 @@ void VirtualFileView::updateScrollBarsFromContent() {
         // 最宽还需考虑最后 8 + 9 字节分组（8 + 1 space + 7*3 + 1 = 31 hex 位，7+7 ascii）
         // 保守用 68 字符 × charWidth
         int vpW = qMax(1, viewport()->width() - gutterWidth());
-        const int hexCharsPerLine = 16 * 3 + 2 + 16;  // = 66
+        const int hexCharsPerLine = m_hexBytesPerRow * 3 + 2 + m_hexBytesPerRow;
         qint64 maxPx64 = qint64(hexCharsPerLine) * qint64(qMax(1, charWidth()));
         int hPageStep = qMax(1, vpW / qMax(1, charWidth()));
         qint64 hmax64 = maxPx64 - qint64(vpW);
@@ -784,6 +877,17 @@ void VirtualFileView::setViewMode(ViewMode mode) {
     updateScrollBarsFromContent();
     viewport()->update();
     emit viewModeChanged(m_viewMode);
+}
+
+void VirtualFileView::setHexBytesPerRow(int bytesPerRow) {
+    bytesPerRow = qBound(8, bytesPerRow, 64);
+    if (m_hexBytesPerRow == bytesPerRow)
+        return;
+    const qint64 anchor = cursorByte_;
+    m_hexBytesPerRow = bytesPerRow;
+    updateMetrics();
+    updateScrollBarsFromContent();
+    gotoByteOffset(anchor, false);
 }
 
 // 将字节区间按 m_displayEncoding 解码为 Unicode 码点数组
@@ -1021,7 +1125,7 @@ void VirtualFileView::gotoByteOffset(qint64 byteOffset, bool /*selectTo*/) {
     int vpW = qMax(1, viewport()->width() - gutterWidth());
     qint64 colPx64;
     if (m_viewMode == ViewMode::Hex) {
-        // col64=0..15: hex 区 x = col64*3 (+1 if col>=8) 起始
+        // Hex byte grid uses three display columns per source byte.
         colPx64 = (col64 >= 8 ? col64 * 3 + 1 : col64 * 3) * cw;
     } else {
         colPx64 = col64 * cw;
@@ -1121,6 +1225,13 @@ namespace {
 
 bool VirtualFileView::insertAtCursor(const QByteArray& bytes, QString* errMsg) {
     if (!isOpen()) { if (errMsg) *errMsg = QObject::tr("文件未打开。"); return false; }
+    const qint64 currentSize = patches_.virtualSize(mmapSize_);
+    if (m_virtualSizeLimitExclusive > 0
+        && currentSize + bytes.size() >= m_virtualSizeLimitExclusive) {
+        if (errMsg)
+            *errMsg = QObject::tr("安全文档必须小于 32 MiB；本次编辑未应用。");
+        return false;
+    }
     qint64 pos = cursorByte_;
     bool ok = patches_.insert(pos, bytes, errMsg);
     if (!ok) return false;
@@ -1198,6 +1309,14 @@ bool VirtualFileView::replaceBytes(qint64 byteOffset, qint32 oldLength, const QB
     if (oldLength < 0) oldLength = 0;
     if (qint64(oldLength) > maxLen) oldLength = qint32(maxLen);
 
+    if (m_virtualSizeLimitExclusive > 0
+        && virtSize - oldLength + newData.size()
+               >= m_virtualSizeLimitExclusive) {
+        if (errMsg)
+            *errMsg = QObject::tr("安全文档必须小于 32 MiB；本次编辑未应用。");
+        return false;
+    }
+
     // 1) 如果当前有选区被替换，先把选区删掉，保证"替换当前"不会插在旁边
     if (hasSelection() && qint64(oldLength) == 0) {
         if (!removeSelection(errMsg)) return false;
@@ -1261,6 +1380,10 @@ bool VirtualFileView::removeSelection(QString* errMsg) {
 //  小 chunk + ±1 预读 + Scintilla 小窗口：公开 API / 工具函数
 // ============================================================================
 qint64 VirtualFileView::computeDisplayWindowBytes() const {
+    // Hex expands every source byte to roughly three display characters.
+    // Bound the editable overlay to about 768 KiB of Scintilla text.
+    if (m_viewMode == ViewMode::Hex)
+        return Q_INT64_C(256) * 1024;
     // W_display = 11 screens × 每屏字节数（真实 viewport 尺寸 + 当前字体度量，不猜）
     const int rows = qMax(1, visibleLineCount());
     const int vpW  = qMax(1, viewport()->width() - gutterWidth());
@@ -1380,7 +1503,7 @@ qint64 VirtualFileView::computeViewportCenterByteFromScrollbars() const {
         const int vLine = verticalScrollBar()->value() + visibleLineCount() / 2;
         const qint64 off = hexLineToByteOffset(vLine);
         // 再加 8 字节让它偏该行中心；hscroll 暂时忽略（hex 中心字节精度 ±8 足够预览）
-        return qBound<qint64>(0, off + 8, vSize);
+        return qBound<qint64>(0, off + m_hexBytesPerRow / 2, vSize);
     }
     // Text 模式：用 LineIndex → 中间一行的起始字节 + 最长行的一半，估算"中心字节"
     const qint64 total = lineIndex_.totalLines();
@@ -1506,8 +1629,18 @@ void VirtualFileView::submitPrefetchForChunks(const QVector<qint64>& chunkIds, b
 
     m_prefetchCancel = QSharedPointer<std::atomic<bool>>::create(false);
     AsyncCancelPtr outerCancel = m_prefetchCancel;
+    const auto workerDone = std::make_shared<std::atomic_bool>(false);
+    m_prefetchWorkers.erase(
+        std::remove_if(m_prefetchWorkers.begin(), m_prefetchWorkers.end(),
+                       [](const auto &done) {
+                           return !done || done->load(std::memory_order_acquire);
+                       }),
+        m_prefetchWorkers.end());
+    m_prefetchWorkers.append(workerDone);
     const qint64 activeStart = m_activeWindowStart;
     const qint64 activeLen   = m_activeWindowLen;
+    const quint64 mappingGeneration = m_mappingGeneration;
+    const bool sensitive = m_memoryBacked;
 
     m_prefetchTaskId = AsyncTaskManager::instance().submit(
         AsyncTaskType::Other,
@@ -1515,14 +1648,29 @@ void VirtualFileView::submitPrefetchForChunks(const QVector<qint64>& chunkIds, b
         QObject::tr("预读文件块"),
         QObject::tr("准备相邻文件块以无缝滚动..."),
         // WorkerFn = void(taskId, cancel, reportProgress, reportError)
-        [that, base, fSize, cBytes, validIds, outerCancel, activeStart, activeLen]
+        [that, base, fSize, cBytes, validIds, outerCancel, activeStart, activeLen,
+         mappingGeneration, sensitive, workerDone]
         (qint64, AsyncCancelPtr innerCancel,
          std::function<void(qint64,qint64)> reportProgress,
          std::function<void(const AsyncErrorInfo&)>)
         {
+            struct CompletionGuard {
+                std::shared_ptr<std::atomic_bool> done;
+                ~CompletionGuard() {
+                    done->store(true, std::memory_order_release);
+                }
+            } completion{workerDone};
             const qint64 total = validIds.size();
             QVector<QPair<qint64, QByteArray>> result;  // <chunkId, bytes>
             result.reserve(total);
+            const auto scrubResult = [&result, sensitive]() {
+                if (!sensitive)
+                    return;
+                for (auto &item : result) {
+                    if (!item.second.isEmpty())
+                        item.second.fill(0);
+                }
+            };
             for (qint64 k = 0; k < total; ++k) {
                 const qint64 id = validIds[int(k)];
                 const qint64 start = id * cBytes;
@@ -1531,6 +1679,7 @@ void VirtualFileView::submitPrefetchForChunks(const QVector<qint64>& chunkIds, b
                 // 取消检查（任一 cancel 原子为真立即终止）
                 if ((outerCancel && outerCancel->load(std::memory_order_acquire)) ||
                     (innerCancel && innerCancel->load(std::memory_order_acquire))) {
+                    scrubResult();
                     return;
                 }
                 QByteArray buf;
@@ -1544,17 +1693,34 @@ void VirtualFileView::submitPrefetchForChunks(const QVector<qint64>& chunkIds, b
                 if (reportProgress) reportProgress(k + 1, total);
             }
             // Worker 线程结束 → 回到主线程写 LRU + 信号（通过 invokeMethod queued）
-            QMetaObject::invokeMethod(that,
-                [that, result, activeStart, activeLen]() {
-                    if (!that) return;
-                    if (that->m_inDestruction) return;
+            auto queuedResult = std::make_shared<
+                QVector<QPair<qint64, QByteArray>>>(std::move(result));
+            const bool queued = QMetaObject::invokeMethod(that,
+                [that, queuedResult, activeStart, activeLen,
+                 mappingGeneration, sensitive]() mutable {
+                    auto &result = *queuedResult;
+                    const auto scrubQueued = [&result, sensitive]() {
+                        if (!sensitive)
+                            return;
+                        for (auto &item : result) {
+                            if (!item.second.isEmpty())
+                                item.second.fill(0);
+                        }
+                    };
+                    if (!that || that->m_inDestruction
+                        || that->m_mappingGeneration != mappingGeneration
+                        || !that->isOpen()) {
+                        scrubQueued();
+                        return;
+                    }
                     // 如果期间用户又甩了一次导致 activeWindow 改了，就不要
                     // 拿旧预取结果去强制覆盖新窗口，防止"灌错字节窗口"。
                     const bool windowStillMatched =
                         (that->m_activeWindowStart == activeStart) &&
                         (that->m_activeWindowLen   == activeLen);
-                    for (const auto& p : result) {
-                        if (p.first >= 0) that->lruPutChunk(p.first, p.second);
+                    for (auto &p : result) {
+                        if (p.first >= 0)
+                            that->lruPutChunk(p.first, std::move(p.second));
                     }
                     if (windowStillMatched && that->m_activeWindowLen > 0) {
                         emit that->activeWindowChanged(
@@ -1562,6 +1728,12 @@ void VirtualFileView::submitPrefetchForChunks(const QVector<qint64>& chunkIds, b
                             that->m_activeWindowStart + that->m_activeWindowLen);
                     }
                 }, Qt::QueuedConnection);
+            if (!queued && sensitive) {
+                for (auto &item : *queuedResult) {
+                    if (!item.second.isEmpty())
+                        item.second.fill(0);
+                }
+            }
         },
         0, QLatin1String("ChunkPrefetch"), validIds.size()
     );
@@ -1689,6 +1861,9 @@ void VirtualFileView::startAsyncLineBuild() {
 
     const uchar* data = mmapBase_;
     qint64 size       = mmapSize_;
+    const quint64 generation = m_mappingGeneration;
+    m_lineBuildWorkerDone = std::make_shared<std::atomic_bool>(false);
+    const auto workerDone = m_lineBuildWorkerDone;
     QPointer<VirtualFileView> that(this);
     QFileInfo fi(file_.fileName());
     const QString title = tr("构建行索引: %1").arg(fi.fileName().isEmpty() ? tr("(未命名)") : fi.fileName());
@@ -1696,34 +1871,22 @@ void VirtualFileView::startAsyncLineBuild() {
         .arg(file_.fileName().isEmpty() ? QLatin1String("-") : file_.fileName())
         .arg(size);
 
-    // DIAGNOSTIC LOG - write to file for GUI app visibility
-    {
-        QFile diagFile(QDir::tempPath() + "/notepad-safe-diag.log");
-        diagFile.open(QIODevice::Append | QIODevice::Text);
-        QTextStream ts(&diagFile);
-        ts << "[DIAG] startAsyncLineBuild: data=" << (quintptr)data << " size=" << size << "\n";
-    }
-
     m_lineBuildTaskId = AsyncTaskManager::instance().submit(
         AsyncTaskType::LineIndexBuild,
         AsyncTaskPriority::Normal,
         title,
         desc,
-        /* workerFn = */ [data, size, that](qint64 /*taskId*/, AsyncCancelPtr cancel,
+        /* workerFn = */ [data, size, that, generation, workerDone](qint64 /*taskId*/, AsyncCancelPtr cancel,
                                             std::function<void(qint64,qint64)> reportProgress,
                                             std::function<void(const AsyncErrorInfo&)> reportError)
         {
+            struct CompletionFlag {
+                std::shared_ptr<std::atomic_bool> done;
+                ~CompletionFlag() {
+                    if (done) done->store(true, std::memory_order_release);
+                }
+            } completion{workerDone};
             Q_UNUSED(reportError);
-            {
-                QFile diagFile(QDir::tempPath() + "/notepad-safe-diag.log");
-                diagFile.open(QIODevice::Append | QIODevice::Text);
-                QTextStream ts(&diagFile);
-                ts << "[DIAG] workerFn started: data=" << (quintptr)data
-                   << " size=" << size
-                   << " cancel=" << (cancel ? (quintptr)cancel.get() : 0)
-                   << " cancelVal=" << (cancel ? cancel->load(std::memory_order_acquire) : -1) << "\n";
-            }
-
             auto wrappedProgress = [&reportProgress, that](qint64 bytesDone, qint64 bytesTotal) {
                 if (reportProgress) reportProgress(bytesDone, bytesTotal);
                 if (!that.isNull()) {
@@ -1736,34 +1899,21 @@ void VirtualFileView::startAsyncLineBuild() {
                 }
             };
             LineIndex result = VirtualFileView::buildLineIndexOnWorker(data, size, cancel, wrappedProgress);
-            {
-                QFile diagFile(QDir::tempPath() + "/notepad-safe-diag.log");
-                diagFile.open(QIODevice::Append | QIODevice::Text);
-                QTextStream ts(&diagFile);
-                ts << "[DIAG] buildLineIndexOnWorker returned: totalBytes=" << result.totalBytes()
-                   << " totalLines=" << result.totalLines()
-                   << " maxLineBytes=" << result.maxLineBytes()
-                   << " incomplete=" << result.isIncomplete() << "\n";
-            }
-
             bool ok = true;
             if (size > 0 && result.totalBytes() == 0 && !result.isIncomplete()) {
                 ok = false;
             }
             if (that.isNull()) {
-                QFile diagFile(QDir::tempPath() + "/notepad-safe-diag.log");
-                diagFile.open(QIODevice::Append | QIODevice::Text);
-                QTextStream ts(&diagFile);
-                ts << "[DIAG] workerFn: that is null, skipping swap\n";
                 return;
             }
-            QFile diagFile(QDir::tempPath() + "/notepad-safe-diag.log");
-            (void)diagFile.open(QIODevice::Append | QIODevice::Text);
-            QTextStream ts(&diagFile);
-            ts << "[DIAG] workerFn: sending result to onAsyncLineBuildSwapped, ok=" << ok << "\n";
-            QMetaObject::invokeMethod(
-                that, "onAsyncLineBuildSwapped", Qt::QueuedConnection,
-                Q_ARG(LineIndex, result), Q_ARG(bool, ok));
+            QMetaObject::invokeMethod(that,
+                [that, generation, result = std::move(result), ok]() mutable {
+                    if (!that || that->m_mappingGeneration != generation
+                        || that->m_closingFile || !that->mmapBase_) {
+                        return;
+                    }
+                    that->onAsyncLineBuildSwapped(std::move(result), ok);
+                }, Qt::QueuedConnection);
         },
         /* batchId = */ 0,
         /* categoryTag = */ QLatin1String("LineIndex"),
@@ -1781,46 +1931,16 @@ LineIndex VirtualFileView::buildLineIndexOnWorker(const uchar* data, qint64 size
 {
     LineIndex result;
     std::atomic<bool>* cancelPtr = cancel ? cancel.data() : nullptr;
-    {
-        QFile diagFile(QDir::tempPath() + "/notepad-safe-diag.log");
-        (void)diagFile.open(QIODevice::Append | QIODevice::Text);
-        QTextStream ts(&diagFile);
-        ts << "[DIAG] buildLineIndexOnWorker: data=" << (quintptr)data
-           << " size=" << size
-           << " cancelPtr=" << (quintptr)cancelPtr
-           << " cancelVal=" << (cancelPtr ? cancelPtr->load(std::memory_order_acquire) : -1)
-           << " SEARCH_THREADS=" << DynamicThresholds::instance().SEARCH_THREADS << "\n";
-    }
-
-    auto progress = [&reportProgress](qint64 /*linesDone*/, qint64 bytesDone, qint64 bytesTotal) {
-        if (reportProgress) reportProgress(bytesDone, bytesTotal);
-    };
     (void)result.buildFromMmap(data, size,
         [&reportProgress](qint64 /*linesDone*/, qint64 bytesDone){ if (reportProgress) reportProgress(bytesDone, -1); },
         cancelPtr, LINEBUILD_PROGRESS_STEP);
-    Q_UNUSED(progress);
-    {
-        QFile diagFile(QDir::tempPath() + "/notepad-safe-diag.log");
-        (void)diagFile.open(QIODevice::Append | QIODevice::Text);
-        QTextStream ts(&diagFile);
-        ts << "[DIAG] buildLineIndexOnWorker: buildFromMmap returned, result.totalBytes="
-           << result.totalBytes() << " result.totalLines=" << result.totalLines() << "\n";
-    }
     return result;
 }
 
 void VirtualFileView::onAsyncLineBuildSwapped(LineIndex result, bool buildOk)
 {
-    {
-        QFile diagFile(QDir::tempPath() + "/notepad-safe-diag.log");
-        (void)diagFile.open(QIODevice::Append | QIODevice::Text);
-        QTextStream ts(&diagFile);
-        ts << "[DIAG] onAsyncLineBuildSwapped: buildOk=" << buildOk
-           << " result.totalBytes=" << result.totalBytes()
-           << " result.totalLines=" << result.totalLines()
-           << " result.maxLineBytes=" << result.maxLineBytes()
-           << " result.isIncomplete=" << result.isIncomplete() << "\n";
-    }
+    if (m_closingFile || !mmapBase_)
+        return;
     bool ok = buildOk;
     try {
         if (ok) {

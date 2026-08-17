@@ -8,7 +8,7 @@ QString AsyncErrorInfo::toString() const
     }
     out += message;
     if (!stackFrames.isEmpty()) {
-        out += QLatin1String("\n堆栈:\n  ");
+        out += QStringLiteral("\n堆栈:\n  ");
         out += stackFrames.join(QLatin1String("\n  "));
     }
     return out;
@@ -54,6 +54,7 @@ QString AsyncTask::typeText() const
     case AsyncTaskType::FileEncrypt:    return QObject::tr("文件加密");
     case AsyncTaskType::FileDecrypt:    return QObject::tr("文件解密");
     case AsyncTaskType::LargeFileSave:  return QObject::tr("大文件保存");
+    case AsyncTaskType::LargeFileLoad:  return QObject::tr("准备大文件编辑");
     default: return QObject::tr("其他");
     }
 }

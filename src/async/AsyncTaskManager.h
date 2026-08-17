@@ -45,6 +45,8 @@ public:
     int runningCount() const;   // 状态==Running 的任务数
     int queuedCount() const;    // 状态==Queued
     int errorCount() const;     // 失败/已取消 的最近 100 条内
+    int failedCount() const;    // 状态==Failed 的最近 100 条内（取消不算错误）
+    int cancellableCount() const; // 当前 Queued + Running
     int activeThreadCount();    // 池内活跃线程
 
     // ========= 提交 / 管理 =========
@@ -103,6 +105,7 @@ private:
     Q_INVOKABLE void finishTaskImpl(qint64 taskId, AsyncTaskState finalState, const AsyncErrorInfo &err);
 
     void pushHistory(const AsyncTask &t);  // 已结束任务移入 history（最多 100 条）
+    void emitSummarySnapshot();
 
 private:
     mutable QMutex mu_;

@@ -71,6 +71,10 @@ try {
             [string]$component.integrity.signer_fingerprint -notmatch '^[0-9A-F]{40}$') {
             Fail "$name signer fingerprint must contain exactly 40 uppercase hex digits"
         }
+        if ([string]$component.integrity.kind -eq "pgp-signed-tag" -and
+            [string]$component.resolved_commit -notmatch '^[0-9a-f]{40}$') {
+            Fail "$name resolved_commit must pin the signed tag to exactly 40 lowercase hex digits"
+        }
 
         if ([string]::IsNullOrWhiteSpace([string]$component.local_path)) {
             continue

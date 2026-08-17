@@ -62,6 +62,6 @@ public:
     static constexpr qint64 CommitReserveBytes = 2LL * 1024 * 1024 * 1024;
 
     // Deterministic, conservative estimate for promoting an S2 document from
-    // mmap preview into a complete Scintilla document. This does not allocate.
+    // bounded window preview into a complete Scintilla document. This does not allocate.
     static ResourceAdmissionDecision evaluate(const ResourceAdmissionInput &input);
 };

@@ -21,9 +21,19 @@ void check(bool condition, const char *message)
 class FakeVaultBackend final : public IVaultBackend {
 public:
     VaultError create(const QString &, const SecureBuffer &password,
-                      const QString &keyFilePath) override
+                      const QString &keyFilePath,
+                      const QVariantMap &publicCustomData) override
     {
+        storedPublicCustomData = publicCustomData;
         return unlock({}, password, keyFilePath);
+    }
+
+    VaultError readPublicCustomData(const QString &, QVariantMap *publicCustomData) const override
+    {
+        if (!publicCustomData)
+            return {VaultErrorCode::InternalError, QStringLiteral("missing output"), {}};
+        *publicCustomData = storedPublicCustomData;
+        return VaultError::success();
     }
 
     VaultError unlock(const QString &, const SecureBuffer &password,
@@ -48,15 +58,51 @@ public:
         return {{QUuid::createUuid(), QStringLiteral("Example"), {}, {}, {}, false, true}};
     }
 
+    QList<VaultEntrySummary> listRecycledEntries(VaultError *error) const override
+    {
+        if (error)
+            *error = VaultError::success();
+        return {};
+    }
+    QSet<QUuid> searchEntryIds(const QString &, bool, VaultError *error) const override
+    {
+        if (error)
+            *error = VaultError::success();
+        return {};
+    }
+
     std::unique_ptr<VaultEntryData> readEntry(const QUuid &, VaultError *) const override
     {
         return {};
     }
+    VaultError currentTotp(const QUuid &, VaultTotpSnapshot *snapshot) const override
+    {
+        if (snapshot)
+            *snapshot = {QStringLiteral("123456"), 12};
+        return VaultError::success();
+    }
+    VaultError generatePassword(int length, SecureBuffer *passwordUtf8) const override
+    {
+        const QByteArray generated(length, 'A');
+        passwordUtf8->assign(generated.constData(), generated.size());
+        return VaultError::success();
+    }
+    VaultError assessPassword(const SecureBuffer &passwordUtf8,
+                              VaultPasswordAssessment *assessment) const override
+    {
+        *assessment = {passwordUtf8.empty() ? VaultPasswordQuality::Empty
+                                            : VaultPasswordQuality::Good,
+                       passwordUtf8.empty() ? 0.0 : 80.0};
+        return VaultError::success();
+    }
     VaultError upsertEntry(VaultEntryData &&) override { return VaultError::success(); }
+    VaultError recycleEntry(const QUuid &) override { return VaultError::success(); }
+    VaultError restoreEntry(const QUuid &) override { return VaultError::success(); }
     VaultError removeEntry(const QUuid &) override { return VaultError::success(); }
     VaultError save() override { return VaultError::success(); }
 
     bool open = false;
+    QVariantMap storedPublicCustomData;
 };
 
 QString fixture(const char *name)

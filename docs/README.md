@@ -82,7 +82,9 @@ build\notepad-safe.exe a.txt      :: 启动并打开指定文件（支持多文�
 - 窗口 / 任务栏图标 = `notepad_safe.png`（通过 `resources/app_resources.qrc` 内嵌，运行时 setWindowIcon）
 
 **数据目录**：
-- 会话 + 自动保存：`%LOCALAPPDATA%\NotepadSafe\session.json` / `autosave\*.tmp`
+- 会话 + 自动恢复：`%LOCALAPPDATA%\NotepadSafe\session.json` / `autosave\*.ndraft`
+  （S1 使用 Windows DPAPI 当前用户密封；S2 使用加密编辑日志及分块检查点；
+  旧版 `.tmp` 仅保留迁移读取）
 - 设置：`HKEY_CURRENT_USER\Software\NotepadSafe\NotepadSafe`（或等效 ini，由 Qt QSettings 决定）
 
 > 为与原 Credential Vault 产品隔离，独立后 Notepad Safe 不读取/写入任何
@@ -112,12 +114,16 @@ notepad-safe/
 ├── tests/                      # 逻辑、组件、GUI 冒烟与真实进程 E2E 测试
 └── docs/
     ├── README.md               # 用户文档（本文件）
-    └── DESIGN.md               # 设计文档（模块/方案/验收标准）
+    ├── DESIGN.md               # 架构、安全边界和实现路线
+    ├── TARGET_EXPERIENCE.md    # 目标体验、功能总账与动态 GUI 验收
+    ├── REFERENCE_BASELINE.md   # 成熟产品/上游行为参考与探索停止规则
+    ├── ITERATION_ROADMAP.md    # 最终目标、十轮收敛路线与发布门槛
+    └── SUPPLY_CHAIN.md         # 固定依赖的更新与验证规程
 ```
 
 ## 5. 目标架构
 
-详见 [docs/DESIGN.md](DESIGN.md)。该文档是后续开发的唯一架构基线，主要决策包括：
+架构与安全边界见 [docs/DESIGN.md](DESIGN.md)；用户可见目标、功能总账和正式 GUI 动态验收方法见 [目标体验与动态验收参考](TARGET_EXPERIENCE.md)；成熟产品/上游能力的采用与拒绝边界见 [参考基线](REFERENCE_BASELINE.md)；自主开发轮次和最终停止条件见 [目标模式收敛路线](ITERATION_ROADMAP.md)。后续开发必须同时满足这些基线，主要决策包括：
 
 - 供应链版本锁定、更新验证、SBOM 和退出策略（机器锁见 `../third_party/dependencies.lock.json`，操作规程见 `SUPPLY_CHAIN.md`）。
 - 小于 32 MiB：Scintilla 完整编辑。

@@ -3,15 +3,35 @@
 #include <QWidget>
 #include <QTimer>
 #include <QByteArray>
+#include <QVector>
+#include <QUuid>
 #include <Qsci/qsciscintilla.h>
 #include "TextEncoding.h"
 #include "LargeFileSearch.h"   // 先入 LargeFileSearchMatch 定义
+#include "DiskFileVersion.h"
 
 enum class ViewMode : int;  // 前置声明（定义在 VirtualFileView.h）
 
+// L2 的呈现方式与“是否在后台提升为完整 Scintilla 编辑器”是两个独立决策。
+// Text + false 用于强制保持 mmap 文本视图；Hex 永不构建文本行索引。
+enum class L2Presentation {
+    Text,
+    Hex,
+};
+
+enum class L2ContentKind {
+    Text,
+    Binary,
+};
+
 class QsciLexer;
 class VirtualFileView;
+class WindowedReadOnlyProvider;
 class QStackedWidget;
+class QIODevice;
+class ILoader;
+class QKeyEvent;
+class QPlainTextEdit;
 
 // 语法类型
 enum class Syntax {
@@ -38,12 +58,25 @@ struct ScintillaSearchMatch {
     int length;     // 匹配长度
     QString text;   // 匹配文本
     QString context; // 所在行内容
+    qint64 byteOffset = -1; // 完整文档 UTF-8 byte range；跨行匹配以此导航
+    qint32 byteLength = -1;
 };
 using SearchMatch = ScintillaSearchMatch;
 
 class EditorTab : public QWidget {
     Q_OBJECT
 public:
+    using ExternalFileState = DiskFileState;
+    enum class LargeDocumentRuntimeState {
+        None,
+        PreviewReady,
+        PreparingEditor,
+        Editable,
+        ReadOnlyAnalysis,
+        ReadOnlyFallback,
+    };
+    Q_ENUM(LargeDocumentRuntimeState)
+
     explicit EditorTab(QWidget *parent = nullptr);
     ~EditorTab() override;
 
@@ -56,7 +89,9 @@ public:
     // ---- L1 路径（QsciScintilla，现有接口完全不变，避免功能回退）----
     // 文件操作
     bool loadFile(const QString &path);
-    bool loadAutosave(const QString &autosavePath);  // 仅加载内容，不设置 m_filePath（对用户透明）
+    bool loadAutosave(const QString &autosavePath);  // 兼容旧版明文恢复文件
+    // 从已解密的内部恢复快照加载，不把正文再次落入临时文件。
+    bool loadAutosaveBytes(const QByteArray &data, const QString &backingPath);
     bool saveFile(QString *errMsg = nullptr);
     bool saveAsFile(const QString &path, QString *errMsg = nullptr);
     bool isModified() const;
@@ -64,15 +99,51 @@ public:
     bool isUntitled() const;
     QString filePath() const;
     void setFilePath(const QString &path);
+    // Bounded on-disk version tracking shared by text, promoted S2 and mmap/Hex.
+    // A save must never silently replace a file that changed after it was opened.
+    ExternalFileState externalFileState() const;
+    void refreshDiskVersionBaseline();
+    bool representsDiskFile(const DiskFileVersion &candidate) const;
     QString fileName() const;
     QString tabTitle() const;
+    QUuid sessionInstanceId() const { return m_sessionInstanceId; }
+    quint64 contentRevision() const { return m_contentRevision; }
+    // Secure notes use the same QScintilla editor but are persisted through
+    // VaultService instead of a plaintext filesystem path.
+    bool isSecureDocument() const { return !m_secureDocumentId.isNull(); }
+    bool isSecureBinaryDocument() const {
+        return isSecureDocument() && m_secureBinaryDocument;
+    }
+    bool isBinaryDocument() const { return m_binaryDocument; }
+    bool hexOverwriteMode() const { return m_hexOverwriteMode; }
+    bool isSecureDocumentMasked() const { return m_secureDocumentMasked; }
+    bool isSecureDocumentTransitioning() const { return m_secureDocumentTransitioning; }
+    QUuid secureDocumentId() const { return m_secureDocumentId; }
+    QString secureDocumentTitle() const { return m_secureDocumentTitle; }
+    void initializeSecureDocument(const QUuid &id, const QString &title,
+                                  const QString &plainText = {},
+                                  const QString &filePath = {});
+    bool initializeSecureBinaryDocument(const QUuid &id, const QString &title,
+                                        QByteArray bytes,
+                                        const QString &filePath = {},
+                                        QString *error = nullptr);
+    bool exportBinaryPayloadBytes(QByteArray *bytes, QString *error = nullptr);
+    qint64 securePayloadLimitExclusive() const {
+        return m_securePayloadLimitExclusive;
+    }
+    void setSecurePayloadLimitExclusive(qint64 limit);
+    void maskSecureDocument();
+    void setSecureDocumentTitle(const QString &title);
+    void convertToPlainDocument(const QString &filePath);
     TextEncoding encoding() const;
     void setEncoding(TextEncoding enc);
+    QString lineEndingName() const;
     Syntax syntax() const;
 
     // 编辑器访问（L2 模式下仍返回有效 QsciScintilla 指针，但内容为空；
     // 优先使用下方统一分流的 selectAll/copy/paste/... 等接口，避免直接调 editor 方法）
     QsciScintilla *editor() const { return m_editor; }
+    qint64 currentByteOffset() const;
 
     // 语法
     void setSyntax(Syntax syntax);
@@ -95,7 +166,9 @@ public:
     // 搜索（供 FindReplaceDialog 调用；内部按 isL2Mode 自动分流 L1/L2）
     // findNext 返回是否找到，并跳转光标
     bool findNext(const QString &pattern, bool regex, bool caseSensitive,
-                  bool wholeWord, bool forward, bool wrap);
+                  bool wholeWord, bool forward, bool wrap,
+                  bool hexBytes = false);
+    void resetSearchPosition(bool forward);
     // replace 当前匹配（需先 findNext）
     void replaceCurrent(const QString &replaceText);
     // replaceAll 返回替换次数（L2：按 1000 条/UndoGroup 原子批）
@@ -104,21 +177,29 @@ public:
     // findAll 收集所有匹配；L1 走 QVector、L2 走 SearchResultsModel
     QVector<SearchMatch> findAll(const QString &pattern, bool regex,
                                  bool caseSensitive, bool wholeWord);
-    // L2 专用 findAll（同步阻塞版本，内部对 LineIndex 构建做等待 + 搜索等待）
+    bool lastFindAllWasTruncated() const { return m_lastFindAllTruncated; }
+    QString lastSearchError() const { return m_lastSearchError; }
+    void setSearchHighlights(const QVector<SearchMatch> &matches);
+    void clearSearchHighlights();
+    void selectSearchMatch(int line, int index, int length);
+    // L2 专用 findAll（同步阻塞版本；搜索本身不等待 LineIndex）
     // 仅用于 L1 层的 findNext/findPrev 内部（需要先同步拿到结果集）及旧调用方
     // 返回 SearchResultsModel 所有权（调用方 delete 或 setParent）
     class SearchResultsModel* findAllL2(const QString& pattern, bool regex,
                                         bool caseSensitive, bool wholeWord,
-                                        QObject* parentForModel = nullptr);
+                                        QObject* parentForModel = nullptr,
+                                        bool hexBytes = false);
     // L2 专用 findAll（纯异步，不阻塞 UI）：
-    //   - LineIndex 未构建完：等 l2LineBuildFinished 信号后再启动搜索
+    //   - LineIndex 未构建完：先发布 byte range，完成后原位补齐行号
     //   - 搜索走 AsyncTaskManager::submit（LargeFileSearch）
     //   - 完成后触发 findAllL2Finished(SearchResultsModel*, pattern, fileName)
-    //   - 期间触发 findAllL2Progress(int percent, qint64 done, qint64 total)（-1 = 正在等 LineIndex）
+    //   - 期间触发 findAllL2Progress(int percent, qint64 done, qint64 total)
     //  返回 true = 成功启动；false = L1 模式或参数空未启动
     bool findAllL2Async(const QString& pattern, bool regex,
                         bool caseSensitive, bool wholeWord,
-                        QObject* parentForModel = nullptr);
+                        QObject* parentForModel = nullptr,
+                        bool hexBytes = false);
+    void cancelFindAllL2();
 
     // 光标位置
     void getCursorPosition(int *line, int *index) const;
@@ -162,6 +243,14 @@ public:
     void cut();
     void copy();
     void paste();
+    bool canUndoCommand() const;
+    bool canRedoCommand() const;
+    bool hasSelectionCommand() const;
+    bool canModifyCommand() const;
+    // Current user-visible payload size in bytes.  The windowed mmap provider
+    // owns the authoritative 64-bit size before an S2 document is promoted;
+    // Scintilla owns it after promotion and for ordinary/secure documents.
+    qint64 contentSizeBytes() const;
 
     // 焦点设置（跳转后对用户可见）
     void setFocusEditor();
@@ -173,13 +262,28 @@ public:
     // ---- L2 路径（VirtualFileView 大文件虚拟视图，独立接口，不破坏 L1）----
     // 当前是否处于 L2 模式
     bool isL2Mode() const { return m_l2Mode; }
+    bool isLargeDocument() const {
+        return (m_l2Mode && !m_secureBinaryDocument) || m_promotedLargeDocument;
+    }
+    bool isReadOnlyByPolicy() const {
+        return m_l2ReadOnlyByPolicy || (m_l2Mode && m_l2TextPreviewReadOnly);
+    }
+    LargeDocumentRuntimeState largeDocumentRuntimeState() const;
+    QString largeDocumentFallbackReason() const { return m_l2FallbackReason; }
+    bool isLargeFilePreparationRunning() const { return m_l2PromotionTaskId > 0; }
     // 获取 L2 视图（未 openLargeFileL2 时返回 nullptr）
     VirtualFileView* l2View() const { return m_l2View; }
+    WindowedReadOnlyProvider *windowedReadOnlyProvider() const {
+        return m_windowedReadOnlyProvider;
+    }
     // 显式打开大文件为 L2 模式（创建 VirtualFileView 实例 + openFile）。
     // 成功后 isL2Mode()=true；失败时回退到 L1 模式并返回 false，此时可走 loadFile 原路径。
     // 注意：loadFile() 不变（永远走 L1），只有显式调用本函数才走 L2。
     // errMsg：失败原因（可读），传 nullptr 忽略。
-    bool openLargeFileL2(const QString &path, QString *errMsg = nullptr);
+    bool openLargeFileL2(const QString &path, QString *errMsg = nullptr,
+                         bool allowFullTextPromotion = true,
+                         L2Presentation presentation = L2Presentation::Text,
+                         L2ContentKind contentKind = L2ContentKind::Text);
     // 保存 L2 视图到指定路径（用 applyAndSaveThenReset 流程）
     bool saveL2As(const QString &path, QString *errMsg = nullptr);
 
@@ -188,6 +292,24 @@ public:
     //   不改变 modified 状态、不改变 m_filePath/m_autosavePath、不清空 L2 patches、
     //   不 remap。用于 SessionManager::saveSession 周期性 autosave。
     bool exportToFile(const QString &destPath) const;
+    // S1 恢复专用：导出原编码字节到内存，交给 DraftStore 立即加密。
+    // 大文件必须走后续分块恢复日志，避免构造 GiB 级 QByteArray。
+    bool exportSnapshotBytes(QByteArray *data) const;
+    // 加密恢复载荷：S1 为完整原编码快照；已晋升的 S2 为相对原文件的有界编辑日志。
+    bool exportRecoveryPayload(QByteArray *data, QString *error = nullptr) const;
+    bool restoreRecoveryPayload(const QByteArray &data, const QString &realFilePath,
+                                QString *error = nullptr);
+    bool exportRecoveryCheckpoint(QIODevice *output, QString *error = nullptr) const;
+    bool restoreRecoveryCheckpoint(const QString &checkpointPath,
+                                   const QString &realFilePath,
+                                   TextEncoding encoding, qint64 plaintextBytes,
+                                   QString *error = nullptr);
+    // Binary/Hex recovery stores only the normalized patch journal, encrypted
+    // by DraftStore, and re-applies it only when the original file version matches.
+    bool exportBinaryRecoveryJournal(QIODevice *output, QString *error = nullptr);
+    bool restoreBinaryRecoveryJournal(const QString &journalPath,
+                                      const QString &realFilePath,
+                                      QString *error = nullptr);
     // · openAutosaveAutoMode：恢复 autosave 时按文件尺寸自动选 L1/L2：
     //   S1（< 32 MiB）→ 走原 loadAutosave (Scintilla sync，毫秒级)
     //   尺寸 ≥ 限制 → mmap autosave 文件到 L2 VirtualFileView（秒开），
@@ -205,6 +327,8 @@ signals:
     void encodingChanged(TextEncoding encoding);
     void syntaxChanged(Syntax syntax);
     void titleChanged(const QString &title);
+    void contentChanged(quint64 revision);
+    void commandCapabilitiesChanged();
 
     // 当前 EditorTab 内部 L2<->L1 模式切换（从 L1 切换到 L2 或反向）——MainWindow 用它同步"不适配 L2 的菜单项 enabled"
     // 触发点：openFile/L1 打开小文件(222行m_l2Mode=false)/openAutosaveAutoMode/... 等所有设置 m_l2Mode 的位置 emit
@@ -219,9 +343,14 @@ signals:
     // 转发 VirtualFileView 后台行索引构建进度（秒开 UI 状态栏）
     void l2LineBuildProgress(qint64 bytesDone, qint64 bytesTotal);
     void l2LineBuildFinished(bool ok);
+    void largeDocumentRuntimeStateChanged(EditorTab::LargeDocumentRuntimeState state,
+                                          const QString &reason);
 
     // L2 findAllL2Async 结果 / 进度信号（纯异步，不阻塞）
     void findAllL2Progress(int percent, qint64 done, qint64 total);
+    void findAllL2Partial(const QVector<LargeFileSearchMatch>& batch,
+                          const QString& pattern,
+                          const QString& fileName);
     void findAllL2Finished(class SearchResultsModel* model,
                            const QString& pattern,
                            const QString& fileName);
@@ -231,6 +360,15 @@ private:
     QStackedWidget *m_stack = nullptr;  // 0: m_editor (L1), 1: m_l2View (L2)
     QString m_filePath;       // 真实文件路径（空=未命名）
     QString m_autosavePath;   // 内部 autosave 临时路径（对用户透明）
+    QUuid m_sessionInstanceId = QUuid::createUuid();
+    quint64 m_contentRevision = 0;
+    QUuid m_secureDocumentId;
+    QString m_secureDocumentTitle;
+    bool m_secureDocumentMasked = false;
+    qint64 m_securePayloadLimitExclusive = 0;
+    bool m_secureDocumentTransitioning = false;
+    bool m_secureBinaryDocument = false;
+    bool m_binaryDocument = false;
     TextEncoding m_encoding = TextEncoding::Utf8;
     Syntax m_syntax = Syntax::Plain;
     int m_bookmarkMarker = -1;
@@ -242,6 +380,20 @@ private:
     QsciLexer *createLexer(Syntax syntax) const;
     void clearMarkers();
     void applyEdgeSettings();
+    void activateL2Overlay(VirtualFileView *view);
+    void clearL2BridgeBaseline();
+    void ensureHexAsciiPreview(QWidget *parent);
+    void layoutL2Overlay();
+    bool handleHexKeyPress(QKeyEvent *event);
+    bool handleHexAsciiKeyPress(QKeyEvent *event);
+    bool handleHexInsertModeKey(QKeyEvent *event);
+    bool hexSelectionByteRange(qint64 *start, qint64 *end,
+                               int *nibble = nullptr) const;
+    bool asciiSelectionByteRange(qint64 *start, qint64 *end) const;
+    void setHexCaret(qint64 globalByte, int nibble = 0);
+    void setAsciiCaret(qint64 globalByte);
+    void syncAsciiSelectionFromHex();
+    void syncHexSelectionFromAscii();
 
     // 大文件分块加载：通过 SCI_APPENDTEXT 分块追加 UTF-8 字节，
     // 避免 setText() 一次性重建整个文档导致 UI 卡死
@@ -249,11 +401,59 @@ private:
 
     // ---- L2 私有（懒创建 VirtualFileView，避免影响 L1 默认路径）----
     bool               m_l2Mode = false;
+    bool               m_l2ReadOnlyByPolicy = false;
+    bool               m_l2TextPreviewReadOnly = false;
+    bool               m_promotedLargeDocument = false;
+    bool               m_promotedLargeDirty = false;
+    bool               m_l2PromotionRepresentsDirty = false;
+    qint64             m_l2PromotionTaskId = 0;
+    QString            m_l2PromotionPath;
+    QString            m_l2FallbackReason;
+    struct LargeRecoveryOperation {
+        enum class Kind : quint8 { Insert = 1, Delete = 2 };
+        Kind kind = Kind::Insert;
+        qint64 position = 0;
+        QByteArray insertedBytes;
+        qint64 deleteLength = 0;
+    };
+    QVector<LargeRecoveryOperation> m_largeRecoveryOperations;
+    QVector<LargeRecoveryOperation> m_pendingRecoveryOperations;
+    qint64             m_recoveryBaseSize = -1;
+    qint64             m_recoveryBaseMtimeMs = -1;
+    QString            m_recoveryBasePath;
+    bool               m_recoveryRequiresCheckpoint = false;
+    bool               m_replayingRecoveryJournal = false;
+    DiskFileVersion    m_diskVersion;
+    // Scintilla has a save-point model for text edits but cannot be forced
+    // dirty by metadata-only changes such as an encoding conversion.
+    bool m_metadataModified = false;
     VirtualFileView   *m_l2View = nullptr;  // 懒创建，仅 openLargeFileL2 成功后非空
+    WindowedReadOnlyProvider *m_windowedReadOnlyProvider = nullptr;
     bool               m_l2SaveNeeded = false;  // 对应 L2 saveNeededChanged 信号
     int                m_lastL2Line = 0;         // L2 光标缓存（getCursorPosition 用）
     int                m_lastL2Col  = 0;
-    qint64             m_lastL2Byte = 0;         // L2 光标字节缓存（findNext 起始位置）
+    qint64             m_lastL2Byte = -1;        // L2 光标字节缓存（findNext 起始位置）
+    struct L1SearchHit {
+        qint64 byteOffset = -1;
+        qint32 byteLength = 0;
+    };
+    QVector<L1SearchHit> m_l1SearchCache;
+    QString            m_l1SearchCachePattern;
+    bool               m_l1SearchCacheRegex = false;
+    bool               m_l1SearchCacheCaseSensitive = true;
+    bool               m_l1SearchCacheWholeWord = false;
+    bool               m_l1SearchCacheValid = false;
+    quint64            m_l1SearchCacheRevision = 0;
+    int                m_lastL1MatchIndex = -1;
+    QString            m_lastSearchError;
+    QString            m_l2SearchCachePattern;
+    bool               m_l2SearchCacheRegex = false;
+    bool               m_l2SearchCacheCaseSensitive = true;
+    bool               m_l2SearchCacheWholeWord = false;
+    bool               m_l2SearchCacheHexBytes = false;
+    bool               m_l2SearchCacheValid = false;
+    quint64            m_l2SearchCacheRevision = 0;
+    bool               m_lastFindAllTruncated = false;
 
     // findAllL2Async 的内部上下文：避免同时启动多个搜索
     struct PendingL2Search {
@@ -262,21 +462,41 @@ private:
         bool regex = false;
         bool caseSensitive = true;
         bool wholeWord = false;
+        bool hexBytes = false;
+        quint64 contentRevision = 0;
         QPointer<QObject> parentForModel;
         QMetaObject::Connection waitLineBuildConn;
         QMetaObject::Connection searchProgressConn;
+        QMetaObject::Connection searchPartialConn;
         QMetaObject::Connection searchFinishedConn;
         QMetaObject::Connection searchFailedConn;
+        int previewMatchesPublished = 0;
     };
     PendingL2Search m_pendingL2Search;
 
     // 确保 VirtualFileView 存在（懒创建）；同时把 m_l2View 加入 m_stack。
     // 不依赖固定索引：Scintilla 在 L2 期间会被 reparent，Qt 会重排 stack 页面。
     VirtualFileView *ensureL2View();
+    WindowedReadOnlyProvider *ensureWindowedReadOnlyProvider();
+    bool windowedReadOnlyActive() const;
+    bool ensureWindowedSearchSource(QString *error = nullptr);
     // findAllL2Async 的内部启动：LineIndex 已完整 → 实际调 LargeFileSearch::findAllViaTaskManager
     void startPendingL2Search();
     // 清理 m_pendingL2Search 所有连接并重置为 inactive
     void resetPendingL2Search();
+    void advanceContentRevision();
+    void cancelPendingL2SearchForContentChange();
+    void startLargeTextPromotion(const QString &path, qint64 sourceBytes);
+    void finishLargeTextPromotion(ILoader *loader, qint64 taskId,
+                                  const QString &path, TextEncoding encoding,
+                                  const QString &fallbackReason);
+    void cancelLargeTextPromotion();
+    void resetLargeRecoveryJournal(const QString &basePath);
+    void clearLargeRecoveryOperations(QVector<LargeRecoveryOperation> *operations);
+    bool applyPendingLargeRecovery(QString *error);
+    bool savePromotedLargeAs(const QString &path, QString *errMsg);
+    bool streamPromotedDocumentTo(QIODevice *output, QString *errMsg,
+                                  bool yieldUi) const;
 
     // ============================================================================
     //  L2ScintillaBridge —— VFV 不做任何绘制；Scintilla overlay 盖满 VFV viewport，
@@ -294,12 +514,23 @@ private:
         bool      applying = false; // 桥 1/3 灌 Scintilla 时抑制 SCN_UPDATEUI 递归
     };
     L2ScintillaBridge m_bridge;
+    bool m_l2BridgeConnectionsInstalled = false;
+    QPlainTextEdit *m_hexAsciiPreview = nullptr;
+    int m_hexBytesPerRow = 16;
+    bool m_hexOverwriteMode = true;
+    bool m_adjustingHexCaret = false;
+    bool m_adjustingAsciiCaret = false;
+    QVector<QPair<qint64, qint32>> m_l2SearchHighlights;
+
 
     // ---- L2ScintillaBridge 内部辅助 ----
     // 桥 1：读 VFV [s,e)（应用 patch）→ Scintilla setText；记录 baseline
     void bridgePopulateScintilla(qint64 s, qint64 e);
     // 桥 2：把 Scintilla 当前文本 vs baseline 做 diff → 写 VFV patches()。s/e 同 baseline 窗口。
-    void bridgeFlushOverlayToPatches(QString* errMsg = nullptr);
+    bool bridgeFlushOverlayToPatches(QString* errMsg = nullptr);
+    int preferredHexBytesPerRow() const;
+    void adaptHexBytesPerRow(bool repopulate);
+    void applyL2SearchHighlightsToOverlay();
     // 桥 3：syncVfvDebounce 超时回调 → 取 Scintilla 中心 → 换算全局字节 → syncActiveWindowToCursor
     void bridgeOnSyncDebounce();
     // 切回 L1 / closeEvent 时，把 overlay Scintilla 从 VFV viewport 上拆回 m_stack

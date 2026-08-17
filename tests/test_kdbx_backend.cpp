@@ -3,6 +3,7 @@
 
 #include <QCoreApplication>
 #include <QDebug>
+#include <QDir>
 #include <QFile>
 #include <QTemporaryDir>
 
@@ -120,6 +121,48 @@ int main(int argc, char **argv)
                          saveResult.diagnosticCode.toUtf8().constData());
         }
         check(!saveResult.isError(), "modified database saves atomically");
+
+        VaultEntryData updatedEntry;
+        updatedEntry.id = insertedId;
+        updatedEntry.title = QStringLiteral("NotepadSafe roundtrip");
+        updatedEntry.username = QStringLiteral("alice@example.test");
+        updatedEntry.url = QStringLiteral("https://example.test");
+        updatedEntry.tags = {QStringLiteral("integration"),
+                             QStringLiteral("notepadsafe/secure-note")};
+        updatedEntry.passwordUtf8 = password("updated-entry-password");
+        updatedEntry.notesUtf8 = password("encrypted note body");
+        updatedEntry.totpSeedUtf8 = password("JBSWY3DPEHPK3PXP");
+        check(!service.upsertEntry(std::move(updatedEntry)).isError(),
+              "existing entry update succeeds");
+        VaultError historyError;
+        const auto history = service.entryHistory(insertedId, &historyError);
+        check(!historyError.isError(), "entry history is readable");
+        check(history.size() == 1, "existing entry update creates one history version");
+        if (!history.isEmpty()) {
+            check(!service.restoreEntryHistory(insertedId, history.constFirst().index).isError(),
+                  "entry history version restores");
+            VaultEntrySecrets restoredSecrets;
+            check(!service.readEntrySecrets(insertedId, &restoredSecrets).isError(),
+                  "restored entry secrets are readable");
+            check(restoredSecrets.passwordUtf8.equals("fixture-entry-password", 22),
+                  "history restore recovers the previous password");
+            restoredSecrets.passwordUtf8.clear();
+            restoredSecrets.totpSeedUtf8.clear();
+        }
+        check(!service.save().isError(), "restored history state saves atomically");
+    }
+
+    const QDir backupDirectory(writableCopy + QStringLiteral(".backups"));
+    const QStringList encryptedSnapshots = backupDirectory.entryList(
+        {QStringLiteral("*.kdbx")}, QDir::Files, QDir::Name);
+    check(encryptedSnapshots.size() == 2,
+          "each save creates one encrypted pre-replacement snapshot");
+    if (!encryptedSnapshots.isEmpty()) {
+        VaultService snapshotService(std::make_unique<KeePassXCVaultBackend>());
+        auto master = password("t");
+        check(!snapshotService.unlock(backupDirectory.filePath(encryptedSnapshots.constFirst()),
+                                      master).isError(),
+              "encrypted snapshot is independently unlockable");
     }
 
     {
@@ -137,6 +180,23 @@ int main(int argc, char **argv)
             check(entry->totpSeedUtf8.equals("JBSWY3DPEHPK3PXP", 16),
                   "TOTP seed survives encrypted roundtrip");
         }
+        auto metadata = service.readEntryMetadata(insertedId, &readError);
+        check(metadata && !readError.isError(), "entry metadata is readable");
+        if (metadata) {
+            check(metadata->hasPassword && metadata->hasTotp,
+                  "metadata reports secret presence without returning values");
+            check(metadata->passwordUtf8.empty() && metadata->totpSeedUtf8.empty(),
+                  "metadata does not retain password or TOTP seed");
+        }
+        VaultEntrySecrets secrets;
+        check(!service.readEntrySecrets(insertedId, &secrets).isError(),
+              "short-lived entry secrets are readable on demand");
+        check(secrets.passwordUtf8.equals("fixture-entry-password", 22),
+              "secret lease returns the password");
+        check(secrets.totpSeedUtf8.equals("JBSWY3DPEHPK3PXP", 16),
+              "secret lease returns the TOTP seed");
+        secrets.passwordUtf8.clear();
+        secrets.totpSeedUtf8.clear();
     }
 
     if (failures == 0)

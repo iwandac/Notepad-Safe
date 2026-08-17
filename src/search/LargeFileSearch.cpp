@@ -3,26 +3,26 @@
 #include "PatchList.h"
 #include "DynamicThresholds.h"
 #include "AsyncTaskManager.h"
-#include "AsyncThreadPool.h"
+#include "Pcre2Regex.h"
 
 #include <QFile>
 #include <QDir>
 #include <QDataStream>
-#include <QSaveFile>
 #include <QtConcurrent>
-#include <QFutureWatcher>
-#include <QFutureSynchronizer>
-#include <QThreadPool>
+#include <QScopeGuard>
+#include <QTemporaryFile>
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QUuid>
 #include <cstring>
 #include <algorithm>
 
 namespace {
 
 constexpr quint32 OVR_MAGIC   = 0x564F534Du; // 'MSOV' little endian stored
-constexpr quint32 OVR_VERSION = 1;
+constexpr quint32 OVR_VERSION = 2;
 constexpr int     OVERRUN_CTX_MAX = 512;
+constexpr qint64  OVERRUN_FILE_LIMIT = Q_INT64_C(1024) * 1024 * 1024;
 
 QString overrunDir() {
     QString d = QDir::tempPath() + QStringLiteral("/notepad-safe");
@@ -37,7 +37,134 @@ inline uchar foldCaseAscii(uchar c, bool caseSensitive) {
     return c;
 }
 
+int hexNibble(QChar ch)
+{
+    if (ch >= QLatin1Char('0') && ch <= QLatin1Char('9'))
+        return ch.unicode() - QLatin1Char('0').unicode();
+    if (ch >= QLatin1Char('a') && ch <= QLatin1Char('f'))
+        return 10 + ch.unicode() - QLatin1Char('a').unicode();
+    if (ch >= QLatin1Char('A') && ch <= QLatin1Char('F'))
+        return 10 + ch.unicode() - QLatin1Char('A').unicode();
+    return -1;
+}
+
+bool prepareSearchPattern(const QString &pattern, const LargeFileSearch::Options &opts,
+                          QByteArray *literal, bool *usePcre2, QString *error)
+{
+    if (opts.hexBytesMode) {
+        *usePcre2 = false;
+        return LargeFileSearch::parseHexBytePattern(pattern, literal, error);
+    }
+    // Exact case-sensitive literals retain the linear KMP path. Regex,
+    // Unicode case folding and Unicode word boundaries use the same PCRE2
+    // provider as the in-memory editor.
+    *usePcre2 = opts.regexMode || opts.wholeWord || !opts.caseSensitive;
+    if (!*usePcre2)
+        *literal = pattern.toUtf8();
+    if (pattern.isEmpty() || (!*usePcre2 && literal->isEmpty())) {
+        if (error)
+            *error = QStringLiteral("查找文本为空。");
+        return false;
+    }
+    return true;
+}
+
+bool readOverrunHeader(QDataStream &stream, quint32 *version, quint64 *count)
+{
+    quint32 magic = 0;
+    quint32 parsedVersion = 0;
+    quint64 parsedCount = 0;
+    stream >> magic >> parsedVersion >> parsedCount;
+    if (stream.status() != QDataStream::Ok || magic != OVR_MAGIC
+        || (parsedVersion != 1 && parsedVersion != OVR_VERSION)) {
+        return false;
+    }
+    if (version) *version = parsedVersion;
+    if (count) *count = parsedCount;
+    return true;
+}
+
+bool readOverrunRecord(QDataStream &stream, quint32 version,
+                       LargeFileSearchMatch *match)
+{
+    if (!match)
+        return false;
+    quint64 byteOffset = 0;
+    qint32 length = 0;
+    qint32 line = 0;
+    qint32 col = 0;
+    quint64 contextByteOffset = 0;
+    QByteArray context;
+    stream >> byteOffset >> length >> line >> col;
+    if (version >= 2)
+        stream >> contextByteOffset;
+    stream >> context;
+    if (stream.status() != QDataStream::Ok)
+        return false;
+    match->byteOffset = qint64(byteOffset);
+    match->length = length;
+    match->line = line;
+    match->col = col;
+    match->contextByteOffset = version >= 2
+        ? qint64(contextByteOffset)
+        : qMax<qint64>(0, qint64(byteOffset) - col);
+    match->lineContext = std::move(context);
+    return true;
+}
+
 } // namespace
+
+bool LargeFileSearch::parseHexBytePattern(const QString &pattern,
+                                          QByteArray *bytes,
+                                          QString *error)
+{
+    if (!bytes)
+        return false;
+    bytes->clear();
+    QString digits;
+    digits.reserve(pattern.size());
+    for (qsizetype i = 0; i < pattern.size(); ++i) {
+        const QChar ch = pattern.at(i);
+        if (ch.isSpace() || ch == QLatin1Char('_') || ch == QLatin1Char('-')
+            || ch == QLatin1Char(',')) {
+            continue;
+        }
+        if (ch == QLatin1Char('0') && i + 1 < pattern.size()
+            && (pattern.at(i + 1) == QLatin1Char('x')
+                || pattern.at(i + 1) == QLatin1Char('X'))) {
+            ++i;
+            continue;
+        }
+        if (hexNibble(ch) < 0) {
+            if (error) {
+                *error = QObject::tr("十六进制字节串第 %1 个字符“%2”无效。")
+                             .arg(i + 1).arg(ch);
+            }
+            return false;
+        }
+        digits.append(ch);
+        if (digits.size() > 2 * 1024 * 1024) {
+            if (error)
+                *error = QObject::tr("十六进制搜索模式过长（最多 1 MiB 字节）。");
+            return false;
+        }
+    }
+    if (digits.isEmpty()) {
+        if (error) *error = QObject::tr("请输入至少一个十六进制字节。");
+        return false;
+    }
+    if ((digits.size() % 2) != 0) {
+        if (error)
+            *error = QObject::tr("十六进制字节必须由成对数字组成，例如 DE AD BE EF。");
+        return false;
+    }
+    bytes->reserve(digits.size() / 2);
+    for (qsizetype i = 0; i < digits.size(); i += 2) {
+        bytes->append(char((hexNibble(digits.at(i)) << 4)
+                           | hexNibble(digits.at(i + 1))));
+    }
+    return true;
+}
 
 // ============================================================================
 //  构造 / 析构 / 数据源
@@ -60,10 +187,18 @@ void LargeFileSearch::setSource(const uchar* mmapBase, qint64 mmapSize,
     mmapBase_ = mmapBase;
     mmapSize_ = mmapSize;
     lineIndex_ = lineIndex;
+    lineIndexCompleteAtSnapshot_ = lineIndex && !lineIndex->isIncomplete();
     patchList_ = patchList;
     memMatches_.clear();
+    storageFailed_ = false;
+    scanError_.clear();
     closeOverrunFile();
     overrunCount_ = 0;
+    overrunCheckpoints_.clear();
+    overrunCheckpointBytes_.clear();
+    overrunGroupedCount_ = 0;
+    overrunLastLine_ = std::numeric_limits<qint32>::min();
+    overrunLastContext_ = std::numeric_limits<qint64>::min();
     if (!overrunFile_.isEmpty()) { QFile::remove(overrunFile_); overrunFile_.clear(); }
 }
 
@@ -76,9 +211,10 @@ void LargeFileSearch::requestCancel() {
 // ============================================================================
 bool LargeFileSearch::prepareOverrunFile(QString* errMsg) {
     if (overrunFp_) return true;
-    QString fn = QStringLiteral("matches_%1_%2.bin")
+    QString fn = QStringLiteral("matches_%1_%2_%3.bin")
         .arg(QCoreApplication::applicationPid())
-        .arg(QDateTime::currentMSecsSinceEpoch());
+        .arg(QDateTime::currentMSecsSinceEpoch())
+        .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
     overrunFile_ = QDir(overrunDir()).filePath(fn);
     auto* f = new QFile(overrunFile_);
     if (!f->open(QIODevice::WriteOnly)) {
@@ -108,23 +244,66 @@ void LargeFileSearch::closeOverrunFile() {
 
 void LargeFileSearch::appendMatches(const QVector<LargeFileSearchMatch>& batch) {
     qint64 cap = qint64(maxMemMatches_);
+    const auto sameDisplayGroup = [](const LargeFileSearchMatch &left,
+                                     const LargeFileSearchMatch &right) {
+        return left.line == right.line
+               && left.contextByteOffset == right.contextByteOffset;
+    };
+    const auto writeOverrun = [this](const LargeFileSearchMatch &match) -> bool {
+        if (!overrunFp_ && !prepareOverrunFile(nullptr)) {
+            storageFailed_ = true;
+            return false;
+        }
+        QDataStream stream(overrunFp_);
+        stream.setByteOrder(QDataStream::LittleEndian);
+        if (overrunFp_->pos() >= OVERRUN_FILE_LIMIT) {
+            scanError_ = QObject::tr(
+                "搜索结果已达到 1 GiB 临时存储上限；已保留此前结果，请缩小范围后重试。");
+            return false;
+        }
+        if (match.line != overrunLastLine_
+            || match.contextByteOffset != overrunLastContext_) {
+            if ((overrunGroupedCount_ % 512) == 0) {
+                overrunCheckpoints_.append(qMakePair(overrunGroupedCount_,
+                                                      overrunFp_->pos()));
+                overrunCheckpointBytes_.append(match.byteOffset);
+            }
+            ++overrunGroupedCount_;
+            overrunLastLine_ = match.line;
+            overrunLastContext_ = match.contextByteOffset;
+        }
+        stream << quint64(match.byteOffset) << qint32(match.length)
+               << qint32(match.line) << qint32(match.col)
+               << quint64(match.contextByteOffset);
+        QByteArray context = match.lineContext;
+        if (context.size() > OVERRUN_CTX_MAX)
+            context.truncate(OVERRUN_CTX_MAX);
+        stream << context;
+        if (stream.status() != QDataStream::Ok) {
+            storageFailed_ = true;
+            return false;
+        }
+        ++overrunCount_;
+        return true;
+    };
     for (const LargeFileSearchMatch& m : batch) {
-        if (qint64(memMatches_.size()) < cap) {
+        if (!overrunFp_ && overrunCount_ == 0 && qint64(memMatches_.size()) < cap) {
             memMatches_.append(m);
         } else {
-            // 溢出文件
-            if (!overrunFp_ && !prepareOverrunFile(nullptr)) {
-                // 溢出文件失败则放弃额外结果（保证不崩）
-                continue;
+            if (!overrunFp_ && overrunCount_ == 0 && !memMatches_.isEmpty()
+                && sameDisplayGroup(memMatches_.constLast(), m)) {
+                int tail = memMatches_.size() - 1;
+                while (tail > 0 && sameDisplayGroup(memMatches_.at(tail - 1), m))
+                    --tail;
+                const QVector<LargeFileSearchMatch> spilled = memMatches_.mid(tail);
+                memMatches_.erase(memMatches_.begin() + tail, memMatches_.end());
+                for (const LargeFileSearchMatch &previous : spilled) {
+                    if (!writeOverrun(previous))
+                        return;
+                }
             }
-            QDataStream s(overrunFp_);
-            s.setByteOrder(QDataStream::LittleEndian);
-            s << quint64(m.byteOffset) << qint32(m.length)
-              << qint32(m.line)       << qint32(m.col);
-            QByteArray ctx = m.lineContext;
-            if (ctx.size() > OVERRUN_CTX_MAX) ctx.truncate(OVERRUN_CTX_MAX);
-            s << ctx;
-            ++overrunCount_;
+            if (!writeOverrun(m))
+                return;
         }
     }
 }
@@ -185,84 +364,261 @@ QByteArray LargeFileSearch::readVirtualBytes(qint64 start, qint64 end) const {
 }
 
 void LargeFileSearch::fillLineContext(LargeFileSearchMatch& m) const {
-    if (!lineIndex_) return;
-    int line = m.line;
-    qint64 start = lineIndex_->lineToByteOffset(line);
-    qint64 end   = lineIndex_->lineToByteOffset(line + 1);
-    if (end > start + OVERRUN_CTX_MAX + 4) end = start + OVERRUN_CTX_MAX + 4;
-    QByteArray lineBytes = readVirtualBytes(start, end);
+    const qint64 originalMatch = patchList_
+        ? patchList_->virtToOrig(m.byteOffset) : m.byteOffset;
+    const bool indexed = lineIndex_ && lineIndexCompleteAtSnapshot_;
+    if (!indexed) {
+        // Search correctness and first results must not wait for the full-file
+        // line index. Build an exact, bounded context around the authoritative
+        // virtual byte range; the row is displayed by byte offset until line
+        // decoration becomes available.
+        constexpr qint64 lookBehind = 64 * 1024;
+        constexpr qint64 lookAhead = 4 * 1024;
+        constexpr qint64 prefixBytes = 64;
+        const qint64 virtualSize = patchList_
+            ? patchList_->virtualSize(mmapSize_) : mmapSize_;
+        const qint64 scanStart = qMax<qint64>(0, m.byteOffset - lookBehind);
+        const qint64 scanEnd = qMin(virtualSize,
+            m.byteOffset + qint64(m.length) + lookAhead);
+        const QByteArray raw = readVirtualBytes(scanStart, scanEnd);
+        const int relative = int(qBound<qint64>(0, m.byteOffset - scanStart,
+                                                raw.size()));
+        const int matchEnd = qMin(raw.size(), relative + int(m.length));
+        const int previousLf = raw.lastIndexOf('\n', relative - 1);
+        const int previousCr = raw.lastIndexOf('\r', relative - 1);
+        const int lineStart = qMax(previousLf, previousCr) + 1;
+        const int nextLf = raw.indexOf('\n', matchEnd);
+        const int nextCr = raw.indexOf('\r', matchEnd);
+        int lineEnd = raw.size();
+        if (nextLf >= 0) lineEnd = qMin(lineEnd, nextLf);
+        if (nextCr >= 0) lineEnd = qMin(lineEnd, nextCr);
+        int contextStart = qMax(lineStart, relative - int(prefixBytes));
+        int contextEnd = qMin(lineEnd, contextStart + OVERRUN_CTX_MAX);
+        if (contextEnd < matchEnd) {
+            contextEnd = qMin(lineEnd, matchEnd + int(prefixBytes));
+            contextStart = qMax(lineStart, contextEnd - OVERRUN_CTX_MAX);
+        }
+        while (contextStart < raw.size()
+               && (static_cast<unsigned char>(raw.at(contextStart)) & 0xc0) == 0x80) {
+            ++contextStart;
+        }
+        m.line = -1;
+        m.col = qint32(qBound<qint64>(qint64(0),
+                                      m.byteOffset - (scanStart + lineStart),
+                                      qint64(INT32_MAX)));
+        m.contextByteOffset = scanStart + contextStart;
+        m.lineContext = raw.mid(contextStart, contextEnd - contextStart);
+        return;
+    }
+    int line = 0;
+    qint64 originalColumn = 0;
+    lineIndex_->byteToLineCol(originalMatch, &line, &originalColumn);
+    Q_UNUSED(originalColumn);
+    const qint64 originalLineStart = lineIndex_->lineToByteOffset(line);
+    const qint64 originalLineEnd = lineIndex_->lineToByteOffset(line + 1);
+    const qint64 lineStart = patchList_
+        ? patchList_->origToVirtForLineStart(originalLineStart) : originalLineStart;
+    const qint64 lineEnd = patchList_
+        ? patchList_->origToVirtForLineStart(originalLineEnd) : originalLineEnd;
+    m.line = line;
+    m.col = qint32(qBound<qint64>(qint64(0), m.byteOffset - lineStart,
+                                  qint64(INT32_MAX)));
+    const qint64 matchEnd = m.byteOffset + m.length;
+    // Keep a compact prefix so the highlighted token is visible without
+    // horizontal scrolling in a typical dock width, while preserving ample
+    // trailing log context for diagnosis.
+    constexpr qint64 prefixBytes = 64;
+    qint64 desiredStart = qMax(lineStart, m.byteOffset - prefixBytes);
+    qint64 end = qMin(lineEnd, desiredStart + OVERRUN_CTX_MAX);
+    if (end < matchEnd) {
+        end = qMin(lineEnd, matchEnd + prefixBytes);
+        desiredStart = qMax(lineStart, end - OVERRUN_CTX_MAX);
+    }
+
+    // Include at most 3 bytes before the desired start, then advance over UTF-8
+    // continuation bytes. This prevents a centered context from beginning in the
+    // middle of a code point without ever reading an unbounded long line.
+    const qint64 rawStart = qMax(lineStart, desiredStart - 3);
+    QByteArray raw = readVirtualBytes(rawStart, end);
+    int trim = int(desiredStart - rawStart);
+    while (trim < raw.size()
+           && (static_cast<unsigned char>(raw[trim]) & 0xc0) == 0x80) {
+        ++trim;
+    }
+    qint64 start = rawStart + trim;
+    QByteArray lineBytes = raw.mid(trim);
     // 去掉行尾 \r\n / \n
-    while (!lineBytes.isEmpty() && (lineBytes.endsWith('\n') || lineBytes.endsWith('\r')))
+    while (end >= lineEnd && !lineBytes.isEmpty()
+           && (lineBytes.endsWith('\n') || lineBytes.endsWith('\r')))
         lineBytes.chop(1);
     if (lineBytes.size() > OVERRUN_CTX_MAX) lineBytes.truncate(OVERRUN_CTX_MAX);
+    m.contextByteOffset = start;
     m.lineContext = lineBytes;
 }
 
-// ============================================================================
-//  scanChunk
-// ============================================================================
-QVector<LargeFileSearchMatch> LargeFileSearch::scanChunk(qint64 chunkStart, qint64 chunkEnd,
-                                                  const Options& opts,
-                                                  const QRegularExpression* reOrNull,
-                                                  const QByteArray& literalBytesOrEmpty,
-                                                  qint64 overlapBack) const
+void LargeFileSearch::fillByteContext(LargeFileSearchMatch& m) const
 {
-    QVector<LargeFileSearchMatch> out;
-    if (!mmapBase_ || !lineIndex_ || chunkEnd <= chunkStart) return out;
+    constexpr qint64 BytesPerRow = 16;
+    const qint64 virtualSize = patchList_ ? patchList_->virtualSize(mmapSize_) : mmapSize_;
+    const qint64 rowStart = (m.byteOffset / BytesPerRow) * BytesPerRow;
+    const qint64 rowEnd = qMin(virtualSize, rowStart + BytesPerRow);
+    QByteArray preview = readVirtualBytes(rowStart, rowEnd);
+    for (char &value : preview) {
+        const uchar byte = uchar(value);
+        if (byte < 0x20 || byte > 0x7e)
+            value = '.';
+    }
+    m.line = qint32(qMin<qint64>(rowStart / BytesPerRow, INT32_MAX));
+    m.col = qint32(m.byteOffset - rowStart);
+    m.contextByteOffset = rowStart;
+    m.lineContext = std::move(preview);
+}
 
-    // 读入这段虚拟字节（考虑 patch）
-    QByteArray chunk = readVirtualBytes(chunkStart, chunkEnd);
-    if (chunk.isEmpty()) return out;
-    const uchar* text = (const uchar*)chunk.constData();
-    qint64 n = chunk.size();
+bool LargeFileSearch::scanAllBounded(
+    qint64 virtualSize, const QString &pattern, const Options &opts,
+    const std::function<bool()> &isCancelled,
+    const std::function<void(qint64)> &reportProgress,
+    const std::function<bool(const QVector<LargeFileSearchMatch>&)> &reportBatch)
+{
+    scanError_.clear();
+    const auto closeSpool = qScopeGuard([this] { closeOverrunFile(); });
+    constexpr qsizetype PublishBatchSize = 1000;
+    QVector<LargeFileSearchMatch> pending;
+    pending.reserve(PublishBatchSize);
+    const auto publish = [&]() -> bool {
+        if (pending.isEmpty())
+            return true;
+        appendMatches(pending);
+        if (storageFailed_ || !scanError_.isEmpty())
+            return false;
+        if (reportBatch && !reportBatch(pending))
+            return false;
+        pending.clear();
+        return true;
+    };
 
-    QVector<QPair<qint64, int>> hits; // (relative pos in chunk, length)
-    if (reOrNull) {
-        QString s = QString::fromUtf8(chunk);
-        auto it = reOrNull->globalMatch(s);
-        while (it.hasNext()) {
-            QRegularExpressionMatch m = it.next();
-            if (m.capturedStart() < 0 || m.capturedLength() <= 0) continue;
-            // 把 UTF-16 偏移转回字节偏移（非 ASCII 场景偏差，P1 按字符序近似；P2 用 UTF-8 偏移匹配器）
-            qint64 bytePos = QStringView{s.data(), m.capturedStart()}.toUtf8().size();
-            qint32 len = m.captured().toUtf8().size();
-            hits.append(qMakePair(bytePos, len));
+    QByteArray literalBytes;
+    bool usePcre2 = false;
+    if (!prepareSearchPattern(pattern, opts, &literalBytes, &usePcre2, &scanError_))
+        return false;
+
+    if (!usePcre2) {
+        if (literalBytes.isEmpty())
+            return true;
+        const bool caseSensitive = opts.hexBytesMode ? true : opts.caseSensitive;
+        const QVector<int> failure = kmpBuildFail(literalBytes, caseSensitive);
+        const int needleSize = literalBytes.size();
+        int matched = 0;
+        constexpr qint64 ReadChunk = Q_INT64_C(16) * 1024 * 1024;
+        for (qint64 start = 0; start < virtualSize; ) {
+            if (isCancelled && isCancelled())
+                return false;
+            const qint64 end = qMin(virtualSize, start + ReadChunk);
+            const QByteArray bytes = readVirtualBytes(start, end);
+            if (bytes.isEmpty() && end > start)
+                break;
+            for (qsizetype index = 0; index < bytes.size(); ++index) {
+                const uchar value = foldCaseAscii(uchar(bytes.at(index)), caseSensitive);
+                while (matched > 0
+                       && foldCaseAscii(uchar(literalBytes.at(matched)), caseSensitive)
+                              != value) {
+                    matched = failure.at(matched - 1);
+                }
+                if (foldCaseAscii(uchar(literalBytes.at(matched)), caseSensitive) == value)
+                    ++matched;
+                if (matched == needleSize) {
+                    LargeFileSearchMatch match;
+                    match.byteOffset = start + index + 1 - needleSize;
+                    match.length = needleSize;
+                    if (opts.byteContextMode)
+                        fillByteContext(match);
+                    else
+                        fillLineContext(match);
+                    pending.append(std::move(match));
+                    if (pending.size() >= PublishBatchSize && !publish())
+                        return false;
+                    matched = failure.at(matched - 1);
+                }
+            }
+            start = end;
+            if (reportProgress)
+                reportProgress(start);
         }
     } else {
-        hits = kmpMatches(text, n, literalBytesOrEmpty, opts.caseSensitive);
+        Pcre2Regex compiled;
+        if (!compiled.compile(pattern, !opts.regexMode, opts.caseSensitive,
+                              opts.wholeWord, &scanError_)) {
+            return false;
+        }
+
+        const uchar *subject = mmapBase_;
+        QTemporaryFile snapshot(QDir(overrunDir()).filePath(
+            QStringLiteral("regex_snapshot_XXXXXX.tmp")));
+        uchar *snapshotMap = nullptr;
+        const bool needsSnapshot = patchList_ && patchList_->isModified();
+        if (needsSnapshot) {
+            snapshot.setAutoRemove(true);
+            if (!snapshot.open()) {
+                scanError_ = QObject::tr("无法创建正则搜索快照：%1")
+                                 .arg(snapshot.errorString());
+                return false;
+            }
+            constexpr qint64 SnapshotChunk = Q_INT64_C(16) * 1024 * 1024;
+            for (qint64 start = 0; start < virtualSize; start += SnapshotChunk) {
+                if (isCancelled && isCancelled())
+                    return false;
+                const qint64 end = qMin(virtualSize, start + SnapshotChunk);
+                const QByteArray bytes = readVirtualBytes(start, end);
+                if (bytes.size() != end - start || snapshot.write(bytes) != bytes.size()) {
+                    scanError_ = QObject::tr("无法写入正则搜索快照：%1")
+                                     .arg(snapshot.errorString());
+                    return false;
+                }
+            }
+            if (!snapshot.flush()) {
+                scanError_ = QObject::tr("无法刷新正则搜索快照：%1")
+                                 .arg(snapshot.errorString());
+                return false;
+            }
+            snapshotMap = snapshot.map(0, virtualSize);
+            if (!snapshotMap && virtualSize > 0) {
+                scanError_ = QObject::tr("无法映射正则搜索快照：%1")
+                                 .arg(snapshot.errorString());
+                return false;
+            }
+            subject = snapshotMap;
+        }
+        const auto unmapSnapshot = qScopeGuard([&] {
+            if (snapshotMap)
+                snapshot.unmap(snapshotMap);
+        });
+
+        const Pcre2Regex::ScanResult result = compiled.scan(
+            subject, virtualSize, isCancelled, reportProgress,
+            [&](qint64 offset, qint64 length) {
+                LargeFileSearchMatch match;
+                match.byteOffset = offset;
+                match.length = qint32(length);
+                if (opts.byteContextMode)
+                    fillByteContext(match);
+                else
+                    fillLineContext(match);
+                pending.append(std::move(match));
+                return pending.size() < PublishBatchSize || publish();
+            }, &scanError_);
+        if (result != Pcre2Regex::ScanResult::Complete)
+            return false;
     }
 
-    // 过滤：
-    //   1) overlapBack 区内的匹配如果与前一块重复则丢弃（跨 overlap 边界的匹配保留）
-    //      我们用「匹配起点不在 overlapBack 内 但匹配内容部分在 chunk 内」原则无法精确判定，
-    //      因此采用：在前 overlapBack 字节内的纯匹配一律丢弃，后续由 UI 阶段去重。
-    //      跨块匹配（起点 < overlapBack 且 start + length > overlapBack）保留。
-    for (auto& hit : hits) {
-        qint64 localStart = hit.first;
-        qint32 len = hit.second;
-        bool inBackOnly     = (localStart + len <= overlapBack);
-        bool spansBoundary  = (localStart < overlapBack && localStart + len > overlapBack);
-        bool inBody         = (localStart >= overlapBack);
-        if (inBackOnly && !spansBoundary) continue; // 丢弃纯前一块重叠重复
-
-        LargeFileSearchMatch m;
-        m.byteOffset = chunkStart + localStart;
-        m.length     = len;
-        int ln; qint64 col64;
-        lineIndex_->byteToLineCol(m.byteOffset, &ln, &col64);
-        m.line = ln;
-        m.col  = qint32(qMin<qint64>(INT32_MAX, col64));  // 长行 col 可能超 int32，钳到上限
-        fillLineContext(m);
-        out.append(std::move(m));
-    }
-    return out;
+    const bool ok = publish();
+    return ok && !storageFailed_ && scanError_.isEmpty();
 }
 
 // ============================================================================
 //  findAll（异步）
 // ============================================================================
 void LargeFileSearch::findAll(const QString& pattern, const Options& opts) {
-    if (!mmapBase_ || !lineIndex_) {
+    if (!mmapBase_ || (!lineIndex_ && !opts.byteContextMode)) {
         emit failed(QStringLiteral("数据源未设置。"));
         return;
     }
@@ -274,141 +630,48 @@ void LargeFileSearch::findAll(const QString& pattern, const Options& opts) {
     // 内存屏障：worker 前主线程所有写入可见；memMatches/overrunCount 初始值正确刷入
     std::atomic_thread_fence(std::memory_order_release);
     memMatches_.clear();
+    storageFailed_ = false;
+    scanError_.clear();
     closeOverrunFile();
     overrunCount_ = 0;
+    overrunCheckpoints_.clear();
+    overrunCheckpointBytes_.clear();
+    overrunGroupedCount_ = 0;
+    overrunLastLine_ = std::numeric_limits<qint32>::min();
+    overrunLastContext_ = std::numeric_limits<qint64>::min();
     if (!overrunFile_.isEmpty()) { QFile::remove(overrunFile_); overrunFile_.clear(); }
     memMatches_.reserve(int(qMin<qint64>(maxMemMatches_, qint64(2000000))));
 
-    QRegularExpression re;
     QByteArray literalBytes;
-    bool useRegex = !opts.regex.pattern().isEmpty();
-    if (useRegex) {
-        re = opts.regex;
-        if (!re.isValid()) {
-            emit failed(QStringLiteral("正则无效：%1").arg(re.errorString()));
-            return;
-        }
-    } else {
-        literalBytes = pattern.toUtf8();
-        if (literalBytes.isEmpty()) {
-            emit failed(QStringLiteral("查找文本为空。"));
-            return;
-        }
+    bool usePcre2 = false;
+    QString patternError;
+    if (!prepareSearchPattern(pattern, opts, &literalBytes,
+                              &usePcre2, &patternError)) {
+        emit failed(patternError);
+        return;
     }
 
-    const qint64 CHUNK = qint64(16) * 1024 * 1024;
-    const qint64 OVERLAP = qint64(4) * 1024;
-
-    // 把整个虚拟范围 [0, virtualSize) 切块；virtualSize 默认 = mmapSize_；
-    // 有 patch 时，我们假定 patch 总长度变化不超过 4GB 上限（16MB 分块仍合理），
-    // 采用 [0, mmapSize_ + 合理 patch 总长度)。这里简化：以 mmapSize_ + 512MB 作为
-    // 上限扫描（真正的读取会被 renderRange 安全 clamp）。
-    qint64 virtualSize = mmapSize_;
-    if (patchList_ && patchList_->isModified()) virtualSize += qint64(512) * 1024 * 1024;
-
-    // 多线程并行搜索：将 [0, virtualSize) 分成 N 段（N = SEARCH_THREADS），
-    // 每段由独立线程并行扫描，最后合并结果。
-    // 有 patch（isModified）时段边界可能不准确 → 降级为单线程。
-    auto worker = [this, virtualSize, CHUNK, OVERLAP, opts, re, literalBytes, useRegex]() {
-        const bool hasPatch = (patchList_ && patchList_->isModified());
-        const int numThreads = DynamicThresholds::instance().SEARCH_THREADS;
-
-        std::atomic<qint64> bytesScanned{0};
-
-        auto isCancelled = [this]() -> bool {
+    const qint64 virtualSize = patchList_ ? patchList_->virtualSize(mmapSize_) : mmapSize_;
+    auto worker = [this, virtualSize, pattern, opts]() {
+        const auto isCancelled = [this]() {
             return cancel_.load(std::memory_order_relaxed);
         };
-
-        using SegMatches = QVector<LargeFileSearchMatch>;
-
-        // 单段扫描：在 [segStart, segEnd) 内用 16MB CHUNK + 4KB OVERLAP 机制
-        // 段边界处也做 overlap（首块 start==0 时无 overlapBack，其余块均有）
-        auto scanSegment = [&](qint64 segStart, qint64 segEnd) -> SegMatches {
-            SegMatches segMatches;
-            if (segEnd <= segStart) return segMatches;
-            qint64 myLastProg = 0;
-            for (qint64 start = segStart; start < segEnd; ) {
-                if (isCancelled()) break;
-                qint64 end = qMin(segEnd, start + CHUNK);
-                qint64 scanStart = (start == 0) ? 0 : qMax<qint64>(0, start - OVERLAP);
-                qint64 overlapBack = start - scanStart;
-                QVector<LargeFileSearchMatch> batch = scanChunk(scanStart, end, opts,
-                                                       useRegex ? &re : nullptr,
-                                                       literalBytes,
-                                                       overlapBack);
-                if (!batch.isEmpty()) segMatches += batch;
-                bytesScanned.fetch_add(end - start, std::memory_order_relaxed);
-                qint64 total = bytesScanned.load(std::memory_order_relaxed);
-                if (total - myLastProg >= CHUNK) {
-                    myLastProg = total;
-                    emit progress(total, virtualSize);
-                }
-                start = end;
-            }
-            return segMatches;
-        };
-
-        QVector<SegMatches> segResults;
-
-        if (hasPatch || numThreads <= 1 || virtualSize <= CHUNK) {
-            // 降级单线程：patch 修改 / 单核 / 小文件
-            segResults.append(scanSegment(0, virtualSize));
-        } else {
-            // 多线程并行：N 段，用独立 QThreadPool 避免与外层 QtConcurrent::run 死锁
-            // 通告 AsyncThreadPool UI：实际将启动 numThreads 条外部线程
-            AsyncThreadPool::instance().incExternalActive(numThreads);
-            struct ScopeDec { int n; ~ScopeDec() { AsyncThreadPool::instance().decExternalActive(n); } } dec_{numThreads};
-            QThreadPool innerPool;
-            innerPool.setMaxThreadCount(numThreads);
-            QFutureSynchronizer<SegMatches> sync;
-            for (int i = 0; i < numThreads; ++i) {
-                qint64 segStart = quint64(virtualSize) * quint64(i) / quint64(numThreads);
-                qint64 segEnd   = quint64(virtualSize) * quint64(i + 1) / quint64(numThreads);
-                if (segStart >= segEnd) continue;
-                sync.addFuture(QtConcurrent::run(&innerPool, scanSegment, segStart, segEnd));
-            }
-            sync.waitForFinished();
-            innerPool.waitForDone();
-            for (const auto& f : sync.futures()) {
-                segResults.append(f.result());
-            }
-        }
-
-        if (isCancelled()) {
-            emit failed(QStringLiteral("已取消。"));
+        const bool ok = scanAllBounded(
+            virtualSize, pattern, opts, isCancelled,
+            [this, virtualSize](qint64 done) { emit progress(done, virtualSize); },
+            [this](const QVector<LargeFileSearchMatch> &batch) {
+                emit partialBatch(batch);
+                return true;
+            });
+        if (!ok) {
+            emit failed(storageFailed_ ? QStringLiteral("搜索结果临时存储写入失败。")
+                                       : (!scanError_.isEmpty() ? scanError_
+                                                               : QStringLiteral("已取消。")));
             return;
         }
-
-        // 合并各段结果（段内已按 byteOffset 排序，段间也是有序的，直接拼接）
-        QVector<LargeFileSearchMatch> merged;
-        for (auto& sm : segResults) merged += sm;
-
-        // 去重跨段 overlap 的匹配：按 byteOffset 排序 + unique
-        std::sort(merged.begin(), merged.end(),
-                  [](const LargeFileSearchMatch& a, const LargeFileSearchMatch& b) {
-                      return a.byteOffset < b.byteOffset;
-                  });
-        {
-            QVector<LargeFileSearchMatch> deduped;
-            deduped.reserve(merged.size());
-            qint64 lastOff = -1;
-            for (auto& m : merged) {
-                if (m.byteOffset != lastOff) { deduped.append(std::move(m)); lastOff = m.byteOffset; }
-            }
-            merged.swap(deduped);
-        }
-
-        // 一次性合并到主结果（appendMatches 非线程安全，此处 workerFn 线程独占）
-        if (!merged.isEmpty()) {
-            appendMatches(merged);
-            emit partialBatch(merged);
-        }
-
-        // release 屏障：确保所有 memMatches_/overrunCount_ 写入对主线程 totalMatches() acquire 可见
         std::atomic_thread_fence(std::memory_order_release);
-        qint64 n = qint64(memMatches_.size()) + overrunCount_;
         emit progress(virtualSize, virtualSize);
-        emit finished(n);
+        emit finished(qint64(memMatches_.size()) + overrunCount_);
     };
 
     QtConcurrent::run(worker);
@@ -420,7 +683,7 @@ void LargeFileSearch::findAll(const QString& pattern, const Options& opts) {
 qint64 LargeFileSearch::findAllViaTaskManager(const QString& pattern, const Options& opts,
                                               const QString& fileDisplayName)
 {
-    if (!mmapBase_ || !lineIndex_) {
+    if (!mmapBase_ || (!lineIndex_ && !opts.byteContextMode)) {
         emit failed(QStringLiteral("数据源未设置。"));
         return -1;
     }
@@ -431,40 +694,36 @@ qint64 LargeFileSearch::findAllViaTaskManager(const QString& pattern, const Opti
     }
     std::atomic_thread_fence(std::memory_order_release);
     memMatches_.clear();
+    storageFailed_ = false;
+    scanError_.clear();
     closeOverrunFile();
     overrunCount_ = 0;
+    overrunCheckpoints_.clear();
+    overrunCheckpointBytes_.clear();
+    overrunGroupedCount_ = 0;
+    overrunLastLine_ = std::numeric_limits<qint32>::min();
+    overrunLastContext_ = std::numeric_limits<qint64>::min();
     if (!overrunFile_.isEmpty()) { QFile::remove(overrunFile_); overrunFile_.clear(); }
     memMatches_.reserve(int(qMin<qint64>(maxMemMatches_, qint64(2000000))));
 
-    QRegularExpression re;
     QByteArray literalBytes;
-    bool useRegex = !opts.regex.pattern().isEmpty();
-    if (useRegex) {
-        re = opts.regex;
-        if (!re.isValid()) {
-            emit failed(QStringLiteral("正则无效：%1").arg(re.errorString()));
-            return -1;
-        }
-    } else {
-        literalBytes = pattern.toUtf8();
-        if (literalBytes.isEmpty()) {
-            emit failed(QStringLiteral("查找文本为空。"));
-            return -1;
-        }
+    bool usePcre2 = false;
+    QString patternError;
+    if (!prepareSearchPattern(pattern, opts, &literalBytes,
+                              &usePcre2, &patternError)) {
+        emit failed(patternError);
+        return -1;
     }
 
-    const qint64 CHUNK = qint64(16) * 1024 * 1024;
-    const qint64 OVERLAP = qint64(4) * 1024;
-    qint64 virtualSize = mmapSize_;
-    if (patchList_ && patchList_->isModified()) virtualSize += qint64(512) * 1024 * 1024;
+    const qint64 virtualSize = patchList_ ? patchList_->virtualSize(mmapSize_) : mmapSize_;
 
     const QString displayName = fileDisplayName.isEmpty()
         ? QObject::tr("(未命名大文件)")
         : fileDisplayName;
     const QString title = QObject::tr("搜索大文件: %1").arg(displayName);
-    const QString desc  = QObject::tr("文件: %1\n模式: %2\n大小写敏感: %3\n整词匹配: %4\n\n搜索任务走 AsyncThreadPool 统一调度，可在「后台任务」面板点击取消。进度按已扫描字节/总虚拟大小计算。")
+    const QString desc  = QObject::tr("文件: %1\n模式: %2\n大小写敏感: %3\n整词匹配: %4\n\n可在查找窗口或「后台任务」面板取消。进度按已扫描字节/总虚拟大小计算。")
         .arg(displayName)
-        .arg(useRegex ? QObject::tr("正则表达式") : QObject::tr("字面值"))
+        .arg(opts.regexMode ? QObject::tr("正则表达式") : QObject::tr("字面值"))
         .arg(opts.caseSensitive ? QObject::tr("是") : QObject::tr("否"))
         .arg(opts.wholeWord ? QObject::tr("是") : QObject::tr("否"));
 
@@ -472,14 +731,14 @@ qint64 LargeFileSearch::findAllViaTaskManager(const QString& pattern, const Opti
     //  我们通过信号的 QueuedConnection 把 finished/failed/progress 回主线程；
     //  若对象在中途被析构，LargeFileSearch::requestCancel()/cancel_ 原子标志保证安全退出，
     //  但要避免访问成员变量（除非对象仍存在）。这里我们用 QPointer + QMetaObject::invokeMethod
-    //  做主线程安全回调；scanChunk/readVirtualBytes 本身是 const，只要对象未析构即可调用。
+    //  做主线程安全回调；scanAllBounded/readVirtualBytes 本身只读数据源。
     QPointer<LargeFileSearch> that(this);
     lastTaskId_ = AsyncTaskManager::instance().submit(
         AsyncTaskType::LargeFileSearch,
         AsyncTaskPriority::High,
         title,
         desc,
-        /* workerFn = */ [that, virtualSize, CHUNK, OVERLAP, opts, re, literalBytes, useRegex]
+        /* workerFn = */ [that, virtualSize, pattern, opts]
         (qint64 /*taskId*/, AsyncCancelPtr cancel,
          std::function<void(qint64,qint64)> reportProgress,
          std::function<void(const AsyncErrorInfo&)> reportError)
@@ -492,116 +751,40 @@ qint64 LargeFileSearch::findAllViaTaskManager(const QString& pattern, const Opti
                 return;
             }
 
-            // 把 AsyncTaskManager 提供的 cancel 原子也写入 LargeFileSearch.cancel_
-            // 这样 requestCancel() 和 AsyncTask 面板取消都会生效（任一 true 即中止）。
             that->cancel_.store(false, std::memory_order_release);
-
-            const bool hasPatch = (that->patchList_ && that->patchList_->isModified());
-            const int numThreads = DynamicThresholds::instance().SEARCH_THREADS;
-
-            std::atomic<qint64> bytesScanned{0};
-
-            // 双取消标志：Manager cancel 或对象自身 cancel_
-            auto isCancelled = [&]() -> bool {
+            const auto isCancelled = [&]() {
                 return (cancel && cancel->load(std::memory_order_acquire))
                     || that->cancel_.load(std::memory_order_relaxed);
             };
-
-            using SegMatches = QVector<LargeFileSearchMatch>;
-
-            // 单段扫描：在 [segStart, segEnd) 内用 16MB CHUNK + 4KB OVERLAP 机制
-            // 各段 worker 收集到本地 vector（appendMatches 非线程安全，不能直接调）
-            auto scanSegment = [&](qint64 segStart, qint64 segEnd) -> SegMatches {
-                SegMatches segMatches;
-                if (segEnd <= segStart) return segMatches;
-                qint64 myLastProg = 0;
-                for (qint64 start = segStart; start < segEnd; ) {
-                    if (isCancelled()) break;
-                    qint64 end = qMin(segEnd, start + CHUNK);
-                    qint64 scanStart = (start == 0) ? 0 : qMax<qint64>(0, start - OVERLAP);
-                    qint64 overlapBack = start - scanStart;
-                    QVector<LargeFileSearchMatch> batch = that->scanChunk(scanStart, end, opts,
-                                                           useRegex ? &re : nullptr,
-                                                           literalBytes,
-                                                           overlapBack);
-                    if (!batch.isEmpty()) segMatches += batch;
-                    bytesScanned.fetch_add(end - start, std::memory_order_relaxed);
-                    qint64 total = bytesScanned.load(std::memory_order_relaxed);
-                    if (total - myLastProg >= CHUNK) {
-                        myLastProg = total;
-                        reportProgress(total, virtualSize);
-                        QMetaObject::invokeMethod(that, "progress", Qt::QueuedConnection,
-                                                  Q_ARG(qint64, total), Q_ARG(qint64, virtualSize));
-                    }
-                    start = end;
-                }
-                return segMatches;
-            };
-
-            QVector<SegMatches> segResults;
-
-            if (hasPatch || numThreads <= 1 || virtualSize <= CHUNK) {
-                // 降级单线程：patch 修改 / 单核 / 小文件（段边界在 patch 下不准确）
-                segResults.append(scanSegment(0, virtualSize));
-            } else {
-                // 多线程并行：将 [0, virtualSize) 分成 numThreads 段
-                // 通告 AsyncThreadPool UI：实际将启动 numThreads 条外部线程
-                AsyncThreadPool::instance().incExternalActive(numThreads);
-                struct ScopeDec { int n; ~ScopeDec() { AsyncThreadPool::instance().decExternalActive(n); } } dec_{numThreads};
-                QThreadPool innerPool;
-                innerPool.setMaxThreadCount(numThreads);
-                QFutureSynchronizer<SegMatches> sync;
-                for (int i = 0; i < numThreads; ++i) {
-                    qint64 segStart = quint64(virtualSize) * quint64(i) / quint64(numThreads);
-                    qint64 segEnd   = quint64(virtualSize) * quint64(i + 1) / quint64(numThreads);
-                    if (segStart >= segEnd) continue;
-                    sync.addFuture(QtConcurrent::run(&innerPool, scanSegment, segStart, segEnd));
-                }
-                sync.waitForFinished();
-                innerPool.waitForDone();
-                for (const auto& f : sync.futures()) {
-                    segResults.append(f.result());
-                }
-            }
-
-            if (isCancelled()) {
-                QMetaObject::invokeMethod(that, "failed", Qt::QueuedConnection,
-                                          Q_ARG(QString, QObject::tr("已取消。")));
+            const bool ok = that->scanAllBounded(
+                virtualSize, pattern, opts, isCancelled,
+                [that, reportProgress, virtualSize](qint64 done) {
+                    reportProgress(done, virtualSize);
+                    QMetaObject::invokeMethod(that, "progress", Qt::QueuedConnection,
+                                              Q_ARG(qint64, done), Q_ARG(qint64, virtualSize));
+                },
+                [that](const QVector<LargeFileSearchMatch> &batch) {
+                    QMetaObject::invokeMethod(
+                        that, "partialBatch", Qt::QueuedConnection,
+                        Q_ARG(QVector<LargeFileSearchMatch>, batch));
+                    return true;
+                });
+            if (!ok) {
+                QMetaObject::invokeMethod(
+                    that, "failed", Qt::QueuedConnection,
+                    Q_ARG(QString, that->storageFailed_
+                        ? QObject::tr("搜索结果临时存储写入失败。")
+                        : (!that->scanError_.isEmpty() ? that->scanError_
+                                                       : QObject::tr("已取消。"))));
                 return;
             }
-
-            // 合并各段结果（段内已按 byteOffset 排序，段间也是有序的，直接拼接）
-            QVector<LargeFileSearchMatch> merged;
-            for (auto& sm : segResults) merged += sm;
-
-            // 去重跨段 overlap 的匹配：按 byteOffset 排序 + unique
-            std::sort(merged.begin(), merged.end(),
-                      [](const LargeFileSearchMatch& a, const LargeFileSearchMatch& b) {
-                          return a.byteOffset < b.byteOffset;
-                      });
-            {
-                QVector<LargeFileSearchMatch> deduped;
-                deduped.reserve(merged.size());
-                qint64 lastOff = -1;
-                for (auto& m : merged) {
-                    if (m.byteOffset != lastOff) { deduped.append(std::move(m)); lastOff = m.byteOffset; }
-                }
-                merged.swap(deduped);
-            }
-
-            // 一次性合并到主结果（appendMatches 非线程安全，此处 workerFn 线程独占）
-            if (!merged.isEmpty()) {
-                that->appendMatches(merged);
-                QMetaObject::invokeMethod(that, "partialBatch", Qt::QueuedConnection,
-                                          Q_ARG(QVector<LargeFileSearchMatch>, merged));
-            }
-
             std::atomic_thread_fence(std::memory_order_release);
-            qint64 n = qint64(that->memMatches_.size()) + that->overrunCount_;
+            const qint64 count = qint64(that->memMatches_.size()) + that->overrunCount_;
             reportProgress(virtualSize, virtualSize);
             QMetaObject::invokeMethod(that, "progress", Qt::QueuedConnection,
                                       Q_ARG(qint64, virtualSize), Q_ARG(qint64, virtualSize));
-            QMetaObject::invokeMethod(that, "finished", Qt::QueuedConnection, Q_ARG(qint64, n));
+            QMetaObject::invokeMethod(that, "finished", Qt::QueuedConnection,
+                                      Q_ARG(qint64, count));
         },
         /* batchId = */ 0,
         /* categoryTag = */ QLatin1String("Search"),
@@ -614,32 +797,38 @@ qint64 LargeFileSearch::findAllViaTaskManager(const QString& pattern, const Opti
 //  findNext / findPrev
 // ============================================================================
 qint64 LargeFileSearch::findNext(qint64 fromByte, LargeFileSearchMatch* outMatch) const {
-    // 线性扫：P1 不做二分，避免复杂溢出索引；100 万条量级可接受。
+    // Resident prefix is bounded; the spool starts from the nearest sparse
+    // checkpoint so F3 latency does not grow linearly with total result count.
     for (const auto& m : memMatches_) {
         if (m.byteOffset > fromByte) {
             if (outMatch) *outMatch = m;
             return m.byteOffset;
         }
     }
-    // 溢出文件：顺序读取（P1 简化）。P2 可加二分索引。
     if (overrunCount_ > 0 && QFile::exists(overrunFile_)) {
         QFile f(overrunFile_);
         if (f.open(QIODevice::ReadOnly)) {
-            f.seek(8+8); // 跳过 MAGIC+VERSION+COUNT 占位（实际 COUNT 无用，顺序读）
             QDataStream s(&f);
             s.setByteOrder(QDataStream::LittleEndian);
+            quint32 version = 0;
+            if (!readOverrunHeader(s, &version, nullptr))
+                return -1;
+            const auto checkpoint = std::upper_bound(
+                overrunCheckpointBytes_.cbegin(), overrunCheckpointBytes_.cend(),
+                fromByte);
+            if (checkpoint != overrunCheckpointBytes_.cbegin()) {
+                const qsizetype index = std::distance(overrunCheckpointBytes_.cbegin(),
+                                                      checkpoint - 1);
+                if (index < overrunCheckpoints_.size())
+                    f.seek(overrunCheckpoints_.at(index).second);
+            }
             while (!s.atEnd()) {
-                quint64 bo; qint32 len, ln, col; QByteArray ctx;
-                s >> bo >> len >> ln >> col >> ctx;
-                if (bo > quint64(fromByte)) {
-                    if (outMatch) {
-                        outMatch->byteOffset = qint64(bo);
-                        outMatch->length = len;
-                        outMatch->line = ln;
-                        outMatch->col = col;
-                        outMatch->lineContext = ctx;
-                    }
-                    return qint64(bo);
+                LargeFileSearchMatch match;
+                if (!readOverrunRecord(s, version, &match))
+                    break;
+                if (match.byteOffset > fromByte) {
+                    if (outMatch) *outMatch = match;
+                    return match.byteOffset;
                 }
             }
         }
@@ -657,17 +846,30 @@ qint64 LargeFileSearch::findPrev(qint64 fromByte, LargeFileSearchMatch* outMatch
     if (overrunCount_ > 0 && QFile::exists(overrunFile_)) {
         QFile f(overrunFile_);
         if (f.open(QIODevice::ReadOnly)) {
-            f.seek(16);
             QDataStream s(&f);
             s.setByteOrder(QDataStream::LittleEndian);
+            quint32 version = 0;
+            if (!readOverrunHeader(s, &version, nullptr))
+                return best;
+            const auto checkpoint = std::lower_bound(
+                overrunCheckpointBytes_.cbegin(), overrunCheckpointBytes_.cend(),
+                fromByte);
+            if (checkpoint == overrunCheckpointBytes_.cbegin())
+                return best;
+            const qsizetype checkpointIndex = std::distance(
+                overrunCheckpointBytes_.cbegin(), checkpoint - 1);
+            if (checkpointIndex < overrunCheckpoints_.size())
+                f.seek(overrunCheckpoints_.at(checkpointIndex).second);
             static thread_local LargeFileSearchMatch tmp;
             while (!s.atEnd()) {
-                quint64 bo; qint32 len, ln, col; QByteArray ctx;
-                s >> bo >> len >> ln >> col >> ctx;
-                if (bo < quint64(fromByte) && qint64(bo) > best) {
-                    best = qint64(bo);
-                    tmp.byteOffset = qint64(bo); tmp.length = len; tmp.line = ln;
-                    tmp.col = col; tmp.lineContext = ctx;
+                LargeFileSearchMatch match;
+                if (!readOverrunRecord(s, version, &match))
+                    break;
+                if (match.byteOffset >= fromByte)
+                    break;
+                if (match.byteOffset < fromByte && match.byteOffset > best) {
+                    best = match.byteOffset;
+                    tmp = std::move(match);
                     bestM = &tmp;
                 }
             }
@@ -691,53 +893,60 @@ bool LargeFileSearch::replaceAll(const QString& pattern, const QString& replacem
     // Step 1：先跑一次 findAll（同步的本地版本，避免信号队列）
     cancel_.store(false);
     memMatches_.clear();
+    storageFailed_ = false;
+    scanError_.clear();
     closeOverrunFile();
     overrunCount_ = 0;
+    overrunCheckpoints_.clear();
+    overrunCheckpointBytes_.clear();
+    overrunGroupedCount_ = 0;
+    overrunLastLine_ = std::numeric_limits<qint32>::min();
+    overrunLastContext_ = std::numeric_limits<qint64>::min();
     if (!overrunFile_.isEmpty()) { QFile::remove(overrunFile_); overrunFile_.clear(); }
 
-    QRegularExpression re;
-    QByteArray literalBytes;
-    bool useRegex = !opts.regex.pattern().isEmpty();
-    if (useRegex) {
-        re = opts.regex;
-        if (!re.isValid()) { if (errMsg) *errMsg = QStringLiteral("正则无效"); return false; }
-    } else {
-        literalBytes = pattern.toUtf8();
-        if (literalBytes.isEmpty()) { if (errMsg) *errMsg = QStringLiteral("pattern 空"); return false; }
-    }
     QByteArray replBytes = replacement.toUtf8();
 
     // Step 1 简化：直接收集所有匹配（分批收集，但这里内存直接做；溢出则失败——replaceAll
     // 必须有完整匹配列表才能正确按 byteOffset 从大到小替换）
     QVector<LargeFileSearchMatch> allMatches;
-    const qint64 CHUNK = qint64(16) * 1024 * 1024;
-    const qint64 OVERLAP = qint64(4) * 1024;
-    qint64 virtualSize = mmapSize_;
-    if (patchList_ && patchList_->isModified()) virtualSize += qint64(512) * 1024 * 1024;
-
-    for (qint64 start = 0; start < virtualSize; ) {
-        if (cancel_.load()) { if (errMsg) *errMsg = QStringLiteral("取消"); return false; }
-        qint64 end = qMin(virtualSize, start + CHUNK);
-        qint64 scanStart = (start == 0) ? 0 : qMax<qint64>(0, start - OVERLAP);
-        qint64 overlapBack = start - scanStart;
-        QVector<LargeFileSearchMatch> batch = scanChunk(scanStart, end, opts,
-                                               useRegex ? &re : nullptr,
-                                               literalBytes,
-                                               overlapBack);
-        for (auto& m : batch) allMatches.append(std::move(m));
-        start = end;
-        if (!patchList_ && start >= mmapSize_) break;
-    }
-    // 去重（跨 OVERLAP 可能重复的匹配）：按 byteOffset 排序 + unique
-    std::sort(allMatches.begin(), allMatches.end(),
-              [](const LargeFileSearchMatch& a, const LargeFileSearchMatch& b) { return a.byteOffset < b.byteOffset; });
-    {
-        QVector<LargeFileSearchMatch> dedup;
-        qint64 last = -1;
-        for (auto& m : allMatches) {
-            if (m.byteOffset != last) { dedup.append(m); last = m.byteOffset; }
+    const qint64 virtualSize = patchList_ ? patchList_->virtualSize(mmapSize_) : mmapSize_;
+    bool resultLimitExceeded = false;
+    bool zeroLengthReplacementUnsupported = false;
+    const bool scanOk = scanAllBounded(
+        virtualSize, pattern, opts,
+        [this] { return cancel_.load(std::memory_order_relaxed); },
+        {},
+        [&](const QVector<LargeFileSearchMatch> &batch) {
+            if (std::any_of(batch.cbegin(), batch.cend(),
+                            [](const LargeFileSearchMatch &match) {
+                                return match.length == 0;
+                            })) {
+                zeroLengthReplacementUnsupported = true;
+                return false;
+            }
+            if (qint64(allMatches.size()) + batch.size() > maxMemMatches_) {
+                resultLimitExceeded = true;
+                return false;
+            }
+            allMatches += batch;
+            return true;
+        });
+    if (!scanOk) {
+        if (errMsg) {
+            if (zeroLengthReplacementUnsupported) {
+                *errMsg = QObject::tr(
+                    "批量替换暂不接受零长度匹配；请让表达式至少消费一个字符。");
+            } else if (resultLimitExceeded) {
+                *errMsg = QObject::tr(
+                    "匹配超过安全批量替换上限（%1 处）。请缩小查找范围后分批替换。")
+                              .arg(maxMemMatches_);
+            } else if (!scanError_.isEmpty()) {
+                *errMsg = scanError_;
+            } else {
+                *errMsg = QObject::tr("取消");
+            }
         }
-        allMatches.swap(dedup);
+        return false;
     }
 
     qint64 total = allMatches.size();

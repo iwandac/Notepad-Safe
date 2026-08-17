@@ -22,15 +22,36 @@
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify_supply_chain.ps1
 ```
 
+SPDX 2.3 SBOM 由同一锁文件生成，不能手工维护第二份版本表：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/generate_sbom.ps1 `
+  -OutputFile build/notepad-safe.spdx.json -ProductVersion 0.3.1
+```
+
+正式 `portable_package` target 会自动生成 SBOM，并把它、`dependencies.lock.json`、完整 GPLv3、
+第三方声明和正式 exe 一起写入版本化 ZIP。SBOM 中必须包含 1 个产品 package、锁文件的
+全部 component，以及产品到每个 component 的 `DEPENDS_ON` 关系。
+
 生产 KDBX 依赖准备命令：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/bootstrap_crypto_deps.ps1
 ```
 
+统一正则引擎准备命令：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/bootstrap_pcre2.ps1
+```
+
+PCRE2 bootstrap 只接受锁文件中的 `pcre2-10.47` 签名 tag、完整签名者指纹和
+解析后的 commit；在隔离 keyring 中验证三者一致后才 checkout。构建只启用 8-bit
+静态库，关闭工具、上游测试和 JIT，正则资源上限与取消行为不依赖私有 Qt ABI。
+
 该脚本只接受锁文件中的来源和精确身份：KeePassXC/Botan/zlib 归档先校验 SHA-256，Argon2 checkout 校验完整 commit，随后回放 `third_party/patches/keepassxc-2.7.12` 中的兼容补丁并构建最小静态 Botan。产物缓存于被 Git 忽略的 `.deps/`，重复执行会做幂等校验；只有明确传入 `-ForceRefresh` 才重建缓存。
 
-生产构建使用 `-DNOTEPADSAFE_ENABLE_KDBX_BACKEND=ON`。CMake 的默认值仍为 `OFF`，用于不下载密码学供应链的编辑器/领域层验证；仓库的 `build.bat` 会先执行上述 bootstrap 并显式开启生产后端，除非调用者设置 `NOTEPADSAFE_WITH_KDBX=OFF`。
+生产构建和普通 CMake 配置默认使用 `-DNOTEPADSAFE_ENABLE_KDBX_BACKEND=ON`，因为默认加密新建是产品基线，不允许无意生成缺少核心能力的发行包。只做编辑器/领域层验证时可显式传入 `OFF`；仓库的 `build.bat` 同样允许调用者设置 `NOTEPADSAFE_WITH_KDBX=OFF`。
 
 ## 选型边界
 
@@ -38,7 +59,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/bootstrap_crypto_deps.
 - KeePassXC 是 KDBX 行为与互操作的参考上游，不直接复制整个应用架构。第一阶段抽取最小必要的 KDBX 数据模型、序列化和测试 fixture。
 - Botan 3 是计划中的通用密码学执行层；KeePassXC 2.7.12 的 Argon2Kdf 仍使用上游参考 libargon2，两者都必须锁定。禁止自研 AES、Argon2、密钥派生或认证加密实现。
 - KDBX gzip 压缩路径使用锁定的 zlib；不为减少一个依赖而改变标准 KDBX 压缩语义。
-- PCRE2 是统一正则语义的计划供应商；S1、S2、S3 共用语法/选项契约，执行器按存储层分别实现。
+- PCRE2 10.47 是统一正则语义的活动供应商；S1、S2、S3 共用 Unicode 语法、大小写和整词契约，执行器按存储层提供快照但不改变匹配方言。
 
 ## 失败策略
 

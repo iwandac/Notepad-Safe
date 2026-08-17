@@ -56,7 +56,7 @@
 | F006-A | 退出 Ctrl+Q（路径 A 快捷键 + 修改文件时 prompt 取消 → 不退出） | openL2 small → 插 1B（saveNeeded=true）→ mock MessageBox Close=Cancel → keySeq(Ctrl+Q) → window still exists；saveNeeded=true；title 仍有 `*` | MainWindow.isVisible()=true | **P1** | - | mockCloseDialog(Cancel) + keySeq Ctrl+Q + windowVisible(true) |
 | F006-B | 退出（菜单点击 + 保存后退出） | openL2 → edit → mock MessageBox Close=Save → exitAct trigger → window closed；disk saved | windowVisible=false；disk==vs | **P1** | - | mockCloseDialog(Save) + actionTrigger(exitAct) |
 | F007 | 打开-编辑-保存-关闭-重新打开：字节流 100% round-trip 一致（闭环） | openL2 small(T_SMALL_20L) → insert MARK_BELOW(14B) at L10 + insert MARK_ABOVE(14B) at L5 → save → close tab → reopen path → read full vs snapshot (openL2 原始 + 两处插入 patch 的虚拟字节流完全相同)；undoStack.canUndo=false；cursor=0 | full byte diff identical | **P0** | ⚠️ L2 保存闭环核心 | open+2 inserts+save+close+reopen+fullDiff(snapshot) |
-| F008 | 文件被外部修改：外部写 5B 到磁盘 → 焦点回窗口弹"文件已被外部修改"对话框；点"重新加载"→ 字节流==外部新内容；点"保持原样"→ 不改 | mock FileChanged prompt + choices：reload / keep；分别断言 | 对应断言 | **P1** | - | modifyFileOnDiskExternal() + mockReloadDialog(Choice) + bytes assertion |
+| F008 | 文件打开后本地编辑，再被外部程序改写；触发真实“保存”后必须弹出“文件已在磁盘上更改”，只提供“重新加载磁盘版本 / 另存为… / 取消”；点重新加载后正文==外部新内容、dirty=false、磁盘内容未被覆盖 | 真实 MainWindow + QAction 保存 + QMessageBox 真实按钮；截图冲突对话框和重载后正文 | 对应断言 | **P0** | 覆盖外部更改会导致无法恢复的数据丢失 | `tc_external_change_save_conflict_reload_roundtrip` |
 
 ---
 
@@ -136,25 +136,25 @@
 
 ---
 
-## 6. 视图菜单（View · 16 条目含子菜单）
-> MainWindow zoom 证据⑥：只调 Scintilla；长行标尺 证据⑦：L2 无效；16 进制模式/自动换行/深色模式有 L2 分发
+## 6. 视图菜单（View · 分组子菜单）
+> 当前入口按外观、呈现方式、长行标尺、缩放和面板分组；Text/Hex 是呈现，不是加密状态。
 
 | TC ID | 标题+快捷键 | 步骤 | 预期 | 优先级 | 已知 FAIL？ | SmokeBase |
 |---|---|---|---|---|---|---|
-| VW01 | 深色模式（视图 → 深色模式 checkable） | L2 open small → 勾选 dark 菜单 → viewport 背景色 == dark palette；再切回 light → 正常；不崩；字节流不变；saveNeeded=false | 背景色；不崩；bytes 不变；saveNeeded=false | P1 | - | triggerAction(darkModeAct) + viewportBackground == expectedColor + saveNeeded(false) |
-| VW02-A | 自动换行 Ctrl+W（路径 A MainWindow 快捷键） | L2 open small（默认 wordWrapOff）→ horizontalScrollBar.range = big（非零）→ **MainWindow Ctrl+W keySeq** → ① m_actWordWrap.checked=true；② horizontalScrollBar.enabled=false（自动换行不应出现水平滚动，W006 语义）；③ wordWrap()=true；④ 再 Ctrl+W → 反向复原 | 4 断言 | **P0** | [EditorTab::setWordWrap L2 已分发](file:///F:/projects/credentials/notepad-safe/EditorTab.cpp#L856-L871)，路径 A 应该 OK | MainWindow实例 Ctrl+W + checkedState + horizontalScrollBar().enabled/Range + wordWrap() bool |
-| VW02-B | 自动换行（菜单点击：wordWrapAct trigger） | 同 VW02-A，用 trigger action | 同 VW02-A | **P0** | - | triggerAction(wordWrapAct) |
-| VW03 | 长行标尺竖线（视图 → 长行标尺(竖线) checkable） | L2 open small → setEdgeColumn(80) → toggle edge visible ON → viewport paint 里 X==80×charWidth 的竖线出现；切 OFF 消失；字节流不变；saveNeeded=false | paint 有/无竖线；bytes 不变；saveNeeded=false | P1 | ⚠️ FAIL 证据⑦：[EditorTab applyEdgeSettings](file:///F:/projects/credentials/notepad-safe/EditorTab.cpp#L715-L723) 只调 Scintilla，VirtualFileView 自己画不检查 edgeVisible | triggerAction(edgeVisibleAct) + paintSpy hasVerticalLineAt(col) or not + saveNeeded(false) |
-| VW04-A | 长行标尺列数 = 72/80/100/120/150/200（6 项循环） | 对 6 个 col，依次点击视图 → 长行标尺列数 → "100 列" 动作 → m_edgeColGroup checked action 的 data==100；edgeColumn property ==100；随后竖线（VW03 打开时）位置正确落在 col × charWidth | checked correct；edgeColumn correct；竖线 X correct | P1 | ⚠️ 证据⑦：同 VW03，L2 VirtualFileView 没读 edgeColumn | 循环 6 个 col + triggerEdgeColMenu(col) + edgeColumn property check + lineAtX == colX |
-| VW05-A | 16 进制编辑模式 Ctrl+Shift+H（路径 A MainWindow 快捷键） | L2 open small → snapshot → Ctrl+Shift+H → ① viewModeL2==Hex；② 视图像素区域中出现 hex dump（"00000000: 4C 30 3a ..."之类的文本行）；③ 字节流不变；④ 再 Ctrl+Shift+H → 回到 Text 模式；⑤ saveNeeded 全程 false | 5 断言 | **P0** | [MainWindow toggleHexViewMode 仅 L2 生效](file:///F:/projects/credentials/notepad-safe/MainWindow.cpp#L835-L847) → L1 切不切都 OK；实锤路径 A L2 | MainWindow实例 Ctrl+Shift+H + viewModeL2() + paint 内容（has hexdump style） + saveNeeded(false) + fullDiff(snapshot) |
-| VW05-B | 16 进制模式（菜单点击 hexAct trigger） | 同 VW05-A trigger hexAct | 同 VW05-A | **P0** | - | triggerAction(hexAct) |
-| VW06 | 16 进制编辑模式 · 非 L2 Tab（L1 small file）按 Ctrl+Shift+H → m_actHexViewMode.checked 仍= false（不进入）；statusBar 有提示「仅 L2 大文件」；无崩溃 | checked=false；status 有提示；noCrash | P1 | - | openL1 small + Ctrl+Shift+H + checked(false) + statusBarContains("仅 L2") |
+| VW01 | 外观（视图 → 外观 → 跟随系统/浅色/深色互斥） | L2 open small → 选择深色 → viewport 背景色 == dark palette；再切回浅色 → 正常；不崩；字节流不变；saveNeeded=false | 背景色；菜单可读；bytes 不变；saveNeeded=false | P1 | - | triggerAction(view.appearance.dark/light) + viewportBackground == expectedColor + saveNeeded(false) |
+| VW02-A | 自动换行（菜单开关） | L2 open small（默认 wordWrapOff）→ horizontalScrollBar.range 非零 → 点击自动换行 → ① action.checked=true；② horizontalScrollBar.enabled=false；③ wordWrap()=true；④ 再点击反向复原 | 4 断言 | **P0** | Ctrl+W 专用于关闭标签，自动换行无默认快捷键 | triggerAction(wordWrapAct) + checkedState + horizontalScrollBar().enabled/Range + wordWrap() bool |
+| VW02-B | Ctrl+W 关闭当前标签 | 两个标签激活其中一个 → Ctrl+W | 仅关闭当前标签；不改变自动换行偏好 | **P0** | - | send Ctrl+W + tab count/current identity |
+| VW03 | 长行标尺竖线（视图 → 长行标尺 → 显示标尺） | L2 open small → setEdgeColumn(80) → toggle edge visible ON → viewport paint 里 X==80×charWidth 的竖线出现；切 OFF 消失；字节流不变；saveNeeded=false | paint 有/无竖线；bytes 不变；saveNeeded=false | P1 | ⚠️ FAIL 证据⑦：VirtualFileView 仍需独立视觉验收 | triggerAction(edgeVisibleAct) + paintSpy hasVerticalLineAt(col) or not + saveNeeded(false) |
+| VW04-A | 长行标尺列数 = 72/80/100/120/150/200（6 项循环） | 对 6 个 col，依次点击视图 → 长行标尺 → "100 列" 动作 → m_edgeColGroup checked action 的 data==100；edgeColumn property ==100；随后竖线（VW03 打开时）位置正确落在 col × charWidth | checked correct；edgeColumn correct；竖线 X correct | P1 | ⚠️ 证据⑦：同 VW03，L2 VirtualFileView 没读 edgeColumn | 循环 6 个 col + triggerEdgeColMenu(col) + edgeColumn property check + lineAtX == colX |
+| VW05-A | 呈现方式 Text/Hex + Ctrl+Shift+H（路径 A MainWindow 快捷键） | L2 open small → snapshot → Ctrl+Shift+H → ① viewModeL2==Hex；② 视图出现 hex dump；③ 字节流不变；④ 再 Ctrl+Shift+H → 回到 Text；⑤ saveNeeded 全程 false | 5 断言 | **P0** | Text/Hex 菜单互斥，快捷键保持双向切换 | MainWindow实例 Ctrl+Shift+H + viewModeL2() + paint 内容 + saveNeeded(false) + fullDiff(snapshot) |
+| VW05-B | 呈现方式（菜单明确选择 Text/Hex） | 依次 trigger `view.presentation.hex/text` | 与 VW05-A 一致且菜单勾选同步 | **P0** | - | triggerAction(hex/text) |
+| VW06 | 非 L2 Tab 的 Text/Hex 项禁用，按 Ctrl+Shift+H 不进入 Hex；无崩溃 | 两项 disabled；viewMode unchanged；noCrash | P1 | - | openL1 small + Ctrl+Shift+H + viewMode unchanged |
 | VW07-A | 放大 Ctrl++（路径 A MainWindow 快捷键 Ctrl+'+'） | L2 open small → zoom level before=Z0 → **MainWindow Ctrl++ keySeq 3 次** → 每次 viewport.font.pointSize 递增（或 fontMetrics height 递增）；字节流不变；saveNeeded=false | height 递增×3；bytes 不变；saveNeeded=false | P1 | ⚠️ **FAIL 证据⑥**：[MainWindow zoomIn](file:///F:/projects/credentials/notepad-safe/MainWindow.cpp#L774-L777) 直接调 `t->editor()->zoomIn()`（Scintilla），L2 VirtualFileView 的字体没变 → 路径 A 必 FAIL；另外 EditorTab 没有 zoomIn() 接口，需要补上 L2 分发 | MainWindow实例 Ctrl++ × 3 + fontMetricsHeightBefore/After（递增） + bytes 不变 + saveNeeded(false) |
 | VW07-B | 缩小 Ctrl+-（路径 A MainWindow 快捷键） | L2 open small → Ctrl+- × 3 → fontMetrics height 递减×3；bytes 不变；saveNeeded=false | 递减×3；其余不变 | P1 | ⚠️ FAIL 证据⑥（MainWindow zoomOut 同样 editor()） | same（递减） |
 | VW07-C | 重置缩放 Ctrl+0（路径 A MainWindow 快捷键） | L2 open small → Ctrl++ × 5（字体变大）→ Ctrl+0 → fontMetrics height === 初始值（精确回到 100%）；bytes 不变；saveNeeded=false | height exactly original | P1 | ⚠️ FAIL 证据⑥（resetZoom 同样 editor()） | same（original） |
 
-### 6.1 16 进制编辑专项（Hex · 10 条，证据⑭：补你说「没看到测试用例」的 Hex 功能）
-> 功能入口：`视图 → 16 进制编辑模式`（Ctrl+Shift+H）。代码已实现 [MainWindow::toggleHexViewMode](file:///F:/projects/credentials/notepad-safe/MainWindow.cpp#L835-L847)，仅 L2 生效。原 TC VW05-A/B/C + VW06 仅覆盖模式切换与 L1 拒绝，完全没覆盖"真正编辑字节"的功能。本节测"16 进制编辑"（不是 Hex 查看）的全链路。
+### 6.1 十六进制编辑专项（Hex · 10 条）
+> 功能入口：`视图 → 呈现方式 → 文本/十六进制`，Ctrl+Shift+H 双向切换。仅具备双呈现能力的 L2 Provider 启用。原 TC VW05-A/B/C + VW06 只覆盖模式切换与 L1 拒绝，本节覆盖真正的字节编辑全链路。
 
 | TC ID | 标题 | 步骤 | 预期 | 优先级 | 溯源（证据⑭） | SmokeBase |
 |---|---|---|---|---|---|---|
@@ -406,17 +406,19 @@
 | 上一书签 | Shift+F2 | BM03 (已知 FAIL!) |
 | 清除所有书签 | - | BM04 (已知 FAIL!) |
 
-### 视图菜单（16 条目 = 8 toggle/action + 1 子菜单 = 6 edgeCols + 分隔符）
-| 原文 | 快捷键 | TC ID |
+### 视图菜单（分组结构）
+| 入口 | 快捷键 | TC ID |
 |---|---|---|
-| 深色模式 | - | VW01 |
-| 自动换行 | Ctrl+W | VW02-A / VW02-B + (关联 W001-W006, C003-C007) |
-| 长行标尺(竖线) | - | VW03 |
-| 长行标尺列数（72/80/100/120/150/200，6 条目） | - | VW04-A×6 |
-| 16 进制编辑模式 | Ctrl+Shift+H | VW05-A / VW05-B / VW06 |
-| 放大 | Ctrl++ / Ctrl+= | VW07-A (已知 FAIL：MainWindow 只调 Scintilla editor()) |
-| 缩小 | Ctrl+- | VW07-B (已知 FAIL) |
-| 重置缩放 | Ctrl+0 | VW07-C (已知 FAIL) |
+| 外观 > 跟随系统/浅色/深色 | - | VW01 |
+| 自动换行 | - | VW02-A；Ctrl+W 关闭标签见 VW02-B |
+| 长行标尺 > 显示标尺 | - | VW03 |
+| 长行标尺 > 72/80/100/120/150/200 | - | VW04-A×6 |
+| 呈现方式 > 文本/十六进制 | Ctrl+Shift+H 切换 | VW05-A / VW05-B / VW06 |
+| 缩放 > 放大 | Ctrl++ / Ctrl+= | VW07-A |
+| 缩放 > 缩小 | Ctrl+- | VW07-B |
+| 缩放 > 重置缩放 | Ctrl+0 | VW07-C |
+| 面板 > 搜索结果/后台任务 | - | GUI shell 定向流程 |
+| 主工具栏/状态栏 | - | GUI shell 定向流程 |
 
 ### 编码菜单（11 条目）
 | 原文 | 快捷键 | TC ID |
@@ -464,7 +466,7 @@
 | TC ID | 状态 | 说明 |
 |---|---|---|
 | SR02-COMFORT | ✅ 代码已修（待 smoke 实锤） | replaceAct shortcut == Ctrl+R 精确；text 含 &R；访问键 Alt+S+R 可打开 |
-| D001 | ✅ 代码已修（解决了「同一 tab 内部 L1 切 L2 currentChanged 不触发 → enabled 不更新」的根因：EditorTab::l2ModeStatusChanged 信号 + MainWindow::syncL2SensitiveActions 统一同步） | L2 打开 → sortAscAct / sortDescAct enabled=false |
+| D001 | ✅ 代码已修（解决了「同一 tab 内部 L1 切 L2 currentChanged 不触发 → enabled 不更新」的根因：EditorTab::l2ModeStatusChanged 信号 + MainWindow::syncCommandStates 统一同步） | L2 打开 → sortAscAct / sortDescAct enabled=false |
 | D002 | ✅ 代码已修 | 切 tab L1→L2→L1 → sort 动作 enabled 同步 true→false→true |
 | D003 | ✅ 代码已修 | L2 打开 → 编码「转为...」5 项 enabled=false；显示组仍 enabled=true |
 | D004 | ✅ 代码已修 | 切 tab L1→L2→L1 → 编码转为组 enabled 同步；显示组恒 true |
@@ -479,10 +481,9 @@
 - **根因修复（你反馈「构建测试了仍然可点击」）：EditorTab 同一个 tab 内部 L1↔L2 切 currentChanged 不发射 → 新增信号 + 显式同步**：
   - [EditorTab.h#L204-L207](file:///F:/projects/credentials/notepad-safe/EditorTab.h#L204-L207) 信号声明 `void l2ModeStatusChanged()`（无参数，避免 bool 与实际模式不一致 bug）
   - [EditorTab.cpp#L222-L223](file:///F:/projects/credentials/notepad-safe/EditorTab.cpp#L222-L223) / [L1039-L1041](file:///F:/projects/credentials/notepad-safe/EditorTab.cpp#L1039-L1041) / [L1262-L1264](file:///F:/projects/credentials/notepad-safe/EditorTab.cpp#L1262-L1264)：所有 `m_l2Mode = true/false` 赋值处 `emit l2ModeStatusChanged()`
-  - [MainWindow.h#L87-L90](file:///F:/projects/credentials/notepad-safe/MainWindow.h#L87-L90) + [MainWindow.cpp#L1043-L1054](file:///F:/projects/credentials/notepad-safe/MainWindow.cpp#L1043-L1054)：统一同步函数 `syncL2SensitiveActions(EditorTab* tab=nullptr)` 入口单一，无冗余
-  - [MainWindow.cpp#L552-L557](file:///F:/projects/credentials/notepad-safe/MainWindow.cpp#L552-L557)：addNewTab 内对每个新 tab 连接 `l2ModeStatusChanged` → syncL2SensitiveActions（同一 tab 内部模式切换立即响应）
-  - [MainWindow.cpp#L559-L562](file:///F:/projects/credentials/notepad-safe/MainWindow.cpp#L559-L562)：新建 tab 后立即 syncL2SensitiveActions(tab)（双重保险，避免早期空状态无信号）
-  - [MainWindow.cpp#L1056-L1066](file:///F:/projects/credentials/notepad-safe/MainWindow.cpp#L1056-L1066)：onTabChanged 里也统一调 syncL2SensitiveActions（切 tab 场景 + index<0 无 tab 全禁用）
+  - `MainWindow::syncCommandStates(EditorTab*)`：统一处理工作区、文档能力与 L2 限制，tab 为 null 时正确禁用文档命令。
+  - `addNewTab` 内对每个新 tab 连接 `l2ModeStatusChanged` → `syncCommandStates`（同一 tab 内部模式切换立即响应）。
+  - 新建 tab 后立即 `syncCommandStates(tab)`，`onTabChanged` 中也重算，覆盖创建、切换及无 tab 场景。
 
 **⚠️ 铁律（用户强制）**：D001~D004/D007 的唯一检验对象是「菜单项的 `.isEnabled()` 状态」；**严禁在 sortLinesAsc/sortLinesDesc/convertEncodingFromAction 三个函数体内加任何 L2 特判**，已回滚到最小实现。
 

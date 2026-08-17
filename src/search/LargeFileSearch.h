@@ -4,10 +4,10 @@
 #include <QVector>
 #include <QByteArray>
 #include <QString>
-#include <QRegularExpression>
 #include <QPoint>
 #include <functional>
 #include <atomic>
+#include <limits>
 
 #include "DynamicThresholds.h"
 #include "AsyncTask.h"
@@ -27,21 +27,23 @@ struct LargeFileSearchMatch {
     qint32   length;
     qint32   line;
     qint32   col;
+    qint64   contextByteOffset = -1; // lineContext[0] 的全局字节偏移；-1=旧记录按 col 回退
     QByteArray lineContext;
 };
+Q_DECLARE_METATYPE(LargeFileSearchMatch)
 
 // ============================================================================
 //  MOC 友好信号：跨 DLL/静态库使用 QList<T> 需要 T 被 moc 认识（见 Qt6 新 moc）。
-//  但 QList<LargeFileSearchMatch> 不是 Qt 内建类型，也不需要 Q_DECLARE_METATYPE，
-//  我们统一用 QVector（已经被内部 API 接受），避免 moc 的模板参数推导失败。
-//  对外 partialBatch 的 QVector 也可以通过 Qt::QueuedConnection 传递（QVector 自动注册）。
+//  对外统一用 QVector，并显式注册元素类型，保证 worker → UI 的 queued
+//  partialBatch 在静态 Qt 与不同编译单元之间都可可靠传递。
 // ============================================================================
 
 // ============================================================================
 //  LargeFileSearch — 大文件全量搜索系统
 //
-//  分块：默认 16MB，4KB overlap（避免跨块匹配漏掉）
-//  线程池：QThreadPool + QtConcurrent（按 DynamicThresholds::SEARCH_THREADS）
+//  字面值：16 MiB 顺序 KMP，状态跨块延续，不使用 overlap
+//  正则：PCRE2 10.47 8-bit 在完整 mmap subject 上以 offset window 推进；
+//        patch 内容先流式形成临时 mmap 快照，因此跨块/跨行不会漏报
 //  批次：每 1000 条匹配 → 发一个 partialBatch 信号（UI 可增量显示）
 //  溢出：当内存结果 > MAX_MATCHES_MEM → 追加写入 matchesOverrun.bin
 //  取消：通过 *cancel 原子标志
@@ -56,12 +58,17 @@ public:
     ~LargeFileSearch() override;
 
     struct Options {
-        QRegularExpression regex;   // 非空：使用正则模式；空：字面值大小写敏感精确匹配
+        bool regexMode     = false;
+        bool hexBytesMode  = false; // "DE AD BE EF" -> exact raw-byte KMP
+        bool byteContextMode = false; // 16-byte ASCII preview context for Hex targets
         bool caseSensitive = true;
-        bool wholeWord     = false; // 字面值模式下生效
+        bool wholeWord     = false; // Unicode letter/number/underscore boundary
         bool forward       = true;  // 不影响 findAll（总是从头到尾），影响 findNext/findPrev
         bool useOverrunFile = true; // 超 MAX_MATCHES_MEM 是否溢出到磁盘
     };
+
+    static bool parseHexBytePattern(const QString &pattern, QByteArray *bytes,
+                                    QString *error = nullptr);
 
     // 设置数据源：mmap + LineIndex + PatchList（全部由 VirtualFileView 提供）
     void setSource(const uchar* mmapBase, qint64 mmapSize,
@@ -92,6 +99,10 @@ public:
     // 访问溢出文件路径（为空 = 无溢出）；文件格式见实现顶部注释
     const QString& overrunFilePath() const { return overrunFile_; }
     qint64 overrunCount() const { return overrunCount_; }
+    const QVector<QPair<qint64, qint64>>& overrunCheckpoints() const {
+        return overrunCheckpoints_;
+    }
+    qint64 overrunGroupedCount() const { return overrunGroupedCount_; }
 
     // findNext/findPrev：从 fromByte 开始，在当前匹配集合里找下/上一条；未找到返回 -1
     // 注意：未执行 findAll 时返回 -1
@@ -124,6 +135,9 @@ private:
     const uchar*   mmapBase_ = nullptr;
     qint64         mmapSize_ = 0;
     const LineIndex*  lineIndex_ = nullptr;
+    // Frozen when the source snapshot is attached. If false, the worker never
+    // reads LineIndex while its background builder may swap data on the UI thread.
+    bool          lineIndexCompleteAtSnapshot_ = false;
     const PatchList*  patchList_ = nullptr;
 
     QVector<LargeFileSearchMatch> memMatches_;
@@ -131,6 +145,13 @@ private:
     QString              overrunFile_;
     qint64               overrunCount_ = 0;
     QFile*               overrunFp_    = nullptr;
+    bool                 storageFailed_ = false;
+    QString              scanError_;
+    QVector<QPair<qint64, qint64>> overrunCheckpoints_; // grouped row -> file offset
+    QVector<qint64>        overrunCheckpointBytes_;
+    qint64               overrunGroupedCount_ = 0;
+    qint32               overrunLastLine_ = std::numeric_limits<qint32>::min();
+    qint64               overrunLastContext_ = std::numeric_limits<qint64>::min();
 
     std::atomic<bool>    cancel_{false};
     qint64               lastTaskId_ = 0;  // AsyncTaskManager 派发后的 taskId（0 = 非 Manager 管理）
@@ -140,19 +161,18 @@ private:
     void appendMatches(const QVector<LargeFileSearchMatch>& batch);  // 内存 + 溢出文件分流
     void closeOverrunFile();
 
-    // 在 [rangeStart, rangeEnd) 字节区间做一次扫描；pattern/literal 依 Options 决定
-    // 返回本块内的匹配集合
-    QVector<LargeFileSearchMatch> scanChunk(qint64 chunkStart, qint64 chunkEnd,
-                                   const Options& opts,
-                                   const QRegularExpression* reOrNull,
-                                   const QByteArray& literalBytesOrEmpty,
-                                   qint64 overlapBack /*前一块 overlap 的额外尾部字节数，用于去重*/) const;
+    bool scanAllBounded(qint64 virtualSize, const QString &pattern,
+                        const Options &opts,
+                        const std::function<bool()> &isCancelled,
+                        const std::function<void(qint64)> &reportProgress,
+                        const std::function<bool(const QVector<LargeFileSearchMatch>&)> &reportBatch);
 
     // 工具：虚拟字节偏移 [start, end) 还原成文本（考虑 patch）
     QByteArray readVirtualBytes(qint64 start, qint64 end) const;
 
     // 工具：给定虚拟偏移 → 填充 line/col + lineContext（512 字节以内行）
     void fillLineContext(LargeFileSearchMatch& m) const;
+    void fillByteContext(LargeFileSearchMatch& m) const;
 
     // 字面值模式匹配（KMP 一次扫描，O(n+m) 最坏）
     static QVector<QPair<qint64, int>> kmpMatches(const uchar* text, qint64 n,

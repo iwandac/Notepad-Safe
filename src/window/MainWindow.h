@@ -6,20 +6,31 @@
 #include <QTimer>
 #include "TextEncoding.h"
 
+#include <memory>
+
 class QTabWidget;
+class QShowEvent;
+class QStackedWidget;
 class QLabel;
 class QMenu;
 class QAction;
+class QUuid;
+class QPoint;
 class EditorTab;
 class FindReplaceDialog;
 class SearchResultsDock;
 class SessionManager;
 class VaultDock;
+class StatusBarTaskWidget;
+class SecuritySessionService;
+class SecureDocumentService;
+struct SecureDocumentSnapshot;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
     explicit MainWindow(QWidget *parent = nullptr);
+    ~MainWindow() override;
 
     // 从命令行/拖放等外部传入打开文件（支持多个）
     Q_INVOKABLE void openFilesFromExternal(const QStringList &paths);
@@ -29,13 +40,19 @@ protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
     bool eventFilter(QObject *watched, QEvent *event) override;
+    void showEvent(QShowEvent *event) override;
+    bool nativeEvent(const QByteArray &eventType, void *message,
+                     qintptr *result) override;
 
 private slots:
     // 文件
     void newFile();
     void openFile();
+    void reloadFile();
     bool saveFile();
     bool saveAsFile();
+    void closeCurrentTab();
+    void closeAllTabs();
     void openRecentFile();
     void clearRecentFiles();
 
@@ -63,7 +80,7 @@ private slots:
     void clearBookmarks();
 
     // 视图
-    void toggleDarkMode();
+    void setAppearanceModeFromAction(QAction *action);
     void zoomIn();
     void zoomOut();
     void resetZoom();
@@ -80,26 +97,35 @@ private slots:
     // 标签
     void onTabChanged(int index);
     void onTabCloseRequested(int index);
+    void showTabContextMenu(const QPoint &position);
     void onTabModifiedChanged(bool modified);
     void onTabCursorPositionChanged(int line, int index);
     void onTabTitleChanged(const QString &title);
     void onTabEncodingChanged(TextEncoding encoding);
 
-    // ===== 统一同步：不适配 L2 的菜单项 enabled（行排序 + 编码"转为..."组 5 项）=====
-    // 用户要求：直接 UI 设 disable（setEnabled=false 变灰点不动 → 用户体验最清楚），不要函数内 early return 冗余
-    // 在 onTabChanged 以及所有 tab 的 l2ModeStatusChanged 信号被触发时调用；tab=nullptr 表示无 tab（动作全 disable）
-    void syncL2SensitiveActions(EditorTab *tab = nullptr);
+    // 统一计算文档、账户、安全中心三类工作区的命令可用性，并叠加 L2 能力限制。
+    void syncCommandStates(EditorTab *tab = nullptr);
 
     // 搜索结果
-    void onJumpTo(int line, int index);
+    void onJumpTo(int line, int index, int length);
     void onJumpToByteOffset(qint64 byteOffset, int length);
+    void onJumpToTab(EditorTab *tab, int line, int index, int length);
+    void onJumpToTabByteOffset(EditorTab *tab, qint64 byteOffset, int length);
+    void openSecureNote(const QUuid &id);
+    void lockSecureDocuments();
+    void maskSecureDocuments();
 
 private:
     QTabWidget *m_tabs = nullptr;
+    QStackedWidget *m_workspaceStack = nullptr;
+    QWidget *m_accountsPage = nullptr;
+    QWidget *m_securityCenterPage = nullptr;
     FindReplaceDialog *m_findDialog = nullptr;
     SearchResultsDock *m_searchDock = nullptr;
     VaultDock *m_vaultDock = nullptr;
     SessionManager *m_session = nullptr;
+    std::unique_ptr<SecuritySessionService> m_securitySession;
+    std::unique_ptr<SecureDocumentService> m_secureDocuments;
 
     // 状态栏
     QLabel *m_statusPos = nullptr;
@@ -107,6 +133,7 @@ private:
     QLabel *m_statusSize = nullptr;
     QLabel *m_statusSyntax = nullptr;
     QLabel *m_statusModified = nullptr;
+    StatusBarTaskWidget *m_taskWidget = nullptr;
 
     // 最近文件菜单
     QMenu *m_recentMenu = nullptr;
@@ -123,13 +150,46 @@ private:
 
     // 视图菜单 action（用于 loadSettings 后同步勾选状态，避免数据与UI不一致）
     QAction *m_actDarkMode = nullptr;
+    QAction *m_actAppearanceSystem = nullptr;
+    QAction *m_actAppearanceLight = nullptr;
     QAction *m_actWordWrap = nullptr;
     QAction *m_actEdgeVisible = nullptr;
+    QAction *m_actTextViewMode = nullptr;
     QAction *m_actHexViewMode = nullptr;
+    QAction *m_searchPanelAction = nullptr;
+    QAction *m_toolbarVisibilityAction = nullptr;
+    QAction *m_statusVisibilityAction = nullptr;
+    QAction *m_actReload = nullptr;
+    QAction *m_actCloseTab = nullptr;
+    QAction *m_actCloseAll = nullptr;
+    QAction *m_saveAction = nullptr;
+    QAction *m_saveAsAction = nullptr;
+    QAction *m_undoAction = nullptr;
+    QAction *m_redoAction = nullptr;
+    QAction *m_cutAction = nullptr;
+    QAction *m_copyAction = nullptr;
+    QAction *m_pasteAction = nullptr;
+    QAction *m_selectAllAction = nullptr;
+    QAction *m_findAction = nullptr;
+    QAction *m_replaceAction = nullptr;
+    QAction *m_accountsAction = nullptr;
+    QAction *m_securityCenterAction = nullptr;
+    QAction *m_tasksAction = nullptr;
+    QLabel *m_securityIdentityStatus = nullptr;
+    QLabel *m_securitySessionStatus = nullptr;
+    QLabel *m_securityRecoveryStatus = nullptr;
     QActionGroup *m_edgeColGroup = nullptr;   // 长行标尺列数组，遍历其 action 同步勾选
+    QVector<QAction *> m_documentOnlyActions;
+    QVector<QAction *> m_textMutationActions;
+    QVector<QAction *> m_languageActions;
+    QVector<QAction *> m_displayEncodingActions;
 
-    // Dark Mode
+    enum class AppearanceMode { System = 0, Light = 1, Dark = 2 };
+    AppearanceMode m_appearanceMode = AppearanceMode::System;
+    QActionGroup *m_appearanceGroup = nullptr;
+    // Resolved palette state. System mode updates this when Windows changes.
     bool m_darkMode = false;
+    bool m_highContrastMode = false;
 
     // 长行标尺
     bool m_edgeVisible = true;
@@ -137,6 +197,7 @@ private:
 
     // 自动换行
     bool m_wordWrap = false;
+    bool m_searchDockWasVisibleBeforeWorkspace = false;
 
     // 查找历史
     QString m_lastFindPattern;
@@ -153,20 +214,47 @@ private:
 
     EditorTab *currentTab() const;
     EditorTab *addNewTab();
+    void showDocumentWorkspace();
+    bool showAccountsWorkspace();
+    bool showSecurityCenterWorkspace();
+    void refreshSecurityCenter();
+    void changeMasterPassword();
+    void exportRecoveryKey();
+    void verifyRecoveryKey();
+    bool ensureSecuritySessionInteractive();
+    bool openPathUnified(const QString &path, EditorTab *reuseTab = nullptr);
+    bool openSecurePath(const QString &path, EditorTab *reuseTab = nullptr);
+    EditorTab *adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
+                                   EditorTab *reuseTab = nullptr);
+    enum class ExternalSaveDisposition { Proceed, HandledSuccess, Cancelled };
+    ExternalSaveDisposition resolveExternalSaveConflict(EditorTab *tab);
+    ExternalSaveDisposition resolveSecureExternalSaveConflict(EditorTab *tab);
+    bool reloadTabFromDisk(EditorTab *tab);
+    bool reloadSecureTabFromDisk(EditorTab *tab);
     // closingApp=true: 关闭整个应用，未命名文件走 autosave 不提示
     // closingApp=false (默认): 关闭单个标签，未命名文件且有内容也要提示是否保存
     bool maybeSaveTab(int index, bool closingApp = false);
+    void closeTabUnchecked(int index);
+    void closeOtherTabs(int keepIndex);
     void updateStatusBar();
+    void showWorkspaceStatus(const QString &workspaceName);
     void updateRecentFiles(const QString &path);
     void rebuildRecentFilesMenu();
     void applyDarkMode(bool dark);
+    void applyAppearanceMode();
     // 将当前 m_darkMode/m_wordWrap/m_edgeVisible/m_edgeColumn 同步到视图菜单的勾选状态
     // 必须在 createMenus 之后、loadSettings 之后调用，避免"设置恢复了但菜单勾选没变"
     void syncGlobalMenuCheckStates();
+    bool isDocumentWorkspaceActive() const;
     void loadSettings();
     void saveSettings();
     void restoreSession();
-    void saveSessionNow();
+    void saveSessionNow(bool forceSnapshots = false);
+    bool saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool showErrors = true);
+    static QString secureTitleFrom(EditorTab *tab);
+    void purgeSensitiveSearchState();
+    void protectForSystemLock();
+    void restoreAfterSystemUnlock();
 
     // ===== 启动阶段异步会话恢复（避免构造阻塞导致窗口不显示）=====
 public slots:
@@ -187,6 +275,12 @@ private:
     void registerDropProxy(QWidget *w);
 
     QTimer m_autosaveTimer;
+    QTimer m_secureAutosaveTimer;
+    QTimer m_securityExpiryTimer;
+    bool m_systemProtectionActive = false;
+    bool m_sessionNotificationsRegistered = false;
+    bool m_restoreAccountsAfterSystemUnlock = false;
+    bool m_destroying = false;
 
     static constexpr int MAX_RECENT = 10;
 };

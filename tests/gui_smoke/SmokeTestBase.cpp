@@ -8,6 +8,7 @@
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
 #include <QtCore/QDebug>
+#include <QtCore/QElapsedTimer>
 #include <QtCore/QSaveFile>
 
 #include "EditorTab.h"
@@ -48,7 +49,7 @@ bool SmokeTestBase::openL2(const QString& filePath, QString* errMsg) {
         return false;
     }
     QString err;
-    const bool ok = tab_->openLargeFileL2(filePath, &err);
+    const bool ok = tab_->openLargeFileL2(filePath, &err, false);
     if (!ok) {
         if (errMsg) *errMsg = err;
         return false;
@@ -58,12 +59,14 @@ bool SmokeTestBase::openL2(const QString& filePath, QString* errMsg) {
         if (errMsg) *errMsg = QStringLiteral("openLargeFileL2 成功但 isL2Mode 返回 false");
         return false;
     }
-    // 等待 LineIndex 后台构建（最多 800ms），避免后续断言因 incomplete → totalLines 估算值过低失败
-    for (int i = 0; i < 10; ++i) {
+    // 测试夹具要等待真实的完成标志。旧逻辑以 totalLines > 100 判断就绪，
+    // 对只有几行的小文件永远不成立，并且会在索引仍 incomplete 时继续执行。
+    QElapsedTimer waitTimer;
+    waitTimer.start();
+    while (tab_->l2View()->lineIndex().isIncomplete()
+           && waitTimer.elapsed() < 3000) {
         QApplication::processEvents(QEventLoop::AllEvents, 50);
         QTest::qWait(40);
-        const qint64 tl = tab_ ? (tab_->l2View() ? tab_->l2View()->lineIndex().totalLines() : 0) : 0;
-        if (tl > 100) break;  // 够多了，直接返回
     }
     return true;
 }
@@ -86,7 +89,7 @@ QString SmokeTestBase::saveAsTempAndReopen(QString* errMsg) {
         return {};
     }
     tab_->shutdownL2BeforeClose();
-    if (!tab_->openLargeFileL2(tmp, &err)) {
+    if (!tab_->openLargeFileL2(tmp, &err, false)) {
         if (errMsg) *errMsg = QStringLiteral("重打开失败: %1").arg(err);
         return {};
     }

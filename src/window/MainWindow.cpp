@@ -8,8 +8,15 @@
 #include "VirtualFileView.h"
 #include "StatusBarTaskWidget.h"
 #include "VaultDock.h"
+#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
+#include "KdbxFormatProbe.h"
+#include "SecureDocumentService.h"
+#include "SecuritySessionService.h"
+#endif
 
 #include <QTabWidget>
+#include <QTabBar>
+#include <QStackedWidget>
 #include <QMenuBar>
 #include <QMenu>
 #include <QAction>
@@ -20,26 +27,73 @@
 #include <QToolBar>
 #include <QFileDialog>
 #include <QMessageBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFormLayout>
+#include <QGroupBox>
+#include <QHBoxLayout>
+#include <QLineEdit>
+#include <QPlainTextEdit>
+#include <QPushButton>
+#include <QVBoxLayout>
 #include <QCloseEvent>
+#include <QShowEvent>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QMimeData>
 #include <QUrl>
 #include <QFileInfo>
+#include <QFile>
+#include <QSaveFile>
 #include <QSettings>
 #include <QFont>
 #include <QPalette>
+#include <QStyleHints>
 #include <QIcon>
 #include <QApplication>
+#include <QCheckBox>
+#include <QComboBox>
 #include <QShortcut>
 #include <QKeySequence>
 #include <QDateTime>
 #include <QElapsedTimer>
 #include <QDir>
+#include <QUuid>
+#include <QPointer>
+#include <QClipboard>
+#include <QCryptographicHash>
+#include <QDesktopServices>
+#include <QProcess>
 
 #include <memory>
+#include <utility>
+
+#ifndef NOTEPADSAFE_VERSION
+#define NOTEPADSAFE_VERSION "0.0.0-dev"
+#endif
+
+#ifdef Q_OS_WIN
+#include <Windows.h>
+#include <WtsApi32.h>
+#endif
 
 namespace {
+
+bool systemHighContrastEnabled()
+{
+    // Deterministic GUI coverage without changing the developer machine's OS
+    // accessibility settings. This is intentionally process-local.
+    if (qEnvironmentVariableIntValue("NOTEPADSAFE_FORCE_HIGH_CONTRAST") == 1)
+        return true;
+#ifdef Q_OS_WIN
+    HIGHCONTRASTW state{};
+    state.cbSize = sizeof(state);
+    return ::SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(state), &state, 0)
+           && (state.dwFlags & HCF_HIGHCONTRASTON) != 0;
+#else
+    return false;
+#endif
+}
 
 std::unique_ptr<QSettings> createAppSettings()
 {
@@ -54,6 +108,200 @@ std::unique_ptr<QSettings> createAppSettings()
 
     return std::make_unique<QSettings>(QStringLiteral("NotepadSafe"),
                                        QStringLiteral("NotepadSafe"));
+}
+
+void scrubByteArray(QByteArray &bytes)
+{
+    if (bytes.isEmpty())
+        return;
+#ifdef Q_OS_WIN
+    ::SecureZeroMemory(bytes.data(), static_cast<size_t>(bytes.size()));
+#else
+    volatile char *cursor = bytes.data();
+    for (qsizetype i = 0; i < bytes.size(); ++i)
+        cursor[i] = 0;
+#endif
+    bytes.clear();
+}
+
+QString takeSensitiveLineEdit(QLineEdit *edit)
+{
+    if (!edit)
+        return {};
+    QString sensitive = edit->text();
+    if (!sensitive.isEmpty()) {
+        // Replace the widget's reference first. The returned QString then owns
+        // the old buffer and its caller can overwrite it after use.
+        edit->setText(QString(sensitive.size(), QChar(0)));
+        edit->clear();
+    }
+    return sensitive;
+}
+
+void clearSensitiveLineEdit(QLineEdit *edit)
+{
+    QString sensitive = takeSensitiveLineEdit(edit);
+    if (!sensitive.isEmpty())
+        sensitive.fill(QChar(0));
+    sensitive.clear();
+}
+
+#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
+class FileCredentialDialog final : public QDialog {
+public:
+    enum class Kind { Passphrase, RecoveryKey };
+
+    FileCredentialDialog(const QString &title, const QString &message,
+                         bool allowRecovery, QWidget *parent)
+        : QDialog(parent)
+    {
+        setObjectName(QStringLiteral("fileCredentialDialog"));
+        setWindowTitle(title);
+        setMinimumWidth(500);
+        auto *layout = new QVBoxLayout(this);
+        auto *description = new QLabel(message, this);
+        description->setWordWrap(true);
+        layout->addWidget(description);
+
+        auto *form = new QFormLayout();
+        kind_ = new QComboBox(this);
+        kind_->setObjectName(QStringLiteral("fileCredentialKind"));
+        kind_->addItem(QStringLiteral("文件密码"), static_cast<int>(Kind::Passphrase));
+        if (allowRecovery)
+            kind_->addItem(QStringLiteral("恢复密钥"), static_cast<int>(Kind::RecoveryKey));
+        form->addRow(QStringLiteral("解锁方式"), kind_);
+
+        fields_ = new QStackedWidget(this);
+        passphrase_ = new QLineEdit(fields_);
+        passphrase_->setObjectName(QStringLiteral("fileCredentialPassphrase"));
+        passphrase_->setEchoMode(QLineEdit::Password);
+        passphrase_->setClearButtonEnabled(true);
+        fields_->addWidget(passphrase_);
+        recoveryKey_ = new QLineEdit(fields_);
+        recoveryKey_->setObjectName(QStringLiteral("fileCredentialRecoveryKey"));
+        recoveryKey_->setEchoMode(QLineEdit::Password);
+        recoveryKey_->setClearButtonEnabled(true);
+        recoveryKey_->setPlaceholderText(QStringLiteral("NSR1-…"));
+        fields_->addWidget(recoveryKey_);
+        form->addRow(QStringLiteral("凭据"), fields_);
+        layout->addLayout(form);
+
+        auto *showInput = new QCheckBox(QStringLiteral("显示输入"), this);
+        showInput->setObjectName(QStringLiteral("fileCredentialShowInput"));
+        layout->addWidget(showInput);
+        error_ = new QLabel(this);
+        error_->setObjectName(QStringLiteral("fileCredentialError"));
+        error_->setStyleSheet(QStringLiteral("color:#b00020"));
+        error_->setWordWrap(true);
+        layout->addWidget(error_);
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Open | QDialogButtonBox::Cancel,
+                                             Qt::Horizontal, this);
+        buttons->setObjectName(QStringLiteral("fileCredentialButtons"));
+        buttons->button(QDialogButtonBox::Open)->setText(QStringLiteral("打开"));
+        buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("取消"));
+        layout->addWidget(buttons);
+        connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+        connect(kind_, &QComboBox::currentIndexChanged, this, [this](int) {
+            clearSecrets();
+            error_->clear();
+            fields_->setCurrentIndex(kind() == Kind::RecoveryKey ? 1 : 0);
+            focusCredential();
+        });
+        connect(showInput, &QCheckBox::toggled, this, [this](bool shown) {
+            const auto mode = shown ? QLineEdit::Normal : QLineEdit::Password;
+            passphrase_->setEchoMode(mode);
+            recoveryKey_->setEchoMode(mode);
+        });
+        passphrase_->setFocus();
+    }
+
+    ~FileCredentialDialog() override { clearSecrets(); }
+
+    Kind kind() const
+    {
+        return static_cast<Kind>(kind_->currentData().toInt());
+    }
+
+    SecureBuffer takePassphrase()
+    {
+        QString text = takeSensitiveLineEdit(passphrase_);
+        QByteArray utf8 = text.toUtf8();
+        if (!text.isEmpty())
+            text.fill(QChar(0));
+        text.clear();
+        SecureBuffer result(utf8.constData(), utf8.size());
+        scrubByteArray(utf8);
+        return result;
+    }
+
+    QString takeRecoveryKey()
+    {
+        QString raw = takeSensitiveLineEdit(recoveryKey_);
+        QString result = raw.trimmed();
+        if (!raw.isEmpty())
+            raw.fill(QChar(0));
+        raw.clear();
+        return result;
+    }
+
+    void showError(const QString &message)
+    {
+        error_->setText(message);
+        focusCredential();
+    }
+
+    void clearSecrets()
+    {
+        clearSensitiveLineEdit(passphrase_);
+        clearSensitiveLineEdit(recoveryKey_);
+    }
+
+private:
+    void focusCredential()
+    {
+        if (kind() == Kind::RecoveryKey)
+            recoveryKey_->setFocus();
+        else
+            passphrase_->setFocus();
+    }
+
+    QComboBox *kind_ = nullptr;
+    QStackedWidget *fields_ = nullptr;
+    QLineEdit *passphrase_ = nullptr;
+    QLineEdit *recoveryKey_ = nullptr;
+    QLabel *error_ = nullptr;
+};
+#endif
+
+// A bounded content probe keeps the unified Open action fast. Files with NULs or
+// a high density of non-text control bytes are routed to the existing mmap hex
+// view; everything else continues through the normal text tier policy.
+bool looksLikeBinaryFile(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return false;
+    const QByteArray sample = file.read(64 * 1024);
+    if (sample.isEmpty())
+        return false;
+    if (sample.size() >= 2) {
+        const auto first = static_cast<unsigned char>(sample[0]);
+        const auto second = static_cast<unsigned char>(sample[1]);
+        if ((first == 0xff && second == 0xfe)
+            || (first == 0xfe && second == 0xff)) {
+            return false; // UTF-16 BOM is text even though every other byte may be NUL.
+        }
+    }
+
+    qsizetype controls = 0;
+    for (const unsigned char byte : sample) {
+        if (byte == 0)
+            return true;
+        if (byte < 0x20 && byte != '\n' && byte != '\r' && byte != '\t' && byte != '\f')
+            ++controls;
+    }
+    return controls * 100 > sample.size() * 3;
 }
 
 } // namespace
@@ -76,12 +324,26 @@ static void syncEncodingMenuTo(QMenu *menu, TextEncoding enc)
 
 // S1/S2/S3 自动分流打开文件（DESIGN §5.2 固定产品边界）：
 //   S1 → EditorTab::loadFile (QsciScintilla 完整编辑)
-//   S2/S3 → 先 try openLargeFileL2，失败回退到 loadFile（避免用户无法打开）
-// TODO: S3 的只读交互约束将在 VirtualFileView 分层中强制执行；当前先统一入口决策。
+//   S2/S3 → 只允许 mmap 路径。失败时绝不回退到主线程 readAll；否则一个
+//           2 GiB+ 文件会把“只读分析”退化成界面卡死或进程内存耗尽。
 // 返回是否成功（与 loadFile 返回一致）
 static bool openTabAutoMode(EditorTab *tab, const QString &path)
 {
     if (!tab) return false;
+    // Binary routing belongs to the shared document opener so normal Open,
+    // recent files, drag/drop and session restore cannot disagree.
+    if (looksLikeBinaryFile(path)) {
+        QString error;
+        if (!tab->openLargeFileL2(path, &error, false,
+                                  L2Presentation::Hex,
+                                  L2ContentKind::Binary)) {
+            qWarning("[openTabAutoMode] binary mmap open failed: path='%s', error='%s'",
+                     qUtf8Printable(path), qUtf8Printable(error));
+            return false;
+        }
+        tab->setViewModeL2(ViewMode::Hex);
+        return true;
+    }
     QFileInfo fi(path);
     qint64 size = fi.exists() ? fi.size() : 0;
     const FileTierDecision decision = FileTierPolicy::classify(size);
@@ -89,10 +351,64 @@ static bool openTabAutoMode(EditorTab *tab, const QString &path)
         QString err;
         if (tab->openLargeFileL2(path, &err))
             return true;
-        // L2 失败（mmap 不支持/编码不是 UTF-8 兼容字节？）：回退到 L1 分块加载
-        // 不弹 warning：交给 caller 统一处理失败提示
+        qWarning("[openTabAutoMode] mmap 打开失败，拒绝回退到同步全量加载: path='%s', error='%s'",
+                 qUtf8Printable(path), qUtf8Printable(err));
+        return false;
     }
     return tab->loadFile(path);
+}
+
+static bool openSessionFile(EditorTab *tab, const SessionTab &state)
+{
+    if (!tab || state.filePath.isEmpty())
+        return false;
+    if (state.presentation == QLatin1String("hex")) {
+        QString error;
+        if (!tab->openLargeFileL2(state.filePath, &error, false,
+                                  L2Presentation::Hex,
+                                  L2ContentKind::Binary)) {
+            qWarning("[session] explicit Hex restore failed: path='%s', error='%s'",
+                     qUtf8Printable(state.filePath), qUtf8Printable(error));
+            return false;
+        }
+        return true;
+    }
+    if (state.presentation == QLatin1String("text")
+        && looksLikeBinaryFile(state.filePath)) {
+        QString error;
+        // The user explicitly overrode Binary/Unknown classification with a
+        // text presentation. Preserve that choice across restart without
+        // promoting a potentially huge/arbitrary byte stream into Scintilla.
+        if (!tab->openLargeFileL2(state.filePath, &error, false,
+                                  L2Presentation::Text,
+                                  L2ContentKind::Binary)) {
+            qWarning("[session] explicit Text restore failed: path='%s', error='%s'",
+                     qUtf8Printable(state.filePath), qUtf8Printable(error));
+            return false;
+        }
+        return true;
+    }
+    return openTabAutoMode(tab, state.filePath);
+}
+
+static void restoreSessionPosition(EditorTab *tab, const SessionTab &state)
+{
+    if (!tab)
+        return;
+    if (state.cursorByteOffset >= 0) {
+        const qint64 selectionStart = qMin(state.selectionStartByte,
+                                           state.selectionEndByte);
+        const qint64 selectionEnd = qMax(state.selectionStartByte,
+                                         state.selectionEndByte);
+        if (selectionStart >= 0 && selectionEnd > selectionStart) {
+            tab->gotoByteOffset(selectionStart, int(qMin<qint64>(
+                selectionEnd - selectionStart, INT_MAX)));
+        } else {
+            tab->gotoByteOffset(state.cursorByteOffset);
+        }
+        return;
+    }
+    tab->setCursorPosition(state.cursorLine, state.cursorIndex);
 }
 
 MainWindow::MainWindow(QWidget *parent)
@@ -108,12 +424,18 @@ MainWindow::MainWindow(QWidget *parent)
     m_tabs->setTabsClosable(true);
     m_tabs->setMovable(true);
     m_tabs->setDocumentMode(true);
-    setCentralWidget(m_tabs);
+    m_tabs->tabBar()->setContextMenuPolicy(Qt::CustomContextMenu);
+    m_workspaceStack = new QStackedWidget(this);
+    m_workspaceStack->setObjectName(QStringLiteral("WorkspaceStack"));
+    m_workspaceStack->addWidget(m_tabs);
+    setCentralWidget(m_workspaceStack);
     // 把 m_tabs 也加入 drag 转发（防止 QTabBar 吞事件）
     registerDropProxy(m_tabs);
 
     connect(m_tabs, &QTabWidget::currentChanged, this, &MainWindow::onTabChanged);
     connect(m_tabs, &QTabWidget::tabCloseRequested, this, &MainWindow::onTabCloseRequested);
+    connect(m_tabs->tabBar(), &QWidget::customContextMenuRequested,
+            this, &MainWindow::showTabContextMenu);
 
     // 搜索 Dock
     m_searchDock = new SearchResultsDock(this);
@@ -123,15 +445,166 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_searchDock, &SearchResultsDock::jumpTo, this, &MainWindow::onJumpTo);
     connect(m_searchDock, &SearchResultsDock::jumpToByteOffset,
             this, &MainWindow::onJumpToByteOffset);
+    connect(m_searchDock, &SearchResultsDock::jumpToTab,
+            this, &MainWindow::onJumpToTab);
+    connect(m_searchDock, &SearchResultsDock::jumpToTabByteOffset,
+            this, &MainWindow::onJumpToTabByteOffset);
 
-    // 账号保险箱与加密笔记使用独立 Dock；编辑器只依赖 VaultService
-    // 边界，不接触任何 KeePassXC 类型。
-    m_vaultDock = new VaultDock(this);
-    addDockWidget(Qt::RightDockWidgetArea, m_vaultDock);
+    // 账户管理是一级中央工作区。现有 VaultDock 的业务表单先复用为页面内容，
+    // 移除 Dock 标题和停靠能力，用户不再看到“插件拼在编辑器右侧”的形态。
+    m_accountsPage = new QWidget(m_workspaceStack);
+    m_accountsPage->setObjectName(QStringLiteral("AccountsWorkspace"));
+    auto *accountsLayout = new QVBoxLayout(m_accountsPage);
+    accountsLayout->setContentsMargins(18, 14, 18, 14);
+    auto *accountsHeader = new QHBoxLayout();
+    auto *backToDocuments = new QPushButton(QStringLiteral("← 返回文档"), m_accountsPage);
+    backToDocuments->setObjectName(QStringLiteral("accountsBackToDocuments"));
+    auto *accountsTitle = new QLabel(QStringLiteral("账户"), m_accountsPage);
+    QFont accountsTitleFont = accountsTitle->font();
+    accountsTitleFont.setPointSize(accountsTitleFont.pointSize() + 5);
+    accountsTitleFont.setBold(true);
+    accountsTitle->setFont(accountsTitleFont);
+    accountsHeader->addWidget(backToDocuments);
+    accountsHeader->addSpacing(12);
+    accountsHeader->addWidget(accountsTitle);
+    accountsHeader->addStretch();
+    accountsLayout->addLayout(accountsHeader);
+    m_vaultDock = new VaultDock(m_accountsPage);
+    m_vaultDock->setFeatures(QDockWidget::NoDockWidgetFeatures);
+    auto *emptyDockTitle = new QWidget(m_vaultDock);
+    emptyDockTitle->setFixedHeight(0);
+    m_vaultDock->setTitleBarWidget(emptyDockTitle);
+    accountsLayout->addWidget(m_vaultDock, 1);
+    m_workspaceStack->addWidget(m_accountsPage);
+    connect(backToDocuments, &QPushButton::clicked,
+            this, &MainWindow::showDocumentWorkspace);
+    connect(m_vaultDock, &VaultDock::secureNoteOpenRequested,
+            this, &MainWindow::openSecureNote);
+    connect(m_vaultDock, &VaultDock::lockRequested,
+            this, &MainWindow::lockSecureDocuments);
+    connect(m_vaultDock, &VaultDock::secureStoreLocked,
+            this, &MainWindow::maskSecureDocuments);
+    connect(m_vaultDock, &VaultDock::workspaceCommandStateChanged,
+            this, [this]() { syncCommandStates(currentTab()); });
+    connect(m_vaultDock, &VaultDock::userNotificationRequested,
+            this, [this](const QString &message, int timeoutMs) {
+                statusBar()->showMessage(message, timeoutMs);
+            });
+    connect(m_vaultDock, &VaultDock::externalStoreReloadRequested,
+            this, [this](const QString &path) {
+                if (!m_vaultDock || path.isEmpty())
+                    return;
+                m_vaultDock->discardAndLockForExternalReload();
+                if (!openPathUnified(path)) {
+                    QMessageBox::warning(
+                        this, QStringLiteral("无法重新打开账户文件"),
+                        QStringLiteral("磁盘版本无法使用当前会话或输入的凭据解锁。"));
+                    return;
+                }
+                showAccountsWorkspace();
+                statusBar()->showMessage(QStringLiteral("已重新打开账户文件的磁盘版本"), 3000);
+            });
+
+    m_securityCenterPage = new QWidget(m_workspaceStack);
+    m_securityCenterPage->setObjectName(QStringLiteral("SecurityCenterWorkspace"));
+    auto *securityLayout = new QVBoxLayout(m_securityCenterPage);
+    securityLayout->setContentsMargins(28, 20, 28, 24);
+    securityLayout->setSpacing(16);
+    auto *securityHeader = new QHBoxLayout();
+    auto *securityBack = new QPushButton(QStringLiteral("← 返回文档"), m_securityCenterPage);
+    securityBack->setObjectName(QStringLiteral("securityCenterBackToDocuments"));
+    auto *securityTitle = new QLabel(QStringLiteral("安全中心"), m_securityCenterPage);
+    QFont securityTitleFont = securityTitle->font();
+    securityTitleFont.setPointSize(securityTitleFont.pointSize() + 5);
+    securityTitleFont.setBold(true);
+    securityTitle->setFont(securityTitleFont);
+    securityHeader->addWidget(securityBack);
+    securityHeader->addSpacing(12);
+    securityHeader->addWidget(securityTitle);
+    securityHeader->addStretch();
+    securityLayout->addLayout(securityHeader);
+    auto *securityIntro = new QLabel(
+        QStringLiteral("这里管理本机安全身份、恢复能力和七天设备会话。日常编辑无需在这里执行加解密操作。"),
+        m_securityCenterPage);
+    securityIntro->setWordWrap(true);
+    securityLayout->addWidget(securityIntro);
+
+    auto *deviceGroup = new QGroupBox(QStringLiteral("本设备会话"), m_securityCenterPage);
+    deviceGroup->setObjectName(QStringLiteral("securityCenterDeviceGroup"));
+    auto *deviceLayout = new QHBoxLayout(deviceGroup);
+    m_securitySessionStatus = new QLabel(deviceGroup);
+    m_securitySessionStatus->setObjectName(QStringLiteral("securityCenterSessionStatus"));
+    m_securitySessionStatus->setWordWrap(true);
+    auto *securityLock = new QPushButton(QStringLiteral("立即锁定"), deviceGroup);
+    securityLock->setObjectName(QStringLiteral("securityCenterLockNow"));
+    deviceLayout->addWidget(m_securitySessionStatus, 1);
+    deviceLayout->addWidget(securityLock, 0, Qt::AlignTop);
+    securityLayout->addWidget(deviceGroup);
+
+    auto *identityGroup = new QGroupBox(QStringLiteral("主密码与本地身份"), m_securityCenterPage);
+    identityGroup->setObjectName(QStringLiteral("securityCenterIdentityGroup"));
+    auto *identityLayout = new QVBoxLayout(identityGroup);
+    m_securityIdentityStatus = new QLabel(identityGroup);
+    m_securityIdentityStatus->setObjectName(QStringLiteral("securityCenterIdentityStatus"));
+    m_securityIdentityStatus->setWordWrap(true);
+    identityLayout->addWidget(m_securityIdentityStatus);
+    auto *identityExplanation = new QLabel(
+        QStringLiteral("主密码不存储在设备会话中；会话只保存由 Windows 当前用户保护的派生密钥。"),
+        identityGroup);
+    identityExplanation->setWordWrap(true);
+    identityLayout->addWidget(identityExplanation);
+    auto *identityActions = new QHBoxLayout();
+    identityActions->addStretch();
+    auto *changePasswordButton = new QPushButton(
+        QStringLiteral("修改主密码…"), identityGroup);
+    changePasswordButton->setObjectName(
+        QStringLiteral("securityCenterChangePassword"));
+    identityActions->addWidget(changePasswordButton);
+    identityLayout->addLayout(identityActions);
+    securityLayout->addWidget(identityGroup);
+
+    auto *recoveryGroup = new QGroupBox(QStringLiteral("恢复"), m_securityCenterPage);
+    recoveryGroup->setObjectName(QStringLiteral("securityCenterRecoveryGroup"));
+    auto *recoveryLayout = new QHBoxLayout(recoveryGroup);
+    m_securityRecoveryStatus = new QLabel(
+        QStringLiteral("恢复密钥用于应用数据损坏、设备迁移或忘记主密码时解锁文件。请离线保存。"),
+        recoveryGroup);
+    m_securityRecoveryStatus->setObjectName(QStringLiteral("securityCenterRecoveryStatus"));
+    m_securityRecoveryStatus->setWordWrap(true);
+    auto *recoveryButton = new QPushButton(QStringLiteral("查看或导出恢复密钥"), recoveryGroup);
+    recoveryButton->setObjectName(QStringLiteral("securityCenterRecoveryButton"));
+    auto *verifyRecoveryButton = new QPushButton(
+        QStringLiteral("验证恢复密钥…"), recoveryGroup);
+    verifyRecoveryButton->setObjectName(
+        QStringLiteral("securityCenterVerifyRecovery"));
+    auto *recoveryActions = new QVBoxLayout();
+    recoveryActions->addWidget(recoveryButton);
+    recoveryActions->addWidget(verifyRecoveryButton);
+    recoveryActions->addStretch();
+    recoveryLayout->addWidget(m_securityRecoveryStatus, 1);
+    recoveryLayout->addLayout(recoveryActions);
+    securityLayout->addWidget(recoveryGroup);
+    securityLayout->addStretch();
+    m_workspaceStack->addWidget(m_securityCenterPage);
+    connect(securityBack, &QPushButton::clicked,
+            this, &MainWindow::showDocumentWorkspace);
+    connect(recoveryButton, &QPushButton::clicked,
+            this, &MainWindow::exportRecoveryKey);
+    connect(verifyRecoveryButton, &QPushButton::clicked,
+            this, &MainWindow::verifyRecoveryKey);
+    connect(changePasswordButton, &QPushButton::clicked,
+            this, &MainWindow::changeMasterPassword);
+    connect(securityLock, &QPushButton::clicked, this, [this]() {
+        lockSecureDocuments();
+        refreshSecurityCenter();
+        if (!m_securitySession || !m_securitySession->hasActiveSession())
+            showDocumentWorkspace();
+    });
 
     // 查找/替换对话框
     m_findDialog = new FindReplaceDialog(this);
     m_findDialog->setSearchResultsDock(m_searchDock);
+    m_findDialog->setTabWidget(m_tabs);
     connect(m_findDialog, &FindReplaceDialog::findParametersChanged,
             this, [this](const QString &pattern, bool regex, bool cs, bool wo) {
         m_lastFindPattern = pattern;
@@ -142,15 +615,27 @@ MainWindow::MainWindow(QWidget *parent)
 
     // 会话管理器
     m_session = new SessionManager(this);
+#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
+    m_securitySession = std::make_unique<SecuritySessionService>();
+    m_secureDocuments = std::make_unique<SecureDocumentService>(m_securitySession.get());
+#endif
 
     createActions();
     createMenus();         // 菜单项用默认值创建，action 指针存在 m_act* / m_edgeColGroup
     createToolBar();
     createStatusBar();
+    connect(QGuiApplication::clipboard(), &QClipboard::dataChanged,
+            this, [this]() { syncCommandStates(currentTab()); });
+    syncCommandStates(nullptr);
 
-    loadSettings();        // 从 QSettings 覆盖 m_darkMode/m_wordWrap/m_edge*
+    loadSettings();        // 从 QSettings 覆盖外观/换行/标尺等偏好
     syncGlobalMenuCheckStates(); // 关键：把恢复后的设置同步回菜单勾选状态（解决UI不同步bug）
-    applyDarkMode(m_darkMode);
+    applyAppearanceMode();
+    connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged,
+            this, [this](Qt::ColorScheme) {
+                if (m_appearanceMode == AppearanceMode::System)
+                    applyAppearanceMode();
+            });
 
     // ============================================================
     //  启动阶段会话恢复触发权移交给 main.cpp !!
@@ -183,6 +668,572 @@ MainWindow::MainWindow(QWidget *parent)
             saveSessionNow();
     });
     m_autosaveTimer.start(30000);
+
+    // 加密笔记直接保存回KDBX，绝不进入明文 session/autosave 目录。
+    // 仅在安全身份已经解锁时后台保存；锁定状态下不突然弹出解锁框。
+    m_secureAutosaveTimer.setSingleShot(true);
+    m_secureAutosaveTimer.setInterval(1200);
+    connect(&m_secureAutosaveTimer, &QTimer::timeout, this, [this]() {
+        if (!m_secureDocuments || !m_securitySession
+            || !m_securitySession->hasActiveSession())
+            return;
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
+            if (tab && tab->isSecureDocument() && tab->isModified())
+                saveSecureTab(tab, false, false);
+        }
+    });
+
+    m_securityExpiryTimer.setInterval(60 * 1000);
+    connect(&m_securityExpiryTimer, &QTimer::timeout, this, [this]() {
+        if (!m_securitySession || !m_securitySession->expiresAtUtc().isValid()
+            || QDateTime::currentDateTimeUtc() < m_securitySession->expiresAtUtc()) {
+            return;
+        }
+        lockSecureDocuments();
+    });
+    m_securityExpiryTimer.start();
+}
+
+MainWindow::~MainWindow()
+{
+    m_destroying = true;
+    m_securityExpiryTimer.stop();
+    if (m_vaultDock)
+        disconnect(m_vaultDock, nullptr, this, nullptr);
+#ifdef Q_OS_WIN
+    if (m_sessionNotificationsRegistered)
+        ::WTSUnRegisterSessionNotification(reinterpret_cast<HWND>(winId()));
+#endif
+}
+
+void MainWindow::showEvent(QShowEvent *event)
+{
+    QMainWindow::showEvent(event);
+#ifdef Q_OS_WIN
+    if (!m_sessionNotificationsRegistered) {
+        m_sessionNotificationsRegistered = ::WTSRegisterSessionNotification(
+            reinterpret_cast<HWND>(winId()), NOTIFY_FOR_THIS_SESSION) != FALSE;
+    }
+#endif
+}
+
+bool MainWindow::nativeEvent(const QByteArray &eventType, void *message,
+                             qintptr *result)
+{
+#ifdef Q_OS_WIN
+    Q_UNUSED(eventType)
+    auto *nativeMessage = static_cast<MSG *>(message);
+    if (nativeMessage) {
+        if (nativeMessage->message == WM_WTSSESSION_CHANGE) {
+            if (nativeMessage->wParam == WTS_SESSION_LOCK)
+                protectForSystemLock();
+            else if (nativeMessage->wParam == WTS_SESSION_UNLOCK)
+                restoreAfterSystemUnlock();
+        } else if (nativeMessage->message == WM_POWERBROADCAST) {
+            if (nativeMessage->wParam == PBT_APMSUSPEND)
+                protectForSystemLock();
+            else if (nativeMessage->wParam == PBT_APMRESUMEAUTOMATIC)
+                QTimer::singleShot(0, this, &MainWindow::restoreAfterSystemUnlock);
+        }
+    }
+#else
+    Q_UNUSED(eventType)
+    Q_UNUSED(message)
+#endif
+    return QMainWindow::nativeEvent(eventType, message, result);
+}
+
+void MainWindow::showDocumentWorkspace()
+{
+    QWidget *leavingPage = m_workspaceStack ? m_workspaceStack->currentWidget() : nullptr;
+    const bool leavingAccounts = leavingPage && leavingPage == m_accountsPage;
+    const bool leavingAuxiliaryWorkspace = leavingPage && leavingPage != m_tabs;
+    if (leavingAccounts && m_vaultDock && !m_vaultDock->releaseWorkspaceSecrets())
+        return;
+    if (m_workspaceStack && m_tabs)
+        m_workspaceStack->setCurrentWidget(m_tabs);
+    if (leavingAuxiliaryWorkspace && m_searchDockWasVisibleBeforeWorkspace && m_searchDock)
+        m_searchDock->show();
+    if (auto *tab = currentTab()) {
+        if (m_findDialog)
+            m_findDialog->setActiveTab(tab);
+        tab->setFocusEditor();
+    }
+    syncCommandStates(currentTab());
+    updateStatusBar();
+}
+
+bool MainWindow::isDocumentWorkspaceActive() const
+{
+    return !m_workspaceStack || !m_tabs
+           || m_workspaceStack->currentWidget() == m_tabs;
+}
+
+bool MainWindow::showAccountsWorkspace()
+{
+#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
+    QMessageBox::critical(this, QStringLiteral("账户功能不可用"),
+                          QStringLiteral("当前构建未包含 KDBX 安全后端。"));
+    return false;
+#else
+    if (!m_vaultDock || !ensureSecuritySessionInteractive())
+        return false;
+    if (!m_vaultDock->isSecureStoreOpen()) {
+        const QString path = m_vaultDock->preferredManagedStorePath();
+        SecurityOperationLease lease;
+        VaultError error = m_securitySession->acquireOperationLease(&lease);
+        if (error.isError()) {
+            QMessageBox::critical(this, QStringLiteral("无法使用安全会话"),
+                                  error.userMessage);
+            return false;
+        }
+        if (QFileInfo::exists(path)) {
+            error = m_vaultDock->unlockManagedStoreWithMasterKey(
+                path, lease.masterUnlockKey());
+            if (error.code == VaultErrorCode::InvalidCredentials) {
+                lease.clear();
+                // Historical/foreign account files get the same single fallback
+                // password flow as files opened from the unified Open action.
+                if (!openPathUnified(path) || !m_vaultDock->isSecureStoreOpen())
+                    return false;
+            } else if (error.isError()) {
+                QMessageBox::critical(this, QStringLiteral("无法打开账户"),
+                                      error.userMessage);
+                return false;
+            }
+        } else {
+            const QFileInfo target(path);
+            if (!QDir().mkpath(target.absolutePath())) {
+                QMessageBox::critical(this, QStringLiteral("无法建立账户文件"),
+                                      QStringLiteral("无法创建目录：%1")
+                                          .arg(target.absolutePath()));
+                return false;
+            }
+            error = m_vaultDock->createManagedStoreForIdentity(
+                path, m_securitySession->parameters(),
+                lease.masterUnlockKey(), lease.recoverySecret());
+            if (error.isError()) {
+                QMessageBox::critical(this, QStringLiteral("无法建立账户文件"),
+                                      error.userMessage);
+                return false;
+            }
+        }
+        lease.clear();
+    }
+    if (m_workspaceStack && m_accountsPage) {
+        if (m_workspaceStack->currentWidget() != m_accountsPage) {
+            if (m_workspaceStack->currentWidget() == m_tabs)
+                m_searchDockWasVisibleBeforeWorkspace = m_searchDock && m_searchDock->isVisible();
+            if (m_searchDock)
+                m_searchDock->hide();
+        }
+        m_workspaceStack->setCurrentWidget(m_accountsPage);
+    }
+    syncCommandStates(nullptr);
+    if (m_findDialog)
+        m_findDialog->setActiveTab(nullptr);
+    showWorkspaceStatus(QStringLiteral("账户"));
+    return true;
+#endif
+}
+
+bool MainWindow::showSecurityCenterWorkspace()
+{
+#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
+    QMessageBox::critical(this, QStringLiteral("安全功能不可用"),
+                          QStringLiteral("当前构建未包含 KDBX 安全后端。"));
+    return false;
+#else
+    if (!m_securityCenterPage || !ensureSecuritySessionInteractive())
+        return false;
+    if (m_workspaceStack && m_accountsPage
+        && m_workspaceStack->currentWidget() == m_accountsPage
+        && m_vaultDock && !m_vaultDock->releaseWorkspaceSecrets()) {
+        return false;
+    }
+    if (m_workspaceStack) {
+        if (m_workspaceStack->currentWidget() == m_tabs)
+            m_searchDockWasVisibleBeforeWorkspace = m_searchDock && m_searchDock->isVisible();
+        if (m_searchDock)
+            m_searchDock->hide();
+        m_workspaceStack->setCurrentWidget(m_securityCenterPage);
+    }
+    refreshSecurityCenter();
+    syncCommandStates(nullptr);
+    if (m_findDialog)
+        m_findDialog->setActiveTab(nullptr);
+    showWorkspaceStatus(QStringLiteral("安全中心"));
+    return true;
+#endif
+}
+
+void MainWindow::refreshSecurityCenter()
+{
+#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
+    const bool hasIdentity = m_securitySession && m_securitySession->hasIdentity();
+    const bool active = hasIdentity && m_securitySession->hasActiveSession();
+    if (m_securitySessionStatus) {
+        m_securitySessionStatus->setText(
+            active
+                ? QStringLiteral("已解锁\n本设备会话有效至：%1")
+                      .arg(m_securitySession->expiresAtUtc().toLocalTime()
+                               .toString(QStringLiteral("yyyy-MM-dd HH:mm")))
+                : QStringLiteral("已锁定"));
+    }
+    if (m_securityIdentityStatus) {
+        if (!hasIdentity) {
+            m_securityIdentityStatus->setText(QStringLiteral("尚未建立本地安全身份。"));
+        } else {
+            QString identity = m_securitySession->identityId();
+            if (identity.size() > 16)
+                identity = identity.left(16) + QChar(0x2026);
+            QString identityText = QStringLiteral("本地身份：%1\n密钥版本：v%2")
+                                       .arg(identity)
+                                       .arg(m_securitySession->keyVersion());
+            if (m_securitySession->issuedAtUtc().isValid()) {
+                identityText += QStringLiteral("\n本次会话建立于：%1")
+                                    .arg(m_securitySession->issuedAtUtc().toLocalTime()
+                                             .toString(QStringLiteral("yyyy-MM-dd HH:mm")));
+            }
+            m_securityIdentityStatus->setText(identityText);
+        }
+    }
+    if (m_securityRecoveryStatus) {
+        QString recoveryText = QStringLiteral(
+            "恢复密钥用于应用数据损坏、设备迁移或忘记主密码时解锁文件。请离线保存。");
+        if (hasIdentity && m_securitySession->recoveryVerifiedAtUtc().isValid()) {
+            recoveryText += QStringLiteral("\n上次验证：%1")
+                                .arg(m_securitySession->recoveryVerifiedAtUtc()
+                                         .toLocalTime()
+                                         .toString(QStringLiteral("yyyy-MM-dd HH:mm")));
+        } else if (hasIdentity) {
+            recoveryText += QStringLiteral("\n尚未验证独立保存的恢复密钥。");
+        }
+        m_securityRecoveryStatus->setText(recoveryText);
+    }
+    if (m_securityCenterPage) {
+        if (auto *button = m_securityCenterPage->findChild<QPushButton *>(
+                QStringLiteral("securityCenterRecoveryButton"))) {
+            button->setEnabled(active);
+        }
+        if (auto *button = m_securityCenterPage->findChild<QPushButton *>(
+                QStringLiteral("securityCenterLockNow"))) {
+            button->setEnabled(active);
+        }
+        if (auto *button = m_securityCenterPage->findChild<QPushButton *>(
+                QStringLiteral("securityCenterChangePassword"))) {
+            button->setEnabled(active);
+        }
+        if (auto *button = m_securityCenterPage->findChild<QPushButton *>(
+                QStringLiteral("securityCenterVerifyRecovery"))) {
+            button->setEnabled(active);
+        }
+    }
+#else
+    if (m_securitySessionStatus)
+        m_securitySessionStatus->setText(QStringLiteral("当前构建未包含 KDBX 安全后端。"));
+#endif
+}
+
+void MainWindow::changeMasterPassword()
+{
+#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
+    return;
+#else
+    if (!m_securitySession || !m_securitySession->hasActiveSession())
+        return;
+
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("securityCenterChangePasswordDialog"));
+    dialog.setWindowTitle(QStringLiteral("修改主密码"));
+    dialog.setMinimumWidth(520);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *description = new QLabel(
+        QStringLiteral("新建文件将使用新的密钥版本。已有文件不会被批量改写，"
+                       "并仍可使用原密码或恢复密钥解锁。"),
+        &dialog);
+    description->setWordWrap(true);
+    layout->addWidget(description);
+
+    auto *form = new QFormLayout();
+    auto *currentPassword = new QLineEdit(&dialog);
+    currentPassword->setObjectName(QStringLiteral("changePasswordCurrent"));
+    currentPassword->setEchoMode(QLineEdit::Password);
+    currentPassword->setClearButtonEnabled(true);
+    auto *newPassword = new QLineEdit(&dialog);
+    newPassword->setObjectName(QStringLiteral("changePasswordNew"));
+    newPassword->setEchoMode(QLineEdit::Password);
+    newPassword->setClearButtonEnabled(true);
+    auto *confirmation = new QLineEdit(&dialog);
+    confirmation->setObjectName(QStringLiteral("changePasswordConfirmation"));
+    confirmation->setEchoMode(QLineEdit::Password);
+    form->addRow(QStringLiteral("当前主密码"), currentPassword);
+    form->addRow(QStringLiteral("新主密码"), newPassword);
+    form->addRow(QStringLiteral("确认新主密码"), confirmation);
+    layout->addLayout(form);
+
+    auto *showInput = new QCheckBox(QStringLiteral("显示输入"), &dialog);
+    showInput->setObjectName(QStringLiteral("changePasswordShowInput"));
+    layout->addWidget(showInput);
+    connect(showInput, &QCheckBox::toggled, &dialog,
+            [currentPassword, newPassword, confirmation](bool visible) {
+        const auto mode = visible ? QLineEdit::Normal : QLineEdit::Password;
+        currentPassword->setEchoMode(mode);
+        newPassword->setEchoMode(mode);
+        confirmation->setEchoMode(mode);
+    });
+
+    auto *errorLabel = new QLabel(&dialog);
+    errorLabel->setObjectName(QStringLiteral("changePasswordError"));
+    errorLabel->setStyleSheet(QStringLiteral("color:#b00020"));
+    errorLabel->setWordWrap(true);
+    layout->addWidget(errorLabel);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok
+                                             | QDialogButtonBox::Cancel,
+                                         Qt::Horizontal, &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("修改主密码"));
+    buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("取消"));
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    currentPassword->setFocus();
+
+    while (dialog.exec() == QDialog::Accepted) {
+        QString currentText = currentPassword->text();
+        QString replacementText = newPassword->text();
+        QString confirmationText = confirmation->text();
+        if (replacementText.size() < 12) {
+            errorLabel->setText(QStringLiteral("新主密码至少需要 12 个字符。"));
+            newPassword->selectAll();
+            newPassword->setFocus();
+            currentText.fill(QChar(0));
+            replacementText.fill(QChar(0));
+            confirmationText.fill(QChar(0));
+            continue;
+        }
+        if (replacementText != confirmationText) {
+            errorLabel->setText(QStringLiteral("两次输入的新主密码不一致。"));
+            clearSensitiveLineEdit(confirmation);
+            confirmation->setFocus();
+            currentText.fill(QChar(0));
+            replacementText.fill(QChar(0));
+            confirmationText.fill(QChar(0));
+            continue;
+        }
+        if (currentText == replacementText) {
+            errorLabel->setText(QStringLiteral("新主密码必须与当前主密码不同。"));
+            newPassword->selectAll();
+            newPassword->setFocus();
+            currentText.fill(QChar(0));
+            replacementText.fill(QChar(0));
+            confirmationText.fill(QChar(0));
+            continue;
+        }
+
+        QByteArray currentUtf8 = currentText.toUtf8();
+        QByteArray replacementUtf8 = replacementText.toUtf8();
+        clearSensitiveLineEdit(currentPassword);
+        clearSensitiveLineEdit(newPassword);
+        clearSensitiveLineEdit(confirmation);
+        currentText.fill(QChar(0));
+        replacementText.fill(QChar(0));
+        confirmationText.fill(QChar(0));
+        SecureBuffer currentSecret(currentUtf8.constData(), currentUtf8.size());
+        SecureBuffer replacementSecret(replacementUtf8.constData(),
+                                       replacementUtf8.size());
+        scrubByteArray(currentUtf8);
+        scrubByteArray(replacementUtf8);
+        const VaultError result = m_securitySession->changeMasterPassword(
+            currentSecret, replacementSecret);
+        currentSecret.clear();
+        replacementSecret.clear();
+        if (result.isError()) {
+            errorLabel->setText(result.userMessage);
+            currentPassword->setFocus();
+            continue;
+        }
+
+        refreshSecurityCenter();
+        statusBar()->showMessage(
+            QStringLiteral("主密码已更改；新建文件将使用密钥版本 v%1，已有文件保持原版本。")
+                .arg(m_securitySession->keyVersion()),
+            8000);
+        return;
+    }
+    clearSensitiveLineEdit(currentPassword);
+    clearSensitiveLineEdit(newPassword);
+    clearSensitiveLineEdit(confirmation);
+#endif
+}
+
+void MainWindow::exportRecoveryKey()
+{
+#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
+    return;
+#else
+    if (!m_securitySession || !m_securitySession->hasActiveSession())
+        return;
+    SecurityOperationLease lease;
+    const VaultError leaseError = m_securitySession->acquireOperationLease(&lease);
+    if (leaseError.isError()) {
+        QMessageBox::critical(this, QStringLiteral("无法读取恢复密钥"),
+                              leaseError.userMessage);
+        return;
+    }
+    QString recoveryKey = SecurityIdentity::recoveryKeyText(lease.recoverySecret());
+    lease.clear();
+
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("securityCenterRecoveryDialog"));
+    dialog.setWindowTitle(QStringLiteral("恢复密钥"));
+    dialog.setMinimumWidth(620);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *warning = new QLabel(
+        QStringLiteral("拥有此密钥即可解锁你的加密文件。请仅保存到可信的离线位置，不要通过聊天或邮件发送。"),
+        &dialog);
+    warning->setWordWrap(true);
+    layout->addWidget(warning);
+    auto *keyView = new QPlainTextEdit(recoveryKey, &dialog);
+    keyView->setObjectName(QStringLiteral("securityCenterRecoveryKey"));
+    keyView->setReadOnly(true);
+    keyView->setMaximumHeight(96);
+    layout->addWidget(keyView);
+    auto *buttons = new QDialogButtonBox(&dialog);
+    auto *copyButton = buttons->addButton(QStringLiteral("复制（60 秒后清除）"),
+                                           QDialogButtonBox::ActionRole);
+    copyButton->setObjectName(QStringLiteral("securityCenterRecoveryCopy"));
+    auto *saveButton = buttons->addButton(QStringLiteral("保存到文件…"),
+                                           QDialogButtonBox::ActionRole);
+    saveButton->setObjectName(QStringLiteral("securityCenterRecoverySave"));
+    auto *closeButton = buttons->addButton(QDialogButtonBox::Close);
+    closeButton->setText(QStringLiteral("关闭"));
+    layout->addWidget(buttons);
+    connect(closeButton, &QPushButton::clicked, &dialog, &QDialog::accept);
+    connect(copyButton, &QPushButton::clicked, &dialog, [this, &recoveryKey]() {
+        QByteArray keyBytes = recoveryKey.toUtf8();
+        const QByteArray fingerprint = QCryptographicHash::hash(
+            keyBytes, QCryptographicHash::Sha256);
+        QApplication::clipboard()->setText(recoveryKey);
+        scrubByteArray(keyBytes);
+        QTimer::singleShot(60 * 1000, this, [fingerprint]() {
+            QClipboard *clipboard = QApplication::clipboard();
+            QByteArray current = clipboard->text().toUtf8();
+            const QByteArray currentFingerprint = QCryptographicHash::hash(
+                current, QCryptographicHash::Sha256);
+            scrubByteArray(current);
+            if (currentFingerprint == fingerprint)
+                clipboard->clear();
+        });
+        statusBar()->showMessage(QStringLiteral("恢复密钥已复制，将在 60 秒后从剪贴板清除"),
+                                 5000);
+    });
+    connect(saveButton, &QPushButton::clicked, &dialog, [this, &dialog, &recoveryKey]() {
+        const QString path = QFileDialog::getSaveFileName(
+            &dialog, QStringLiteral("保存恢复密钥"),
+            QStringLiteral("notepad-safe-recovery-key.txt"),
+            QStringLiteral("文本文件 (*.txt);;所有文件 (*.*)"));
+        if (path.isEmpty())
+            return;
+        QSaveFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QMessageBox::critical(&dialog, QStringLiteral("无法保存恢复密钥"),
+                                  file.errorString());
+            return;
+        }
+        QByteArray bytes = recoveryKey.toUtf8();
+        const qint64 written = file.write(bytes);
+        const qsizetype expected = bytes.size();
+        scrubByteArray(bytes);
+        if (written != expected || !file.commit()) {
+            QMessageBox::critical(&dialog, QStringLiteral("无法保存恢复密钥"),
+                                  file.errorString());
+            return;
+        }
+        QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        statusBar()->showMessage(QStringLiteral("恢复密钥已保存"), 3000);
+    });
+    dialog.exec();
+    keyView->clear();
+    if (!recoveryKey.isEmpty())
+        recoveryKey.fill(QChar(0));
+    recoveryKey.clear();
+#endif
+}
+
+void MainWindow::verifyRecoveryKey()
+{
+#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
+    return;
+#else
+    if (!m_securitySession || !m_securitySession->hasActiveSession())
+        return;
+
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("securityCenterVerifyRecoveryDialog"));
+    dialog.setWindowTitle(QStringLiteral("验证恢复密钥"));
+    dialog.setMinimumWidth(620);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *message = new QLabel(
+        QStringLiteral("请从独立保存的位置粘贴完整恢复密钥。验证只确认它属于当前本地身份，"
+                       "不会改写任何加密文件。"),
+        &dialog);
+    message->setWordWrap(true);
+    layout->addWidget(message);
+    auto *input = new QLineEdit(&dialog);
+    input->setObjectName(QStringLiteral("securityCenterRecoveryVerificationInput"));
+    input->setEchoMode(QLineEdit::Password);
+    input->setClearButtonEnabled(true);
+    input->setPlaceholderText(QStringLiteral("NSR1-…"));
+    layout->addWidget(input);
+    auto *showInput = new QCheckBox(QStringLiteral("显示输入"), &dialog);
+    showInput->setObjectName(QStringLiteral("securityCenterRecoveryVerificationShowInput"));
+    layout->addWidget(showInput);
+    auto *errorLabel = new QLabel(&dialog);
+    errorLabel->setObjectName(QStringLiteral("securityCenterRecoveryVerificationError"));
+    errorLabel->setStyleSheet(QStringLiteral("color:#b00020"));
+    errorLabel->setWordWrap(true);
+    layout->addWidget(errorLabel);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok
+                                             | QDialogButtonBox::Cancel,
+                                         Qt::Horizontal, &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("验证"));
+    buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("取消"));
+    layout->addWidget(buttons);
+    connect(showInput, &QCheckBox::toggled, input, [input](bool shown) {
+        input->setEchoMode(shown ? QLineEdit::Normal : QLineEdit::Password);
+    });
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    input->setFocus();
+
+    while (dialog.exec() == QDialog::Accepted) {
+        QString rawRecoveryText = takeSensitiveLineEdit(input);
+        QString recoveryText = rawRecoveryText.trimmed();
+        if (!rawRecoveryText.isEmpty())
+            rawRecoveryText.fill(QChar(0));
+        rawRecoveryText.clear();
+        SecureBuffer candidate;
+        VaultError result = SecurityIdentity::parseRecoveryKey(
+            recoveryText, &candidate);
+        if (!recoveryText.isEmpty())
+            recoveryText.fill(QChar(0));
+        recoveryText.clear();
+        if (!result.isError())
+            result = m_securitySession->verifyRecoverySecret(candidate);
+        candidate.clear();
+        if (result.isError()) {
+            errorLabel->setText(result.userMessage);
+            input->setFocus();
+            continue;
+        }
+
+        refreshSecurityCenter();
+        statusBar()->showMessage(QStringLiteral("恢复密钥验证成功"), 5000);
+        return;
+    }
+    clearSensitiveLineEdit(input);
+#endif
 }
 
 // ============ 创建 Actions / Menus / Toolbar / StatusBar ============
@@ -196,85 +1247,116 @@ void MainWindow::createMenus()
 {
     // 文件菜单
     auto *fileMenu = menuBar()->addMenu(QStringLiteral("文件(&F)"));
+    fileMenu->menuAction()->setObjectName(QStringLiteral("menu.file"));
 
     auto *newAct = fileMenu->addAction(QStringLiteral("新建(&N)"));
+    newAct->setObjectName(QStringLiteral("file.new"));
     newAct->setShortcut(QKeySequence::New);
     connect(newAct, &QAction::triggered, this, &MainWindow::newFile);
 
     auto *openAct = fileMenu->addAction(QStringLiteral("打开(&O)..."));
+    openAct->setObjectName(QStringLiteral("file.open"));
     openAct->setShortcut(QKeySequence::Open);
     connect(openAct, &QAction::triggered, this, &MainWindow::openFile);
 
     m_recentMenu = fileMenu->addMenu(QStringLiteral("最近打开(&R)"));
+    m_recentMenu->setObjectName(QStringLiteral("file.recent"));
+
+    m_actReload = fileMenu->addAction(QStringLiteral("从磁盘重新加载(&L)"));
+    m_actReload->setObjectName(QStringLiteral("file.reload"));
+    m_actReload->setEnabled(false);
+    connect(m_actReload, &QAction::triggered, this, &MainWindow::reloadFile);
 
     fileMenu->addSeparator();
 
-    auto *saveAct = fileMenu->addAction(QStringLiteral("保存(&S)"));
-    saveAct->setShortcut(QKeySequence::Save);
-    connect(saveAct, &QAction::triggered, this, &MainWindow::saveFile);
+    m_saveAction = fileMenu->addAction(QStringLiteral("保存(&S)"));
+    m_saveAction->setObjectName(QStringLiteral("file.save"));
+    m_saveAction->setShortcut(QKeySequence::Save);
+    connect(m_saveAction, &QAction::triggered, this, &MainWindow::saveFile);
 
-    auto *saveAsAct = fileMenu->addAction(QStringLiteral("另存为(&A)..."));
-    saveAsAct->setShortcut(QKeySequence::SaveAs);
-    connect(saveAsAct, &QAction::triggered, this, &MainWindow::saveAsFile);
+    m_saveAsAction = fileMenu->addAction(QStringLiteral("另存为(&A)..."));
+    m_saveAsAction->setObjectName(QStringLiteral("file.saveAs"));
+    m_saveAsAction->setShortcut(QKeySequence::SaveAs);
+    connect(m_saveAsAction, &QAction::triggered, this, &MainWindow::saveAsFile);
+
+    fileMenu->addSeparator();
+
+    m_actCloseTab = fileMenu->addAction(QStringLiteral("关闭标签(&C)"));
+    m_actCloseTab->setObjectName(QStringLiteral("file.close"));
+    m_actCloseTab->setEnabled(false);
+    m_actCloseTab->setShortcut(QKeySequence(QStringLiteral("Ctrl+W")));
+    connect(m_actCloseTab, &QAction::triggered, this, &MainWindow::closeCurrentTab);
+
+    m_actCloseAll = fileMenu->addAction(QStringLiteral("关闭所有标签"));
+    m_actCloseAll->setObjectName(QStringLiteral("file.closeAll"));
+    m_actCloseAll->setEnabled(false);
+    connect(m_actCloseAll, &QAction::triggered, this, &MainWindow::closeAllTabs);
 
     fileMenu->addSeparator();
 
     auto *exitAct = fileMenu->addAction(QStringLiteral("退出(&X)"));
+    exitAct->setObjectName(QStringLiteral("file.exit"));
     exitAct->setShortcut(QKeySequence::Quit);
     connect(exitAct, &QAction::triggered, this, &QMainWindow::close);
 
     rebuildRecentFilesMenu();
 
-    auto *vaultMenu = menuBar()->addMenu(QStringLiteral("保险库(&V)"));
-    auto *newVaultAct = vaultMenu->addAction(QStringLiteral("新建 KDBX 保险库(&N)…"));
-    connect(newVaultAct, &QAction::triggered, m_vaultDock, &VaultDock::newVaultInteractive);
-    auto *openVaultAct = vaultMenu->addAction(QStringLiteral("打开 KDBX 保险库(&O)…"));
-    openVaultAct->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+O")));
-    connect(openVaultAct, &QAction::triggered, m_vaultDock, &VaultDock::openVaultInteractive);
-    auto *lockVaultAct = vaultMenu->addAction(QStringLiteral("锁定保险库(&L)"));
-    lockVaultAct->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+L")));
-    connect(lockVaultAct, &QAction::triggered, m_vaultDock, &VaultDock::lockVault);
-    vaultMenu->addSeparator();
-    auto *showVaultAct = m_vaultDock->toggleViewAction();
-    showVaultAct->setText(QStringLiteral("显示保险库面板(&P)"));
-    vaultMenu->addAction(showVaultAct);
-
     // 编辑菜单
     auto *editMenu = menuBar()->addMenu(QStringLiteral("编辑(&E)"));
+    editMenu->menuAction()->setObjectName(QStringLiteral("menu.edit"));
+    m_documentOnlyActions.append(editMenu->menuAction());
 
     auto *undoAct = editMenu->addAction(QStringLiteral("撤销(&U)"));
+    m_undoAction = undoAct;
+    undoAct->setObjectName(QStringLiteral("edit.undo"));
+    m_documentOnlyActions.append(undoAct);
     undoAct->setShortcut(QKeySequence::Undo);
     connect(undoAct, &QAction::triggered, this, [this]() {
-        if (auto *t = currentTab()) t->editor()->undo();
+        if (auto *t = currentTab()) t->undo();
     });
 
     auto *redoAct = editMenu->addAction(QStringLiteral("重做(&R)"));
+    m_redoAction = redoAct;
+    redoAct->setObjectName(QStringLiteral("edit.redo"));
+    m_documentOnlyActions.append(redoAct);
     redoAct->setShortcut(QKeySequence::Redo);
     connect(redoAct, &QAction::triggered, this, [this]() {
-        if (auto *t = currentTab()) t->editor()->redo();
+        if (auto *t = currentTab()) t->redo();
     });
 
     editMenu->addSeparator();
 
     auto *cutAct = editMenu->addAction(QStringLiteral("剪切(&T)"));
+    m_cutAction = cutAct;
+    cutAct->setObjectName(QStringLiteral("edit.cut"));
+    m_documentOnlyActions.append(cutAct);
     cutAct->setShortcut(QKeySequence::Cut);
     connect(cutAct, &QAction::triggered, this, [this]() {
         if (auto *t = currentTab()) t->cut();
     });
 
     auto *copyAct = editMenu->addAction(QStringLiteral("复制(&C)"));
+    m_copyAction = copyAct;
+    copyAct->setObjectName(QStringLiteral("edit.copy"));
+    m_documentOnlyActions.append(copyAct);
     copyAct->setShortcut(QKeySequence::Copy);
     connect(copyAct, &QAction::triggered, this, [this]() {
         if (auto *t = currentTab()) t->copy();
     });
 
     auto *pasteAct = editMenu->addAction(QStringLiteral("粘贴(&P)"));
+    m_pasteAction = pasteAct;
+    pasteAct->setObjectName(QStringLiteral("edit.paste"));
+    m_documentOnlyActions.append(pasteAct);
     pasteAct->setShortcut(QKeySequence::Paste);
     connect(pasteAct, &QAction::triggered, this, [this]() {
         if (auto *t = currentTab()) t->paste();
     });
 
     auto *selectAllAct = editMenu->addAction(QStringLiteral("全选(&A)"));
+    m_selectAllAction = selectAllAct;
+    selectAllAct->setObjectName(QStringLiteral("edit.selectAll"));
+    m_documentOnlyActions.append(selectAllAct);
     selectAllAct->setShortcut(QKeySequence::SelectAll);
     connect(selectAllAct, &QAction::triggered, this, [this]() {
         if (auto *t = currentTab()) t->selectAll();
@@ -283,18 +1365,30 @@ void MainWindow::createMenus()
     editMenu->addSeparator();
 
     auto *dupLineAct = editMenu->addAction(QStringLiteral("复制当前行(&D)"));
+    dupLineAct->setObjectName(QStringLiteral("edit.line.duplicate"));
+    m_documentOnlyActions.append(dupLineAct);
+    m_textMutationActions.append(dupLineAct);
     dupLineAct->setShortcut(QKeySequence("Ctrl+D"));
     connect(dupLineAct, &QAction::triggered, this, &MainWindow::duplicateLine);
 
     auto *delLineAct = editMenu->addAction(QStringLiteral("删除当前行(&L)"));
+    delLineAct->setObjectName(QStringLiteral("edit.line.delete"));
+    m_documentOnlyActions.append(delLineAct);
+    m_textMutationActions.append(delLineAct);
     delLineAct->setShortcut(QKeySequence("Ctrl+Shift+L"));
     connect(delLineAct, &QAction::triggered, this, &MainWindow::deleteLine);
 
     auto *moveUpAct = editMenu->addAction(QStringLiteral("上移当前行"));
+    moveUpAct->setObjectName(QStringLiteral("edit.line.moveUp"));
+    m_documentOnlyActions.append(moveUpAct);
+    m_textMutationActions.append(moveUpAct);
     moveUpAct->setShortcut(QKeySequence("Alt+Up"));
     connect(moveUpAct, &QAction::triggered, this, &MainWindow::moveLineUp);
 
     auto *moveDownAct = editMenu->addAction(QStringLiteral("下移当前行"));
+    moveDownAct->setObjectName(QStringLiteral("edit.line.moveDown"));
+    m_documentOnlyActions.append(moveDownAct);
+    m_textMutationActions.append(moveDownAct);
     moveDownAct->setShortcut(QKeySequence("Alt+Down"));
     connect(moveDownAct, &QAction::triggered, this, &MainWindow::moveLineDown);
 
@@ -302,37 +1396,51 @@ void MainWindow::createMenus()
 
     auto *sortAscAct = editMenu->addAction(QStringLiteral("行升序排序"));
     m_actSortAsc = sortAscAct;
+    sortAscAct->setObjectName(QStringLiteral("edit.lines.sortAscending"));
+    m_documentOnlyActions.append(sortAscAct);
     connect(sortAscAct, &QAction::triggered, this, &MainWindow::sortLinesAsc);
 
     auto *sortDescAct = editMenu->addAction(QStringLiteral("行降序排序"));
     m_actSortDesc = sortDescAct;
+    sortDescAct->setObjectName(QStringLiteral("edit.lines.sortDescending"));
+    m_documentOnlyActions.append(sortDescAct);
     connect(sortDescAct, &QAction::triggered, this, &MainWindow::sortLinesDesc);
 
     // 搜索菜单
     auto *searchMenu = menuBar()->addMenu(QStringLiteral("搜索(&S)"));
+    searchMenu->menuAction()->setObjectName(QStringLiteral("menu.search"));
 
-    auto *findAct = searchMenu->addAction(QStringLiteral("查找(&F)..."));
-    findAct->setShortcut(QKeySequence::Find);
-    connect(findAct, &QAction::triggered, this, &MainWindow::showFindDialog);
+    m_findAction = searchMenu->addAction(QStringLiteral("查找(&F)..."));
+    m_findAction->setObjectName(QStringLiteral("search.find"));
+    m_findAction->setShortcut(QKeySequence::Find);
+    connect(m_findAction, &QAction::triggered, this, &MainWindow::showFindDialog);
 
-    auto *replaceAct = searchMenu->addAction(QStringLiteral("替换(&R)..."));
+    m_replaceAction = searchMenu->addAction(QStringLiteral("替换(&R)..."));
+    m_replaceAction->setObjectName(QStringLiteral("search.replace"));
+    m_documentOnlyActions.append(m_replaceAction);
     // 用户强制：菜单显示 (&R) → 全局快捷键必须为 Ctrl+R 显示一致（Notepad++ 习惯），禁止 Ctrl+H
     // 见 QA SR02-COMFORT 3 条硬断言：text 含 &R + shortcut==QKeySequence("Ctrl+R") 精确 + Alt+S+R 访问键可打开
-    replaceAct->setShortcut(QKeySequence("Ctrl+R"));
-    connect(replaceAct, &QAction::triggered, this, &MainWindow::showReplaceDialog);
+    m_replaceAction->setShortcut(QKeySequence("Ctrl+R"));
+    connect(m_replaceAction, &QAction::triggered, this, &MainWindow::showReplaceDialog);
 
     searchMenu->addSeparator();
 
     auto *findNextAct = searchMenu->addAction(QStringLiteral("查找下一个"));
+    findNextAct->setObjectName(QStringLiteral("search.next"));
+    m_documentOnlyActions.append(findNextAct);
     findNextAct->setShortcut(QKeySequence("F3"));
     connect(findNextAct, &QAction::triggered, this, &MainWindow::findNext);
 
     auto *findPrevAct = searchMenu->addAction(QStringLiteral("查找上一个"));
+    findPrevAct->setObjectName(QStringLiteral("search.previous"));
+    m_documentOnlyActions.append(findPrevAct);
     findPrevAct->setShortcut(QKeySequence("Shift+F3"));
     connect(findPrevAct, &QAction::triggered, this, &MainWindow::findPrev);
 
-    // 语法菜单
-    auto *syntaxMenu = menuBar()->addMenu(QStringLiteral("语法(&Y)"));
+    // 语言菜单
+    auto *syntaxMenu = menuBar()->addMenu(QStringLiteral("语言(&L)"));
+    syntaxMenu->menuAction()->setObjectName(QStringLiteral("menu.language"));
+    m_languageActions.append(syntaxMenu->menuAction());
     auto *syntaxGroup = new QActionGroup(this);
     QStringList syntaxNames = {
         QStringLiteral("纯文本"), QStringLiteral("C/C++"),
@@ -341,145 +1449,321 @@ void MainWindow::createMenus()
         QStringLiteral("SQL"), QStringLiteral("YAML"),
         QStringLiteral("Markdown"),
     };
+    const QStringList syntaxIds = {
+        QStringLiteral("plain"), QStringLiteral("cpp"),
+        QStringLiteral("python"), QStringLiteral("json"),
+        QStringLiteral("html"), QStringLiteral("xml"),
+        QStringLiteral("sql"), QStringLiteral("yaml"),
+        QStringLiteral("markdown"),
+    };
     for (int i = 0; i < syntaxNames.size(); ++i) {
         auto *act = syntaxMenu->addAction(syntaxNames[i]);
+        act->setObjectName(QStringLiteral("language.%1").arg(syntaxIds[i]));
         act->setCheckable(true);
         act->setData(i);
         syntaxGroup->addAction(act);
+        m_languageActions.append(act);
         if (i == 0) act->setChecked(true);
         connect(act, &QAction::triggered, this, &MainWindow::setSyntaxFromAction);
     }
 
-    // 书签菜单
-    auto *bookmarkMenu = menuBar()->addMenu(QStringLiteral("书签(&B)"));
+    // 书签属于搜索导航，不再占用独立顶级菜单。
+    auto *bookmarkMenu = searchMenu->addMenu(QStringLiteral("书签(&B)"));
+    bookmarkMenu->setObjectName(QStringLiteral("search.bookmarks"));
+    m_documentOnlyActions.append(bookmarkMenu->menuAction());
 
     auto *toggleBmAct = bookmarkMenu->addAction(QStringLiteral("切换书签(&M)"));
+    toggleBmAct->setObjectName(QStringLiteral("bookmark.toggle"));
+    m_documentOnlyActions.append(toggleBmAct);
     toggleBmAct->setShortcut(QKeySequence("Ctrl+F2"));
     connect(toggleBmAct, &QAction::triggered, this, &MainWindow::toggleBookmark);
 
     auto *nextBmAct = bookmarkMenu->addAction(QStringLiteral("下一书签"));
+    nextBmAct->setObjectName(QStringLiteral("bookmark.next"));
+    m_documentOnlyActions.append(nextBmAct);
     nextBmAct->setShortcut(QKeySequence("F2"));
     connect(nextBmAct, &QAction::triggered, this, &MainWindow::nextBookmark);
 
     auto *prevBmAct = bookmarkMenu->addAction(QStringLiteral("上一书签"));
+    prevBmAct->setObjectName(QStringLiteral("bookmark.previous"));
+    m_documentOnlyActions.append(prevBmAct);
     prevBmAct->setShortcut(QKeySequence("Shift+F2"));
     connect(prevBmAct, &QAction::triggered, this, &MainWindow::prevBookmark);
 
     bookmarkMenu->addSeparator();
 
     auto *clearBmAct = bookmarkMenu->addAction(QStringLiteral("清除所有书签"));
+    clearBmAct->setObjectName(QStringLiteral("bookmark.clear"));
+    m_documentOnlyActions.append(clearBmAct);
     connect(clearBmAct, &QAction::triggered, this, &MainWindow::clearBookmarks);
 
     // 视图菜单
     auto *viewMenu = menuBar()->addMenu(QStringLiteral("视图(&V)"));
+    viewMenu->menuAction()->setObjectName(QStringLiteral("menu.view"));
 
-    m_actDarkMode = viewMenu->addAction(QStringLiteral("深色模式"));
+    auto *appearanceMenu = viewMenu->addMenu(QStringLiteral("外观"));
+    appearanceMenu->setObjectName(QStringLiteral("view.appearance"));
+    m_appearanceGroup = new QActionGroup(this);
+    m_appearanceGroup->setExclusive(true);
+    m_actAppearanceSystem = appearanceMenu->addAction(QStringLiteral("跟随系统"));
+    m_actAppearanceSystem->setObjectName(QStringLiteral("view.appearance.system"));
+    m_actAppearanceSystem->setCheckable(true);
+    m_actAppearanceSystem->setData(static_cast<int>(AppearanceMode::System));
+    m_appearanceGroup->addAction(m_actAppearanceSystem);
+    m_actAppearanceLight = appearanceMenu->addAction(QStringLiteral("浅色"));
+    m_actAppearanceLight->setObjectName(QStringLiteral("view.appearance.light"));
+    m_actAppearanceLight->setCheckable(true);
+    m_actAppearanceLight->setData(static_cast<int>(AppearanceMode::Light));
+    m_appearanceGroup->addAction(m_actAppearanceLight);
+    m_actDarkMode = appearanceMenu->addAction(QStringLiteral("深色"));
+    m_actDarkMode->setObjectName(QStringLiteral("view.appearance.dark"));
     m_actDarkMode->setCheckable(true);
-    m_actDarkMode->setChecked(m_darkMode);
-    connect(m_actDarkMode, &QAction::triggered, this, &MainWindow::toggleDarkMode);
+    m_actDarkMode->setData(static_cast<int>(AppearanceMode::Dark));
+    m_appearanceGroup->addAction(m_actDarkMode);
+    connect(m_appearanceGroup, &QActionGroup::triggered,
+            this, &MainWindow::setAppearanceModeFromAction);
 
     viewMenu->addSeparator();
 
     m_actWordWrap = viewMenu->addAction(QStringLiteral("自动换行"));
+    m_actWordWrap->setObjectName(QStringLiteral("view.wordWrap"));
+    m_documentOnlyActions.append(m_actWordWrap);
     m_actWordWrap->setCheckable(true);
     m_actWordWrap->setChecked(m_wordWrap);
-    m_actWordWrap->setShortcut(QKeySequence("Ctrl+W"));
     connect(m_actWordWrap, &QAction::triggered, this, &MainWindow::toggleWordWrap);
 
     viewMenu->addSeparator();
 
-    m_actEdgeVisible = viewMenu->addAction(QStringLiteral("长行标尺(竖线)"));
+    auto *presentationMenu = viewMenu->addMenu(QStringLiteral("呈现方式"));
+    presentationMenu->setObjectName(QStringLiteral("view.presentation"));
+    m_documentOnlyActions.append(presentationMenu->menuAction());
+    auto *presentationGroup = new QActionGroup(this);
+    presentationGroup->setExclusive(true);
+    m_actTextViewMode = presentationMenu->addAction(QStringLiteral("文本"));
+    m_actTextViewMode->setObjectName(QStringLiteral("view.presentation.text"));
+    m_actTextViewMode->setCheckable(true);
+    presentationGroup->addAction(m_actTextViewMode);
+    m_actHexViewMode = presentationMenu->addAction(QStringLiteral("十六进制"));
+    m_actHexViewMode->setObjectName(QStringLiteral("view.presentation.hex"));
+    m_actHexViewMode->setCheckable(true);
+    presentationGroup->addAction(m_actHexViewMode);
+    connect(m_actTextViewMode, &QAction::triggered, this, [this]() {
+        auto *tab = currentTab();
+        if (!tab || !tab->isL2Active())
+            return;
+        tab->setViewModeL2(ViewMode::Text);
+        syncCommandStates(tab);
+        syncGlobalMenuCheckStates();
+        updateStatusBar();
+    });
+    connect(m_actHexViewMode, &QAction::triggered, this, [this]() {
+        auto *tab = currentTab();
+        if (!tab || !tab->isL2Active())
+            return;
+        tab->setViewModeL2(ViewMode::Hex);
+        syncCommandStates(tab);
+        syncGlobalMenuCheckStates();
+        updateStatusBar();
+    });
+    // The menu entries select a concrete presentation; the established
+    // shortcut remains a true two-way toggle.
+    auto *togglePresentation = new QAction(this);
+    togglePresentation->setObjectName(QStringLiteral("view.presentation.toggle"));
+    togglePresentation->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+H")));
+    togglePresentation->setShortcutContext(Qt::WindowShortcut);
+    addAction(togglePresentation);
+    m_documentOnlyActions.append(togglePresentation);
+    connect(togglePresentation, &QAction::triggered,
+            this, &MainWindow::toggleHexViewMode);
+
+    auto *edgeMenu = viewMenu->addMenu(QStringLiteral("长行标尺"));
+    edgeMenu->setObjectName(QStringLiteral("view.edge"));
+    m_documentOnlyActions.append(edgeMenu->menuAction());
+    m_actEdgeVisible = edgeMenu->addAction(QStringLiteral("显示标尺"));
+    m_actEdgeVisible->setObjectName(QStringLiteral("view.edge.visible"));
+    m_documentOnlyActions.append(m_actEdgeVisible);
     m_actEdgeVisible->setCheckable(true);
     m_actEdgeVisible->setChecked(m_edgeVisible);
     connect(m_actEdgeVisible, &QAction::triggered, this, &MainWindow::toggleEdgeLine);
 
-    viewMenu->addSeparator();
-
-    m_actHexViewMode = viewMenu->addAction(QStringLiteral("16 进制编辑模式"));
-    m_actHexViewMode->setCheckable(true);
-    m_actHexViewMode->setChecked(false);
-    m_actHexViewMode->setShortcut(QKeySequence("Ctrl+Shift+H"));
-    connect(m_actHexViewMode, &QAction::triggered, this, &MainWindow::toggleHexViewMode);
-
-    viewMenu->addSeparator();
-
-    auto *edgeColMenu = viewMenu->addMenu(QStringLiteral("长行标尺列数"));
+    edgeMenu->addSeparator();
     m_edgeColGroup = new QActionGroup(this);
     QList<int> edgeCols = {72, 80, 100, 120, 150, 200};
     for (int col : edgeCols) {
-        auto *a = edgeColMenu->addAction(QStringLiteral("%1 列").arg(col));
+        auto *a = edgeMenu->addAction(QStringLiteral("%1 列").arg(col));
+        a->setObjectName(QStringLiteral("view.edge.column.%1").arg(col));
         a->setCheckable(true);
         a->setData(col);
         m_edgeColGroup->addAction(a);
+        m_documentOnlyActions.append(a);
         if (col == m_edgeColumn) a->setChecked(true);
         connect(a, &QAction::triggered, this, &MainWindow::setEdgeColumnFromAction);
     }
 
     viewMenu->addSeparator();
 
-    auto *zoomInAct = viewMenu->addAction(QStringLiteral("放大(&+)"));
+    auto *zoomMenu = viewMenu->addMenu(QStringLiteral("缩放"));
+    zoomMenu->setObjectName(QStringLiteral("view.zoom"));
+    m_documentOnlyActions.append(zoomMenu->menuAction());
+    auto *zoomInAct = zoomMenu->addAction(QStringLiteral("放大(&+)"));
+    zoomInAct->setObjectName(QStringLiteral("view.zoom.in"));
+    m_documentOnlyActions.append(zoomInAct);
     zoomInAct->setShortcut(QKeySequence::ZoomIn);
     connect(zoomInAct, &QAction::triggered, this, &MainWindow::zoomIn);
 
-    auto *zoomOutAct = viewMenu->addAction(QStringLiteral("缩小(&-)"));
+    auto *zoomOutAct = zoomMenu->addAction(QStringLiteral("缩小(&-)"));
+    zoomOutAct->setObjectName(QStringLiteral("view.zoom.out"));
+    m_documentOnlyActions.append(zoomOutAct);
     zoomOutAct->setShortcut(QKeySequence::ZoomOut);
     connect(zoomOutAct, &QAction::triggered, this, &MainWindow::zoomOut);
 
-    auto *resetZoomAct = viewMenu->addAction(QStringLiteral("重置缩放"));
+    auto *resetZoomAct = zoomMenu->addAction(QStringLiteral("重置缩放"));
+    resetZoomAct->setObjectName(QStringLiteral("view.zoom.reset"));
+    m_documentOnlyActions.append(resetZoomAct);
     resetZoomAct->setShortcut(QKeySequence("Ctrl+0"));
     connect(resetZoomAct, &QAction::triggered, this, &MainWindow::resetZoom);
 
+    viewMenu->addSeparator();
+    auto *panelMenu = viewMenu->addMenu(QStringLiteral("面板"));
+    panelMenu->setObjectName(QStringLiteral("view.panels"));
+    m_searchPanelAction = panelMenu->addAction(QStringLiteral("搜索结果"));
+    m_searchPanelAction->setObjectName(QStringLiteral("view.panel.searchResults"));
+    m_searchPanelAction->setCheckable(true);
+    connect(m_searchPanelAction, &QAction::toggled, this, [this](bool visible) {
+        if (m_searchDock)
+            m_searchDock->setVisible(visible);
+    });
+    connect(m_searchDock, &QDockWidget::visibilityChanged,
+            m_searchPanelAction, &QAction::setChecked);
+    m_tasksAction = panelMenu->addAction(QStringLiteral("后台任务(&T)"));
+    m_tasksAction->setObjectName(QStringLiteral("tools.tasks"));
+    connect(m_tasksAction, &QAction::triggered, this, [this]() {
+        if (m_taskWidget)
+            m_taskWidget->showPanel();
+    });
+    viewMenu->addSeparator();
+    m_toolbarVisibilityAction = viewMenu->addAction(QStringLiteral("主工具栏"));
+    m_toolbarVisibilityAction->setObjectName(QStringLiteral("view.toolbar"));
+    m_toolbarVisibilityAction->setCheckable(true);
+    m_toolbarVisibilityAction->setChecked(true);
+    connect(m_toolbarVisibilityAction, &QAction::toggled, this, [this](bool visible) {
+        if (auto *toolbar = findChild<QToolBar *>(QStringLiteral("MainToolBar")))
+            toolbar->setVisible(visible);
+    });
+    m_statusVisibilityAction = viewMenu->addAction(QStringLiteral("状态栏"));
+    m_statusVisibilityAction->setObjectName(QStringLiteral("view.statusBar"));
+    m_statusVisibilityAction->setCheckable(true);
+    m_statusVisibilityAction->setChecked(true);
+    connect(m_statusVisibilityAction, &QAction::toggled,
+            statusBar(), &QStatusBar::setVisible);
+
     // 编码菜单（Notepad++ 同款）
     m_encodingMenu = menuBar()->addMenu(QStringLiteral("编码(&N)"));
+    m_encodingMenu->menuAction()->setObjectName(QStringLiteral("menu.encoding"));
+    m_documentOnlyActions.append(m_encodingMenu->menuAction());
     auto *encGroup = new QActionGroup(this);
     // 按 Notepad++ 顺序：ANSI -> UTF-8 -> UTF-8 BOM -> UCS-2 LE -> UCS-2 BE
     QVector<QPair<QString, TextEncoding>> encItems = {
         {QStringLiteral("转为 ANSI (GBK)"),          TextEncoding::GBK},
         {QStringLiteral("转为 UTF-8 (无 BOM)"),       TextEncoding::Utf8},
         {QStringLiteral("转为 UTF-8 (含 BOM)"),       TextEncoding::Utf8Bom},
-        {QStringLiteral("转为 UCS-2 Little Endian"),  TextEncoding::Utf16LE},
-        {QStringLiteral("转为 UCS-2 Big Endian"),     TextEncoding::Utf16BE},
+        {QStringLiteral("转为 UTF-16 Little Endian"), TextEncoding::Utf16LE},
+        {QStringLiteral("转为 UTF-16 Big Endian"),    TextEncoding::Utf16BE},
+    };
+    const QStringList convertEncodingIds = {
+        QStringLiteral("gbk"), QStringLiteral("utf8"),
+        QStringLiteral("utf8bom"), QStringLiteral("utf16le"),
+        QStringLiteral("utf16be"),
     };
     m_convertEncodingActions.clear();
-    for (const auto &item : encItems) {
+    for (int i = 0; i < encItems.size(); ++i) {
+        const auto &item = encItems[i];
         auto *a = m_encodingMenu->addAction(item.first);
+        a->setObjectName(QStringLiteral("encoding.convert.%1")
+                             .arg(convertEncodingIds[i]));
         a->setCheckable(true);
         a->setData(static_cast<int>(item.second));
         encGroup->addAction(a);
         m_convertEncodingActions.append(a);
+        m_documentOnlyActions.append(a);
         connect(a, &QAction::triggered, this, &MainWindow::convertEncodingFromAction);
     }
 
-    // "以编码显示"子菜单（Notepad++ 风格：不修改文件内容，仅改变显示解码方式）
+    // "以编码重新打开"：重新解释原始字节，不把它误解为编码转换。
     m_encodingMenu->addSeparator();
-    m_displayEncodingMenu = m_encodingMenu->addMenu(QStringLiteral("以编码显示"));
+    m_displayEncodingMenu = m_encodingMenu->addMenu(QStringLiteral("以编码重新打开"));
+    m_displayEncodingMenu->setObjectName(QStringLiteral("encoding.reopen"));
     auto *dispEncGroup = new QActionGroup(this);
     QVector<QPair<QString, TextEncoding>> dispEncItems = {
-        {QStringLiteral("以 ANSI (GBK) 显示"),        TextEncoding::GBK},
-        {QStringLiteral("以 UTF-8 显示"),             TextEncoding::Utf8},
-        {QStringLiteral("以 UTF-8 (含 BOM) 显示"),    TextEncoding::Utf8Bom},
-        {QStringLiteral("以 UCS-2 Little Endian 显示"), TextEncoding::Utf16LE},
-        {QStringLiteral("以 UCS-2 Big Endian 显示"),    TextEncoding::Utf16BE},
+        {QStringLiteral("以 ANSI (GBK) 重新打开"),        TextEncoding::GBK},
+        {QStringLiteral("以 UTF-8 重新打开"),             TextEncoding::Utf8},
+        {QStringLiteral("以 UTF-8 (含 BOM) 重新打开"),    TextEncoding::Utf8Bom},
+        {QStringLiteral("以 UTF-16 Little Endian 重新打开"), TextEncoding::Utf16LE},
+        {QStringLiteral("以 UTF-16 Big Endian 重新打开"),    TextEncoding::Utf16BE},
     };
-    for (const auto &item : dispEncItems) {
+    for (int i = 0; i < dispEncItems.size(); ++i) {
+        const auto &item = dispEncItems[i];
         auto *a = m_displayEncodingMenu->addAction(item.first);
+        a->setObjectName(QStringLiteral("encoding.reopen.%1")
+                             .arg(convertEncodingIds[i]));
         a->setCheckable(true);
         a->setData(static_cast<int>(item.second));
         dispEncGroup->addAction(a);
+        m_displayEncodingActions.append(a);
+        m_documentOnlyActions.append(a);
         connect(a, &QAction::triggered, this, &MainWindow::displayEncodingFromAction);
     }
     // 注意：菜单勾选在 onTabChanged / onTabEncodingChanged 中同步
 
     // 帮助菜单
+    auto *toolsMenu = menuBar()->addMenu(QStringLiteral("工具(&T)"));
+    toolsMenu->menuAction()->setObjectName(QStringLiteral("menu.tools"));
+    m_accountsAction = toolsMenu->addAction(QStringLiteral("账户(&A)"));
+    m_accountsAction->setObjectName(QStringLiteral("tools.accounts"));
+    m_accountsAction->setIconText(QStringLiteral("账户"));
+    connect(m_accountsAction, &QAction::triggered,
+            this, &MainWindow::showAccountsWorkspace);
+    m_securityCenterAction = toolsMenu->addAction(QStringLiteral("安全中心(&S)"));
+    m_securityCenterAction->setObjectName(QStringLiteral("tools.securityCenter"));
+    connect(m_securityCenterAction, &QAction::triggered,
+            this, &MainWindow::showSecurityCenterWorkspace);
+    toolsMenu->addSeparator();
+    auto *lockVaultAct = toolsMenu->addAction(QStringLiteral("立即锁定(&L)"));
+    lockVaultAct->setObjectName(QStringLiteral("tools.lockNow"));
+    connect(lockVaultAct, &QAction::triggered, this, &MainWindow::lockSecureDocuments);
+    if (m_tasksAction)
+        toolsMenu->addAction(m_tasksAction);
+
     auto *helpMenu = menuBar()->addMenu(QStringLiteral("帮助(&H)"));
+    helpMenu->menuAction()->setObjectName(QStringLiteral("menu.help"));
     auto *aboutAct = helpMenu->addAction(QStringLiteral("关于(&A)"));
+    aboutAct->setObjectName(QStringLiteral("help.about"));
     connect(aboutAct, &QAction::triggered, this, [this]() {
         QMessageBox::about(this, QStringLiteral("关于 Notepad Safe"),
             QStringLiteral("<h3>Notepad Safe</h3>"
-                           "<p>基于 Qt 6.11 + QScintilla 2.14.1 的加密笔记本编辑器。</p>"
-                           "<p>版本: 0.3.1</p>"
-                           "<p>许可证: GPL v3</p>"));
+                           "<p>离线安全文本、Hex 与大文件分析编辑器。</p>"
+                           "<p><b>应用版本：</b>%1<br>"
+                           "<b>Qt：</b>%2<br>"
+                           "<b>QScintilla：</b>2.14.1<br>"
+                           "<b>KDBX：</b>KeePassXC Core 2.7.12<br>"
+                           "<b>密码学：</b>Botan 3.12.0 + libargon2 20190702<br>"
+                           "<b>正则：</b>PCRE2 10.47</p>"
+                           "<p>许可证：GNU GPL v3。核心供应商均按锁文件和 SHA-256/commit 固定，"
+                           "更新必须通过格式、加密、搜索与 GUI 回归门禁。</p>"
+                           "<p><a href='https://www.qt.io/'>Qt</a> · "
+                           "<a href='https://www.riverbankcomputing.com/software/qscintilla/'>QScintilla</a> · "
+                           "<a href='https://keepassxc.org/'>KeePassXC</a> · "
+                           "<a href='https://botan.randombit.net/'>Botan</a> · "
+                           "<a href='https://www.pcre.org/'>PCRE2</a></p>")
+                .arg(QStringLiteral(NOTEPADSAFE_VERSION),
+                     QString::fromLatin1(qVersion())));
     });
+
+    // Top-level information architecture: File, Edit, Search, View, Language,
+    // Encoding, Tools, Help. View was populated after Language above, so move
+    // its menu action once instead of duplicating menu construction paths.
+    menuBar()->removeAction(viewMenu->menuAction());
+    menuBar()->insertAction(syntaxMenu->menuAction(), viewMenu->menuAction());
 }
 
 void MainWindow::createToolBar()
@@ -489,43 +1773,76 @@ void MainWindow::createToolBar()
     toolbar->setMovable(false);
     toolbar->setIconSize(QSize(16, 16));
 
-    toolbar->addAction(QStringLiteral("新建"), this, &MainWindow::newFile);
-    toolbar->addAction(QStringLiteral("打开"), this, &MainWindow::openFile);
-    toolbar->addAction(QStringLiteral("保存"), this, &MainWindow::saveFile);
+    toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    auto *newAction = findChild<QAction *>(QStringLiteral("file.new"));
+    auto *openAction = findChild<QAction *>(QStringLiteral("file.open"));
+    if (newAction) {
+        newAction->setIcon(style()->standardIcon(QStyle::SP_FileIcon));
+        newAction->setIconText(QStringLiteral("新建"));
+        newAction->setToolTip(QStringLiteral("新建（默认安全保存）"));
+        toolbar->addAction(newAction);
+    }
+    if (openAction) {
+        openAction->setIcon(style()->standardIcon(QStyle::SP_DialogOpenButton));
+        openAction->setIconText(QStringLiteral("打开"));
+        openAction->setToolTip(QStringLiteral("打开文件"));
+        toolbar->addAction(openAction);
+    }
+    if (m_saveAction) {
+        m_saveAction->setIcon(style()->standardIcon(QStyle::SP_DialogSaveButton));
+        m_saveAction->setIconText(QStringLiteral("保存"));
+        m_saveAction->setToolTip(QStringLiteral("保存"));
+        toolbar->addAction(m_saveAction);
+    }
     toolbar->addSeparator();
-    toolbar->addAction(QStringLiteral("查找"), this, &MainWindow::showFindDialog);
-    toolbar->addAction(QStringLiteral("替换"), this, &MainWindow::showReplaceDialog);
-    toolbar->addSeparator();
-    toolbar->addAction(QStringLiteral("保险库"), m_vaultDock, &VaultDock::openVaultInteractive);
+    if (m_findAction) {
+        m_findAction->setIcon(style()->standardIcon(QStyle::SP_FileDialogContentsView));
+        m_findAction->setIconText(QStringLiteral("查找"));
+        m_findAction->setToolTip(QStringLiteral("查找 / 查找全部"));
+        toolbar->addAction(m_findAction);
+    }
+    if (m_accountsAction) {
+        m_accountsAction->setIcon(style()->standardIcon(QStyle::SP_DirHomeIcon));
+        toolbar->addAction(m_accountsAction);
+    }
 }
 
 void MainWindow::createStatusBar()
 {
     m_statusPos = new QLabel(QStringLiteral("行: 1, 列: 1"));
+    m_statusPos->setObjectName(QStringLiteral("status.position"));
+    m_statusPos->setAccessibleName(QStringLiteral("光标位置"));
     m_statusPos->setMinimumWidth(120);
     statusBar()->addWidget(m_statusPos);
 
     m_statusEncoding = new QLabel(QStringLiteral("UTF-8"));
+    m_statusEncoding->setObjectName(QStringLiteral("status.encoding"));
+    m_statusEncoding->setAccessibleName(QStringLiteral("编码与换行符"));
     m_statusEncoding->setMinimumWidth(80);
     statusBar()->addWidget(m_statusEncoding);
 
     m_statusSyntax = new QLabel(QStringLiteral("纯文本"));
+    m_statusSyntax->setObjectName(QStringLiteral("status.context"));
+    m_statusSyntax->setAccessibleName(QStringLiteral("文档类型或当前工作区"));
     m_statusSyntax->setMinimumWidth(80);
     statusBar()->addWidget(m_statusSyntax);
 
     m_statusSize = new QLabel(QStringLiteral("0 B"));
+    m_statusSize->setObjectName(QStringLiteral("status.size"));
+    m_statusSize->setAccessibleName(QStringLiteral("文档大小"));
     m_statusSize->setMinimumWidth(80);
     statusBar()->addWidget(m_statusSize);
 
     m_statusModified = new QLabel(QStringLiteral(""));
+    m_statusModified->setObjectName(QStringLiteral("status.modified"));
+    m_statusModified->setAccessibleName(QStringLiteral("保存状态"));
     m_statusModified->setMinimumWidth(40);
     statusBar()->addPermanentWidget(m_statusModified);
 
-    // ============ 通用异步任务：状态栏右下角永久 widget ============
-    //  显示：线程占用（活跃/并发上限）+ 后台任务数量按钮
-    //  点击按钮：弹出 AsyncTaskPanelDialog（非模态，查看全部任务/进度/取消/异常堆栈）
-    auto *taskWidget = new StatusBarTaskWidget(this);
-    statusBar()->addPermanentWidget(taskWidget);
+    // 活跃任务或失败存在时才显示一个状态 chip；线程占用只放在 tooltip/任务中心，
+    // 不让实现细节永久挤占编辑状态栏。
+    m_taskWidget = new StatusBarTaskWidget(this);
+    statusBar()->addPermanentWidget(m_taskWidget);
 }
 
 void MainWindow::createDock()
@@ -540,13 +1857,194 @@ void MainWindow::createFindDialog()
 
 // ============ 文件操作 ============
 
+bool MainWindow::ensureSecuritySessionInteractive()
+{
+#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
+    QMessageBox::critical(this, QStringLiteral("安全功能不可用"),
+                          QStringLiteral("当前构建未包含 KDBX 安全后端。"));
+    return false;
+#else
+    const auto restoreMaskedTabs = [this]() {
+        if (m_secureDocuments) {
+            const int activeIndex = m_tabs ? m_tabs->currentIndex() : -1;
+            for (int i = 0; m_tabs && i < m_tabs->count(); ++i) {
+                auto *masked = qobject_cast<EditorTab *>(m_tabs->widget(i));
+                if (!masked || !masked->isSecureDocument()
+                    || !masked->isSecureDocumentMasked()) {
+                    continue;
+                }
+                const QString backing = masked->filePath().isEmpty()
+                                            ? masked->autosavePath() : masked->filePath();
+                if (backing.isEmpty() || !QFileInfo::exists(backing))
+                    continue;
+                SecureDocumentSnapshot restored;
+                const VaultError restoreError = m_secureDocuments->open(backing, &restored);
+                if (!restoreError.isError()) {
+                    adoptSecureSnapshot(restored, masked);
+                    restored.text.fill(QChar(0));
+                }
+            }
+            if (activeIndex >= 0 && activeIndex < m_tabs->count())
+                m_tabs->setCurrentIndex(activeIndex);
+        }
+    };
+    if (m_securitySession && m_securitySession->hasActiveSession()) {
+        restoreMaskedTabs();
+        return true;
+    }
+    if (!m_securitySession)
+        return false;
+
+    const bool creating = !m_securitySession->hasIdentity();
+    QDialog dialog(this);
+    dialog.setWindowTitle(creating ? QStringLiteral("建立本地安全身份")
+                                   : QStringLiteral("登录 Notepad Safe"));
+    dialog.setMinimumWidth(430);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *message = new QLabel(
+        creating
+            ? QStringLiteral("设置一个主密码。文件始终离线加密；本设备登录后 7 天内使用无提示。")
+            : QStringLiteral("输入主密码以开始新的 7 天本机会话。"),
+        &dialog);
+    message->setWordWrap(true);
+    layout->addWidget(message);
+    auto *form = new QFormLayout();
+    auto *password = new QLineEdit(&dialog);
+    password->setObjectName(QStringLiteral("securitySessionPassword"));
+    password->setEchoMode(QLineEdit::Password);
+    password->setClearButtonEnabled(true);
+    form->addRow(QStringLiteral("主密码"), password);
+    QLineEdit *confirmation = nullptr;
+    if (creating) {
+        confirmation = new QLineEdit(&dialog);
+        confirmation->setObjectName(QStringLiteral("securitySessionConfirmation"));
+        confirmation->setEchoMode(QLineEdit::Password);
+        form->addRow(QStringLiteral("确认主密码"), confirmation);
+    }
+    layout->addLayout(form);
+    auto *errorLabel = new QLabel(&dialog);
+    errorLabel->setStyleSheet(QStringLiteral("color:#b00020"));
+    errorLabel->setWordWrap(true);
+    layout->addWidget(errorLabel);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
+                                         Qt::Horizontal, &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText(creating ? QStringLiteral("建立身份")
+                                                            : QStringLiteral("登录"));
+    buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("取消"));
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    password->setFocus();
+
+    while (dialog.exec() == QDialog::Accepted) {
+        QString passwordText = password->text();
+        if (passwordText.size() < 12) {
+            errorLabel->setText(QStringLiteral("主密码至少需要 12 个字符。"));
+            password->selectAll();
+            continue;
+        }
+        if (creating && confirmation && passwordText != confirmation->text()) {
+            errorLabel->setText(QStringLiteral("两次输入的主密码不一致。"));
+            clearSensitiveLineEdit(confirmation);
+            confirmation->setFocus();
+            passwordText.fill(QChar(0));
+            continue;
+        }
+        QByteArray passwordUtf8 = passwordText.toUtf8();
+        clearSensitiveLineEdit(password);
+        if (confirmation)
+            clearSensitiveLineEdit(confirmation);
+        passwordText.fill(QChar(0));
+        SecureBuffer passphrase(passwordUtf8.constData(), passwordUtf8.size());
+        scrubByteArray(passwordUtf8);
+        QString recoveryKey;
+        VaultError result = creating
+                                ? m_securitySession->createIdentity(passphrase, &recoveryKey)
+                                : m_securitySession->unlockIdentity(passphrase);
+        passphrase.clear();
+        if (result.isError()) {
+            errorLabel->setText(result.userMessage);
+            password->setFocus();
+            continue;
+        }
+
+        if (creating) {
+            QDialog recoveryDialog(this);
+            recoveryDialog.setWindowTitle(QStringLiteral("保存恢复密钥"));
+            recoveryDialog.setMinimumWidth(620);
+            auto *recoveryLayout = new QVBoxLayout(&recoveryDialog);
+            auto *recoveryMessage = new QLabel(
+                QStringLiteral("恢复密钥是主密码丢失后的唯一恢复方式。请保存到本设备之外；"
+                               "Notepad Safe 和任何厂商都无法替你找回。"),
+                &recoveryDialog);
+            recoveryMessage->setWordWrap(true);
+            recoveryLayout->addWidget(recoveryMessage);
+            auto *keyView = new QPlainTextEdit(recoveryKey, &recoveryDialog);
+            keyView->setReadOnly(true);
+            keyView->setMaximumHeight(96);
+            keyView->setObjectName(QStringLiteral("securityRecoveryKey"));
+            recoveryLayout->addWidget(keyView);
+            auto *verify = new QLineEdit(&recoveryDialog);
+            verify->setPlaceholderText(QStringLiteral("输入恢复密钥最后 8 个字符以确认已保存"));
+            recoveryLayout->addWidget(verify);
+            auto *finish = new QDialogButtonBox(QDialogButtonBox::Ok,
+                                                 Qt::Horizontal, &recoveryDialog);
+            finish->button(QDialogButtonBox::Ok)->setText(QStringLiteral("完成"));
+            finish->button(QDialogButtonBox::Ok)->setEnabled(false);
+            recoveryLayout->addWidget(finish);
+            const QString suffix = recoveryKey.right(8);
+            connect(verify, &QLineEdit::textChanged, finish->button(QDialogButtonBox::Ok),
+                    [button = finish->button(QDialogButtonBox::Ok), suffix](const QString &text) {
+                        button->setEnabled(text.trimmed().compare(suffix,
+                                                                  Qt::CaseInsensitive) == 0);
+                    });
+            connect(finish, &QDialogButtonBox::accepted,
+                    &recoveryDialog, &QDialog::accept);
+            recoveryDialog.setWindowFlag(Qt::WindowCloseButtonHint, false);
+            while (recoveryDialog.exec() != QDialog::Accepted) {
+                // Identity creation is already durable at this point. Do not let a
+                // dismissed dialog silently skip the only recovery-key handoff.
+            }
+            keyView->clear();
+            clearSensitiveLineEdit(verify);
+            recoveryKey.fill(QChar(0));
+            recoveryKey.clear();
+        }
+        restoreMaskedTabs();
+        return true;
+    }
+    clearSensitiveLineEdit(password);
+    if (confirmation)
+        clearSensitiveLineEdit(confirmation);
+    return false;
+#endif
+}
+
 void MainWindow::newFile()
 {
+#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
+    if (!ensureSecuritySessionInteractive() || !m_secureDocuments)
+        return;
+    SecureDocumentSnapshot snapshot;
+    const VaultError error = m_secureDocuments->newDraft(&snapshot);
+    if (error.isError()) {
+        QMessageBox::critical(this, QStringLiteral("无法新建文档"), error.userMessage);
+        return;
+    }
+    auto *tab = addNewTab();
+    tab->initializeSecureDocument(snapshot.documentId, snapshot.title,
+                                  snapshot.text, snapshot.filePath);
+    tab->setAutosavePath(snapshot.backingPath);
+    m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
+    statusBar()->showMessage(QStringLiteral("已新建文档"), 1800);
+#else
     addNewTab();
+#endif
 }
 
 EditorTab *MainWindow::addNewTab()
 {
+    showDocumentWorkspace();
     auto *tab = new EditorTab(this);
     int index = m_tabs->addTab(tab, QStringLiteral("未命名"));
 
@@ -557,14 +2055,70 @@ EditorTab *MainWindow::addNewTab()
     tab->setEdgeVisible(m_edgeVisible);
     tab->setEdgeColumn(m_edgeColumn);
     tab->setWordWrap(m_wordWrap);
+    // QScintilla keeps its own colors outside the QWidget palette. Apply the
+    // resolved appearance to newly created/restored tabs as well as existing ones.
+    applyDarkMode(m_darkMode);
 
     connect(tab, &EditorTab::modificationChanged, this, [this, tab](bool m) {
+        if (m && tab->isSecureDocument() && !tab->isSecureDocumentTransitioning()) {
+            tab->setSecureDocumentTitle(secureTitleFrom(tab));
+            m_secureAutosaveTimer.start();
+        }
         int idx = m_tabs->indexOf(tab);
         if (idx >= 0) {
             onTabModifiedChanged(m);
             m_tabs->setTabText(idx, tab->tabTitle());
         }
+        if (currentTab() == tab)
+            syncCommandStates(tab);
     });
+    connect(tab, &EditorTab::commandCapabilitiesChanged,
+            this, [this, tab]() {
+        if (currentTab() == tab)
+            syncCommandStates(tab);
+    });
+    connect(tab, &EditorTab::largeDocumentRuntimeStateChanged,
+            this, [this, tab](EditorTab::LargeDocumentRuntimeState, const QString &) {
+        if (currentTab() != tab)
+            return;
+        syncCommandStates(tab);
+        updateStatusBar();
+    });
+#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
+    connect(tab, &EditorTab::contentChanged, this, [this, tab](quint64) {
+        if (!tab->isSecureDocument() || tab->isBinaryDocument()
+            || tab->isSecureDocumentMasked()
+            || tab->isSecureDocumentTransitioning()
+            || tab->securePayloadLimitExclusive() <= 0
+            || tab->editor()->length() < tab->securePayloadLimitExclusive()
+            || tab->property("securePayloadLimitUndoPending").toBool()) {
+            return;
+        }
+        tab->setProperty("securePayloadLimitUndoPending", true);
+        QPointer<EditorTab> guarded(tab);
+        QTimer::singleShot(0, tab, [this, guarded]() {
+            if (!guarded)
+                return;
+            guarded->setProperty("securePayloadLimitUndoPending", false);
+            if (!guarded->isSecureDocument() || guarded->isBinaryDocument()
+                || guarded->editor()->length()
+                       < guarded->securePayloadLimitExclusive()) {
+                return;
+            }
+            guarded->undo();
+            const bool restored = guarded->editor()->length()
+                                  < guarded->securePayloadLimitExclusive();
+            if (!restored)
+                guarded->editor()->setReadOnly(true);
+            statusBar()->showMessage(
+                restored
+                    ? QStringLiteral("安全文档必须小于 32 MiB；本次编辑已撤销。请另存为普通文件后继续。")
+                    : QStringLiteral("安全文档已达到大小上限并已停止编辑；请另存为普通文件。"),
+                8000);
+            QApplication::beep();
+        });
+    });
+#endif
     connect(tab, &EditorTab::cursorPositionChanged, this, &MainWindow::onTabCursorPositionChanged);
     connect(tab, &EditorTab::titleChanged, this, [this, tab](const QString &) {
         int idx = m_tabs->indexOf(tab);
@@ -579,6 +2133,10 @@ EditorTab *MainWindow::addNewTab()
     connect(tab, &EditorTab::l2LineBuildProgress,
             this, [this, tab](qint64 done, qint64 total) {
         if (currentTab() != tab) return;
+        if (tab->isL2Active() && tab->viewModeL2() == ViewMode::Hex) {
+            statusBar()->clearMessage();
+            return;
+        }
         if (total <= 0) {
             statusBar()->clearMessage();
             return;
@@ -592,24 +2150,614 @@ EditorTab *MainWindow::addNewTab()
     });
     connect(tab, &EditorTab::l2LineBuildFinished, this, [this, tab](bool ok) {
         if (currentTab() != tab) return;
+        if (tab->isL2Active() && tab->viewModeL2() == ViewMode::Hex) {
+            statusBar()->clearMessage();
+            return;
+        }
         if (ok) statusBar()->showMessage(QObject::tr("行索引构建完成"), 3000);
         else    statusBar()->clearMessage();
+    });
+    connect(tab, &EditorTab::l2FileOpenedChanged, this, [this, tab](bool) {
+        if (currentTab() == tab)
+            updateStatusBar();
+    });
+    connect(tab, &EditorTab::l2SaveNeededChanged, this, [this, tab](bool) {
+        if (currentTab() == tab)
+            updateStatusBar();
     });
 
     // ============== L2 禁用不适配菜单：同一 tab 内部 L1↔L2 切换时立即同步（关键：addTab/currentChanged 不触发）==============
     // 最小侵入：直接用 sender() 转 EditorTab* 当 tab 参数（精准指向信号发射源，避免无参
-    // syncL2SensitiveActions() → currentTab() 在 currentIndex 未切好时查到旧 tab → 新 tab 的
+    // syncCommandStates() → currentTab() 在 currentIndex 未切好时查到旧 tab → 新 tab 的
     // L2 状态被旧 tab 覆盖（enabled=true 不变灰的 D001/D003/D007 根因）。
     connect(tab, &EditorTab::l2ModeStatusChanged, this, [this]() {
         auto* src = qobject_cast<EditorTab*>(sender());
-        syncL2SensitiveActions(src ? src : currentTab());
+        syncCommandStates(src ? src : currentTab());
+        if (!src || src == currentTab())
+            syncGlobalMenuCheckStates();
     });
 
     m_tabs->setCurrentIndex(index);
     m_findDialog->setActiveTab(tab);
+    m_findDialog->notifyTabOpened(tab);
     // 新建后立刻同步一次 L2 敏感动作（覆盖新 tab 还没收到任何信号的早期空状态）
-    syncL2SensitiveActions(tab);
+    syncCommandStates(tab);
     return tab;
+}
+
+QString MainWindow::secureTitleFrom(EditorTab *tab)
+{
+    if (!tab || !tab->editor())
+        return QStringLiteral("未命名");
+    if (tab->isBinaryDocument()) {
+        if (tab->isSecureDocument() && !tab->secureDocumentTitle().trimmed().isEmpty()
+            && tab->secureDocumentTitle() != QStringLiteral("未命名")) {
+            return tab->secureDocumentTitle();
+        }
+        if (!tab->filePath().isEmpty())
+            return QFileInfo(tab->filePath()).completeBaseName().left(80);
+        return QStringLiteral("未命名");
+    }
+    const int lines = qMin(tab->editor()->lines(), 8);
+    for (int i = 0; i < lines; ++i) {
+        QString line = tab->editor()->text(i).trimmed();
+        while (line.startsWith(QLatin1Char('#')))
+            line.remove(0, 1);
+        line = line.trimmed();
+        if (!line.isEmpty())
+            return line.left(80);
+    }
+    return QStringLiteral("未命名");
+}
+
+bool MainWindow::saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool showErrors)
+{
+    if (!tab || !tab->isSecureDocument() || !m_secureDocuments || !m_securitySession)
+        return false;
+    if (tab->isSecureDocumentMasked()) {
+        if (showErrors)
+            statusBar()->showMessage(QStringLiteral("加密文档已锁定，请先解锁后再保存。"), 5000);
+        return false;
+    }
+    if (!m_securitySession->hasActiveSession()) {
+        if (!allowInteractiveUnlock || !ensureSecuritySessionInteractive())
+            return false;
+    }
+
+    const DiskFileState diskState = m_secureDocuments->externalFileState(
+        tab->secureDocumentId());
+    if (diskState == DiskFileState::Changed
+        || diskState == DiskFileState::Missing
+        || diskState == DiskFileState::Unreadable) {
+        if (!allowInteractiveUnlock) {
+            statusBar()->showMessage(
+                QStringLiteral("安全文档已在磁盘上变化，自动保存已暂停。"), 6000);
+            return false;
+        }
+        const ExternalSaveDisposition disposition = resolveSecureExternalSaveConflict(tab);
+        return disposition == ExternalSaveDisposition::HandledSuccess;
+    }
+
+    const QString title = secureTitleFrom(tab);
+    // An unnamed secure note already owns an encrypted .nsafe-draft backing
+    // file. Ordinary Save commits that same persistence kind silently; only
+    // Save As chooses a portable path or converts the document format.
+    const QString targetPath;
+    VaultError error;
+    if (tab->isSecureBinaryDocument()) {
+        QByteArray body;
+        QString exportError;
+        if (!tab->exportBinaryPayloadBytes(&body, &exportError)) {
+            if (showErrors)
+                QMessageBox::critical(this, QStringLiteral("加密保存失败"), exportError);
+            return false;
+        }
+        error = m_secureDocuments->saveBinary(
+            tab->secureDocumentId(), body, title, targetPath);
+        scrubByteArray(body);
+    } else {
+        QString body = tab->editor()->text();
+        error = m_secureDocuments->save(
+            tab->secureDocumentId(), body, title, targetPath);
+        if (!body.isEmpty())
+            body.fill(QChar(0));
+        body.clear();
+    }
+    if (error.isError()) {
+        if (error.diagnosticCode.startsWith(
+                QStringLiteral("secure-document.external-change"))) {
+            if (allowInteractiveUnlock) {
+                const ExternalSaveDisposition disposition =
+                    resolveSecureExternalSaveConflict(tab);
+                return disposition == ExternalSaveDisposition::HandledSuccess;
+            }
+            statusBar()->showMessage(
+                QStringLiteral("安全文档已在磁盘上变化，自动保存已暂停。"), 6000);
+            return false;
+        }
+        if (showErrors) {
+            QMessageBox box(QMessageBox::Critical, QStringLiteral("加密保存失败"),
+                            error.userMessage, QMessageBox::Ok, this);
+            box.setDetailedText(error.diagnosticCode);
+            box.exec();
+        }
+        return false;
+    }
+    tab->setSecureDocumentTitle(title);
+    tab->setAutosavePath(m_secureDocuments->backingPath(tab->secureDocumentId()));
+    tab->setModified(false);
+    const int index = m_tabs->indexOf(tab);
+    if (index >= 0)
+        m_tabs->setTabText(index, tab->tabTitle());
+    statusBar()->showMessage(showErrors ? QStringLiteral("已保存")
+                                        : QStringLiteral("已自动保存"), 2000);
+    return true;
+}
+
+void MainWindow::openSecureNote(const QUuid &id)
+{
+    if (id.isNull() || !m_vaultDock)
+        return;
+    EditorTab *maskedTab = nullptr;
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        auto *existing = qobject_cast<EditorTab *>(m_tabs->widget(i));
+        if (existing && existing->isSecureDocument() && existing->secureDocumentId() == id) {
+            if (!existing->isSecureDocumentMasked()) {
+                m_tabs->setCurrentIndex(i);
+                return;
+            }
+            maskedTab = existing;
+            break;
+        }
+    }
+    if (!m_vaultDock->isSecureStoreOpen()
+        && !m_vaultDock->ensureSecureStoreReadyInteractive()) {
+        return;
+    }
+
+    VaultError error;
+    auto entry = m_vaultDock->readSecureDocument(id, &error);
+    if (!entry || !entry->tags.contains(VaultSecureNoteTag)) {
+        QMessageBox box(QMessageBox::Critical, QStringLiteral("无法打开加密笔记"),
+                        error.userMessage.isEmpty() ? QStringLiteral("加密笔记不存在。")
+                                                    : error.userMessage,
+                        QMessageBox::Ok, this);
+        box.setDetailedText(error.diagnosticCode);
+        box.exec();
+        return;
+    }
+    QString body = QString::fromUtf8(
+        reinterpret_cast<const char *>(entry->notesUtf8.data()), entry->notesUtf8.size());
+    entry->notesUtf8.clear();
+    auto *tab = maskedTab ? maskedTab : addNewTab();
+    tab->initializeSecureDocument(entry->id, entry->title, body);
+    if (!body.isEmpty())
+        body.fill(QChar(0));
+    body.clear();
+    m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
+    tab->setFocusEditor();
+}
+
+void MainWindow::lockSecureDocuments()
+{
+    m_secureAutosaveTimer.stop();
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
+        if (tab && tab->isSecureDocument() && !tab->isSecureDocumentMasked()
+            && tab->isModified() && !saveSecureTab(tab, false, false)) {
+            statusBar()->showMessage(QStringLiteral("未能保存加密文档，已取消锁定。"), 5000);
+            return;
+        }
+    }
+    if (m_vaultDock && !m_vaultDock->prepareToLock()) {
+        statusBar()->showMessage(QStringLiteral("账户修改尚未处理，已取消锁定。"), 5000);
+        return;
+    }
+    // Lock is also a recovery boundary for ordinary documents. The operation is
+    // explicit, so establish the latest encrypted S1/S2 recovery point first.
+    saveSessionNow(true);
+    purgeSensitiveSearchState();
+    if (m_secureDocuments)
+        m_secureDocuments->closeAll();
+    if (m_securitySession)
+        m_securitySession->endSession(true);
+    if (m_vaultDock)
+        m_vaultDock->lockVault();
+    maskSecureDocuments();
+}
+
+void MainWindow::purgeSensitiveSearchState()
+{
+    m_lastFindPattern.fill(QChar(0));
+    m_lastFindPattern.clear();
+    m_lastFindRegex = false;
+    m_lastFindCase = false;
+    m_lastFindWord = false;
+    if (m_findDialog)
+        m_findDialog->clearSensitiveState();
+    if (m_searchDock)
+        m_searchDock->clearResults();
+}
+
+void MainWindow::protectForSystemLock()
+{
+    if (m_systemProtectionActive)
+        return;
+    m_secureAutosaveTimer.stop();
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
+        if (tab && tab->isSecureDocument() && !tab->isSecureDocumentMasked()
+            && tab->isModified() && !saveSecureTab(tab, false, false)) {
+            // Data integrity wins over clearing an unsaved buffer. Retry on the
+            // next system notification/timer instead of silently losing text.
+            return;
+        }
+    }
+    m_restoreAccountsAfterSystemUnlock = m_workspaceStack && m_accountsPage
+                                         && m_workspaceStack->currentWidget() == m_accountsPage;
+    if (m_vaultDock && !m_vaultDock->lockVaultSilently())
+        return;
+    saveSessionNow(true);
+    purgeSensitiveSearchState();
+    if (m_secureDocuments)
+        m_secureDocuments->closeAll();
+    if (m_securitySession)
+        m_securitySession->endSession(false);
+    maskSecureDocuments();
+    m_systemProtectionActive = true;
+}
+
+void MainWindow::restoreAfterSystemUnlock()
+{
+    if (!m_systemProtectionActive)
+        return;
+    bool restored = false;
+    if (m_securitySession && m_securitySession->restoreSealedSession()) {
+        // This call is non-interactive because restoreSealedSession has already
+        // rehydrated a valid DPAPI session; it also restores masked tabs.
+        restored = ensureSecuritySessionInteractive();
+    }
+    m_systemProtectionActive = false;
+    if (restored && m_restoreAccountsAfterSystemUnlock)
+        showAccountsWorkspace();
+    m_restoreAccountsAfterSystemUnlock = false;
+    if (!restored)
+        statusBar()->showMessage(QStringLiteral("安全会话需要重新登录。"), 5000);
+}
+
+void MainWindow::maskSecureDocuments()
+{
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
+        if (!tab || !tab->isSecureDocument())
+            continue;
+        tab->maskSecureDocument();
+        m_tabs->setTabText(i, tab->tabTitle());
+    }
+    updateStatusBar();
+}
+
+EditorTab *MainWindow::adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
+                                          EditorTab *reuseTab)
+{
+#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
+    showDocumentWorkspace();
+    EditorTab *tab = reuseTab ? reuseTab : addNewTab();
+    if (reuseTab && reuseTab->isSecureDocument()
+        && reuseTab->secureDocumentId() != snapshot.documentId
+        && m_secureDocuments) {
+        m_secureDocuments->close(reuseTab->secureDocumentId());
+    }
+    if (snapshot.payloadKind == SecureDocumentPayloadKind::Binary) {
+        QString error;
+        if (!tab->initializeSecureBinaryDocument(
+                snapshot.documentId, snapshot.title, std::move(snapshot.binary),
+                snapshot.filePath, &error)) {
+            m_secureDocuments->close(snapshot.documentId);
+            if (!reuseTab) {
+                const int failedIndex = m_tabs->indexOf(tab);
+                if (failedIndex >= 0)
+                    m_tabs->removeTab(failedIndex);
+                delete tab;
+            }
+            QMessageBox::critical(this, QStringLiteral("无法打开安全文件"), error);
+            return nullptr;
+        }
+    } else {
+        tab->initializeSecureDocument(snapshot.documentId, snapshot.title,
+                                      snapshot.text, snapshot.filePath);
+        if (!snapshot.text.isEmpty())
+            snapshot.text.fill(QChar(0));
+        snapshot.text.clear();
+    }
+    tab->setAutosavePath(snapshot.backingPath);
+    const int index = m_tabs->indexOf(tab);
+    if (index >= 0) {
+        m_tabs->setCurrentIndex(index);
+        m_tabs->setTabText(index, tab->tabTitle());
+    }
+    tab->setFocusEditor();
+    return tab;
+#else
+    Q_UNUSED(snapshot)
+    Q_UNUSED(reuseTab)
+    return nullptr;
+#endif
+}
+
+bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
+{
+#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
+    Q_UNUSED(path)
+    Q_UNUSED(reuseTab)
+    return false;
+#else
+    if (!m_secureDocuments)
+        return false;
+    const QString absolutePath = QFileInfo(path).absoluteFilePath();
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        auto *openTab = qobject_cast<EditorTab *>(m_tabs->widget(i));
+        if (!openTab || !openTab->isSecureDocument())
+            continue;
+        const QString backing = openTab->filePath().isEmpty()
+                                    ? openTab->autosavePath() : openTab->filePath();
+        if (QFileInfo(backing).absoluteFilePath().compare(absolutePath,
+                                                          Qt::CaseInsensitive) == 0) {
+            showDocumentWorkspace();
+            m_tabs->setCurrentIndex(i);
+            openTab->setFocusEditor();
+            return true;
+        }
+    }
+    if (!m_securitySession->hasActiveSession() && !ensureSecuritySessionInteractive())
+        return false;
+
+    SecureDocumentSnapshot snapshot;
+    VaultError error = m_secureDocuments->open(path, &snapshot);
+    if (!error.isError()) {
+        if (!adoptSecureSnapshot(snapshot, reuseTab))
+            return false;
+        if (!snapshot.draft)
+            updateRecentFiles(path);
+        return true;
+    }
+    if (error.code != VaultErrorCode::InvalidCredentials) {
+        QMessageBox box(QMessageBox::Critical, QStringLiteral("无法打开安全文件"),
+                        error.userMessage, QMessageBox::Ok, this);
+        box.setDetailedText(error.diagnosticCode);
+        box.exec();
+        return false;
+    }
+
+    FileCredentialDialog dialog(
+        QStringLiteral("打开受其他密码保护的文件"),
+        QStringLiteral("当前会话不能解锁此文件。选择该文件的主密码或恢复密钥；成功后本次会话内不再询问。"),
+        true, this);
+    while (dialog.exec() == QDialog::Accepted) {
+        if (dialog.kind() == FileCredentialDialog::Kind::RecoveryKey) {
+            QString recoveryText = dialog.takeRecoveryKey();
+            if (recoveryText.isEmpty()) {
+                dialog.showError(QStringLiteral("请输入恢复密钥。"));
+                continue;
+            }
+            error = m_secureDocuments->openWithRecovery(path, recoveryText, &snapshot);
+            recoveryText.fill(QChar(0));
+            recoveryText.clear();
+        } else {
+            SecureBuffer buffer = dialog.takePassphrase();
+            if (buffer.empty()) {
+                dialog.showError(QStringLiteral("请输入文件密码。"));
+                continue;
+            }
+            error = m_secureDocuments->openWithPassphrase(path, buffer, &snapshot);
+            buffer.clear();
+        }
+        if (!error.isError()) {
+            if (!adoptSecureSnapshot(snapshot, reuseTab))
+                return false;
+            if (!snapshot.draft)
+                updateRecentFiles(path);
+            return true;
+        }
+        dialog.showError(error.userMessage);
+    }
+    return false;
+#endif
+}
+
+bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab)
+{
+    const QFileInfo info(path);
+    if (!info.isFile())
+        return false;
+#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
+    const KdbxHeaderInfo kdbx = KdbxFormatProbe::inspectFile(path);
+    if (kdbx.recognized) {
+        QString documentType;
+        QUuid documentId;
+        SecurityIdentityParameters fileParameters;
+        const VaultError probe = SecureDocumentService::inspect(
+            path, &documentType, &documentId, &fileParameters);
+        if (!probe.isError() && documentType == QStringLiteral("SecureDocument")) {
+            // A copied or hard-linked .nsafe still carries the same document id.
+            // Focus its live editor instead of asking the service to open a
+            // second competing handle to the same logical document.
+            if (!reuseTab && !documentId.isNull()) {
+                for (int i = 0; i < m_tabs->count(); ++i) {
+                    auto *openTab = qobject_cast<EditorTab *>(m_tabs->widget(i));
+                    if (!openTab || openTab->secureDocumentId() != documentId)
+                        continue;
+                    showDocumentWorkspace();
+                    m_tabs->setCurrentIndex(i);
+                    openTab->setFocusEditor();
+                    updateRecentFiles(path);
+                    statusBar()->showMessage(QStringLiteral("文件已在当前窗口中打开"), 2000);
+                    return true;
+                }
+            }
+            return openSecurePath(path, reuseTab);
+        }
+        if (probe.isError()
+            && probe.diagnosticCode != QStringLiteral("identity.envelope.missing")) {
+            QMessageBox box(QMessageBox::Critical, QStringLiteral("安全文件已损坏"),
+                            probe.userMessage, QMessageBox::Ok, this);
+            box.setDetailedText(probe.diagnosticCode);
+            box.exec();
+            return false;
+        }
+
+        const bool managedAccounts = !probe.isError()
+                                     && documentType == QStringLiteral("Accounts");
+        if (!ensureSecuritySessionInteractive())
+            return false;
+        if (managedAccounts) {
+            SecureBuffer rememberedMaster;
+            VaultError sessionOpen = m_securitySession->acquireRememberedMasterKey(
+                fileParameters, &rememberedMaster);
+            if (!sessionOpen.isError()) {
+                sessionOpen = m_vaultDock->unlockManagedStoreWithMasterKey(
+                    path, rememberedMaster);
+            }
+            rememberedMaster.clear();
+            if (sessionOpen.isError()) {
+                SecureBuffer rememberedRecovery;
+                VaultError recoveryOpen =
+                    m_securitySession->acquireRememberedRecoverySecret(
+                        fileParameters, &rememberedRecovery);
+                if (!recoveryOpen.isError()) {
+                    recoveryOpen = m_vaultDock->unlockManagedStoreWithRecoverySecret(
+                        path, rememberedRecovery);
+                }
+                rememberedRecovery.clear();
+                sessionOpen = recoveryOpen;
+            }
+            if (!sessionOpen.isError()) {
+                updateRecentFiles(path);
+                return showAccountsWorkspace();
+            }
+            if (sessionOpen.code != VaultErrorCode::InvalidCredentials) {
+                QMessageBox box(QMessageBox::Critical,
+                                QStringLiteral("无法打开账户集合"),
+                                sessionOpen.userMessage, QMessageBox::Ok, this);
+                box.setDetailedText(sessionOpen.diagnosticCode);
+                box.exec();
+                return false;
+            }
+        }
+
+        FileCredentialDialog dialog(
+            managedAccounts ? QStringLiteral("打开受其他密码保护的账户集合")
+                            : QStringLiteral("打开兼容 KDBX"),
+            managedAccounts
+                ? QStringLiteral("当前会话不能解锁此账户文件。选择该文件的主密码或恢复密钥。")
+                : QStringLiteral("输入此 KDBX 文件的主密码。"),
+            managedAccounts, this);
+        while (dialog.exec() == QDialog::Accepted) {
+            VaultError error;
+            if (dialog.kind() == FileCredentialDialog::Kind::RecoveryKey) {
+                QString recoveryKey = dialog.takeRecoveryKey();
+                if (recoveryKey.isEmpty()) {
+                    dialog.showError(QStringLiteral("请输入恢复密钥。"));
+                    continue;
+                }
+                SecureBuffer recoverySecret;
+                error = SecurityIdentity::parseRecoveryKey(
+                    recoveryKey, &recoverySecret);
+                if (!error.isError()) {
+                    error = m_vaultDock->unlockManagedStoreWithRecoverySecret(
+                        path, recoverySecret);
+                }
+                if (!error.isError()) {
+                    error = m_securitySession->rememberRecoverySecret(
+                        fileParameters, recoverySecret);
+                }
+                recoverySecret.clear();
+                recoveryKey.fill(QChar(0));
+                recoveryKey.clear();
+            } else {
+                SecureBuffer buffer = dialog.takePassphrase();
+                if (buffer.empty()) {
+                    dialog.showError(QStringLiteral("请输入文件密码。"));
+                    continue;
+                }
+                if (managedAccounts) {
+                    SecureBuffer masterUnlockKey;
+                    error = SecurityIdentity::deriveMasterUnlockKey(
+                        buffer, fileParameters, &masterUnlockKey);
+                    if (!error.isError()) {
+                        error = m_vaultDock->unlockManagedStoreWithMasterKey(
+                            path, masterUnlockKey);
+                    }
+                    if (!error.isError()) {
+                        error = m_securitySession->rememberMasterKey(
+                            fileParameters, masterUnlockKey);
+                    }
+                    masterUnlockKey.clear();
+                } else {
+                    error = m_vaultDock->unlockVault(path, buffer);
+                }
+                buffer.clear();
+            }
+            if (!error.isError()) {
+                updateRecentFiles(path);
+                return showAccountsWorkspace();
+            }
+            dialog.showError(error.userMessage);
+        }
+        return false;
+    }
+#endif
+
+    // Normal Open is idempotent.  Probe at most 192 KiB regardless of file
+    // size, then compare against the baselines already captured by each tab.
+    // Reload deliberately supplies reuseTab and must re-read that tab instead.
+    if (!reuseTab) {
+        DiskFileVersion candidate;
+        const DiskFileState candidateState = captureDiskFileVersion(path, &candidate);
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            auto *openTab = qobject_cast<EditorTab *>(m_tabs->widget(i));
+            if (!openTab || openTab->isSecureDocument())
+                continue;
+            const bool samePath = sameDiskFilePath(openTab->filePath(), path);
+            const bool sameIdentity = candidateState == DiskFileState::Unchanged
+                                      && openTab->representsDiskFile(candidate);
+            if (!samePath && !sameIdentity)
+                continue;
+            showDocumentWorkspace();
+            m_tabs->setCurrentIndex(i);
+            openTab->setFocusEditor();
+            updateRecentFiles(path);
+            statusBar()->showMessage(QStringLiteral("文件已在当前窗口中打开"), 2000);
+            return true;
+        }
+    }
+
+    showDocumentWorkspace();
+    EditorTab *tab = reuseTab ? reuseTab : addNewTab();
+    if (reuseTab && reuseTab->isSecureDocument()) {
+        if (m_secureDocuments)
+            m_secureDocuments->close(reuseTab->secureDocumentId());
+        // External Open may reuse the single empty default secure draft. The
+        // reused tab must stop being a secure document before ordinary routing.
+        reuseTab->convertToPlainDocument(QString());
+    }
+    const bool opened = openTabAutoMode(tab, path);
+    if (!opened) {
+        if (!reuseTab) {
+            const int index = m_tabs->indexOf(tab);
+            if (index >= 0)
+                m_tabs->removeTab(index);
+            delete tab;
+        }
+        return false;
+    }
+    updateRecentFiles(path);
+    m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
+    if (tab == currentTab()) {
+        syncGlobalMenuCheckStates();
+        updateStatusBar();
+    }
+    return true;
 }
 
 void MainWindow::openFile()
@@ -629,28 +2777,39 @@ void MainWindow::openFile()
     for (const QString &file : files) {
         if (file.isEmpty())
             continue;
-        auto *tab = addNewTab();
-        if (!openTabAutoMode(tab, file)) {
+        if (!openPathUnified(file)) {
             QMessageBox::warning(this, QStringLiteral("错误"),
                                  QStringLiteral("无法打开文件: %1").arg(file));
-            // 关闭空标签
-            int idx = m_tabs->indexOf(tab);
-            if (idx >= 0)
-                m_tabs->removeTab(idx);
-        } else {
-            updateRecentFiles(file);
-            m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
         }
     }
 }
 
 bool MainWindow::saveFile()
 {
+    if (m_workspaceStack && m_accountsPage
+        && m_workspaceStack->currentWidget() == m_accountsPage) {
+        const bool saved = m_vaultDock && m_vaultDock->saveActiveEntry();
+        if (saved)
+            statusBar()->showMessage(QStringLiteral("账户已保存"), 2500);
+        return saved;
+    }
+    if (!isDocumentWorkspaceActive())
+        return false;
     auto *tab = currentTab();
     if (!tab)
         return false;
+    if (tab->isSecureDocument())
+        return saveSecureTab(tab, true);
     if (tab->isUntitled())
         return saveAsFile();
+    switch (resolveExternalSaveConflict(tab)) {
+    case ExternalSaveDisposition::HandledSuccess:
+        return true;
+    case ExternalSaveDisposition::Cancelled:
+        return false;
+    case ExternalSaveDisposition::Proceed:
+        break;
+    }
     QString err;
     if (!tab->saveFile(&err)) {
         QString detail = err.isEmpty() ? tab->filePath() : QStringLiteral("%1\n\n详细信息：%2").arg(tab->filePath(), err);
@@ -661,28 +2820,470 @@ bool MainWindow::saveFile()
     return true;
 }
 
+MainWindow::ExternalSaveDisposition MainWindow::resolveExternalSaveConflict(EditorTab *tab)
+{
+    if (!tab || tab->isSecureDocument())
+        return ExternalSaveDisposition::Proceed;
+    const EditorTab::ExternalFileState state = tab->externalFileState();
+    if (state == EditorTab::ExternalFileState::NotTracked
+        || state == EditorTab::ExternalFileState::Unchanged) {
+        return ExternalSaveDisposition::Proceed;
+    }
+
+    QMessageBox box(QMessageBox::Warning, QStringLiteral("文件已在磁盘上更改"),
+                    QStringLiteral("为避免覆盖其他程序的修改，本次保存已暂停。"),
+                    QMessageBox::NoButton, this);
+    if (state == EditorTab::ExternalFileState::Changed) {
+        box.setInformativeText(
+            QStringLiteral("“%1”在打开后发生了变化。\n"
+                           "可以重新加载磁盘版本，或将当前编辑内容另存为新文件。")
+                .arg(tab->fileName()));
+    } else if (state == EditorTab::ExternalFileState::Missing) {
+        box.setInformativeText(
+            QStringLiteral("“%1”已被移动或删除。\n"
+                           "可以将当前编辑内容另存为新文件。")
+                .arg(tab->fileName()));
+    } else {
+        box.setInformativeText(
+            QStringLiteral("当前无法安全读取“%1”以确认它是否变化。\n"
+                           "可以将当前编辑内容另存为新文件。")
+                .arg(tab->fileName()));
+    }
+
+    QPushButton *reloadButton = nullptr;
+    if (state == EditorTab::ExternalFileState::Changed) {
+        reloadButton = box.addButton(QStringLiteral("重新加载磁盘版本"),
+                                     QMessageBox::AcceptRole);
+    }
+    auto *saveAsButton = box.addButton(QStringLiteral("另存为…"), QMessageBox::ActionRole);
+    auto *cancelButton = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+    box.setDefaultButton(cancelButton);
+    box.exec();
+
+    if (reloadButton && box.clickedButton() == reloadButton)
+        return reloadTabFromDisk(tab) ? ExternalSaveDisposition::HandledSuccess
+                                      : ExternalSaveDisposition::Cancelled;
+    if (box.clickedButton() == saveAsButton)
+        return saveAsFile() ? ExternalSaveDisposition::HandledSuccess
+                            : ExternalSaveDisposition::Cancelled;
+    return ExternalSaveDisposition::Cancelled;
+}
+
+MainWindow::ExternalSaveDisposition MainWindow::resolveSecureExternalSaveConflict(
+    EditorTab *tab)
+{
+#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
+    Q_UNUSED(tab)
+    return ExternalSaveDisposition::Cancelled;
+#else
+    if (!tab || !tab->isSecureDocument() || !m_secureDocuments)
+        return ExternalSaveDisposition::Cancelled;
+    const DiskFileState state = m_secureDocuments->externalFileState(
+        tab->secureDocumentId());
+
+    QMessageBox box(QMessageBox::Warning,
+                    QStringLiteral("安全文档已在磁盘上更改"),
+                    QStringLiteral("为避免覆盖其他程序写入的密文，本次保存已暂停。"),
+                    QMessageBox::NoButton, this);
+    if (state == DiskFileState::Changed) {
+        box.setInformativeText(
+            QStringLiteral("“%1”在打开后发生了变化。\n"
+                           "可以重新解密并加载磁盘版本，或将当前内容另存为新的安全文档。")
+                .arg(tab->fileName()));
+    } else if (state == DiskFileState::Missing) {
+        box.setInformativeText(
+            QStringLiteral("“%1”已被移动或删除。\n"
+                           "可以将当前内容另存为新的安全文档。")
+                .arg(tab->fileName()));
+    } else {
+        box.setInformativeText(
+            QStringLiteral("当前无法安全验证“%1”的磁盘版本。\n"
+                           "可以将当前内容另存为新的安全文档。")
+                .arg(tab->fileName()));
+    }
+
+    QPushButton *reloadButton = nullptr;
+    if (state == DiskFileState::Changed) {
+        reloadButton = box.addButton(QStringLiteral("重新加载磁盘版本"),
+                                     QMessageBox::AcceptRole);
+    }
+    auto *saveAsButton = box.addButton(QStringLiteral("另存为…"), QMessageBox::ActionRole);
+    auto *cancelButton = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+    box.setDefaultButton(cancelButton);
+    box.exec();
+
+    if (reloadButton && box.clickedButton() == reloadButton)
+        return reloadSecureTabFromDisk(tab) ? ExternalSaveDisposition::HandledSuccess
+                                            : ExternalSaveDisposition::Cancelled;
+    if (box.clickedButton() == saveAsButton)
+        return saveAsFile() ? ExternalSaveDisposition::HandledSuccess
+                            : ExternalSaveDisposition::Cancelled;
+    return ExternalSaveDisposition::Cancelled;
+#endif
+}
+
+bool MainWindow::reloadSecureTabFromDisk(EditorTab *tab)
+{
+#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
+    Q_UNUSED(tab)
+    return false;
+#else
+    if (!tab || !tab->isSecureDocument() || !m_secureDocuments)
+        return false;
+    SecureDocumentSnapshot snapshot;
+    const VaultError error = m_secureDocuments->reload(tab->secureDocumentId(), &snapshot);
+    if (error.isError()) {
+        QMessageBox box(QMessageBox::Critical, QStringLiteral("无法重新加载安全文档"),
+                        error.userMessage, QMessageBox::Ok, this);
+        box.setDetailedText(error.diagnosticCode);
+        box.exec();
+        return false;
+    }
+    if (!adoptSecureSnapshot(snapshot, tab))
+        return false;
+    if (m_searchDock)
+        m_searchDock->clearResults();
+    updateStatusBar();
+    statusBar()->showMessage(QStringLiteral("已重新解密并加载磁盘版本"), 2500);
+    return true;
+#endif
+}
+
+bool MainWindow::reloadTabFromDisk(EditorTab *tab)
+{
+    if (!tab || tab->isSecureDocument() || tab->filePath().isEmpty())
+        return false;
+    const QString path = tab->filePath();
+    QFile probe(path);
+    if (!probe.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(this, QStringLiteral("无法重新加载"),
+                             QStringLiteral("无法读取文件：\n%1\n\n%2")
+                                 .arg(path, probe.errorString()));
+        return false;
+    }
+    probe.close();
+
+    // Discarding edits is already explicit at the call site. Tear down mmap and
+    // route through the complete Open path (KDBX header, binary and size tier).
+    tab->shutdownL2BeforeClose();
+    if (!openPathUnified(path, tab)) {
+        QMessageBox::warning(this, QStringLiteral("无法重新加载"),
+                             QStringLiteral("文件无法按当前格式重新打开：\n%1")
+                                 .arg(path));
+        return false;
+    }
+    if (m_searchDock)
+        m_searchDock->clearResults();
+    updateRecentFiles(path);
+    const int index = m_tabs->indexOf(tab);
+    if (index >= 0)
+        m_tabs->setTabText(index, tab->tabTitle());
+    syncGlobalMenuCheckStates();
+    updateStatusBar();
+    statusBar()->showMessage(QStringLiteral("已从磁盘重新加载"), 2500);
+    return true;
+}
+
+void MainWindow::reloadFile()
+{
+    EditorTab *tab = currentTab();
+    if (!tab || (tab->isSecureDocument() ? tab->filePath().isEmpty()
+                                         : tab->isUntitled()))
+        return;
+    if (tab->isModified()) {
+        QMessageBox box(QMessageBox::Warning, QStringLiteral("重新加载文件"),
+                        QStringLiteral("重新加载将丢弃“%1”的未保存修改。")
+                            .arg(tab->fileName()),
+                        QMessageBox::NoButton, this);
+        auto *reloadButton = box.addButton(QStringLiteral("重新加载"),
+                                           QMessageBox::DestructiveRole);
+        auto *cancelButton = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+        box.setDefaultButton(cancelButton);
+        box.exec();
+        if (box.clickedButton() != reloadButton)
+            return;
+    }
+    if (tab->isSecureDocument())
+        reloadSecureTabFromDisk(tab);
+    else
+        reloadTabFromDisk(tab);
+}
+
 bool MainWindow::saveAsFile()
 {
     auto *tab = currentTab();
     if (!tab)
         return false;
-    QString fileName = QFileDialog::getSaveFileName(
-        this, QStringLiteral("另存为"), QString(),
-        QStringLiteral("所有文件 (*);;文本文件 (*.txt);;C/C++ (*.cpp);;Python (*.py);;JSON (*.json)"));
-    if (fileName.isEmpty())
+    const QString secureFilter = QStringLiteral("Notepad Safe 安全文档 (*.nsafe)");
+    const QString plainFilter = QStringLiteral("未加密文件 (*)");
+    QString selectedFilter = tab->isSecureDocument() ? secureFilter
+                                                      : plainFilter;
+    QString suggestion;
+    if (!tab->filePath().isEmpty())
+        suggestion = tab->filePath();
+    else
+        suggestion = secureTitleFrom(tab) + (tab->isSecureDocument()
+                                                  ? QStringLiteral(".nsafe")
+                                                  : QStringLiteral(".txt"));
+    QDialog saveAsDialog(this);
+    saveAsDialog.setObjectName(QStringLiteral("saveAsDialog"));
+    saveAsDialog.setWindowTitle(QStringLiteral("另存为"));
+    saveAsDialog.resize(940, 650);
+    auto *saveAsLayout = new QVBoxLayout(&saveAsDialog);
+    saveAsLayout->setContentsMargins(10, 10, 10, 10);
+    saveAsLayout->setSpacing(8);
+
+    auto *fileDialog = new QFileDialog(
+        &saveAsDialog, QString(), suggestion,
+        secureFilter + QStringLiteral(";;") + plainFilter);
+    fileDialog->setObjectName(QStringLiteral("saveAsFileDialog"));
+    fileDialog->setWindowFlags(Qt::Widget);
+    fileDialog->setAcceptMode(QFileDialog::AcceptSave);
+    fileDialog->setFileMode(QFileDialog::AnyFile);
+    // The product requires one dialog with an explicit, always-visible
+    // encryption consequence. Native dialogs do not allow that content.
+    fileDialog->setOption(QFileDialog::DontUseNativeDialog, true);
+    fileDialog->setLabelText(QFileDialog::LookIn, QStringLiteral("位置："));
+    fileDialog->setLabelText(QFileDialog::FileName, QStringLiteral("文件名："));
+    fileDialog->setLabelText(QFileDialog::FileType, QStringLiteral("保存类型："));
+    fileDialog->setLabelText(QFileDialog::Accept, QStringLiteral("保存"));
+    fileDialog->setLabelText(QFileDialog::Reject, QStringLiteral("取消"));
+    fileDialog->selectNameFilter(selectedFilter);
+    saveAsLayout->addWidget(fileDialog, 1);
+
+    auto *securityNotice = new QLabel(&saveAsDialog);
+    securityNotice->setObjectName(QStringLiteral("saveAsSecurityNotice"));
+    securityNotice->setWordWrap(true);
+    securityNotice->setContentsMargins(8, 6, 8, 6);
+    securityNotice->setMinimumHeight(42);
+    saveAsLayout->addWidget(securityNotice);
+    const QString plainSuffix = tab->isBinaryDocument()
+                                    ? QStringLiteral("bin") : QStringLiteral("txt");
+    const auto updateSaveAsNotice = [fileDialog, securityNotice, secureFilter,
+                                     plainSuffix](const QString &filter) {
+        if (filter == secureFilter) {
+            fileDialog->setDefaultSuffix(QStringLiteral("nsafe"));
+            securityNotice->setText(QStringLiteral(
+                "将保存为离线加密的 Notepad Safe 文档。普通保存会继续保持此格式。"));
+            securityNotice->setStyleSheet(QStringLiteral(
+                "QLabel { color: #246b45; background: #eaf7ef; border: 1px solid #b9dfc8; "
+                "border-radius: 4px; }"));
+            const QStringList selected = fileDialog->selectedFiles();
+            if (!selected.isEmpty()
+                && !selected.constFirst().endsWith(QStringLiteral(".nsafe"),
+                                                    Qt::CaseInsensitive)) {
+                fileDialog->selectFile(selected.constFirst()
+                                       + QStringLiteral(".nsafe"));
+            }
+        } else {
+            fileDialog->setDefaultSuffix(plainSuffix);
+            securityNotice->setText(QStringLiteral(
+                "将创建未加密文件，其他程序可以直接读取其内容。普通保存会继续保持此格式。"));
+            securityNotice->setStyleSheet(QStringLiteral(
+                "QLabel { color: #7a4b00; background: #fff5dd; border: 1px solid #e8c77a; "
+                "border-radius: 4px; }"));
+
+            // .nsafe is reserved for KDBX-backed encrypted documents. When a
+            // user changes the explicit type selector, update the inherited
+            // suggestion immediately instead of silently writing plaintext
+            // behind an encrypted-looking extension.
+            const QStringList selected = fileDialog->selectedFiles();
+            if (!selected.isEmpty()
+                && selected.constFirst().endsWith(QStringLiteral(".nsafe"),
+                                                   Qt::CaseInsensitive)) {
+                QString plainName = selected.constFirst();
+                plainName.chop(QStringLiteral(".nsafe").size());
+                plainName += QLatin1Char('.') + plainSuffix;
+                fileDialog->selectFile(plainName);
+            }
+        }
+    };
+    connect(fileDialog, &QFileDialog::filterSelected,
+            &saveAsDialog, updateSaveAsNotice);
+    connect(fileDialog, &QFileDialog::accepted,
+            &saveAsDialog, &QDialog::accept);
+    connect(fileDialog, &QFileDialog::rejected,
+            &saveAsDialog, &QDialog::reject);
+    updateSaveAsNotice(selectedFilter);
+
+    if (saveAsDialog.exec() != QDialog::Accepted
+        || fileDialog->selectedFiles().isEmpty()) {
         return false;
-    QString err;
-    if (!tab->saveAsFile(fileName, &err)) {
-        QString detail = err.isEmpty() ? fileName : QStringLiteral("%1\n\n详细信息：%2").arg(fileName, err);
-        QMessageBox::warning(this, QStringLiteral("错误"),
-                             QStringLiteral("无法保存文件：\n%1").arg(detail));
+    }
+    QString fileName = fileDialog->selectedFiles().constFirst();
+    selectedFilter = fileDialog->selectedNameFilter();
+
+    // The explicit type selector is authoritative. An extension is a display
+    // hint only and must never silently change the security boundary.
+    const bool saveSecure = selectedFilter == secureFilter;
+    if (!saveSecure
+        && fileName.endsWith(QStringLiteral(".nsafe"), Qt::CaseInsensitive)) {
+        fileName.chop(QStringLiteral(".nsafe").size());
+        fileName += QLatin1Char('.') + plainSuffix;
+    }
+    if (saveSecure) {
+#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
+        const bool binaryPayload = tab->isBinaryDocument();
+        if (tab->isLargeDocument() && !binaryPayload) {
+            QMessageBox::information(
+                this, QStringLiteral("不能转换为安全文档"),
+                QStringLiteral("安全文档只接受小于 32 MiB 的内容。"
+                               "当前文本处于大文件模式，未写入任何目标文件。"));
+            return false;
+        }
+        if (!ensureSecuritySessionInteractive() || !m_secureDocuments)
+            return false;
+        if (!fileName.endsWith(QStringLiteral(".nsafe"), Qt::CaseInsensitive))
+            fileName += QStringLiteral(".nsafe");
+        const QString title = secureTitleFrom(tab);
+        VaultError error;
+        if (binaryPayload) {
+            QByteArray body;
+            QString exportError;
+            if (!tab->exportBinaryPayloadBytes(&body, &exportError)) {
+                QMessageBox::critical(this, QStringLiteral("另存为失败"), exportError);
+                return false;
+            }
+            if (tab->isSecureDocument()) {
+                error = m_secureDocuments->saveBinary(
+                    tab->secureDocumentId(), body, title, fileName);
+                if (!error.isError()) {
+                    tab->setFilePath(QFileInfo(fileName).absoluteFilePath());
+                    tab->setAutosavePath(
+                        m_secureDocuments->backingPath(tab->secureDocumentId()));
+                    tab->setSecureDocumentTitle(title);
+                    tab->setModified(false);
+                }
+            } else {
+                SecureDocumentSnapshot snapshot;
+                error = m_secureDocuments->saveAsSecureBinary(
+                    body, title, fileName, &snapshot);
+                if (!error.isError() && !adoptSecureSnapshot(snapshot, tab)) {
+                    scrubByteArray(body);
+                    return false;
+                }
+            }
+            scrubByteArray(body);
+        } else {
+            QString body = tab->editor()->text();
+            if (tab->isSecureDocument()) {
+                error = m_secureDocuments->save(
+                    tab->secureDocumentId(), body, title, fileName);
+                if (!error.isError()) {
+                    tab->setFilePath(QFileInfo(fileName).absoluteFilePath());
+                    tab->setAutosavePath(
+                        m_secureDocuments->backingPath(tab->secureDocumentId()));
+                    tab->setSecureDocumentTitle(title);
+                    tab->setModified(false);
+                }
+            } else {
+                SecureDocumentSnapshot snapshot;
+                error = m_secureDocuments->saveAsSecure(
+                    body, title, fileName, &snapshot);
+                if (!error.isError() && !adoptSecureSnapshot(snapshot, tab)) {
+                    body.fill(QChar(0));
+                    return false;
+                }
+            }
+            if (!body.isEmpty())
+                body.fill(QChar(0));
+            body.clear();
+        }
+        if (error.isError()) {
+            QMessageBox box(QMessageBox::Critical, QStringLiteral("另存为失败"),
+                            error.userMessage, QMessageBox::Ok, this);
+            box.setDetailedText(error.diagnosticCode);
+            box.exec();
+            return false;
+        }
+#else
         return false;
+#endif
+    } else {
+        const QUuid previousSecureId = tab->isSecureDocument()
+                                           ? tab->secureDocumentId() : QUuid();
+        QString err;
+        if (tab->isSecureDocument()) {
+            if (tab->isSecureBinaryDocument()) {
+                QByteArray raw;
+                if (!tab->exportBinaryPayloadBytes(&raw, &err)) {
+                    // export supplied the actionable validation message.
+                } else {
+                    QSaveFile output(fileName);
+                    output.setDirectWriteFallback(false);
+                    const bool written = output.open(QIODevice::WriteOnly)
+                                         && output.write(raw) == raw.size()
+                                         && output.commit();
+                    scrubByteArray(raw);
+                    if (!written)
+                        err = output.errorString().isEmpty()
+                                  ? QStringLiteral("无法原子写入文件。")
+                                  : output.errorString();
+                }
+                if (err.isEmpty() && !openPathUnified(fileName, tab))
+                    err = QStringLiteral("文件已写入，但无法重新打开目标文件。");
+                // Re-enter through the unified opener so the newly created raw
+                // file receives its mmap/Hex backing store and disk baseline.
+            } else if (!tab->exportToFile(fileName)) {
+                err = QStringLiteral("无法写入文件。");
+            } else {
+                if (m_secureDocuments)
+                    m_secureDocuments->close(previousSecureId);
+                tab->convertToPlainDocument(QFileInfo(fileName).absoluteFilePath());
+            }
+        } else if (!tab->saveAsFile(fileName, &err)) {
+            // err is populated by the text writer.
+        }
+        if (!err.isEmpty()) {
+            QMessageBox::warning(this, QStringLiteral("错误"),
+                                 QStringLiteral("无法保存文件：\n%1\n\n%2")
+                                     .arg(fileName, err));
+            return false;
+        }
     }
     updateRecentFiles(fileName);
     int idx = m_tabs->indexOf(tab);
     if (idx >= 0)
         m_tabs->setTabText(idx, tab->tabTitle());
+    syncCommandStates(tab);
+    syncGlobalMenuCheckStates();
+    updateStatusBar();
+    statusBar()->showMessage(QStringLiteral("已另存为"), 2500);
     return true;
+}
+
+void MainWindow::closeCurrentTab()
+{
+    if (!m_tabs)
+        return;
+    const int index = m_tabs->currentIndex();
+    if (index >= 0)
+        onTabCloseRequested(index);
+}
+
+void MainWindow::closeAllTabs()
+{
+    if (!m_tabs || m_tabs->count() == 0)
+        return;
+
+    // Preflight every document before removing any tab. If the user cancels a
+    // later prompt, the workspace remains intact instead of being half closed.
+    QVector<int> order;
+    order.reserve(m_tabs->count());
+    const int current = m_tabs->currentIndex();
+    if (current >= 0)
+        order.push_back(current);
+    for (int index = 0; index < m_tabs->count(); ++index) {
+        if (index != current)
+            order.push_back(index);
+    }
+    for (const int index : order) {
+        if (!maybeSaveTab(index, false))
+            return;
+    }
+
+    for (int index = m_tabs->count() - 1; index >= 0; --index)
+        closeTabUnchecked(index);
 }
 
 void MainWindow::openRecentFile()
@@ -694,21 +3295,19 @@ void MainWindow::openRecentFile()
     if (path.isEmpty())
         return;
     if (!QFileInfo::exists(path)) {
-        QMessageBox::information(this, QStringLiteral("提示"),
-                                 QStringLiteral("文件不存在: %1").arg(path));
-        m_recentFiles.removeAll(path);
+        for (int i = m_recentFiles.size() - 1; i >= 0; --i) {
+            if (sameDiskFilePath(m_recentFiles.at(i), path))
+                m_recentFiles.removeAt(i);
+        }
         rebuildRecentFilesMenu();
+        saveSettings();
+        statusBar()->showMessage(
+            QStringLiteral("文件已不存在，已从最近打开中移除：%1").arg(path), 5000);
         return;
     }
-    auto *tab = addNewTab();
-    if (!openTabAutoMode(tab, path)) {
+    if (!openPathUnified(path)) {
         QMessageBox::warning(this, QStringLiteral("错误"),
                              QStringLiteral("无法打开文件: %1").arg(path));
-        int idx = m_tabs->indexOf(tab);
-        if (idx >= 0)
-            m_tabs->removeTab(idx);
-    } else {
-        m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
     }
 }
 
@@ -755,6 +3354,14 @@ void MainWindow::sortLinesDesc()
 
 void MainWindow::showFindDialog()
 {
+    if (m_workspaceStack && m_accountsPage
+        && m_workspaceStack->currentWidget() == m_accountsPage) {
+        if (m_vaultDock)
+            m_vaultDock->focusAccountSearch();
+        return;
+    }
+    if (!isDocumentWorkspaceActive())
+        return;
     auto *tab = currentTab();
     if (!tab)
         return;
@@ -764,6 +3371,8 @@ void MainWindow::showFindDialog()
 
 void MainWindow::showReplaceDialog()
 {
+    if (!isDocumentWorkspaceActive())
+        return;
     auto *tab = currentTab();
     if (!tab)
         return;
@@ -773,20 +3382,16 @@ void MainWindow::showReplaceDialog()
 
 void MainWindow::findNext()
 {
-    auto *tab = currentTab();
-    if (!tab || m_lastFindPattern.isEmpty())
+    if (!currentTab() || m_lastFindPattern.isEmpty())
         return;
-    tab->findNext(m_lastFindPattern, m_lastFindRegex, m_lastFindCase,
-                  m_lastFindWord, true, true);
+    m_findDialog->findNextFromShortcut(true);
 }
 
 void MainWindow::findPrev()
 {
-    auto *tab = currentTab();
-    if (!tab || m_lastFindPattern.isEmpty())
+    if (!currentTab() || m_lastFindPattern.isEmpty())
         return;
-    tab->findNext(m_lastFindPattern, m_lastFindRegex, m_lastFindCase,
-                  m_lastFindWord, false, true);
+    m_findDialog->findNextFromShortcut(false);
 }
 
 // ============ 语法 ============
@@ -828,10 +3433,18 @@ void MainWindow::clearBookmarks()
 
 // ============ 视图 ============
 
-void MainWindow::toggleDarkMode()
+void MainWindow::setAppearanceModeFromAction(QAction *action)
 {
-    m_darkMode = !m_darkMode;
-    applyDarkMode(m_darkMode);
+    if (!action)
+        return;
+    const int value = action->data().toInt();
+    if (value < static_cast<int>(AppearanceMode::System)
+        || value > static_cast<int>(AppearanceMode::Dark)) {
+        return;
+    }
+    m_appearanceMode = static_cast<AppearanceMode>(value);
+    applyAppearanceMode();
+    syncGlobalMenuCheckStates();
     saveSettings();
 }
 
@@ -900,27 +3513,41 @@ void MainWindow::toggleHexViewMode()
 {
     auto *tab = currentTab();
     if (!tab || !tab->isL2Active()) {
-        // L1 tab：提示用户 16 进制模式仅支持大文件 L2 视图
-        if (m_actHexViewMode) m_actHexViewMode->setChecked(false);
+        syncGlobalMenuCheckStates();
         return;
     }
     ViewMode now = tab->viewModeL2();
     ViewMode next = (now == ViewMode::Hex) ? ViewMode::Text : ViewMode::Hex;
     tab->setViewModeL2(next);
-    if (m_actHexViewMode) m_actHexViewMode->setChecked(next == ViewMode::Hex);
+    syncCommandStates(tab);
+    syncGlobalMenuCheckStates();
+    updateStatusBar();
 }
 
-// 统一把 m_darkMode/m_wordWrap/m_edgeVisible/m_edgeColumn 同步到视图菜单的勾选
+// 统一把外观/换行/标尺/呈现方式同步到视图菜单。
 // 这是解决"恢复设置后菜单勾选未同步显示"的核心函数
 void MainWindow::syncGlobalMenuCheckStates()
 {
-    if (m_actDarkMode)  m_actDarkMode->setChecked(m_darkMode);
+    if (m_actAppearanceSystem)
+        m_actAppearanceSystem->setChecked(m_appearanceMode == AppearanceMode::System);
+    if (m_actAppearanceLight)
+        m_actAppearanceLight->setChecked(m_appearanceMode == AppearanceMode::Light);
+    if (m_actDarkMode)
+        m_actDarkMode->setChecked(m_appearanceMode == AppearanceMode::Dark);
     if (m_actWordWrap)  m_actWordWrap->setChecked(m_wordWrap);
     if (m_actEdgeVisible) m_actEdgeVisible->setChecked(m_edgeVisible);
-    if (m_actHexViewMode) {
+    if (m_actTextViewMode || m_actHexViewMode) {
         auto *tab = currentTab();
-        bool checked = tab && tab->isL2Active() && tab->viewModeL2() == ViewMode::Hex;
-        m_actHexViewMode->setChecked(checked);
+        const bool dualPresentation = tab && tab->isL2Active();
+        const bool hex = dualPresentation && tab->viewModeL2() == ViewMode::Hex;
+        if (m_actTextViewMode) {
+            m_actTextViewMode->setEnabled(dualPresentation);
+            m_actTextViewMode->setChecked(dualPresentation && !hex);
+        }
+        if (m_actHexViewMode) {
+            m_actHexViewMode->setEnabled(dualPresentation);
+            m_actHexViewMode->setChecked(hex);
+        }
     }
     if (m_edgeColGroup) {
         for (QAction *a : m_edgeColGroup->actions()) {
@@ -969,24 +3596,15 @@ void MainWindow::openFilesFromExternal(const QStringList &paths)
         if (p.isEmpty()) continue;
         QFileInfo fi(p);
         if (!fi.isFile()) continue;
-        EditorTab *tab = nullptr;
-        if (idx == 0 && anyEmptyUntitledIdx >= 0) {
-            tab = qobject_cast<EditorTab *>(m_tabs->widget(anyEmptyUntitledIdx));
-        } else {
-            tab = addNewTab();
-        }
-        if (!tab) continue;
-        if (openTabAutoMode(tab, p)) {
-            updateRecentFiles(p);
-            m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
-        } else {
+        EditorTab *reuseTab = nullptr;
+        if (idx == 0 && anyEmptyUntitledIdx >= 0)
+            reuseTab = qobject_cast<EditorTab *>(m_tabs->widget(anyEmptyUntitledIdx));
+        // openPathUnified owns tab creation for every non-placeholder file.
+        // This keeps drag/drop and command-line opens on the same duplicate-
+        // detection path as File > Open and Recent Files.
+        if (!openPathUnified(p, reuseTab)) {
             QMessageBox::warning(this, QStringLiteral("错误"),
                 QStringLiteral("无法打开文件: %1").arg(p));
-            // 如果是新创建的空标签则关闭
-            if (anyEmptyUntitledIdx < 0 || idx != 0) {
-                int i = m_tabs->indexOf(tab);
-                if (i >= 0) m_tabs->removeTab(i);
-            }
         }
         ++idx;
     }
@@ -1041,14 +3659,56 @@ void MainWindow::displayEncodingFromAction()
     auto enc = static_cast<TextEncoding>(act->data().toInt());
     auto *tab = currentTab();
     if (!tab) return;
-    // Notepad++ "以编码显示"：不修改文件内容，仅改变显示解码方式
+    if (tab->isSecureDocument() || tab->isUntitled()
+        || (tab->isL2Active() && tab->viewModeL2() == ViewMode::Hex)) {
+        syncEncodingMenuTo(m_displayEncodingMenu, tab->displayEncoding());
+        return;
+    }
+    if (tab->displayEncoding() == enc)
+        return;
+
+    // L1 must reread the original bytes. Never let that silently overwrite
+    // unsaved text. L2 owns a byte-preserving virtual source, so changing its
+    // decoder can retain pending byte patches without a destructive reload.
+    if (!tab->isL2Active() && tab->isModified()) {
+        QMessageBox box(QMessageBox::Warning, QStringLiteral("以编码重新打开"),
+                        QStringLiteral("“%1”有未保存的修改。重新解释磁盘字节前要如何处理？")
+                            .arg(tab->fileName()),
+                        QMessageBox::NoButton, this);
+        auto *saveButton = box.addButton(QStringLiteral("保存并重新打开"),
+                                         QMessageBox::AcceptRole);
+        auto *discardButton = box.addButton(QStringLiteral("放弃修改并重新打开"),
+                                            QMessageBox::DestructiveRole);
+        auto *cancelButton = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+        box.setDefaultButton(cancelButton);
+        box.exec();
+        if (box.clickedButton() == cancelButton || !box.clickedButton()) {
+            syncEncodingMenuTo(m_displayEncodingMenu, tab->displayEncoding());
+            return;
+        }
+        if (box.clickedButton() == saveButton && !saveFile()) {
+            syncEncodingMenuTo(m_displayEncodingMenu, tab->displayEncoding());
+            return;
+        }
+        if (box.clickedButton() == discardButton)
+            tab->clearAutosaveFile();
+    }
+
     tab->setDisplayEncoding(enc);
+    syncEncodingMenuTo(m_encodingMenu, tab->encoding());
+    syncEncodingMenuTo(m_displayEncodingMenu, tab->displayEncoding());
+    updateStatusBar();
 }
 
 void MainWindow::applyDarkMode(bool dark)
 {
     QPalette pal;
-    if (dark) {
+    if (m_highContrastMode) {
+        // Let the platform own every color in accessibility mode. In
+        // particular, do not put our dark menu stylesheet on top of a user's
+        // custom Windows contrast scheme.
+        pal = QApplication::style()->standardPalette();
+    } else if (dark) {
         pal.setColor(QPalette::Window, QColor(45, 45, 48));
         pal.setColor(QPalette::WindowText, QColor(208, 208, 208));
         pal.setColor(QPalette::Base, QColor(30, 30, 30));
@@ -1060,10 +3720,42 @@ void MainWindow::applyDarkMode(bool dark)
         pal.setColor(QPalette::HighlightedText, QColor(255, 255, 255));
         pal.setColor(QPalette::ToolTipBase, QColor(60, 60, 64));
         pal.setColor(QPalette::ToolTipText, QColor(208, 208, 208));
+        pal.setColor(QPalette::Disabled, QPalette::WindowText, QColor(125, 125, 125));
+        pal.setColor(QPalette::Disabled, QPalette::Text, QColor(125, 125, 125));
+        pal.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(125, 125, 125));
     } else {
+        // The platform standard palette may itself be dark when Windows is in
+        // dark mode.  "Light" is an explicit user choice, so restoring that
+        // palette must not depend on the current OS theme (or on the custom
+        // palette previously installed by this application).
         pal = QApplication::style()->standardPalette();
+        pal.setColor(QPalette::Window, QColor(240, 240, 240));
+        pal.setColor(QPalette::WindowText, QColor(0, 0, 0));
+        pal.setColor(QPalette::Base, QColor(255, 255, 255));
+        pal.setColor(QPalette::AlternateBase, QColor(245, 245, 245));
+        pal.setColor(QPalette::Text, QColor(0, 0, 0));
+        pal.setColor(QPalette::Button, QColor(240, 240, 240));
+        pal.setColor(QPalette::ButtonText, QColor(0, 0, 0));
+        pal.setColor(QPalette::Highlight, QColor(0, 120, 215));
+        pal.setColor(QPalette::HighlightedText, QColor(255, 255, 255));
+        pal.setColor(QPalette::ToolTipBase, QColor(255, 255, 220));
+        pal.setColor(QPalette::ToolTipText, QColor(0, 0, 0));
     }
     qApp->setPalette(pal);
+    // The native Windows style does not consistently honor QPalette text
+    // roles for owner-drawn menus. Without these narrow overrides it produces
+    // black menu text on our dark background. Keep the stylesheet limited to
+    // menus/tooltips so individual editor/account control styles still work.
+    qApp->setStyleSheet(!m_highContrastMode && dark ? QStringLiteral(
+        "QMenuBar { background-color:#2d2d30; color:#d0d0d0; }"
+        "QMenuBar::item:selected { background-color:#3c3c40; color:#ffffff; }"
+        "QMenuBar::item:pressed { background-color:#3c3c40; color:#ffffff; }"
+        "QMenu { background-color:#2d2d30; color:#d0d0d0; border:1px solid #55555a; }"
+        "QMenu::item:selected { background-color:#0078d7; color:#ffffff; }"
+        "QMenu::item:disabled { color:#7d7d7d; }"
+        "QMenu::separator { height:1px; background:#505055; margin:4px 8px; }"
+        "QToolTip { color:#d0d0d0; background-color:#3c3c40; border:1px solid #66666a; }")
+        : QString());
 
     // 更新所有 EditorTab 的编辑器配色
     for (int i = 0; i < m_tabs->count(); ++i) {
@@ -1071,7 +3763,15 @@ void MainWindow::applyDarkMode(bool dark)
         if (!tab)
             continue;
         auto *e = tab->editor();
-        if (dark) {
+        if (m_highContrastMode) {
+            e->setPaper(pal.color(QPalette::Base));
+            e->setColor(pal.color(QPalette::Text));
+            e->setMarginsBackgroundColor(pal.color(QPalette::Window));
+            e->setMarginsForegroundColor(pal.color(QPalette::WindowText));
+            e->setCaretLineBackgroundColor(pal.color(QPalette::AlternateBase));
+            e->setSelectionBackgroundColor(pal.color(QPalette::Highlight));
+            e->setSelectionForegroundColor(pal.color(QPalette::HighlightedText));
+        } else if (dark) {
             e->setPaper(QColor(30, 30, 30));
             e->setColor(QColor(208, 208, 208));
             e->setMarginsBackgroundColor(QColor(45, 45, 48));
@@ -1091,24 +3791,141 @@ void MainWindow::applyDarkMode(bool dark)
     }
 }
 
+void MainWindow::applyAppearanceMode()
+{
+    m_highContrastMode = systemHighContrastEnabled();
+    bool dark = false;
+    switch (m_appearanceMode) {
+    case AppearanceMode::Dark:
+        dark = true;
+        break;
+    case AppearanceMode::Light:
+        dark = false;
+        break;
+    case AppearanceMode::System: {
+        const Qt::ColorScheme scheme = QGuiApplication::styleHints()->colorScheme();
+        dark = scheme == Qt::ColorScheme::Dark;
+        if (scheme == Qt::ColorScheme::Unknown) {
+            dark = QApplication::style()->standardPalette()
+                       .color(QPalette::Window).lightness() < 128;
+        }
+        break;
+    }
+    }
+    m_darkMode = dark;
+    applyDarkMode(dark);
+}
+
 // ============ 标签事件 ============
 
 EditorTab *MainWindow::currentTab() const
 {
+    if (m_destroying || !m_tabs)
+        return nullptr;
+    if (m_workspaceStack && m_workspaceStack->currentWidget() != m_tabs)
+        return nullptr;
     return qobject_cast<EditorTab *>(m_tabs->currentWidget());
 }
 
-void MainWindow::syncL2SensitiveActions(EditorTab *tab)
+void MainWindow::syncCommandStates(EditorTab *tab)
 {
-    if (!tab) tab = currentTab();
+    if (m_destroying)
+        return;
+    const bool documentWorkspace = isDocumentWorkspaceActive();
+    if (!tab && documentWorkspace)
+        tab = currentTab();
+    if (!documentWorkspace)
+        tab = nullptr;
+    const bool hasDocument = tab != nullptr;
+    for (QAction *action : m_documentOnlyActions) {
+        if (action)
+            action->setEnabled(hasDocument);
+    }
+    const bool canModify = hasDocument && tab->canModifyCommand();
+    const bool hasSelection = hasDocument && tab->hasSelectionCommand();
+    if (m_undoAction)
+        m_undoAction->setEnabled(hasDocument && tab->canUndoCommand());
+    if (m_redoAction)
+        m_redoAction->setEnabled(hasDocument && tab->canRedoCommand());
+    if (m_cutAction)
+        m_cutAction->setEnabled(canModify && hasSelection);
+    if (m_copyAction)
+        m_copyAction->setEnabled(hasSelection);
+    if (m_pasteAction) {
+        const QMimeData *clipboardData = QGuiApplication::clipboard()->mimeData();
+        m_pasteAction->setEnabled(canModify && clipboardData
+                                  && clipboardData->hasText()
+                                  && !clipboardData->text().isEmpty());
+    }
+    if (m_selectAllAction)
+        m_selectAllAction->setEnabled(hasDocument && !tab->isSecureDocumentMasked());
+    for (QAction *action : m_textMutationActions) {
+        if (action)
+            action->setEnabled(canModify && !tab->isL2Active());
+    }
+    for (QAction *action : m_languageActions) {
+        if (action)
+            action->setEnabled(hasDocument && !tab->isL2Active());
+    }
+    const bool accountsWorkspace = m_workspaceStack && m_accountsPage
+                                   && m_workspaceStack->currentWidget() == m_accountsPage;
+    if (m_saveAction) {
+        m_saveAction->setEnabled(hasDocument
+                                 || (accountsWorkspace && m_vaultDock
+                                     && m_vaultDock->canSaveActiveEntry()));
+    }
+    if (m_saveAsAction)
+        m_saveAsAction->setEnabled(hasDocument);
+    if (m_findAction) {
+        m_findAction->setEnabled(hasDocument
+                                 || (accountsWorkspace && m_vaultDock
+                                     && m_vaultDock->canSearchAccounts()));
+    }
+    if (m_replaceAction)
+        m_replaceAction->setEnabled(hasDocument);
+    if (m_statusModified && accountsWorkspace) {
+        m_statusModified->setText(m_vaultDock && m_vaultDock->canSaveActiveEntry()
+                                      ? QStringLiteral("未保存")
+                                      : QString());
+    }
     // 无 tab 时：所有这些动作一律禁用，避免误点
-    const bool enabled = (tab != nullptr) && !tab->isL2Active();
+    const bool textPresentation = hasDocument
+        && (!tab->isL2Active() || tab->viewModeL2() == ViewMode::Text);
+    const bool displayEncodingAvailable = textPresentation
+        && !tab->isSecureDocument() && !tab->isUntitled();
+    const bool conversionAvailable = displayEncodingAvailable
+        && !tab->isL2Active() && !tab->isBinaryDocument();
+    if (m_encodingMenu)
+        m_encodingMenu->menuAction()->setEnabled(displayEncodingAvailable
+                                                 || conversionAvailable);
+    for (QAction *action : m_displayEncodingActions) {
+        if (action)
+            action->setEnabled(displayEncodingAvailable);
+    }
+    const bool enabled = canModify && !tab->isL2Active();
     if (m_actSortAsc) m_actSortAsc->setEnabled(enabled);
     if (m_actSortDesc) m_actSortDesc->setEnabled(enabled);
     for (auto *a : m_convertEncodingActions) {
-        if (a) a->setEnabled(enabled);
+        if (a) a->setEnabled(conversionAvailable);
     }
-    // 注："以编码显示..."组不在 m_convertEncodingActions 里，它始终可点（只改显示解码不改字节流，L2 允许）
+    const bool hasDualPresentation = hasDocument && tab->isL2Active();
+    if (m_actTextViewMode)
+        m_actTextViewMode->setEnabled(hasDualPresentation);
+    if (m_actHexViewMode)
+        m_actHexViewMode->setEnabled(hasDualPresentation);
+    if (m_searchPanelAction)
+        m_searchPanelAction->setEnabled(hasDocument);
+    if (m_actReload)
+        m_actReload->setEnabled(tab && (tab->isSecureDocument()
+                                            ? !tab->filePath().isEmpty()
+                                            : !tab->isUntitled()));
+    if (m_actCloseTab)
+        m_actCloseTab->setEnabled(tab != nullptr);
+    if (m_actCloseAll)
+        m_actCloseAll->setEnabled(documentWorkspace && m_tabs
+                                  && m_tabs->count() > 0 && currentTab() != nullptr);
+    // 注："以编码显示..."组不在 m_convertEncodingActions 里，文档工作区内
+    // 始终可用（只改显示解码不改字节流，L2 允许）。
 }
 
 void MainWindow::onTabChanged(int index)
@@ -1117,8 +3934,12 @@ void MainWindow::onTabChanged(int index)
     if (index >= 0) tab = qobject_cast<EditorTab *>(m_tabs->widget(index));
     if (m_findDialog) m_findDialog->setActiveTab(tab);
     // 统一同步不适配 L2 的菜单项（含 index<0 无 tab → 全部变灰）
-    syncL2SensitiveActions(tab);
-    if (!tab) return;
+    syncCommandStates(tab);
+    syncGlobalMenuCheckStates();
+    if (!tab) {
+        updateStatusBar();
+        return;
+    }
     // 同步编码菜单勾选到当前标签
     syncEncodingMenuTo(m_encodingMenu, tab->encoding());
     syncEncodingMenuTo(m_displayEncodingMenu, tab->displayEncoding());
@@ -1129,19 +3950,182 @@ void MainWindow::onTabChanged(int index)
     updateStatusBar();
 }
 
+void MainWindow::showTabContextMenu(const QPoint &position)
+{
+    if (!m_tabs || !m_tabs->tabBar() || !isDocumentWorkspaceActive())
+        return;
+
+    QTabBar *bar = m_tabs->tabBar();
+    int index = bar->tabAt(position);
+    QPoint popupPosition = bar->mapToGlobal(position);
+    // Qt sends (-1, -1) for the keyboard context-menu key. In that case use
+    // the active tab and anchor the menu below its label.
+    if (index < 0 && position.x() < 0 && m_tabs->currentIndex() >= 0) {
+        index = m_tabs->currentIndex();
+        const QRect rect = bar->tabRect(index);
+        popupPosition = bar->mapToGlobal(QPoint(rect.left(), rect.bottom()));
+    }
+    if (index < 0)
+        return;
+
+    m_tabs->setCurrentIndex(index);
+    auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(index));
+    if (!tab)
+        return;
+
+    auto *menu = new QMenu(this);
+    menu->setObjectName(QStringLiteral("tabContextMenu"));
+    connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
+    QAction *save = menu->addAction(QStringLiteral("保存"));
+    save->setObjectName(QStringLiteral("tabContext.save"));
+    save->setShortcutVisibleInContextMenu(true);
+    save->setShortcut(QKeySequence::Save);
+    connect(save, &QAction::triggered, this, [this]() { saveFile(); });
+
+    QAction *saveAs = menu->addAction(QStringLiteral("另存为…"));
+    saveAs->setObjectName(QStringLiteral("tabContext.saveAs"));
+    saveAs->setShortcutVisibleInContextMenu(true);
+    saveAs->setShortcut(QKeySequence::SaveAs);
+    connect(saveAs, &QAction::triggered, this, [this]() { saveAsFile(); });
+
+    menu->addSeparator();
+    QAction *close = menu->addAction(QStringLiteral("关闭"));
+    close->setObjectName(QStringLiteral("tabContext.close"));
+    close->setShortcutVisibleInContextMenu(true);
+    close->setShortcut(QKeySequence(QStringLiteral("Ctrl+W")));
+    connect(close, &QAction::triggered, this, [this, index]() {
+        onTabCloseRequested(index);
+    });
+
+    QAction *closeOthers = menu->addAction(QStringLiteral("关闭其他标签"));
+    closeOthers->setObjectName(QStringLiteral("tabContext.closeOthers"));
+    closeOthers->setEnabled(m_tabs->count() > 1);
+    connect(closeOthers, &QAction::triggered, this, [this, index]() {
+        closeOtherTabs(index);
+    });
+
+    QAction *closeAll = menu->addAction(QStringLiteral("关闭全部标签"));
+    closeAll->setObjectName(QStringLiteral("tabContext.closeAll"));
+    connect(closeAll, &QAction::triggered, this, &MainWindow::closeAllTabs);
+
+    // DraftStore paths are private implementation details. Only user-named
+    // files expose path actions, including named encrypted .nsafe files.
+    const QString path = tab->filePath();
+    if (!path.isEmpty()) {
+        menu->addSeparator();
+        QAction *copyPath = menu->addAction(QStringLiteral("复制完整路径"));
+        copyPath->setObjectName(QStringLiteral("tabContext.copyPath"));
+        connect(copyPath, &QAction::triggered, this, [this, path]() {
+            QApplication::clipboard()->setText(QDir::toNativeSeparators(path));
+            statusBar()->showMessage(QStringLiteral("已复制文件路径"), 2500);
+        });
+
+        QAction *reveal = menu->addAction(QStringLiteral("在资源管理器中显示"));
+        reveal->setObjectName(QStringLiteral("tabContext.reveal"));
+        reveal->setEnabled(QFileInfo::exists(path));
+        connect(reveal, &QAction::triggered, this, [this, path]() {
+            bool opened = false;
+#ifdef Q_OS_WIN
+            opened = QProcess::startDetached(
+                QStringLiteral("explorer.exe"),
+                {QStringLiteral("/select,"), QDir::toNativeSeparators(path)});
+#else
+            opened = QDesktopServices::openUrl(
+                QUrl::fromLocalFile(QFileInfo(path).absolutePath()));
+#endif
+            if (!opened)
+                statusBar()->showMessage(QStringLiteral("无法打开文件所在位置"), 5000);
+        });
+    }
+
+    menu->addSeparator();
+    QAction *asText = menu->addAction(QStringLiteral("以文本重新打开"));
+    asText->setObjectName(QStringLiteral("tabContext.presentText"));
+    QAction *asHex = menu->addAction(QStringLiteral("以十六进制重新打开"));
+    asHex->setObjectName(QStringLiteral("tabContext.presentHex"));
+    const bool presentationSwitchAvailable = tab->isL2Active();
+    asText->setEnabled(presentationSwitchAvailable
+                       && tab->viewModeL2() != ViewMode::Text);
+    asHex->setEnabled(presentationSwitchAvailable
+                      && tab->viewModeL2() != ViewMode::Hex);
+    if (!presentationSwitchAvailable) {
+        const QString reason = QStringLiteral(
+            "当前直接编辑视图尚不需要重新装载；二进制和大文件视图可在文本与十六进制间切换。");
+        asText->setStatusTip(reason);
+        asHex->setStatusTip(reason);
+    }
+    connect(asText, &QAction::triggered, this, [this, tab]() {
+        if (!tab || !tab->isL2Active())
+            return;
+        tab->setViewModeL2(ViewMode::Text);
+        syncCommandStates(tab);
+        syncGlobalMenuCheckStates();
+        updateStatusBar();
+    });
+    connect(asHex, &QAction::triggered, this, [this, tab]() {
+        if (!tab || !tab->isL2Active())
+            return;
+        tab->setViewModeL2(ViewMode::Hex);
+        syncCommandStates(tab);
+        syncGlobalMenuCheckStates();
+        updateStatusBar();
+    });
+
+    menu->popup(popupPosition);
+}
+
+void MainWindow::closeTabUnchecked(int index)
+{
+    if (!m_tabs || index < 0 || index >= m_tabs->count())
+        return;
+    QWidget *widget = m_tabs->widget(index);
+    auto *tab = qobject_cast<EditorTab *>(widget);
+    if (tab) {
+        if (tab->isSecureDocument() && m_secureDocuments)
+            m_secureDocuments->close(tab->secureDocumentId());
+        else
+            tab->clearAutosaveFile();
+        tab->shutdownL2BeforeClose();
+    }
+    m_tabs->removeTab(index);
+    delete widget;
+}
+
+void MainWindow::closeOtherTabs(int keepIndex)
+{
+    if (!m_tabs || keepIndex < 0 || keepIndex >= m_tabs->count())
+        return;
+    QPointer<EditorTab> keep = qobject_cast<EditorTab *>(m_tabs->widget(keepIndex));
+    if (!keep)
+        return;
+
+    // Preflight all affected documents before deleting any of them, matching
+    // Close All's all-or-nothing cancellation behavior.
+    for (int index = 0; index < m_tabs->count(); ++index) {
+        if (m_tabs->widget(index) == keep)
+            continue;
+        if (!maybeSaveTab(index, false)) {
+            const int currentKeepIndex = m_tabs->indexOf(keep);
+            if (currentKeepIndex >= 0)
+                m_tabs->setCurrentIndex(currentKeepIndex);
+            return;
+        }
+    }
+    for (int index = m_tabs->count() - 1; index >= 0; --index) {
+        if (m_tabs->widget(index) != keep)
+            closeTabUnchecked(index);
+    }
+    const int currentKeepIndex = m_tabs->indexOf(keep);
+    if (currentKeepIndex >= 0)
+        m_tabs->setCurrentIndex(currentKeepIndex);
+}
+
 void MainWindow::onTabCloseRequested(int index)
 {
     // closingApp=false: 单标签关闭模式
     if (!maybeSaveTab(index, /*closingApp=*/false))
         return;
-    auto *w = m_tabs->widget(index);
-    auto *tab = qobject_cast<EditorTab *>(w);
-    // 只要标签被移除（无论何种情况），未命名的 autosave 必须删除（不在打开标签里了）
-    if (tab) {
-        tab->clearAutosaveFile();
-    }
-    m_tabs->removeTab(index);
-    delete w;
+    closeTabUnchecked(index);
 }
 
 bool MainWindow::maybeSaveTab(int index, bool closingApp)
@@ -1149,6 +4133,14 @@ bool MainWindow::maybeSaveTab(int index, bool closingApp)
     auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(index));
     if (!tab)
         return true;
+
+    // 加密笔记采用 Note 风格自动保存；绝不进入明文 autosave，也不弹出
+    // “另存为”对话框。保存失败时阻止关闭，避免静默丢失。
+    if (tab->isSecureDocument()) {
+        if (!tab->isModified())
+            return true;
+        return saveSecureTab(tab, true, false);
+    }
 
     // 无论何种情况，内容未修改都直接放行
     if (!tab->isModified()) {
@@ -1194,17 +4186,29 @@ bool MainWindow::maybeSaveTab(int index, bool closingApp)
     if (ret == QMessageBox::Cancel)
         return false;
     // Discard: 丢弃改动
-    tab->clearAutosaveFile();
+    if (!tab->isSecureDocument())
+        tab->clearAutosaveFile();
     return true;
 }
 
 void MainWindow::onTabModifiedChanged(bool modified)
 {
-    m_statusModified->setText(modified ? QStringLiteral("● 已修改") : QStringLiteral(""));
+    Q_UNUSED(modified)
+    // Size is the live document payload, not the backing file on disk. This is
+    // especially important for secure documents, whose KDBX container size is
+    // unrelated to the text the user is editing.
+    updateStatusBar();
 }
 
 void MainWindow::onTabCursorPositionChanged(int line, int index)
 {
+    EditorTab *tab = currentTab();
+    if (tab && tab->isL2Active() && tab->viewModeL2() == ViewMode::Hex) {
+        const qint64 offset = qMax<qint64>(0, tab->currentByteOffset());
+        m_statusPos->setText(QStringLiteral("偏移: 0x%1")
+            .arg(QString::number(offset, 16).rightJustified(8, QLatin1Char('0')).toUpper()));
+        return;
+    }
     m_statusPos->setText(QStringLiteral("行: %1, 列: %2").arg(line + 1).arg(index + 1));
 }
 
@@ -1216,16 +4220,19 @@ void MainWindow::onTabTitleChanged(const QString &title)
 
 void MainWindow::onTabEncodingChanged(TextEncoding encoding)
 {
-    m_statusEncoding->setText(encodingName(encoding));
+    const EditorTab *tab = currentTab();
+    m_statusEncoding->setText(tab
+        ? QStringLiteral("%1 · %2").arg(encodingName(encoding), tab->lineEndingName())
+        : encodingName(encoding));
     syncEncodingMenuTo(m_encodingMenu, encoding);
 }
 
-void MainWindow::onJumpTo(int line, int index)
+void MainWindow::onJumpTo(int line, int index, int length)
 {
     auto *tab = currentTab();
     if (!tab)
         return;
-    tab->setCursorPosition(line, index);
+    tab->selectSearchMatch(line, index, length);
     tab->setFocusEditor();
 }
 
@@ -1237,16 +4244,78 @@ void MainWindow::onJumpToByteOffset(qint64 byteOffset, int length)
     tab->setFocusEditor();
 }
 
-void MainWindow::updateStatusBar()
+void MainWindow::onJumpToTab(EditorTab *tab, int line, int index, int length)
 {
-    auto *tab = currentTab();
     if (!tab)
         return;
+    const int tabIndex = m_tabs->indexOf(tab);
+    if (tabIndex < 0)
+        return;
+    showDocumentWorkspace();
+    m_tabs->setCurrentIndex(tabIndex);
+    QPointer<EditorTab> target(tab);
+    QTimer::singleShot(0, tab, [target, line, index, length]() {
+        if (!target)
+            return;
+        target->selectSearchMatch(line, index, length);
+        target->setFocusEditor();
+    });
+}
+
+void MainWindow::onJumpToTabByteOffset(EditorTab *tab, qint64 byteOffset, int length)
+{
+    if (!tab)
+        return;
+    const int tabIndex = m_tabs->indexOf(tab);
+    if (tabIndex < 0)
+        return;
+    showDocumentWorkspace();
+    m_tabs->setCurrentIndex(tabIndex);
+    QPointer<EditorTab> target(tab);
+    QTimer::singleShot(0, tab, [target, byteOffset, length]() {
+        if (!target)
+            return;
+        target->gotoByteOffset(byteOffset, length);
+        target->setFocusEditor();
+    });
+}
+
+void MainWindow::updateStatusBar()
+{
+    if (!isDocumentWorkspaceActive())
+        return;
+    auto *tab = currentTab();
+    if (!tab) {
+        // An empty document workspace must not retain metadata from the tab
+        // that was just closed. The task chip remains independently visible
+        // when background work exists.
+        if (m_statusPos) m_statusPos->hide();
+        if (m_statusEncoding) m_statusEncoding->hide();
+        if (m_statusSyntax) m_statusSyntax->hide();
+        if (m_statusSize) m_statusSize->hide();
+        if (m_statusModified) m_statusModified->hide();
+        return;
+    }
+    if (m_statusPos) m_statusPos->show();
+    if (m_statusEncoding) m_statusEncoding->show();
+    if (m_statusSyntax) m_statusSyntax->show();
+    if (m_statusSize) m_statusSize->show();
+    if (m_statusModified) m_statusModified->show();
 
     int line, index;
     tab->getCursorPosition(&line, &index);
-    m_statusPos->setText(QStringLiteral("行: %1, 列: %2").arg(line + 1).arg(index + 1));
-    m_statusEncoding->setText(encodingName(tab->encoding()));
+    const bool hexMode = tab->isL2Active() && tab->viewModeL2() == ViewMode::Hex;
+    if (hexMode) {
+        const qint64 offset = qMax<qint64>(0, tab->currentByteOffset());
+        m_statusPos->setText(QStringLiteral("偏移: 0x%1")
+            .arg(QString::number(offset, 16).rightJustified(8, QLatin1Char('0')).toUpper()));
+    } else {
+        m_statusPos->setText(QStringLiteral("行: %1, 列: %2").arg(line + 1).arg(index + 1));
+    }
+    m_statusEncoding->setText(hexMode ? QStringLiteral("原始字节")
+                                     : QStringLiteral("%1 · %2")
+                                           .arg(encodingName(tab->encoding()),
+                                                tab->lineEndingName()));
 
     QStringList syntaxNames = {
         QStringLiteral("纯文本"), QStringLiteral("C/C++"),
@@ -1256,36 +4325,107 @@ void MainWindow::updateStatusBar()
         QStringLiteral("Markdown"),
     };
     int s = static_cast<int>(tab->syntax());
-    if (s >= 0 && s < syntaxNames.size())
+    if (hexMode)
+        m_statusSyntax->setText(QStringLiteral("十六进制"));
+    else if (s >= 0 && s < syntaxNames.size())
         m_statusSyntax->setText(syntaxNames[s]);
 
-    // 文件大小
-    qint64 size = 0;
-    if (tab->isL2Mode() && tab->l2View()) {
-        size = tab->l2View()->fileSize();
-    } else if (tab->filePath().isEmpty()) {
-        size = tab->editor()->length();
-    } else {
-        size = QFileInfo(tab->filePath()).size();
-    }
+    // Display the live payload size. EditorTab routes this to the active data
+    // provider, so an mmap S2/S3 preview never reports the unopened legacy
+    // VirtualFileView as 0 B and a secure note never reports its KDBX size.
+    const qint64 size = tab->contentSizeBytes();
     QString sizeStr;
     if (size < 1024)
         sizeStr = QStringLiteral("%1 B").arg(size);
     else if (size < 1024 * 1024)
         sizeStr = QStringLiteral("%1 KB").arg(size / 1024.0, 0, 'f', 1);
-    else
+    else if (size < 1024LL * 1024 * 1024)
         sizeStr = QStringLiteral("%1 MB").arg(size / (1024.0 * 1024), 0, 'f', 2);
-    m_statusSize->setText(sizeStr);
+    else
+        sizeStr = QStringLiteral("%1 GB").arg(size / (1024.0 * 1024 * 1024), 0, 'f', 2);
+
+    const FileTierDecision tier = FileTierPolicy::classify(size);
+    QString tierName;
+    switch (tier.tier) {
+    case FileTier::StandardEdit:
+        tierName = hexMode ? QStringLiteral("B1") : QStringLiteral("S1");
+        break;
+    case FileTier::LargeEditPreview:
+        tierName = hexMode ? QStringLiteral("B2") : QStringLiteral("S2");
+        break;
+    case FileTier::HugeReadOnly:
+        tierName = hexMode ? QStringLiteral("B3") : QStringLiteral("S3");
+        break;
+    case FileTier::Invalid: break;
+    }
+    QString capability = tierName;
+    switch (tab->largeDocumentRuntimeState()) {
+    case EditorTab::LargeDocumentRuntimeState::PreviewReady:
+        capability += QStringLiteral(" · 预览");
+        break;
+    case EditorTab::LargeDocumentRuntimeState::PreparingEditor:
+        capability += QStringLiteral(" · 准备编辑");
+        break;
+    case EditorTab::LargeDocumentRuntimeState::Editable:
+        capability += QStringLiteral(" · 可编辑");
+        break;
+    case EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis:
+        capability += QStringLiteral(" · 只读分析");
+        break;
+    case EditorTab::LargeDocumentRuntimeState::ReadOnlyFallback:
+        capability += QStringLiteral(" · 只读回退");
+        break;
+    case EditorTab::LargeDocumentRuntimeState::None:
+        if (tab->isReadOnlyByPolicy())
+            capability += QStringLiteral(" · 只读");
+        break;
+    }
+    if (tab->largeDocumentRuntimeState()
+            == EditorTab::LargeDocumentRuntimeState::None && hexMode)
+        capability += tab->hexOverwriteMode() ? QStringLiteral(" · OVR")
+                                              : QStringLiteral(" · INS");
+    m_statusSize->setText(capability.isEmpty()
+                              ? sizeStr
+                              : QStringLiteral("%1 · %2").arg(sizeStr, capability));
+    m_statusSize->setToolTip(
+        QStringLiteral("当前文档内容大小；S1 直接编辑，S2 大文件预览/编辑，S3 超大文件只读"));
 
     m_statusModified->setText(tab->isModified() ? QStringLiteral("● 已修改") : QStringLiteral(""));
+}
+
+void MainWindow::showWorkspaceStatus(const QString &workspaceName)
+{
+    if (m_statusPos) m_statusPos->hide();
+    if (m_statusEncoding) m_statusEncoding->hide();
+    if (m_statusSize) m_statusSize->hide();
+    if (m_statusModified) m_statusModified->hide();
+    if (m_statusSyntax) {
+        m_statusSyntax->setText(workspaceName);
+        m_statusSyntax->show();
+    }
 }
 
 // ============ 最近文件 ============
 
 void MainWindow::updateRecentFiles(const QString &path)
 {
-    m_recentFiles.removeAll(path);
-    m_recentFiles.prepend(path);
+    const QString normalized = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+    DiskFileVersion candidate;
+    const bool candidateValid = captureDiskFileVersion(normalized, &candidate)
+                                == DiskFileState::Unchanged;
+    for (int i = m_recentFiles.size() - 1; i >= 0; --i) {
+        const QString existingPath = m_recentFiles.at(i);
+        bool duplicate = sameDiskFilePath(existingPath, normalized);
+        if (!duplicate && candidateValid) {
+            DiskFileVersion existing;
+            duplicate = captureDiskFileVersion(existingPath, &existing)
+                            == DiskFileState::Unchanged
+                        && sameDiskFile(candidate, existing);
+        }
+        if (duplicate)
+            m_recentFiles.removeAt(i);
+    }
+    m_recentFiles.prepend(normalized);
     while (m_recentFiles.size() > MAX_RECENT)
         m_recentFiles.removeLast();
     rebuildRecentFilesMenu();
@@ -1405,32 +4545,19 @@ void MainWindow::restoreSession()
         bool loaded = false;
         // 优先从 autosave 恢复未保存内容
         if (!st.autosavePath.isEmpty() && QFileInfo::exists(st.autosavePath)) {
-            if (st.filePath.isEmpty()) {
-                // 未命名文件：使用 loadAutosave，对用户保持"未命名"
-                loaded = tab->loadAutosave(st.autosavePath);
-                if (loaded) {
-                    hasUnsaved = true;
-                }
-            } else {
-                // 已存在文件有修改：从 autosave 恢复内容（但 loadFile 会设置 m_filePath，
-                // 我们需要先 load autosave 再设置真实 file path）
-                loaded = tab->loadAutosave(st.autosavePath);
-                if (loaded) {
-                    tab->setFilePath(st.filePath);  // 恢复真实路径
-                    tab->setModified(true);
-                    hasUnsaved = true;
-                }
-            }
+            loaded = m_session->restoreAutosave(tab, st.autosavePath, st.filePath);
+            if (loaded)
+                hasUnsaved = true;
             // 恢复语法（autosave 本身不猜语法）
             tab->setSyntax(static_cast<Syntax>(st.syntax));
         } else if (!st.filePath.isEmpty() && QFileInfo::exists(st.filePath)) {
-            loaded = tab->loadFile(st.filePath);
+            loaded = openSessionFile(tab, st);
         }
 
         if (!loaded) {
             tab->setSyntax(static_cast<Syntax>(st.syntax));
         } else {
-            tab->setCursorPosition(st.cursorLine, st.cursorIndex);
+            restoreSessionPosition(tab, st);
         }
         m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
     }
@@ -1447,15 +4574,17 @@ void MainWindow::restoreSession()
     QFile::remove(m_session->sessionFilePath());
 }
 
-void MainWindow::saveSessionNow()
+void MainWindow::saveSessionNow(bool forceSnapshots)
 {
     QVector<EditorTab *> tabs;
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
+        // SessionManager only records secure document ids and encrypted backing
+        // paths; it never serializes decrypted secure text.
         if (tab)
             tabs.append(tab);
     }
-    m_session->saveSession(tabs, m_tabs->currentIndex());
+    m_session->saveSession(tabs, m_tabs->currentIndex(), forceSnapshots);
 }
 
 // ============================================================================
@@ -1475,7 +4604,7 @@ struct MainWindow::PendingSessionRestore {
 //  设计目的：
 //   · 构造函数返回前不读任何大文件（避免 main.cpp 的 w.show() 被延后）
 //   · 每个 tab 恢复之间 QApplication::processEvents 让窗口重绘
-//   · 走 openTabAutoMode ≥32MB 强制 L2 mmap 秒开，不再 L1 主线程阻塞读
+//   · 走 openTabAutoMode ≥32MB 强制 L2 窗口化秒开，不再 L1 主线程阻塞读
 // ============================================================================
 void MainWindow::deferredRestoreSession()
 {
@@ -1487,7 +4616,7 @@ void MainWindow::deferredRestoreSession()
     if (data.tabs.isEmpty()) {
         // 没有会话记录：补一个空 tab（对应原构造函数中的空 tab 兜底）
         if (m_tabs->count() == 0)
-            addNewTab();
+            newFile();
         return;
     }
 
@@ -1534,7 +4663,7 @@ void MainWindow::restoreNextSessionTab()
         m_pendingRestore = nullptr;
         // 安全兜底：一个 tab 都没恢复成功（比如文件全部被删除）→ 补一个空 tab
         if (m_tabs->count() == 0)
-            addNewTab();
+            newFile();
         return;
     }
 
@@ -1548,7 +4677,11 @@ void MainWindow::restoreNextSessionTab()
 
     bool loaded = false;
 
-    if (!st.autosavePath.isEmpty() && QFileInfo::exists(st.autosavePath)) {
+    if (st.secureDocument) {
+        const QString securePath = !st.filePath.isEmpty() ? st.filePath : st.autosavePath;
+        loaded = !securePath.isEmpty() && QFileInfo::exists(securePath)
+                 && openSecurePath(securePath, tab);
+    } else if (!st.autosavePath.isEmpty() && QFileInfo::exists(st.autosavePath)) {
         // ====== 关键修复（BUG C：大文件 autosave 阻塞启动）======
         //   旧做法：直接 tab->loadAutosave(st.autosavePath)
         //     · 100MB autosave：file.readAll() 主线程同步读 1~3s，窗口不显示、无提示
@@ -1564,7 +4697,7 @@ void MainWindow::restoreNextSessionTab()
                m_pendingRestore->currentIndex + 1, total,
                asSize / 1024, limit / 1024);
         if (tier.usesMappedPreview()) {
-            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 mmap 秒开 (S2/S3)，"
+            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选窗口化秒开 (S2/S3)，"
                    "应 < 50ms 返回；若之后 >= 500ms 才返回，说明 openAutosaveAutoMode 内部阻塞了！",
                    m_pendingRestore->currentIndex + 1, total);
         } else {
@@ -1572,14 +4705,10 @@ void MainWindow::restoreNextSessionTab()
                    "一般毫秒级。", m_pendingRestore->currentIndex + 1, total);
         }
 
-        if (st.filePath.isEmpty()) {
-            loaded = tab->openAutosaveAutoMode(st.autosavePath);
-            if (loaded) m_pendingRestore->hasUnsaved = true;
-        } else {
-            loaded = tab->openAutosaveAutoMode(st.autosavePath, st.filePath);
-            if (loaded) m_pendingRestore->hasUnsaved = true;
-        }
-        qDebug("[STARTUP][RESTORE tab %d/%d]   openAutosaveAutoMode 返回 ok=%d, 耗时=%lld ms（关键：如果这里 > 500ms 就是阻塞启动的根因！）",
+        loaded = m_session->restoreAutosave(tab, st.autosavePath, st.filePath);
+        if (loaded)
+            m_pendingRestore->hasUnsaved = true;
+        qDebug("[STARTUP][RESTORE tab %d/%d]   restoreAutosave 返回 ok=%d, 耗时=%lld ms",
                m_pendingRestore->currentIndex + 1, total, loaded ? 1 : 0, tabTimer.elapsed());
         tab->setSyntax(static_cast<Syntax>(st.syntax));
     } else if (!st.filePath.isEmpty() && QFileInfo::exists(st.filePath)) {
@@ -1593,13 +4722,13 @@ void MainWindow::restoreNextSessionTab()
                m_pendingRestore->currentIndex + 1, total,
                realSize / 1024, limit / 1024);
         if (tier.usesMappedPreview()) {
-            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 mmap 秒开 (S2/S3)，应 < 50ms 返回。",
+            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选窗口化秒开 (S2/S3)，应 < 50ms 返回。",
                    m_pendingRestore->currentIndex + 1, total);
         } else {
             qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 L1 同步 loadFile (< 限制)。",
                    m_pendingRestore->currentIndex + 1, total);
         }
-        loaded = openTabAutoMode(tab, st.filePath);
+        loaded = openSessionFile(tab, st);
         qDebug("[STARTUP][RESTORE tab %d/%d]   openTabAutoMode 返回 ok=%d, 耗时=%lld ms（关键：如果 > 500ms 就是阻塞启动的根因！）",
                m_pendingRestore->currentIndex + 1, total, loaded ? 1 : 0, tabTimer.elapsed());
     } else {
@@ -1609,11 +4738,18 @@ void MainWindow::restoreNextSessionTab()
     tabTimer.restart();
 
     if (!loaded) {
-        tab->setSyntax(static_cast<Syntax>(st.syntax));
+        // A failed/missing session item must not survive as a legacy plaintext
+        // blank tab. After the restore queue finishes, the normal default-new
+        // path creates an encrypted draft if no document could be recovered.
+        const int failedIndex = m_tabs->indexOf(tab);
+        if (failedIndex >= 0)
+            m_tabs->removeTab(failedIndex);
+        delete tab;
+        tab = nullptr;
     } else {
-        tab->setCursorPosition(st.cursorLine, st.cursorIndex);
+        restoreSessionPosition(tab, st);
+        m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
     }
-    m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
 
     m_pendingRestore->currentIndex++;
     const int done = m_pendingRestore->currentIndex;
@@ -1638,10 +4774,51 @@ void MainWindow::restoreNextSessionTab()
 void MainWindow::loadSettings()
 {
     const auto settings = createAppSettings();
-    m_darkMode = settings->value("darkMode", false).toBool();
-    m_recentFiles = settings->value("recentFiles").toStringList();
-    while (m_recentFiles.size() > MAX_RECENT)
-        m_recentFiles.removeLast();
+    const QString appearance = settings->value("appearanceMode").toString().trimmed();
+    if (appearance == QLatin1String("dark")) {
+        m_appearanceMode = AppearanceMode::Dark;
+    } else if (appearance == QLatin1String("light")) {
+        m_appearanceMode = AppearanceMode::Light;
+    } else if (appearance == QLatin1String("system")) {
+        m_appearanceMode = AppearanceMode::System;
+    } else if (settings->contains("darkMode")) {
+        // One-time migration preserves the old explicit visual choice. A new
+        // profile with neither key follows Windows by default.
+        m_appearanceMode = settings->value("darkMode").toBool()
+                               ? AppearanceMode::Dark : AppearanceMode::Light;
+    } else {
+        m_appearanceMode = AppearanceMode::System;
+    }
+    const QStringList storedRecent = settings->value("recentFiles").toStringList();
+    m_recentFiles.clear();
+    for (const QString &storedPath : storedRecent) {
+        if (storedPath.trimmed().isEmpty())
+            continue;
+        const QString normalized = QDir::cleanPath(
+            QFileInfo(storedPath).absoluteFilePath());
+        DiskFileVersion candidate;
+        const bool candidateValid = captureDiskFileVersion(normalized, &candidate)
+                                    == DiskFileState::Unchanged;
+        bool duplicate = false;
+        for (const QString &existingPath : std::as_const(m_recentFiles)) {
+            duplicate = sameDiskFilePath(existingPath, normalized);
+            if (!duplicate && candidateValid) {
+                DiskFileVersion existing;
+                duplicate = captureDiskFileVersion(existingPath, &existing)
+                                == DiskFileState::Unchanged
+                            && sameDiskFile(candidate, existing);
+            }
+            if (duplicate)
+                break;
+        }
+        if (!duplicate)
+            m_recentFiles.append(normalized);
+        if (m_recentFiles.size() >= MAX_RECENT)
+            break;
+    }
+    // createMenus() runs before settings are loaded, so rebuild now; otherwise
+    // the visible submenu remains the initial "(none)" until another file is opened.
+    rebuildRecentFilesMenu();
 
     m_edgeVisible = settings->value("edgeVisible", true).toBool();
     m_edgeColumn = settings->value("edgeColumn", 80).toInt();
@@ -1660,20 +4837,29 @@ void MainWindow::loadSettings()
     if (!state.isEmpty())
         restoreState(state);
 
-    // Older releases saved a dock layout before VaultDock existed. Qt treats
-    // a dock absent from that state as hidden, which would conceal the new
-    // primary feature after upgrade. Persist visibility separately so the
-    // migration defaults to visible once, while later user choices survive.
-    if (m_vaultDock) {
-        const bool vaultVisible = settings->value("vaultDockVisible", true).toBool();
-        m_vaultDock->setVisible(vaultVisible);
-    }
+    const bool toolbarVisible = settings->value("toolbarVisible", true).toBool();
+    const bool statusVisible = settings->value("statusBarVisible", true).toBool();
+    if (m_toolbarVisibilityAction)
+        m_toolbarVisibilityAction->setChecked(toolbarVisible);
+    if (auto *toolbar = findChild<QToolBar *>(QStringLiteral("MainToolBar")))
+        toolbar->setVisible(toolbarVisible);
+    if (m_statusVisibilityAction)
+        m_statusVisibilityAction->setChecked(statusVisible);
+    statusBar()->setVisible(statusVisible);
+    if (m_vaultDock)
+        m_vaultDock->show();
 }
 
 void MainWindow::saveSettings()
 {
     const auto settings = createAppSettings();
-    settings->setValue("darkMode", m_darkMode);
+    QString appearance = QStringLiteral("system");
+    if (m_appearanceMode == AppearanceMode::Light)
+        appearance = QStringLiteral("light");
+    else if (m_appearanceMode == AppearanceMode::Dark)
+        appearance = QStringLiteral("dark");
+    settings->setValue("appearanceMode", appearance);
+    settings->remove("darkMode");
     settings->setValue("recentFiles", m_recentFiles);
     settings->setValue("edgeVisible", m_edgeVisible);
     settings->setValue("edgeColumn", m_edgeColumn);
@@ -1681,19 +4867,35 @@ void MainWindow::saveSettings()
     settings->setValue("windowSize", size());
     settings->setValue("windowGeometry", saveGeometry());
     settings->setValue("windowState", saveState());
-    if (m_vaultDock)
-        settings->setValue("vaultDockVisible", m_vaultDock->isVisible());
+    if (auto *toolbar = findChild<QToolBar *>(QStringLiteral("MainToolBar")))
+        settings->setValue("toolbarVisible", toolbar->isVisible());
+    settings->setValue("statusBarVisible", statusBar()->isVisible());
+    settings->remove("vaultDockVisible");
 }
 
 // ============ 关闭 ============
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
-    if (m_vaultDock && !m_vaultDock->prepareToClose()) {
-        event->ignore();
-        return;
-    }
-    saveSettings();
+    // shutdownL2BeforeClose() intentionally pumps the event loop while workers
+    // settle. Prevent autosave/session timers from re-entering document I/O in
+    // the middle of that close transaction. If closing is cancelled, restore
+    // the timers with their normal intervals.
+    const bool autosaveWasActive = m_autosaveTimer.isActive();
+    const bool secureAutosaveWasActive = m_secureAutosaveTimer.isActive();
+    const bool expiryWasActive = m_securityExpiryTimer.isActive();
+    m_autosaveTimer.stop();
+    m_secureAutosaveTimer.stop();
+    m_securityExpiryTimer.stop();
+    const auto resumeTimers = [this, autosaveWasActive,
+                               secureAutosaveWasActive, expiryWasActive]() {
+        if (autosaveWasActive)
+            m_autosaveTimer.start();
+        if (secureAutosaveWasActive)
+            m_secureAutosaveTimer.start();
+        if (expiryWasActive)
+            m_securityExpiryTimer.start();
+    };
 
     // Step 1: 按 Notepad++ 规则检查关闭 (closingApp=true)
     // - 对"已存在文件且已修改"：弹窗提示用户 保存/丢弃/取消
@@ -1701,13 +4903,23 @@ void MainWindow::closeEvent(QCloseEvent *event)
     for (int i = 0; i < m_tabs->count(); ++i) {
         if (!maybeSaveTab(i, /*closingApp=*/true)) {
             // 用户按了 Cancel，中止关闭
+            resumeTimers();
             event->ignore();
             return;
         }
     }
 
+    // 所有中央加密标签已经在 maybeSaveTab 中写回KDBX后，才允许锁定
+    // 安全身份；否则会先销毁密钥，再导致加密标签无法保存。
+    if (m_vaultDock && !m_vaultDock->prepareToClose()) {
+        resumeTimers();
+        event->ignore();
+        return;
+    }
+    saveSettings();
+
     // Step 2: 保存会话
-    saveSessionNow();
+    saveSessionNow(true);
 
     // Step 2.5（崩溃修复关键）：
     //    saveSessionNow() 后，所有需要 L2 mmap 的路径（exportToFile → applyAndSave）已完成。
@@ -1726,10 +4938,17 @@ void MainWindow::closeEvent(QCloseEvent *event)
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
         if (!tab) continue;
-        if (!tab->isUntitled() && !tab->isModified()) {
+        if (!tab->isSecureDocument() && !tab->isUntitled() && !tab->isModified()) {
             tab->clearAutosaveFile();
         }
     }
+
+    // Keep the sealed seven-day session for the next launch, but destroy all
+    // process-resident document credentials and identity material now.
+    if (m_secureDocuments)
+        m_secureDocuments->closeAll();
+    if (m_securitySession)
+        m_securitySession->endSession(false);
 
     event->accept();
 }

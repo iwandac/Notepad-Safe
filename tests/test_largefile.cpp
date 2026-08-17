@@ -734,7 +734,8 @@ static void test_dynamicthresholds_range()
           "S1 boundary is exactly 32 MiB");
     CHECK(d.PATCH_L1_LIMIT >= qint64(8) * 1024 * 1024, "PATCH_L1_LIMIT >= 8MB");
     CHECK(d.SEARCH_CHUNK_BYTES >= qint64(4) * 1024 * 1024, "SEARCH_CHUNK_BYTES >= 4MB");
-    CHECK(d.MAX_MATCHES_MEM >= 100000, "MAX_MATCHES_MEM >= 100000");
+    CHECK(d.MAX_MATCHES_MEM >= 10000 && d.MAX_MATCHES_MEM <= 50000,
+          "MAX_MATCHES_MEM 使用 1-5 万条有界常驻预算");
     CHECK(d.SEARCH_THREADS >= 1, "SEARCH_THREADS >= 1");
     CHECK(d.REPLACE_BATCH_SIZE >= 100, "REPLACE_BATCH_SIZE >= 100");
 }

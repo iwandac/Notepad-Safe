@@ -157,6 +157,30 @@ int AsyncTaskManager::errorCount() const
     return c;
 }
 
+int AsyncTaskManager::failedCount() const
+{
+    QMutexLocker lk(&mu_);
+    int count = 0;
+    for (const auto &task : history_) {
+        if (task.state == AsyncTaskState::Failed)
+            ++count;
+    }
+    return count;
+}
+
+int AsyncTaskManager::cancellableCount() const
+{
+    QMutexLocker lk(&mu_);
+    int count = 0;
+    for (const auto &task : tasks_) {
+        if (task.state == AsyncTaskState::Queued
+            || task.state == AsyncTaskState::Running) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 int AsyncTaskManager::activeThreadCount()
 {
     return AsyncThreadPool::instance().totalActiveThreadCount();
@@ -176,8 +200,19 @@ qint64 AsyncTaskManager::submit(AsyncTaskType type, AsyncTaskPriority priority, 
     t.batchId = batchId;
     t.type = type;
     t.priority = priority;
-    t.title = title;
-    t.description = description;
+    // Crypto operations deliberately remain opaque in the global task UI.
+    // A caller must never make a password, account name or protected path part
+    // of a long-lived task-history row.
+    if (type == AsyncTaskType::FileEncrypt) {
+        t.title = tr("保存安全文档");
+        t.description = tr("正在以原子方式写入加密数据。");
+    } else if (type == AsyncTaskType::FileDecrypt) {
+        t.title = tr("打开安全文档");
+        t.description = tr("正在验证并解密文档。");
+    } else {
+        t.title = title;
+        t.description = description;
+    }
     t.progressDone = 0;
     t.progressTotal = progressTotalInit;
     t.createdAt = QDateTime::currentDateTime();
@@ -189,16 +224,21 @@ qint64 AsyncTaskManager::submit(AsyncTaskType type, AsyncTaskPriority priority, 
     {
         QMutexLocker lk(&mu_);
         // 按优先级插入（Highest 在最前）
-        int insertAt = 0;
-        while (insertAt < tasks_.size() && static_cast<int>(tasks_[insertAt].priority) <= static_cast<int>(priority))
-            insertAt++;
-        tasks_.insert(insertAt, t);
-        rowInsert = insertAt;
+        rowInsert = 0;
+        while (rowInsert < tasks_.size()
+               && static_cast<int>(tasks_[rowInsert].priority)
+                      <= static_cast<int>(priority)) {
+            ++rowInsert;
+        }
     }
-
     beginInsertRows(QModelIndex(), rowInsert, rowInsert);
+    {
+        QMutexLocker lk(&mu_);
+        tasks_.insert(rowInsert, t);
+    }
     endInsertRows();
     emit taskAdded(t.id);
+    emitSummarySnapshot();
 
     auto weakTaskId = t.id;
     auto cancelPtr = t.cancel;
@@ -264,6 +304,7 @@ qint64 AsyncTaskManager::submit(AsyncTaskType type, AsyncTaskPriority priority, 
 void AsyncTaskManager::cancel(qint64 taskId)
 {
     bool found = false;
+    bool queuedCanceled = false;
     AsyncCancelPtr cancelRef;
     {
         QMutexLocker lk(&mu_);
@@ -273,22 +314,37 @@ void AsyncTaskManager::cancel(qint64 taskId)
                 tasks_[idx].cancel->store(true, std::memory_order_release);
                 cancelRef = tasks_[idx].cancel;
             }
-            // 若仍 Queued，直接就地改 Canceled 移入 history 并立刻发出结束信号
-            if (tasks_[idx].state == AsyncTaskState::Queued) {
+            queuedCanceled = tasks_[idx].state == AsyncTaskState::Queued;
+            found = true;
+        }
+    }
+    // Never emit model/task signals while mu_ is held. StatusBarTaskWidget and
+    // other direct receivers query the model synchronously; emitting under the
+    // mutex deadlocks when a just-submitted (still Queued) task is canceled by
+    // immediate Save As/close.
+    if (queuedCanceled) {
+        beginResetModel();
+        {
+            QMutexLocker lk(&mu_);
+            const int idx = findTaskIndex(tasks_, taskId);
+            if (idx >= 0 && tasks_[idx].state == AsyncTaskState::Queued) {
                 AsyncTask copy = tasks_[idx];
                 copy.state = AsyncTaskState::Canceled;
                 copy.finishedAt = QDateTime::currentDateTime();
                 tasks_.removeAt(idx);
                 history_.push_front(copy);
-                if (history_.size() > maxHistory_) history_.pop_back();
-                found = true;
-                emit taskFinished(taskId, AsyncTaskState::Canceled);
-                // 模型行变动：tasks_ 少了一个、history_ 多一个（总 row 不变）；发 dataChanged 即可
-                Q_EMIT dataChanged(index(idx), index(idx + history_.size() - 1));
-                return;
+                if (history_.size() > maxHistory_)
+                    history_.pop_back();
+            } else {
+                queuedCanceled = false;
             }
-            found = true;
         }
+        endResetModel();
+    }
+    if (queuedCanceled) {
+        emit taskFinished(taskId, AsyncTaskState::Canceled);
+        emitSummarySnapshot();
+        return;
     }
     if (found) {
         // Running 状态：置 cancel 原子后交给 worker 自己在下次检查时退出并回调 finishTaskImpl(Canceled)
@@ -310,17 +366,13 @@ void AsyncTaskManager::cancelAllByType(AsyncTaskType type)
 
 void AsyncTaskManager::clearHistory()
 {
-    int oldTasksSize;
+    beginResetModel();
     {
         QMutexLocker lk(&mu_);
-        oldTasksSize = tasks_.size();
         history_.clear();
     }
-    // history 全部在 row >= oldTasksSize 区域
-    if (oldTasksSize >= 0) {
-        beginResetModel();
-        endResetModel();
-    }
+    endResetModel();
+    emitSummarySnapshot();
 }
 
 // ===== 内部 QueuedConnection 更新接口 =====
@@ -370,55 +422,65 @@ void AsyncTaskManager::markTaskRunningImpl(qint64 taskId)
         tasks_[idx].startedAt = QDateTime::currentDateTime();
         row = idx;
     }
-    if (row >= 0) Q_EMIT dataChanged(index(row), index(row));
+    if (row >= 0) {
+        Q_EMIT dataChanged(index(row), index(row));
+        emitSummarySnapshot();
+    }
 }
 
 void AsyncTaskManager::finishTaskImpl(qint64 taskId, AsyncTaskState finalState, const AsyncErrorInfo &err)
 {
-    int idx = -1;
     AsyncTask finished;
-    int oldTotalSize;
+    bool found = false;
+    beginResetModel();
     {
         QMutexLocker lk(&mu_);
-        idx = findTaskIndex(tasks_, taskId);
+        const int idx = findTaskIndex(tasks_, taskId);
         if (idx < 0) {
             // 可能已被 cancel() 直接移入 history（Queued 时）；忽略重复回调
-            return;
+        } else {
+            found = true;
+            finished = tasks_[idx];
+            finished.state = finalState;
+            finished.finishedAt = QDateTime::currentDateTime();
+            if (!err.isNull()) finished.error = err;
+            // 强制同步最终进度：成功完成时将 progressDone 设为 progressTotal
+            if (finalState == AsyncTaskState::Finished && finished.progressTotal > 0 && finished.progressDone < finished.progressTotal) {
+                finished.progressDone = finished.progressTotal;
+            }
+            tasks_.removeAt(idx);
+            history_.push_front(finished);
+            while (history_.size() > maxHistory_) history_.pop_back();
         }
-        finished = tasks_[idx];
-        finished.state = finalState;
-        finished.finishedAt = QDateTime::currentDateTime();
-        if (!err.isNull()) finished.error = err;
-        // 强制同步最终进度：成功完成时将 progressDone 设为 progressTotal
-        if (finalState == AsyncTaskState::Finished && finished.progressTotal > 0 && finished.progressDone < finished.progressTotal) {
-            finished.progressDone = finished.progressTotal;
-        }
-        oldTotalSize = tasks_.size() + history_.size();
-        tasks_.removeAt(idx);
-        history_.push_front(finished);
-        while (history_.size() > maxHistory_) history_.pop_back();
     }
-
-    // tasks_: [0..tasks_.size()-1] 运行队列；history_: [tasks_.size()..] 历史
-    // 我们删除了 tasks_[idx] 并在 history_ 头加了一项 — 对应模型：先 removeRows idx，再 insertRows tasks_.size() 处
-    beginRemoveRows(QModelIndex(), idx, idx);
-    endRemoveRows();
-    int historyInsertAt = tasks_.size(); // 现在的 tasks_ 已少一个
-    beginInsertRows(QModelIndex(), historyInsertAt, historyInsertAt);
-    endInsertRows();
-
+    endResetModel();
+    if (!found)
+        return;
     emit taskFinished(taskId, finalState);
-    Q_UNUSED(oldTotalSize);
+    emitSummarySnapshot();
 }
 
 void AsyncTaskManager::pushHistory(const AsyncTask &t)
 {
-    QMutexLocker lk(&mu_);
-    history_.push_front(t);
-    while (history_.size() > maxHistory_) history_.pop_back();
+    beginResetModel();
+    {
+        QMutexLocker lk(&mu_);
+        history_.push_front(t);
+        while (history_.size() > maxHistory_) history_.pop_back();
+    }
+    endResetModel();
+    emitSummarySnapshot();
 }
 
 void AsyncTaskManager::onTickStats()
+{
+    emitSummarySnapshot();
+    int maxT = AsyncThreadPool::instance().maxThreads();
+    int act  = AsyncThreadPool::instance().totalActiveThreadCount();
+    emit threadCountChanged(act, maxT);
+}
+
+void AsyncTaskManager::emitSummarySnapshot()
 {
     int queued = 0, running = 0, finished = 0;
     {
@@ -429,8 +491,6 @@ void AsyncTaskManager::onTickStats()
         }
         finished = int(history_.size());
     }
-    int maxT = AsyncThreadPool::instance().maxThreads();
-    int act  = AsyncThreadPool::instance().totalActiveThreadCount();
     bool changed = (queued != lastQueued_ || running != lastRunning_ || finished != lastFinished_);
     if (changed) {
         lastQueued_ = queued;
@@ -438,5 +498,4 @@ void AsyncTaskManager::onTickStats()
         lastFinished_ = finished;
         emit summaryChanged(queued, running, finished);
     }
-    emit threadCountChanged(act, maxT);
 }

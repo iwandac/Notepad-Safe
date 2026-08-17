@@ -32,6 +32,7 @@ enum class AsyncTaskType : int {
     FileEncrypt     = 3,  // 大文件加密保存（为后续加密功能预留）
     FileDecrypt     = 4,  // 加密文件打开解密（为后续加密功能预留）
     LargeFileSave   = 5,  // 流式保存
+    LargeFileLoad   = 6,  // S2 mmap 预览后台晋升为完整 Scintilla 文档
     Other           = 99
 };
 

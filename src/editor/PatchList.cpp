@@ -12,6 +12,7 @@
 #include <cstring>
 #include <climits>
 #include <memory>
+#include <utility>
 
 namespace {
 
@@ -36,8 +37,7 @@ static inline qint64 patchMemoryBytes(const Patch& p) {
 // ============================================================================
 PatchList::PatchList() : l1Limit_(dynamicL1Limit()) {}
 PatchList::~PatchList() {
-    for (const auto& f : l2Cold_) QFile::remove(f.filePath);
-    l2Cold_.clear();
+    resetAfterSave();
 }
 qint64 PatchList::dynamicL1Limit() { return DynamicThresholds::instance().PATCH_L1_LIMIT; }
 
@@ -195,6 +195,27 @@ bool PatchList_replaceWithSnapshots(PatchList& self, qint64 byteOffset, qint32 o
     if (oldLength < 0) oldLength = 0;
     if (!self.validateRange(byteOffset, oldLength, errMsg)) return false;
     if (oldLength == 0 && newData.isEmpty()) return true;
+
+    // A later same-size overwrite of the exact virtual range supersedes the
+    // previous overwrite. Keeping both patches would render both payloads and
+    // consume the original range twice (for example F0 -> FF became FF F0).
+    // Preserve the first patch's original snapshot so Undo still returns to
+    // the disk byte, and update its visible payload in place.
+    if (oldLength == newData.size()) {
+        for (int i = 0; i < self.l1Hot_.size(); ++i) {
+            Patch &existing = self.l1Hot_[i];
+            if (existing.byteOffset != byteOffset
+                || existing.oldLength != oldLength
+                || existing.newText.size() != newData.size()) {
+                continue;
+            }
+            if (self.sensitive_ && !existing.newText.isEmpty())
+                existing.newText.fill(0);
+            existing.newText = newData;
+            self.redoStack_.clear();
+            return true;
+        }
+    }
 
     const bool explicitGroup = self.inExplicitGroup_;
     if (!explicitGroup) self.beginUndoGroup();
@@ -376,6 +397,10 @@ bool PatchList::redo(QString* errMsg) {
 //  L2 溢出 + 序列化
 // ============================================================================
 void PatchList::spillIfNeeded() {
+    // Decrypted secure payload deltas must never enter a plaintext spill file.
+    // Their source payload is bounded below 32 MiB, so retaining patches in
+    // memory is both safer and within the document admission budget.
+    if (sensitive_) return;
     if (l1Bytes_ <= l1Limit_) return;
     if (l1Hot_.isEmpty()) return;
     int spillCount = qMax(1, l1Hot_.size() / 4);
@@ -493,6 +518,104 @@ bool PatchList::deserializeColdFile(const QString& path, QVector<Patch>& out,
         metaFill->count = int(count);
     }
     return true;
+}
+
+bool PatchList::writeRecoveryJournal(QIODevice *output, QString *errMsg) const
+{
+    if (!output || !output->isWritable()) {
+        if (errMsg) *errMsg = QObject::tr("恢复日志输出设备不可写。");
+        return false;
+    }
+    QVector<Patch> patches;
+    patches.reserve(l1Hot_.size() + l2Cold_.size() * 16);
+    for (const ColdPatchFile &cold : l2Cold_) {
+        QVector<Patch> batch;
+        QString error;
+        if (!deserializeColdFile(cold.filePath, batch, nullptr, &error)) {
+            if (errMsg) *errMsg = QObject::tr("读取编辑恢复分片失败：%1").arg(error);
+            return false;
+        }
+        for (Patch &patch : batch)
+            patches.append(std::move(patch));
+    }
+    for (const Patch &patch : l1Hot_)
+        patches.append(patch);
+    std::stable_sort(patches.begin(), patches.end(), [](const Patch &left,
+                                                        const Patch &right) {
+        if (left.byteOffset != right.byteOffset)
+            return left.byteOffset < right.byteOffset;
+        const bool leftRemove = left.newText.isEmpty() && left.oldLength > 0;
+        const bool rightRemove = right.newText.isEmpty() && right.oldLength > 0;
+        return leftRemove != rightRemove && leftRemove;
+    });
+
+    QDataStream stream(output);
+    stream.setByteOrder(QDataStream::LittleEndian);
+    stream << quint32(0x4E50524Au) << quint32(1) << quint64(patches.size());
+    for (const Patch &patch : std::as_const(patches)) {
+        stream << patch.byteOffset << patch.oldLength << patch.newText
+               << patch.origInsertOffset;
+        if (stream.status() != QDataStream::Ok) {
+            if (errMsg) *errMsg = QObject::tr("写入编辑恢复日志失败。");
+            return false;
+        }
+    }
+    return stream.status() == QDataStream::Ok;
+}
+
+bool PatchList::restoreRecoveryJournal(QIODevice *input, QString *errMsg)
+{
+    if (!input || !input->isReadable()) {
+        if (errMsg) *errMsg = QObject::tr("恢复日志输入设备不可读。");
+        return false;
+    }
+    QDataStream stream(input);
+    stream.setByteOrder(QDataStream::LittleEndian);
+    quint32 magic = 0;
+    quint32 version = 0;
+    quint64 count = 0;
+    stream >> magic >> version >> count;
+    if (stream.status() != QDataStream::Ok || magic != 0x4E50524Au
+        || version != 1 || count == 0 || count > 1000000) {
+        if (errMsg) *errMsg = QObject::tr("编辑恢复日志头无效。");
+        return false;
+    }
+
+    QVector<Patch> restored;
+    restored.reserve(int(count));
+    qint64 totalBytes = 0;
+    qint64 previousOffset = -1;
+    for (quint64 index = 0; index < count; ++index) {
+        Patch patch;
+        stream >> patch.byteOffset >> patch.oldLength >> patch.newText
+               >> patch.origInsertOffset;
+        totalBytes += patch.newText.size();
+        if (stream.status() != QDataStream::Ok || patch.byteOffset < 0
+            || patch.oldLength < 0 || patch.byteOffset < previousOffset
+            || patch.newText.size() > 128 * 1024 * 1024
+            || totalBytes > Q_INT64_C(512) * 1024 * 1024) {
+            if (errMsg) *errMsg = QObject::tr("编辑恢复日志内容无效或超过 512 MiB 安全上限。");
+            return false;
+        }
+        previousOffset = patch.byteOffset;
+        restored.append(std::move(patch));
+    }
+    if (!stream.atEnd()) {
+        if (errMsg) *errMsg = QObject::tr("编辑恢复日志尾部包含无效数据。");
+        return false;
+    }
+
+    resetAfterSave();
+    l1Hot_ = std::move(restored);
+    l1Bytes_ = 0;
+    for (const Patch &patch : std::as_const(l1Hot_))
+        l1Bytes_ += patch.newText.size();
+    undoStack_.clear();
+    redoStack_.clear();
+    // Do not turn a successfully decrypted recovery journal back into a
+    // plaintext cold-spill file during startup. The journal is bounded to
+    // 512 MiB above and remains in memory until a later explicit edit/save.
+    return isModified();
 }
 
 // ============================================================================
@@ -844,6 +967,24 @@ bool PatchList::applyAndSave(const uchar* mmapBase, qint64 mmapSize, const QStri
 }
 
 void PatchList::resetAfterSave() {
+    if (sensitive_) {
+        const auto scrubPatch = [](Patch &patch) {
+            if (!patch.newText.isEmpty())
+                patch.newText.fill(0);
+            if (!patch.oldSnapshot.isEmpty())
+                patch.oldSnapshot.fill(0);
+        };
+        for (Patch &patch : l1Hot_)
+            scrubPatch(patch);
+        const auto scrubStack = [&scrubPatch](QList<UndoGroup> &stack) {
+            for (UndoGroup &group : stack) {
+                for (Patch &patch : group.patchesSnapshot)
+                    scrubPatch(patch);
+            }
+        };
+        scrubStack(undoStack_);
+        scrubStack(redoStack_);
+    }
     l1Hot_.clear();
     l1Bytes_ = 0;
     for (const auto& f : l2Cold_) QFile::remove(f.filePath);

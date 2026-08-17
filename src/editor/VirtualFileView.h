@@ -2,7 +2,6 @@
 
 #include <QtGlobal>
 #include <QAbstractScrollArea>
-#include <QFile>
 #include <QTimer>
 #include <QPainter>
 #include <QColor>
@@ -21,6 +20,7 @@
 #include "PatchList.h"
 #include "AsyncTask.h"
 #include "TextEncoding.h"
+#include "SharedReadOnlyFile.h"
 
 class QEventLoop;
 class QProgressDialog;
@@ -71,6 +71,11 @@ public:
     // 返回 false 时 errMsg 有可读原因。
     bool openFile(const QString& filePath, QString* errMsg = nullptr,
                   QWidget* parentWidgetForProgress = nullptr);
+    // Decrypted secure binary payloads must never be written to a temporary
+    // file. They use the same byte/patch/Hex provider directly from a bounded
+    // in-memory backing store.
+    bool openMemory(QByteArray bytes, ViewMode mode = ViewMode::Hex,
+                    QString* errMsg = nullptr);
 
     // 重新 map 同一个文件（保存成功后调用：旧 unmap → map → 重建 LineIndex → patch reset）
     bool remapFile(QString* errMsg = nullptr);
@@ -86,7 +91,8 @@ public:
     //    对 LineIndex 100MB 级任务绰绰有余——每 16MB 就检查 cancel，最坏仅 16MB 扫描时间 10~30ms）。
     void closeFile(bool allowProcessEvents = true);
 
-    bool isOpen() const { return mmapBase_ != nullptr; }
+    bool isOpen() const { return m_memoryBacked || mmapBase_ != nullptr; }
+    bool isMemoryBacked() const { return m_memoryBacked; }
     QString filePath() const { return file_.fileName(); }
     qint64 fileSize() const { return mmapSize_; }
     const uchar* mmapBase() const { return mmapBase_; }
@@ -158,6 +164,8 @@ public:
     // ---- 视图模式：文本 / 16 进制 ----
     void setViewMode(ViewMode mode);
     ViewMode viewMode() const { return m_viewMode; }
+    void setHexBytesPerRow(int bytesPerRow);
+    int hexBytesPerRow() const { return m_hexBytesPerRow; }
 
     // ---- 自动换行（L2 大文件）----
     void setWordWrap(bool on);
@@ -178,6 +186,11 @@ public:
 
     // ---- 便捷只读状态访问器 ----
     qint64 virtualFileSize() const { return isOpen() ? patches_.virtualSize(mmapSize_) : 0; }
+    // Zero disables the cap. Secure binary documents set the product's
+    // exclusive payload limit so an edit can never create an unsavable state.
+    void setVirtualSizeLimitExclusive(qint64 limit) {
+        m_virtualSizeLimitExclusive = qMax<qint64>(0, limit);
+    }
     qint64 totalLines()      const { return m_viewMode == ViewMode::Hex ? hexTotalLines() : lineIndex_.totalLines(); }
     bool   isModified()      const { return patches_.isModified(); }
     // 光标位置访问器（GUI smoke 调试 & 断言用）
@@ -307,19 +320,22 @@ private:
         return qMax<qint64>(0, qint64(offPx) / qint64(cw));
     }
 
-    // 16 进制视图辅助：虚拟文件总字节 → 16 进制行数（每 16B 一行）
+    // Hex view helpers use the same adaptive bytes-per-row as the visible
+    // Scintilla projection so scrollbar, caret and absolute offsets agree.
     qint64 hexTotalLines() const {
-        if (mmapSize_ <= 0) return 0;
-        return (mmapSize_ + qint64(15)) / qint64(16);
+        const qint64 size = virtualFileSize();
+        if (size <= 0) return 0;
+        const qint64 row = qMax(1, m_hexBytesPerRow);
+        return (size + row - 1) / row;
     }
     // 16 进制视图：第 line 行起始字节偏移
     qint64 hexLineToByteOffset(int line) const {
-        return qBound(qint64(0), qint64(line) * qint64(16), mmapSize_);
+        return qBound(qint64(0), qint64(line) * qint64(m_hexBytesPerRow), virtualFileSize());
     }
     // 16 进制视图：字节偏移 → 0-based 行号
     int hexByteToLine(qint64 off) const {
         if (off <= 0) return 0;
-        return int(qMin<qint64>(off / qint64(16), hexTotalLines() - 1));
+        return int(qMin<qint64>(off / qint64(m_hexBytesPerRow), hexTotalLines() - 1));
     }
 
     // 绘制：行号区 + 内容区
@@ -367,7 +383,9 @@ private:
     Q_INVOKABLE void onMmapReady(quintptr ptr, qint64 size, LineIndex quickIndex);
 
     // ---- 成员 ----
-    QFile      file_;
+    SharedReadOnlyFile file_;
+    QByteArray m_memoryBacking;
+    bool       m_memoryBacked = false;
     uchar*     mmapBase_ = nullptr;
     qint64     mmapSize_ = 0;
 
@@ -389,6 +407,7 @@ private:
     int            charWidth_    = 0;
     int            gutterWidth_  = 0;
     int            maxLineChars_ = 0;   // LineIndex 估算的最长行（字节数）
+    int            m_hexBytesPerRow = 16;
     int            maxLineDigits_ = 1;  // 行号需要的数字位数（总行数的 log10）
 
     // 光标 & 选择
@@ -402,6 +421,7 @@ private:
     // 鼠标拖动会更新 selEndByte_，同时保持 selStartByte_。
     qint64         selStartByte_ = 0;
     qint64         selEndByte_   = 0;
+    qint64         m_virtualSizeLimitExclusive = 0;
 
     // 搜索引擎（懒创建，首次调用 searchEngine 时 new，closeFile 不删除）
     mutable class LargeFileSearch* search_ = nullptr;
@@ -450,6 +470,7 @@ private:
     // 预取任务：用 AsyncTaskManager + QFutureWatcher 实现 cancel（甩滚时取消无效的 chunk 读取）
     qint64                      m_prefetchTaskId = -1;
     QSharedPointer<std::atomic<bool>> m_prefetchCancel;                 // 跨线程取消原子（AsyncCancelPtr = QSharedPointer<atomic>）
+    QVector<std::shared_ptr<std::atomic_bool>> m_prefetchWorkers;
     QFutureWatcher<QVector<ChunkSlot>>* m_prefetchWatcher = nullptr;  // 完成 / canceled 信号
 
     // L1 预览水印：sliderMoved 过程中画"跳转到 xxx bytes"的半透明提示
@@ -462,4 +483,7 @@ private:
     //  （UI repaint / signal emit / scrollbar 更新）都 NOP。内部数据清理
     //  （unmap / lineIndex clear / file close / patch reset）仍然执行。
     bool           m_inDestruction = false;
+    bool           m_closingFile = false;
+    quint64        m_mappingGeneration = 0;
+    std::shared_ptr<std::atomic_bool> m_lineBuildWorkerDone;
 };

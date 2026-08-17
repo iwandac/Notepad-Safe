@@ -21,10 +21,11 @@ qint64 clampBytes(qint64 value, qint64 lower, qint64 upper)
 
 qint64 estimatePromotionPeak(qint64 documentBytes, qint64 totalPhysicalBytes)
 {
-    // Source mmap remains live during promotion. Scintilla stores the UTF-8
+    // The production preview is a bounded random-read projection and does not
+    // keep a second full source document resident. Scintilla stores the UTF-8
     // document plus gap/metadata, line/style indexes, bounded search/save
     // scratch space, and a bounded initial undo allowance.
-    const qint64 sourceMap = documentBytes;
+    const qint64 previewAndDecode = 32LL * 1024 * 1024;
     const qint64 scintillaDocument = saturatingAdd(documentBytes, documentBytes / 3);
     const qint64 lineAndStyle = saturatingAdd(documentBytes / 6, 8LL * 1024 * 1024);
     const qint64 saveAndSearch = clampBytes(documentBytes / 4,
@@ -33,7 +34,7 @@ qint64 estimatePromotionPeak(qint64 documentBytes, qint64 totalPhysicalBytes)
     const qint64 undoAllowance = std::min(512LL * 1024 * 1024,
                                          totalPhysicalBytes / 10);
 
-    qint64 peak = saturatingAdd(sourceMap, scintillaDocument);
+    qint64 peak = saturatingAdd(previewAndDecode, scintillaDocument);
     peak = saturatingAdd(peak, lineAndStyle);
     peak = saturatingAdd(peak, saveAndSearch);
     return saturatingAdd(peak, undoAllowance);

@@ -122,10 +122,17 @@ public:
                       QString* errMsg = nullptr);
 
     void resetAfterSave();
+    void setSensitive(bool sensitive) { sensitive_ = sensitive; }
+    bool isSensitive() const { return sensitive_; }
 
     // ---- 高级：replaceAll 压力检测（返回 true=需要中间保存提示）----
     // estimatedEditSizeBytes = totalReplacements * avg(newText.size()) - totalDeleted
     bool pressureWillExceedSoftWarn(qint64 estimatedEditSizeBytes) const;
+
+    // Crash recovery persists the normalized final patch set inside DraftStore's
+    // encrypted stream. Undo history is intentionally not restored.
+    bool writeRecoveryJournal(QIODevice *output, QString *errMsg = nullptr) const;
+    bool restoreRecoveryJournal(QIODevice *input, QString *errMsg = nullptr);
 
 private:
     friend bool PatchList_removeWithSnapshot(PatchList&, qint64, qint32, const QByteArray&, QString*);
@@ -149,6 +156,7 @@ private:
     QList<UndoGroup> redoStack_;
 
     bool inExplicitGroup_ = false;
+    bool sensitive_ = false;
 
     // ---- 内部 helper ----
     int  lowerBound(qint64 pos) const;

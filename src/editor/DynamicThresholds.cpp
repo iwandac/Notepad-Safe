@@ -28,11 +28,17 @@ DynamicThresholds computeFrom(qint64 ramBytes, int cpuCores) {
                                    2LL * 1024 * 1024 * 1024);
     t.PATCH_SOFT_WARN = qint64(t.PATCH_L1_LIMIT * 0.8);
 
-    // findAll 内存结果上限：(RAM/16) / 50B 每条
-    qint64 perMatch = 50;
-    t.MAX_MATCHES_MEM = clampInt64((ramBytes / 16) / perMatch,
-                                   (qint64)100000,                  // 下限 10 万条
-                                   (qint64)400000000);             // 顶 4 亿条（实际极少到）
+    // A match owns bounded context plus Qt container metadata; the previous
+    // 50-byte estimate ignored the QByteArray payload and could reserve tens of
+    // gigabytes on a high-memory workstation. Keep the resident result prefix
+    // inside an 8-32 MiB producer budget. The grouped Qt model owns another
+    // bounded copy, keeping producer + presentation near the 64 MiB contract.
+    const qint64 resultBudget = clampInt64(ramBytes / 128,
+                                          8LL * 1024 * 1024,
+                                          32LL * 1024 * 1024);
+    constexpr qint64 conservativeBytesPerMatch = 640;
+    t.MAX_MATCHES_MEM = clampInt64(resultBudget / conservativeBytesPerMatch,
+                                   qint64(10000), qint64(50000));
 
     t.REPLACE_BATCH_SIZE = 1000;
 

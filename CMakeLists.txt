@@ -1,8 +1,12 @@
 cmake_minimum_required(VERSION 3.22)
-project(notepad-safe LANGUAGES CXX)
+project(notepad-safe VERSION 0.3.1 LANGUAGES C CXX)
 
 option(NOTEPADSAFE_ENABLE_KDBX_BACKEND
     "Build the pinned KeePassXC/Botan/Argon2/zlib production vault backend"
+    ON
+)
+option(NOTEPADSAFE_ENABLE_ASAN
+    "Instrument Notepad Safe targets with MSVC AddressSanitizer"
     OFF
 )
 
@@ -11,6 +15,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # 强制使用静态 CRT（/MT），与 Qt 静态库编译选项匹配
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+if(MSVC AND NOTEPADSAFE_ENABLE_ASAN)
+    add_compile_options(/fsanitize=address /Zi)
+    add_link_options(/fsanitize=address /INCREMENTAL:NO /DEBUG)
+endif()
 
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
@@ -26,13 +35,23 @@ endif()
 set(CMAKE_PREFIX_PATH "${NOTEPADSAFE_QT6_DIR}")
 
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network PrintSupport Svg SvgWidgets Concurrent TaskTree Test)
+include(cmake/PCRE2.cmake)
 
 # QScintilla 静态库（相对于产品根，clone 后即可构建）
-set(QSCINTILLA_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/QScintilla_src-2.14.1/src")
+set(QSCINTILLA_INCLUDE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/QScintilla_src-2.14.1/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/QScintilla_src-2.14.1/scintilla/include"
+)
 set(QSCINTILLA_LIB "${CMAKE_CURRENT_SOURCE_DIR}/third_party/QScintilla_src-2.14.1/src/release/qscintilla2_qt6.lib")
 
-# 应用资源：EXE 图标 RC + 窗口/任务栏 QRC
-set(APP_RC_FILE    "${CMAKE_CURRENT_SOURCE_DIR}/resources/app_icon.rc")
+# 应用资源：EXE 图标/版本 RC + 窗口/任务栏 QRC。RC 与 About、ZIP 共用
+# project(VERSION)，避免发布时出现三个版本号各自更新。
+set(APP_RC_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/app_icon.rc")
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/app_icon.rc"
+    "${APP_RC_FILE}"
+    @ONLY
+)
 set(APP_QRC_FILE   "${CMAKE_CURRENT_SOURCE_DIR}/resources/app_resources.qrc")
 
 # ============================================================================
@@ -55,15 +74,28 @@ set(APP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src/vault
 )
 
+add_library(notepadsafe_search_runtime STATIC
+    src/search/Pcre2Regex.cpp
+)
+target_include_directories(notepadsafe_search_runtime PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/search
+)
+target_link_libraries(notepadsafe_search_runtime PUBLIC Qt6::Core notepadsafe_pcre2)
+
 # Stable product-domain policies. Keep file tiers and resource admission free of
 # QWidget/QScintilla dependencies so they can be tested at exact byte boundaries.
 add_library(notepadsafe_domain STATIC
     src/domain/FileTierPolicy.cpp
+    src/session/DraftStore.cpp
 )
 target_include_directories(notepadsafe_domain PUBLIC
     ${CMAKE_SOURCE_DIR}/src/domain
+    ${CMAKE_SOURCE_DIR}/src/session
 )
 target_link_libraries(notepadsafe_domain PUBLIC Qt6::Core)
+if(WIN32)
+    target_link_libraries(notepadsafe_domain PRIVATE crypt32)
+endif()
 
 add_library(notepadsafe_vault STATIC
     src/vault/SecureBuffer.cpp
@@ -73,15 +105,24 @@ add_library(notepadsafe_vault STATIC
 )
 target_include_directories(notepadsafe_vault PUBLIC
     ${CMAKE_SOURCE_DIR}/src/vault
+    ${CMAKE_SOURCE_DIR}/src/domain
 )
 target_link_libraries(notepadsafe_vault PUBLIC Qt6::Core)
 
 if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     include(cmake/KeePassXCCore.cmake)
-    target_sources(notepadsafe_vault PRIVATE src/vault/KeePassXCVaultBackend.cpp)
+    target_sources(notepadsafe_vault PRIVATE
+        src/vault/KeePassXCVaultBackend.cpp
+        src/vault/SecurityIdentity.cpp
+        src/vault/SecuritySessionService.cpp
+        src/vault/SecureDocumentService.cpp
+    )
     set_property(TARGET notepadsafe_vault PROPERTY CXX_STANDARD 20)
     target_link_libraries(notepadsafe_vault PRIVATE notepadsafe_keepassxc_core)
     target_compile_definitions(notepadsafe_vault PUBLIC NOTEPADSAFE_HAS_KDBX_BACKEND=1)
+    if(WIN32)
+        target_link_libraries(notepadsafe_vault PRIVATE crypt32)
+    endif()
 endif()
 
 if(WIN32)
@@ -96,6 +137,22 @@ if(WIN32)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         VERBATIM
     )
+    set(NOTEPADSAFE_SBOM "${CMAKE_CURRENT_BINARY_DIR}/notepad-safe.spdx.json")
+    add_custom_command(
+        OUTPUT "${NOTEPADSAFE_SBOM}"
+        COMMAND ${NOTEPADSAFE_POWERSHELL_EXECUTABLE}
+            -NoProfile -ExecutionPolicy Bypass
+            -File ${CMAKE_SOURCE_DIR}/tools/generate_sbom.ps1
+            -LockFile ${CMAKE_SOURCE_DIR}/third_party/dependencies.lock.json
+            -OutputFile "${NOTEPADSAFE_SBOM}"
+            -ProductVersion ${PROJECT_VERSION}
+        DEPENDS
+            ${CMAKE_SOURCE_DIR}/tools/generate_sbom.ps1
+            ${CMAKE_SOURCE_DIR}/third_party/dependencies.lock.json
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        VERBATIM
+    )
+    add_custom_target(generate_sbom DEPENDS "${NOTEPADSAFE_SBOM}")
 endif()
 
 # ============ 主程序 ============
@@ -114,6 +171,7 @@ add_executable(notepad-safe WIN32
     src/search/LargeFileSearch.cpp
     src/search/SearchResultsModel.cpp
     src/editor/VirtualFileView.cpp
+    src/editor/LargeFileVerticalSlice.cpp
     src/async/AsyncTask.cpp
     src/async/AsyncThreadPool.cpp
     src/async/AsyncTaskManager.cpp
@@ -124,11 +182,19 @@ add_executable(notepad-safe WIN32
     ${APP_QRC_FILE}
 )
 
+if(WIN32)
+    add_dependencies(notepad-safe generate_sbom)
+endif()
+
 target_include_directories(notepad-safe PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_compile_definitions(notepad-safe PRIVATE
+    NOTEPADSAFE_VERSION="${PROJECT_VERSION}"
+)
 
 target_link_libraries(notepad-safe PRIVATE
     notepadsafe_domain
     notepadsafe_vault
+    notepadsafe_search_runtime
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -166,6 +232,7 @@ if(WIN32)
         dxguid
         strmiids
         crypt32
+        wtsapi32
     )
 endif()
 
@@ -176,13 +243,62 @@ qt_import_plugins(notepad-safe
     INCLUDE Qt6::QSvgIconPlugin
 )
 
+# Portable Windows release. Qt and the C runtime are static in the supported
+# release build, so the package deliberately contains one executable plus the
+# license, dependency lock, SPDX SBOM and user-facing documentation.
+install(TARGETS notepad-safe RUNTIME DESTINATION .)
+install(FILES
+    README.md
+    THIRD_PARTY_NOTICES.md
+    third_party/QScintilla_src-2.14.1/LICENSE
+    DESTINATION .
+)
+install(FILES
+    third_party/dependencies.lock.json
+    "${NOTEPADSAFE_SBOM}"
+    DESTINATION metadata
+)
+install(FILES
+    docs/TARGET_EXPERIENCE.md
+    docs/SUPPLY_CHAIN.md
+    DESTINATION docs
+)
+
+set(CPACK_GENERATOR "ZIP")
+set(CPACK_PACKAGE_NAME "NotepadSafe")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_FILE_NAME "NotepadSafe-${PROJECT_VERSION}-windows-x64")
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
+set(CPACK_RESOURCE_FILE_LICENSE
+    "${CMAKE_SOURCE_DIR}/third_party/QScintilla_src-2.14.1/LICENSE")
+set(CMAKE_SKIP_INSTALL_ALL_DEPENDENCY TRUE)
+include(CPack)
+if(TARGET package)
+    add_dependencies(package notepad-safe generate_sbom)
+endif()
+add_custom_target(portable_package
+    COMMAND "${CMAKE_CPACK_COMMAND}"
+        -G ZIP --config "${CMAKE_CURRENT_BINARY_DIR}/CPackConfig.cmake"
+    COMMAND ${NOTEPADSAFE_POWERSHELL_EXECUTABLE}
+        -NoProfile -ExecutionPolicy Bypass
+        -File ${CMAKE_SOURCE_DIR}/tools/verify_release_package.ps1
+        -Package "${CMAKE_CURRENT_BINARY_DIR}/NotepadSafe-${PROJECT_VERSION}-windows-x64.zip"
+        -ProductExecutable "$<TARGET_FILE:notepad-safe>"
+        -LockFile ${CMAKE_SOURCE_DIR}/third_party/dependencies.lock.json
+        -ProductVersion ${PROJECT_VERSION}
+    DEPENDS notepad-safe generate_sbom
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    COMMENT "Create the portable Notepad Safe release ZIP"
+    VERBATIM
+)
+
 # ============ 测试 ============
 
 # Windows 静态 Qt 需要的系统库（复用于测试）
 set(WIN_SYSTEM_LIBS
     winmm imm32 ws2_32 ole32 oleaut32 advapi32 shell32
     gdi32 user32 comdlg32 uuid version netapi32 userenv
-    dwmapi uxtheme d2d1 dwrite d3d11 dxgi dxguid strmiids crypt32
+    dwmapi uxtheme d2d1 dwrite d3d11 dxgi dxguid strmiids crypt32 wtsapi32
 )
 
 # 测试 1: 编码检测（仅需 Qt6::Core）
@@ -208,6 +324,15 @@ if(WIN32)
 endif()
 qt_import_plugins(test_search INCLUDE Qt6::QWindowsIntegrationPlugin)
 
+add_executable(test_pcre2_regex
+    tests/test_pcre2_regex.cpp
+)
+target_include_directories(test_pcre2_regex PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(test_pcre2_regex PRIVATE notepadsafe_search_runtime Qt6::Core)
+if(WIN32)
+    target_link_libraries(test_pcre2_regex PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+
 # 测试 3: 会话序列化（需 Qt6::Core + QScintilla，因为 SessionManager.cpp 依赖 EditorTab）
 add_executable(test_session
     tests/test_session.cpp
@@ -220,6 +345,7 @@ add_executable(test_session
     src/search/LargeFileSearch.cpp
     src/search/SearchResultsModel.cpp
     src/editor/VirtualFileView.cpp
+    src/editor/LargeFileVerticalSlice.cpp
     src/async/AsyncTask.cpp
     src/async/AsyncThreadPool.cpp
     src/async/AsyncTaskManager.cpp
@@ -227,6 +353,7 @@ add_executable(test_session
 target_include_directories(test_session PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(test_session PRIVATE
     notepadsafe_domain
+    notepadsafe_search_runtime
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -271,6 +398,7 @@ add_executable(test_largefile
 target_include_directories(test_largefile PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(test_largefile PRIVATE
     notepadsafe_domain
+    notepadsafe_search_runtime
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -318,6 +446,13 @@ if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     if(WIN32)
         target_link_libraries(test_kdbx_backend PRIVATE ${WIN_SYSTEM_LIBS})
     endif()
+
+    add_executable(test_security_identity tests/test_security_identity.cpp)
+    target_include_directories(test_security_identity PRIVATE ${APP_INCLUDE_DIRS})
+    target_link_libraries(test_security_identity PRIVATE notepadsafe_vault Qt6::Core)
+    if(WIN32)
+        target_link_libraries(test_security_identity PRIVATE ${WIN_SYSTEM_LIBS})
+    endif()
 endif()
 
 # 测试 6: 端到端启动秒开验证（100MB 会话恢复 → 主窗口 < 1500ms 可见）
@@ -354,6 +489,7 @@ endif()
 enable_testing()
 add_test(NAME textencoding COMMAND test_textencoding)
 add_test(NAME search       COMMAND test_search)
+add_test(NAME pcre2_regex  COMMAND test_pcre2_regex)
 add_test(NAME session      COMMAND test_session)
 add_test(NAME settings_ui  COMMAND test_settings_ui)
 add_test(NAME largefile    COMMAND test_largefile)
@@ -362,6 +498,8 @@ add_test(NAME vault_contract COMMAND test_vault_contract)
 if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     add_test(NAME kdbx_backend COMMAND test_kdbx_backend)
     set_tests_properties(kdbx_backend PROPERTIES LABELS "vault;integration" TIMEOUT 120)
+    add_test(NAME security_identity COMMAND test_security_identity)
+    set_tests_properties(security_identity PROPERTIES LABELS "vault;security" TIMEOUT 120)
 endif()
 if(WIN32)
     add_test(NAME supply_chain_lock
@@ -421,6 +559,7 @@ add_executable(diag_gui_l2_editops
 )
 target_include_directories(diag_gui_l2_editops PRIVATE ${APP_INCLUDE_DIRS})
 target_link_libraries(diag_gui_l2_editops PRIVATE
+    notepadsafe_search_runtime
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -451,6 +590,7 @@ target_link_libraries(diag_save_l2_chain PRIVATE
 set(GUI_SMOKE_SHARED_SOURCES
     tests/gui_smoke/SmokeTestBase.cpp
     src/editor/VirtualFileView.cpp
+    src/editor/LargeFileVerticalSlice.cpp
     src/editor/PatchList.cpp
     src/editor/LineIndex.cpp
     src/search/LargeFileSearch.cpp
@@ -475,6 +615,7 @@ add_executable(gui_smoke_coord
 target_include_directories(gui_smoke_coord PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_coord PRIVATE
     notepadsafe_domain
+    notepadsafe_search_runtime
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -492,9 +633,60 @@ add_executable(gui_smoke_findreplace
     tests/gui_smoke/smoke_find_replace.cpp
     ${GUI_SMOKE_SHARED_SOURCES}
 )
+
+# S2 acceptance: mmap first paint -> background ILoader promotion -> real keyboard edit -> atomic save.
+add_executable(gui_smoke_s2_promotion
+    tests/gui_smoke/smoke_s2_promotion.cpp
+    ${GUI_SMOKE_SHARED_SOURCES}
+)
+target_compile_definitions(gui_smoke_s2_promotion PRIVATE
+    NOTEPADSAFE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+target_include_directories(gui_smoke_s2_promotion PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_s2_promotion PRIVATE
+    notepadsafe_domain
+    notepadsafe_search_runtime
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::PrintSupport
+    Qt6::Svg
+    Qt6::SvgWidgets
+    Qt6::TaskTree
+    Qt6::Test
+    ${QSCINTILLA_LIB}
+)
+
+# Architecture proof: one visible global scrollbar for mmap S2/S3 preview,
+# real 256 MiB ILoader promotion, and direct readonly search in the retained
+# 4.59 GiB fixture. This target intentionally does not link the legacy L2 bridge.
+add_executable(gui_smoke_largefile_vertical_slice
+    tests/gui_smoke/smoke_largefile_vertical_slice.cpp
+    src/editor/LargeFileVerticalSlice.cpp
+)
+target_compile_definitions(gui_smoke_largefile_vertical_slice PRIVATE
+    NOTEPADSAFE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+target_include_directories(gui_smoke_largefile_vertical_slice PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR}
+)
+target_link_libraries(gui_smoke_largefile_vertical_slice PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::Test
+    ${QSCINTILLA_LIB}
+)
+if(WIN32)
+    target_link_libraries(gui_smoke_largefile_vertical_slice PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+qt_import_plugins(gui_smoke_largefile_vertical_slice INCLUDE Qt6::QWindowsIntegrationPlugin)
 target_include_directories(gui_smoke_findreplace PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_findreplace PRIVATE
     notepadsafe_domain
+    notepadsafe_search_runtime
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -518,10 +710,14 @@ add_executable(gui_smoke_smallfixes
     src/async/AsyncTaskPanelDialog.cpp
     src/vault/VaultDock.cpp
 )
+target_compile_definitions(gui_smoke_smallfixes PRIVATE
+    NOTEPADSAFE_VERSION="${PROJECT_VERSION}"
+)
 target_include_directories(gui_smoke_smallfixes PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_smallfixes PRIVATE
     notepadsafe_domain
     notepadsafe_vault
+    notepadsafe_search_runtime
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -539,7 +735,7 @@ if(WIN32)
         winmm imm32 ws2_32 ole32 oleaut32 advapi32
         shell32 gdi32 user32 comdlg32 uuid version
         netapi32 userenv dwmapi uxtheme d2d1 dwrite
-        d3d11 dxgi dxguid strmiids crypt32
+        d3d11 dxgi dxguid strmiids crypt32 wtsapi32
     )
 endif()
 
@@ -566,11 +762,65 @@ if(WIN32)
 endif()
 qt_import_plugins(gui_smoke_vault INCLUDE Qt6::QWindowsIntegrationPlugin)
 
+if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
+    add_executable(gui_smoke_secure_documents
+        tests/gui_smoke/smoke_secure_documents.cpp
+        ${GUI_SMOKE_SHARED_SOURCES}
+        src/window/MainWindow.cpp
+        src/async/StatusBarTaskWidget.cpp
+        src/async/AsyncTaskPanelDialog.cpp
+        src/vault/VaultDock.cpp
+    )
+    target_include_directories(gui_smoke_secure_documents PRIVATE
+        ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR}
+    )
+    target_link_libraries(gui_smoke_secure_documents PRIVATE
+        notepadsafe_domain
+        notepadsafe_vault
+        notepadsafe_search_runtime
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Concurrent
+        Qt6::PrintSupport
+        Qt6::Svg
+        Qt6::SvgWidgets
+        Qt6::TaskTree
+        Qt6::Test
+        ${QSCINTILLA_LIB}
+    )
+    if(WIN32)
+        target_link_libraries(gui_smoke_secure_documents PRIVATE ${WIN_SYSTEM_LIBS})
+    endif()
+    qt_import_plugins(gui_smoke_secure_documents
+        INCLUDE Qt6::QWindowsIntegrationPlugin
+        INCLUDE Qt6::QSvgPlugin
+        INCLUDE Qt6::QSvgIconPlugin
+    )
+endif()
+
 # CTest 注册（可选；日常由 run_all_gui_smoke.bat 直跑更直观）
 add_test(NAME gui_smoke_coord        COMMAND gui_smoke_coord)
 add_test(NAME gui_smoke_findreplace  COMMAND gui_smoke_findreplace)
+add_test(NAME gui_smoke_s2_promotion COMMAND gui_smoke_s2_promotion)
+add_test(NAME gui_smoke_largefile_vertical_slice COMMAND gui_smoke_largefile_vertical_slice)
 add_test(NAME gui_smoke_smallfixes   COMMAND gui_smoke_smallfixes)
 add_test(NAME gui_smoke_vault        COMMAND gui_smoke_vault)
+if(TARGET gui_smoke_secure_documents)
+    add_test(NAME gui_smoke_secure_documents COMMAND gui_smoke_secure_documents)
+    set_tests_properties(gui_smoke_secure_documents PROPERTIES LABELS "gui;security;vault")
+endif()
+set_tests_properties(
+    gui_smoke_coord gui_smoke_findreplace gui_smoke_s2_promotion
+    gui_smoke_smallfixes gui_smoke_vault
+    PROPERTIES RUN_SERIAL TRUE TIMEOUT 60
+)
+set_tests_properties(gui_smoke_largefile_vertical_slice PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 300 LABELS "gui;large-file;vertical-slice"
+)
+if(TARGET gui_smoke_secure_documents)
+    set_tests_properties(gui_smoke_secure_documents PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+endif()
 
 # 真实进程 E2E：启动完整 notepad-safe.exe，并通过 Win32 获取窗口/像素。
 # 串行执行，避免两个测试同时抢占前台窗口、DWM 和同机磁盘吞吐导致误判。

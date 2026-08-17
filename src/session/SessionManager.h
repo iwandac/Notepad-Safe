@@ -3,6 +3,9 @@
 #include <QObject>
 #include <QVector>
 #include <QString>
+#include <QHash>
+#include <QDateTime>
+#include <QUuid>
 
 class EditorTab;
 
@@ -13,13 +16,19 @@ struct SessionTab {
     int syntax = 0;          // Syntax 枚举值
     int cursorLine = 0;
     int cursorIndex = 0;
+    qint64 cursorByteOffset = -1;
+    qint64 selectionStartByte = -1;
+    qint64 selectionEndByte = -1;
     bool modified = false;
     QString autosavePath;    // 未保存内容的临时文件路径
+    bool secureDocument = false;
+    QString documentId;
+    QString presentation;   // "text" / "hex"; empty means legacy auto routing
 };
 
 // 完整会话
 struct SessionData {
-    int version = 1;
+    int version = 2;
     QVector<SessionTab> tabs;
     int activeTab = 0;
 };
@@ -39,7 +48,13 @@ public:
 
     // 保存当前所有标签的状态
     // tabs: 所有标签列表，activeIndex: 当前活动标签索引
-    bool saveSession(const QVector<EditorTab *> &tabs, int activeIndex);
+    bool saveSession(const QVector<EditorTab *> &tabs, int activeIndex,
+                     bool forceSnapshots = false);
+
+    // 恢复内部快照。新版 .ndraft 在内存中解密后直接交给编辑器；旧版 .tmp
+    // 仅作为迁移读取路径保留，不再产生新的 S1 明文快照。
+    bool restoreAutosave(EditorTab *tab, const QString &autosavePath,
+                         const QString &realFilePath = QString()) const;
 
     // 加载上次会话
     SessionData loadSession() const;
@@ -59,6 +74,8 @@ public:
 private:
     QString m_dataDir;
     QString m_autosaveDir;
+    QHash<QUuid, quint64> m_snapshotRevisions;
+    QHash<QUuid, QDateTime> m_snapshotTimes;
 
     void ensureDirs();
 };

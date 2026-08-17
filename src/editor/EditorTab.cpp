@@ -1,17 +1,21 @@
 #include "EditorTab.h"
 #include "VirtualFileView.h"
+#include "LargeFileVerticalSlice.h"
 #include "FileTierPolicy.h"
 #include "SearchResultsModel.h"
+#include "Pcre2Regex.h"
 #include "AsyncTaskManager.h"
+#include "DraftStore.h"
 
 #include <QVBoxLayout>
 #include <QStackedWidget>
 #include <QFile>
 #include <QFileInfo>
+#include <QDir>
 #include <QSaveFile>
+#include <QDataStream>
 #include <QFont>
 #include <QColor>
-#include <QRegularExpression>
 #include <QMimeDatabase>
 #include <QStringConverter>
 #include <QStringDecoder>
@@ -25,11 +29,29 @@
 #include <QClipboard>
 #include <QMainWindow>
 #include <QStatusBar>
+#include <QPointer>
+#include <QKeyEvent>
+#include <QApplication>
+#include <QPlainTextEdit>
+#include <QTextBlock>
+#include <QTextCursor>
+#include <QScrollBar>
+#include <QBuffer>
+#include <algorithm>
 #include <limits>
 #include <atomic>
+#include <climits>
+#include <cstdint>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+#include <ILoader.h>
 
 #ifdef Q_OS_WIN
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -42,6 +64,318 @@
 #include <Qsci/qscilexersql.h>
 #include <Qsci/qscilexeryaml.h>
 #include <Qsci/qscilexermarkdown.h>
+
+namespace {
+
+QsciScintilla::EolMode detectLineEndingMode(const QString &text)
+{
+    qsizetype crlf = 0;
+    qsizetype lf = 0;
+    qsizetype cr = 0;
+    for (qsizetype i = 0; i < text.size(); ++i) {
+        if (text.at(i) == QLatin1Char('\r')) {
+            if (i + 1 < text.size() && text.at(i + 1) == QLatin1Char('\n')) {
+                ++crlf;
+                ++i;
+            } else {
+                ++cr;
+            }
+        } else if (text.at(i) == QLatin1Char('\n')) {
+            ++lf;
+        }
+    }
+    if (crlf >= lf && crlf >= cr && crlf > 0)
+        return QsciScintilla::EolWindows;
+    if (cr > lf && cr > 0)
+        return QsciScintilla::EolMac;
+    if (lf > 0)
+        return QsciScintilla::EolUnix;
+    return QsciScintilla::EolWindows;
+}
+
+constexpr char LargeRecoveryMagic[] = "NotepadSafe.LargeEditJournal.v1";
+constexpr quint32 LargeRecoveryVersion = 1;
+constexpr qsizetype MaximumLargeRecoveryPayload = 32 * 1024 * 1024;
+constexpr char BinaryRecoveryMagic[] = "NotepadSafe.BinaryPatchJournal.v1";
+constexpr quint32 BinaryRecoveryVersion = 1;
+
+QString formatHexBytes(const QByteArray &bytes, int bytesPerRow = 16)
+{
+    bytesPerRow = qMax(1, bytesPerRow);
+    static constexpr char Digits[] = "0123456789ABCDEF";
+    QString text;
+    text.reserve(bytes.size() * 3 + bytes.size() / bytesPerRow + 1);
+    for (qsizetype i = 0; i < bytes.size(); ++i) {
+        const auto value = static_cast<unsigned char>(bytes.at(i));
+        text.append(QLatin1Char(Digits[value >> 4]));
+        text.append(QLatin1Char(Digits[value & 0x0f]));
+        const bool endOfLine = ((i + 1) % bytesPerRow) == 0;
+        if (i + 1 < bytes.size())
+            text.append(endOfLine ? QLatin1Char('\n') : QLatin1Char(' '));
+    }
+    return text;
+}
+
+QString formatAsciiBytes(const QByteArray &bytes, int bytesPerRow = 16)
+{
+    bytesPerRow = qMax(1, bytesPerRow);
+    QString text;
+    text.reserve(bytes.size() + bytes.size() / bytesPerRow + 1);
+    for (qsizetype i = 0; i < bytes.size(); ++i) {
+        const auto value = static_cast<unsigned char>(bytes.at(i));
+        text.append(value >= 0x20 && value <= 0x7e
+                        ? QChar::fromLatin1(char(value))
+                        : QLatin1Char('.'));
+        if ((i + 1) % bytesPerRow == 0 && i + 1 < bytes.size())
+            text.append(QLatin1Char('\n'));
+    }
+    return text;
+}
+
+int hexNibble(QChar ch)
+{
+    const ushort value = ch.unicode();
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+bool parseHexBytes(const QString &text, QByteArray *bytes, QString *error)
+{
+    if (!bytes)
+        return false;
+    bytes->clear();
+    bytes->reserve(text.size() / 3 + 1);
+    int highNibble = -1;
+    for (qsizetype i = 0; i < text.size(); ++i) {
+        const QChar ch = text.at(i);
+        if (ch.isSpace()) {
+            if (highNibble >= 0) {
+                if (error) {
+                    *error = QObject::tr(
+                        "第 %1 个字符处的十六进制字节只有一位；每个字节必须是两位。")
+                                 .arg(i + 1);
+                }
+                bytes->clear();
+                return false;
+            }
+            continue;
+        }
+        const int nibble = hexNibble(ch);
+        if (nibble < 0) {
+            if (error)
+                *error = QObject::tr("第 %1 个字符“%2”不是十六进制数字。")
+                             .arg(i + 1).arg(ch);
+            bytes->clear();
+            return false;
+        }
+        if (highNibble < 0) {
+            highNibble = nibble;
+        } else {
+            bytes->append(char((highNibble << 4) | nibble));
+            highNibble = -1;
+        }
+    }
+    if (highNibble >= 0) {
+        if (error)
+            *error = QObject::tr("末尾的十六进制字节只有一位；每个字节必须是两位。");
+        bytes->clear();
+        return false;
+    }
+    return true;
+}
+
+bool replaceFileAtomically(const QString &temporaryPath, const QString &targetPath,
+                           QString *error)
+{
+#ifdef Q_OS_WIN
+    const std::wstring temporary = QDir::toNativeSeparators(temporaryPath).toStdWString();
+    const std::wstring target = QDir::toNativeSeparators(targetPath).toStdWString();
+    const BOOL replaced = QFileInfo::exists(targetPath)
+        ? ::ReplaceFileW(target.c_str(), temporary.c_str(), nullptr,
+                         REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)
+        : ::MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH);
+    if (replaced)
+        return true;
+    if (error) {
+        *error = QObject::tr("Windows 原子替换失败（错误 %1）；恢复副本保留在 %2")
+                     .arg(::GetLastError()).arg(temporaryPath);
+    }
+    return false;
+#else
+    QFile input(temporaryPath);
+    QSaveFile output(targetPath);
+    output.setDirectWriteFallback(false);
+    if (!input.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly)) {
+        if (error) *error = QObject::tr("无法打开原子替换文件。");
+        return false;
+    }
+    QByteArray chunk;
+    while (!(chunk = input.read(4 * 1024 * 1024)).isEmpty()) {
+        if (output.write(chunk) != chunk.size()) {
+            output.cancelWriting();
+            if (error) *error = QObject::tr("原子替换写入不完整。");
+            return false;
+        }
+    }
+    if (input.error() != QFileDevice::NoError || !output.commit()) {
+        if (error) *error = QObject::tr("原子替换提交失败。");
+        return false;
+    }
+    QFile::remove(temporaryPath);
+    return true;
+#endif
+}
+
+using ScintillaSigned = intptr_t;
+using ScintillaUnsigned = uintptr_t;
+using ScintillaDirectFunction = ScintillaSigned (SCI_METHOD *)(
+    ScintillaSigned, unsigned int, ScintillaUnsigned, ScintillaSigned);
+
+ScintillaSigned directScintilla(QsciScintilla *editor, unsigned int message,
+                                ScintillaUnsigned wParam = 0,
+                                ScintillaSigned lParam = 0)
+{
+    if (!editor)
+        return 0;
+    const auto function = reinterpret_cast<ScintillaDirectFunction>(
+        editor->SendScintillaPtrResult(QsciScintillaBase::SCI_GETDIRECTFUNCTION));
+    const auto context = reinterpret_cast<ScintillaSigned>(
+        editor->SendScintillaPtrResult(QsciScintillaBase::SCI_GETDIRECTPOINTER));
+    return function && context ? function(context, message, wParam, lParam) : 0;
+}
+
+class Utf8StreamValidator final {
+public:
+    bool feed(const char *data, qsizetype size)
+    {
+        const auto *bytes = reinterpret_cast<const unsigned char *>(data);
+        for (qsizetype i = 0; i < size; ++i) {
+            const unsigned char byte = bytes[i];
+            if (remaining_ == 0) {
+                if (byte <= 0x7f)
+                    continue;
+                if (byte >= 0xc2 && byte <= 0xdf) {
+                    begin(byte & 0x1f, 1, 0x80);
+                } else if (byte >= 0xe0 && byte <= 0xef) {
+                    begin(byte & 0x0f, 2, 0x800);
+                } else if (byte >= 0xf0 && byte <= 0xf4) {
+                    begin(byte & 0x07, 3, 0x10000);
+                } else {
+                    return false;
+                }
+                continue;
+            }
+            if ((byte & 0xc0) != 0x80)
+                return false;
+            codePoint_ = (codePoint_ << 6) | (byte & 0x3f);
+            if (--remaining_ == 0
+                && (codePoint_ < minimum_ || codePoint_ > 0x10ffff
+                    || (codePoint_ >= 0xd800 && codePoint_ <= 0xdfff))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool complete() const { return remaining_ == 0; }
+
+private:
+    void begin(quint32 prefix, int remaining, quint32 minimum)
+    {
+        codePoint_ = prefix;
+        remaining_ = remaining;
+        minimum_ = minimum;
+    }
+
+    quint32 codePoint_ = 0;
+    quint32 minimum_ = 0;
+    int remaining_ = 0;
+};
+
+TextEncoding sniffLargeTextEncoding(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return TextEncoding::Utf8;
+    const QByteArray sample = file.read(1024 * 1024);
+    if (sample.size() >= 3
+        && static_cast<unsigned char>(sample[0]) == 0xef
+        && static_cast<unsigned char>(sample[1]) == 0xbb
+        && static_cast<unsigned char>(sample[2]) == 0xbf) {
+        return TextEncoding::Utf8Bom;
+    }
+    if (sample.size() >= 2
+        && static_cast<unsigned char>(sample[0]) == 0xff
+        && static_cast<unsigned char>(sample[1]) == 0xfe) {
+        return TextEncoding::Utf16LE;
+    }
+    if (sample.size() >= 2
+        && static_cast<unsigned char>(sample[0]) == 0xfe
+        && static_cast<unsigned char>(sample[1]) == 0xff) {
+        return TextEncoding::Utf16BE;
+    }
+    Utf8StreamValidator validator;
+    return validator.feed(sample.constData(), sample.size())
+               ? TextEncoding::Utf8 : TextEncoding::GBK;
+}
+
+qint64 estimatedUtf8Size(qint64 sourceBytes, TextEncoding encoding)
+{
+    if (sourceBytes < 0)
+        return -1;
+    if (encoding == TextEncoding::Utf8 || encoding == TextEncoding::Utf8Bom)
+        return sourceBytes;
+    // UTF-16 and the Windows system codepage can expand when represented as UTF-8.
+    // 1.5x is the conservative common-language bound used for admission; overflow
+    // saturates so the file safely remains in analysis mode.
+    if (sourceBytes > (std::numeric_limits<qint64>::max() / 3) * 2)
+        return std::numeric_limits<qint64>::max();
+    return sourceBytes + sourceBytes / 2;
+}
+
+QString admissionFallbackText(ResourceAdmissionReason reason)
+{
+    switch (reason) {
+    case ResourceAdmissionReason::PhysicalMemoryBudgetExceeded:
+        return QObject::tr("当前物理内存不足，保持只读分析模式");
+    case ResourceAdmissionReason::CommitReserveInsufficient:
+        return QObject::tr("当前可提交内存不足，保持只读分析模式");
+    case ResourceAdmissionReason::InvalidMemorySnapshot:
+        return QObject::tr("无法确认安全内存余量，保持只读分析模式");
+    default:
+        return QObject::tr("当前文件不能晋升为完整编辑模式");
+    }
+}
+
+} // namespace
+
+EditorTab::ExternalFileState EditorTab::externalFileState() const
+{
+    if (isSecureDocument() || m_filePath.isEmpty())
+        return ExternalFileState::NotTracked;
+    return compareDiskFileVersion(m_filePath, m_diskVersion);
+}
+
+void EditorTab::refreshDiskVersionBaseline()
+{
+    m_diskVersion = {};
+    if (isSecureDocument() || m_filePath.isEmpty())
+        return;
+    DiskFileVersion captured;
+    if (captureDiskFileVersion(m_filePath, &captured) == ExternalFileState::Unchanged)
+        m_diskVersion = std::move(captured);
+}
+
+bool EditorTab::representsDiskFile(const DiskFileVersion &candidate) const
+{
+    if (isSecureDocument() || m_filePath.isEmpty() || !candidate.valid)
+        return false;
+    if (sameDiskFile(m_diskVersion, candidate))
+        return true;
+    return sameDiskFilePath(m_filePath, candidate.absolutePath);
+}
 
 EditorTab::EditorTab(QWidget *parent)
     : QWidget(parent)
@@ -56,6 +390,21 @@ EditorTab::EditorTab(QWidget *parent)
     layout->addWidget(m_stack);
 
     setupEditor();
+    connect(m_editor, &QsciScintilla::selectionChanged,
+            this, &EditorTab::commandCapabilitiesChanged);
+    connect(m_editor, &QsciScintilla::textChanged,
+            this, &EditorTab::commandCapabilitiesChanged);
+    connect(&AsyncTaskManager::instance(), &AsyncTaskManager::taskFinished,
+            this, [this](qint64 taskId, AsyncTaskState state) {
+        // A queued task can be canceled before its worker body ever runs, so
+        // worker-side cancellation checks alone cannot complete the UI state.
+        if (taskId != m_l2PromotionTaskId || state != AsyncTaskState::Canceled)
+            return;
+        const QString path = m_l2PromotionPath;
+        finishLargeTextPromotion(
+            nullptr, taskId, path, TextEncoding::Utf8,
+            QObject::tr("用户已取消准备编辑，保持只读分析模式"));
+    });
 }
 
 EditorTab::~EditorTab() {
@@ -69,18 +418,30 @@ EditorTab::~EditorTab() {
     //
     //  此处析构体里仅做 dtor-safe 兜底：如果 MainWindow 路径没执行到（如异常析构），
     //  手动调 closeFile(false)—— 禁止 processEvents，保守等待 500ms 让 worker 自退出。
+    cancelLargeTextPromotion();
+    clearLargeRecoveryOperations(&m_largeRecoveryOperations);
+    clearLargeRecoveryOperations(&m_pendingRecoveryOperations);
     bridgeReparentEditorToStack();
+    clearL2BridgeBaseline();
+    if (m_windowedReadOnlyProvider)
+        m_windowedReadOnlyProvider->closeFile();
     if (m_l2View && m_l2View->isOpen()) {
         m_l2View->closeFile(/*allowProcessEvents=*/false);
     }
 }
 
 void EditorTab::shutdownL2BeforeClose() {
+    cancelLargeTextPromotion();
+    if (m_windowedReadOnlyProvider)
+        m_windowedReadOnlyProvider->closeFile();
     if (Q_LIKELY(!m_l2Mode || !m_l2View)) return;
     if (!m_l2View->isOpen()) {
         // 虽然没 open，但 Scintilla 可能 reparent 到了 viewport；先回到 stack 避免下一次
         // loadFile L1 找不到 editor 在 stack page 0
         bridgeReparentEditorToStack();
+        m_bridge.syncVfvDebounce.stop();
+        clearL2BridgeBaseline();
+        m_l2Mode = false;
         return;
     }
 
@@ -98,6 +459,8 @@ void EditorTab::shutdownL2BeforeClose() {
            qUtf8Printable(tabTitle()));
     m_l2View->closeFile(/*allowProcessEvents=*/true);
     bridgeReparentEditorToStack();
+    m_bridge.syncVfvDebounce.stop();
+    clearL2BridgeBaseline();
     m_l2Mode = false;
     qDebug("[EditorTab::shutdownL2BeforeClose] Tab '%s' L2 shutdown done.",
            qUtf8Printable(tabTitle()));
@@ -105,6 +468,7 @@ void EditorTab::shutdownL2BeforeClose() {
 
 void EditorTab::setupEditor()
 {
+    m_editor->installEventFilter(this);
     // 等宽字体
     QFont font("Consolas", 10);
     font.setStyleHint(QFont::Monospace);
@@ -133,6 +497,9 @@ void EditorTab::setupEditor()
     m_editor->setIndentationsUseTabs(false);
     m_editor->setTabWidth(4);
     m_editor->setIndentationGuides(true);
+    // New documents follow the Windows convention. Existing documents replace
+    // this with their detected dominant line ending before text is installed.
+    m_editor->setEolMode(QsciScintilla::EolWindows);
 
     // 当前行高亮
     m_editor->setCaretLineVisible(true);
@@ -169,23 +536,88 @@ void EditorTab::setupEditor()
         emit modificationChanged(true);
     });
     connect(m_editor, &QsciScintilla::cursorPositionChanged,
-            this, &EditorTab::cursorPositionChanged);
+            this, [this](int line, int index) {
+        if (!isL2Mode() || !m_l2View
+            || m_l2View->viewMode() != ViewMode::Hex
+            || m_bridge.windowStart < 0) {
+            emit cursorPositionChanged(line, index);
+            return;
+        }
+
+        const qint64 local = qBound<qint64>(0,
+                                             qint64(line) * m_hexBytesPerRow + index / 3,
+                                             qMax<qint64>(0, m_bridge.windowLen));
+        m_lastL2Line = line;
+        m_lastL2Col = int(local % m_hexBytesPerRow);
+        m_lastL2Byte = qMin(m_l2View->virtualFileSize(),
+                            m_bridge.windowStart + local);
+        emit cursorPositionChanged(m_lastL2Line, m_lastL2Col);
+    });
     connect(m_editor, &QsciScintilla::modificationChanged,
             this, [this](bool m) {
         emit modificationChanged(m);
         emit titleChanged(tabTitle());
     });
+    connect(m_editor, &QsciScintilla::SCN_MODIFIED, this,
+            [this](int position, int modificationType, const char *text, int length, int,
+                   int, int, int, int, int) {
+        constexpr int contentChanges = QsciScintillaBase::SC_MOD_INSERTTEXT
+                                       | QsciScintillaBase::SC_MOD_DELETETEXT;
+        if (!m_bridge.applying && (modificationType & contentChanges)) {
+            advanceContentRevision();
+            if (m_promotedLargeDocument && !m_replayingRecoveryJournal && length > 0) {
+                if ((modificationType & QsciScintillaBase::SC_MOD_INSERTTEXT) && text) {
+                    const QByteArray inserted(text, length);
+                    if (!m_largeRecoveryOperations.isEmpty()) {
+                        auto &last = m_largeRecoveryOperations.last();
+                        if (last.kind == LargeRecoveryOperation::Kind::Insert
+                            && last.position + last.insertedBytes.size() == position) {
+                            last.insertedBytes.append(inserted);
+                            return;
+                        }
+                    }
+                    LargeRecoveryOperation operation;
+                    operation.kind = LargeRecoveryOperation::Kind::Insert;
+                    operation.position = position;
+                    operation.insertedBytes = inserted;
+                    m_largeRecoveryOperations.push_back(std::move(operation));
+                } else if (modificationType & QsciScintillaBase::SC_MOD_DELETETEXT) {
+                    if (!m_largeRecoveryOperations.isEmpty()) {
+                        auto &last = m_largeRecoveryOperations.last();
+                        if (last.kind == LargeRecoveryOperation::Kind::Delete
+                            && last.position == position) {
+                            last.deleteLength += length;
+                            return;
+                        }
+                    }
+                    LargeRecoveryOperation operation;
+                    operation.kind = LargeRecoveryOperation::Kind::Delete;
+                    operation.position = position;
+                    operation.deleteLength = length;
+                    m_largeRecoveryOperations.push_back(std::move(operation));
+                }
+            }
+        }
+    });
 }
 
 bool EditorTab::loadFile(const QString &path)
 {
+    m_metadataModified = false;
+    m_binaryDocument = false;
+    cancelLargeTextPromotion();
+    resetLargeRecoveryJournal(QString());
+    m_promotedLargeDocument = false;
+    m_promotedLargeDirty = false;
+    m_l2PromotionRepresentsDirty = false;
+    m_l2TextPreviewReadOnly = false;
     QElapsedTimer t; t.start();
     const qint64 size = QFileInfo(path).size();
     const FileTierDecision tier = FileTierPolicy::classify(size);
     if (tier.usesMappedPreview()) {
         qCritical("[EditorTab::loadFile] ⚠️  大文件(%lld MB)直接走了 L1 loadFile！"
                   " 这会阻塞 UI 线程 %lld ms+，导致启动时'全程静默无弹窗直到加载完'！"
-                  " 正确路径应是 openTabAutoMode → openLargeFileL2 mmap 秒开。"
+                  " 正确路径应是 openTabAutoMode → openLargeFileL2 窗口化秒开。"
                   " path='%s'",
                   size / (1024*1024), qMax(1LL, size / (50 * 1024 * 1024)),
                   qUtf8Printable(path));
@@ -208,7 +640,8 @@ bool EditorTab::loadFile(const QString &path)
 
     DecodeResult result = decodeBytes(data);
     m_encoding = result.encoding;
-    m_filePath = path;
+    m_editor->setEolMode(detectLineEndingMode(result.text));
+    m_filePath = QFileInfo(path).absoluteFilePath();
     m_autosavePath.clear();  // 加载正式文件，清除 autosave 关联
 
     // 大文件分块加载：避免 setText() 一次性重建整个文档导致 UI 长时间卡死
@@ -237,6 +670,8 @@ bool EditorTab::loadFile(const QString &path)
     // L2 会把 Scintilla 临时 reparent 到 VirtualFileView 的 viewport；reparent 时
     // QStackedWidget 会自动移除该页，因此不能假设 L1 永远仍是 index 0。
     bridgeReparentEditorToStack();
+    if (m_windowedReadOnlyProvider)
+        m_windowedReadOnlyProvider->closeFile();
     m_l2Mode = false;
     emit l2ModeStatusChanged();
     if (m_stack) m_stack->setCurrentWidget(m_editor);
@@ -244,6 +679,8 @@ bool EditorTab::loadFile(const QString &path)
     // 根据后缀猜测语法
     Syntax s = guessSyntaxFromExtension(path);
     setSyntax(s);
+
+    refreshDiskVersionBaseline();
 
     emit encodingChanged(m_encoding);
     emit syntaxChanged(m_syntax);
@@ -259,7 +696,7 @@ bool EditorTab::loadAutosave(const QString &autosavePath)
     if (tier.usesMappedPreview()) {
         qCritical("[EditorTab::loadAutosave] ⚠️  大 autosave(%lld MB)直接走了 L1 loadAutosave！"
                   " 这会阻塞 UI 线程 %lld ms+，导致启动时'全程静默无弹窗直到加载完'！"
-                  " 正确路径应是 openAutosaveAutoMode → ensureL2View+openFile mmap 秒开。"
+                  " 正确路径应是 openAutosaveAutoMode → 窗口化大文件恢复。"
                   " autosavePath='%s'",
                   size / (1024*1024), qMax(1LL, size / (50 * 1024 * 1024)),
                   qUtf8Printable(autosavePath));
@@ -280,10 +717,27 @@ bool EditorTab::loadAutosave(const QString &autosavePath)
                size / 1024, msReadAll);
     }
 
+    return loadAutosaveBytes(data, autosavePath);
+}
+
+bool EditorTab::loadAutosaveBytes(const QByteArray &data, const QString &backingPath)
+{
+    m_metadataModified = false;
+    m_binaryDocument = false;
+    if (data.size() >= FileTierPolicy::StandardEditLimitBytes)
+        return false;
+    cancelLargeTextPromotion();
+    m_promotedLargeDocument = false;
+    m_promotedLargeDirty = false;
+    m_l2PromotionRepresentsDirty = false;
+    m_l2TextPreviewReadOnly = false;
+
     DecodeResult result = decodeBytes(data);
     m_encoding = result.encoding;
+    m_editor->setEolMode(detectLineEndingMode(result.text));
     // 关键：不设置 m_filePath，保持未命名状态，对用户透明
-    m_autosavePath = autosavePath;
+    m_autosavePath = backingPath;
+    m_diskVersion = {};
 
     // 设置文本（但不清除 modified 标记，让用户知道内容是上次未保存的）
     const int largeThreshold = 2 * 1024 * 1024;
@@ -323,17 +777,32 @@ bool EditorTab::saveFile(QString *errMsg)
 
 bool EditorTab::saveAsFile(const QString &path, QString *errMsg)
 {
+    if (sameDiskFilePath(m_filePath, path)) {
+        const ExternalFileState diskState = externalFileState();
+        if (diskState == ExternalFileState::Changed
+            || diskState == ExternalFileState::Missing
+            || diskState == ExternalFileState::Unreadable) {
+            if (errMsg) {
+                *errMsg = QObject::tr(
+                    "目标仍是已被外部修改的原文件。请选择其他路径，或先重新加载磁盘版本。");
+            }
+            return false;
+        }
+    }
     if (isL2Mode())
         return saveL2As(path, errMsg);
+    if (m_promotedLargeDocument)
+        return savePromotedLargeAs(path, errMsg);
 
     QByteArray data = encodeText(m_editor->text(), m_encoding);
 
-    // 原子写入：先写 .tmp，再 rename
-    QString tmpPath = path + ".tmp";
-    QSaveFile saveFile(tmpPath);
+    // QSaveFile already writes a sibling temporary file and atomically replaces
+    // the destination on commit. A second remove/rename layer created a data-loss
+    // window when the final rename failed.
+    QSaveFile saveFile(path);
     saveFile.setDirectWriteFallback(false);
     if (!saveFile.open(QIODevice::WriteOnly)) {
-        if (errMsg) *errMsg = QObject::tr("无法打开临时文件进行写入：%1").arg(tmpPath);
+        if (errMsg) *errMsg = QObject::tr("无法打开文件进行原子写入：%1").arg(path);
         return false;
     }
     qint64 written = saveFile.write(data);
@@ -346,42 +815,188 @@ bool EditorTab::saveAsFile(const QString &path, QString *errMsg)
         return false;
     }
 
-    // rename
-    QFile::remove(path);
-    if (!QFile::rename(tmpPath, path)) {
-        if (errMsg) *errMsg = QObject::tr("重命名临时文件到目标路径失败：%1").arg(path);
-        return false;
-    }
-
-    m_filePath = path;
-    m_editor->setModified(false);
+    m_filePath = QFileInfo(path).absoluteFilePath();
+    setModified(false);
 
     // 保存成功：自动清理 autosave 临时文件（自清理机制）
     clearAutosaveFile();
     m_autosavePath.clear();
+    refreshDiskVersionBaseline();
 
     emit titleChanged(tabTitle());
+    return true;
+}
+
+bool EditorTab::savePromotedLargeAs(const QString &path, QString *errMsg)
+{
+    if (!m_promotedLargeDocument || path.isEmpty()) {
+        if (errMsg)
+            *errMsg = QObject::tr("大文件保存参数无效。");
+        return false;
+    }
+
+    QSaveFile output(path);
+    output.setDirectWriteFallback(false);
+    if (!output.open(QIODevice::WriteOnly)) {
+        if (errMsg)
+            *errMsg = QObject::tr("无法建立原子保存文件：%1").arg(output.errorString());
+        return false;
+    }
+
+    m_editor->setReadOnly(true);
+    const auto restoreEditable = [this]() { m_editor->setReadOnly(false); };
+    if (!streamPromotedDocumentTo(&output, errMsg, true)) {
+        output.cancelWriting();
+        restoreEditable();
+        return false;
+    }
+    if (!output.commit()) {
+        restoreEditable();
+        if (errMsg)
+            *errMsg = QObject::tr("原子提交大文件失败：%1").arg(output.errorString());
+        return false;
+    }
+
+    restoreEditable();
+    if (auto *window = qobject_cast<QMainWindow *>(this->window()))
+        window->statusBar()->showMessage(QObject::tr("大文件已保存"), 3000);
+    m_filePath = QFileInfo(path).absoluteFilePath();
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETSAVEPOINT);
+    m_editor->setModified(false);
+    m_promotedLargeDirty = false;
+    resetLargeRecoveryJournal(m_filePath);
+    clearAutosaveFile();
+    m_autosavePath.clear();
+    refreshDiskVersionBaseline();
+    emit titleChanged(tabTitle());
+    return true;
+}
+
+bool EditorTab::streamPromotedDocumentTo(QIODevice *output, QString *errMsg,
+                                         bool yieldUi) const
+{
+    if (!output || !output->isWritable()) {
+        if (errMsg)
+            *errMsg = QObject::tr("大文件输出设备不可写。");
+        return false;
+    }
+
+    QByteArray bom;
+    switch (m_encoding) {
+    case TextEncoding::Utf8Bom:  bom = QByteArray("\xef\xbb\xbf", 3); break;
+    case TextEncoding::Utf16LE:  bom = QByteArray("\xff\xfe", 2); break;
+    case TextEncoding::Utf16BE:  bom = QByteArray("\xfe\xff", 2); break;
+    default: break;
+    }
+    if (!bom.isEmpty() && output->write(bom) != bom.size()) {
+        if (errMsg)
+            *errMsg = QObject::tr("写入文件编码标记失败。");
+        return false;
+    }
+
+    std::unique_ptr<QStringDecoder> decoder;
+    std::unique_ptr<QStringEncoder> encoder;
+    if (m_encoding != TextEncoding::Utf8 && m_encoding != TextEncoding::Utf8Bom) {
+        decoder = std::make_unique<QStringDecoder>(QStringConverter::Utf8);
+        if (m_encoding == TextEncoding::Utf16LE)
+            encoder = std::make_unique<QStringEncoder>(QStringConverter::Utf16LE);
+        else if (m_encoding == TextEncoding::Utf16BE)
+            encoder = std::make_unique<QStringEncoder>(QStringConverter::Utf16BE);
+        else
+            encoder = std::make_unique<QStringEncoder>(QStringConverter::System);
+    }
+
+    const qint64 total = static_cast<qint64>(directScintilla(
+        m_editor, QsciScintillaBase::SCI_GETLENGTH));
+    constexpr qint64 chunkBytes = 8LL * 1024 * 1024;
+    auto *window = yieldUi ? qobject_cast<QMainWindow *>(this->window()) : nullptr;
+    for (qint64 position = 0; position < total;) {
+        const qint64 length = qMin(chunkBytes, total - position);
+        const char *data = reinterpret_cast<const char *>(directScintilla(
+            m_editor, QsciScintillaBase::SCI_GETRANGEPOINTER,
+            static_cast<ScintillaUnsigned>(position),
+            static_cast<ScintillaSigned>(length)));
+        if (!data) {
+            if (errMsg)
+                *errMsg = QObject::tr("读取 Scintilla 大文件快照失败。");
+            return false;
+        }
+        QByteArray encoded;
+        if (decoder && encoder) {
+            const QString decoded = (*decoder)(QByteArrayView(data, length));
+            encoded = (*encoder)(QStringView(decoded));
+            data = encoded.constData();
+            if (decoder->hasError() || encoder->hasError()) {
+                if (errMsg)
+                    *errMsg = QObject::tr("按原编码转换大文件时遇到无效字符。");
+                return false;
+            }
+        }
+        const qint64 outputLength = encoded.isNull() ? length : encoded.size();
+        if (output->write(data, outputLength) != outputLength) {
+            if (errMsg)
+                *errMsg = QObject::tr("流式写入大文件失败。");
+            return false;
+        }
+        position += length;
+        if (window && window->statusBar()) {
+            window->statusBar()->showMessage(
+                QObject::tr("正在保存大文件… %1%").arg(
+                    total > 0 ? int((position * 100) / total) : 100));
+        }
+        if (yieldUi)
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    }
     return true;
 }
 
 bool EditorTab::isModified() const
 {
     if (isL2Mode())
-        return m_l2SaveNeeded;
-    return m_editor->isModified();
+        // Overlay edits become PatchList entries at the next window switch or
+        // save. They must still participate in close prompts immediately.
+        return m_l2SaveNeeded || m_editor->isModified() || m_metadataModified;
+    if (m_promotedLargeDocument)
+        return m_promotedLargeDirty || m_editor->isModified() || m_metadataModified;
+    return m_editor->isModified() || m_metadataModified;
 }
 
 void EditorTab::setModified(bool m)
 {
     if (isL2Mode()) {
-        if (m_l2SaveNeeded != m) {
-            m_l2SaveNeeded = m;
-            emit modificationChanged(m);
+        const bool before = isModified();
+        m_l2SaveNeeded = m;
+        if (!m) {
+            m_metadataModified = false;
+            m_editor->setModified(false);
+        }
+        if (before != isModified()) {
+            emit modificationChanged(isModified());
             emit titleChanged(tabTitle());
         }
         return;
     }
-    m_editor->setModified(m);
+    if (m_promotedLargeDocument) {
+        const bool before = isModified();
+        m_promotedLargeDirty = m;
+        if (!m) {
+            m_metadataModified = false;
+            m_editor->setModified(false);
+        }
+        if (before != isModified()) {
+            emit modificationChanged(isModified());
+            emit titleChanged(tabTitle());
+        }
+        return;
+    }
+    const bool before = isModified();
+    m_metadataModified = m;
+    if (!m)
+        m_editor->setModified(false);
+    if (before != isModified()) {
+        emit modificationChanged(isModified());
+        emit titleChanged(tabTitle());
+    }
 }
 
 bool EditorTab::isUntitled() const
@@ -397,11 +1012,18 @@ QString EditorTab::filePath() const
 void EditorTab::setFilePath(const QString &path)
 {
     m_filePath = path;
+    refreshDiskVersionBaseline();
     emit titleChanged(tabTitle());
 }
 
 QString EditorTab::fileName() const
 {
+    if (isSecureDocument()) {
+        if (!m_filePath.isEmpty())
+            return QFileInfo(m_filePath).fileName();
+        return m_secureDocumentTitle.isEmpty() ? QStringLiteral("未命名")
+                                               : m_secureDocumentTitle;
+    }
     if (m_filePath.isEmpty())
         return QStringLiteral("未命名");
     return QFileInfo(m_filePath).fileName();
@@ -415,6 +1037,217 @@ QString EditorTab::tabTitle() const
     return title;
 }
 
+void EditorTab::initializeSecureDocument(const QUuid &id, const QString &title,
+                                         const QString &plainText,
+                                         const QString &filePath)
+{
+    Q_ASSERT(!id.isNull());
+    m_metadataModified = false;
+    cancelLargeTextPromotion();
+    m_promotedLargeDocument = false;
+    m_promotedLargeDirty = false;
+    m_l2PromotionRepresentsDirty = false;
+    m_l2TextPreviewReadOnly = false;
+    m_secureDocumentTransitioning = true;
+    bridgeReparentEditorToStack();
+    clearL2BridgeBaseline();
+    if (m_l2View && m_l2View->isOpen())
+        m_l2View->closeFile(true);
+    if (m_windowedReadOnlyProvider)
+        m_windowedReadOnlyProvider->closeFile();
+    if (m_l2View)
+        m_l2View->setVirtualSizeLimitExclusive(0);
+    m_l2Mode = false;
+    m_filePath = filePath;
+    m_autosavePath.clear();
+    m_secureDocumentId = id;
+    m_secureDocumentTitle = title.trimmed();
+    m_secureDocumentMasked = false;
+    m_secureBinaryDocument = false;
+    setSecurePayloadLimitExclusive(32LL * 1024 * 1024);
+    m_binaryDocument = false;
+    m_diskVersion = {};
+    m_encoding = TextEncoding::Utf8;
+    m_editor->setEolMode(detectLineEndingMode(plainText));
+    m_editor->setScrollWidth(1);
+    m_editor->setReadOnly(false);
+    m_editor->setMarginType(0, QsciScintilla::NumberMargin);
+    m_editor->setMarginLineNumbers(0, true);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETUNDOCOLLECTION, 0UL);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_CLEARALL);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_EMPTYUNDOBUFFER);
+    m_editor->setText(plainText);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETUNDOCOLLECTION, 1UL);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_EMPTYUNDOBUFFER);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETSAVEPOINT);
+    m_editor->setModified(false);
+    m_secureDocumentTransitioning = false;
+    if (m_stack)
+        m_stack->setCurrentWidget(m_editor);
+    setSyntax(Syntax::Markdown);
+    emit l2ModeStatusChanged();
+    emit encodingChanged(m_encoding);
+    emit titleChanged(tabTitle());
+}
+
+bool EditorTab::initializeSecureBinaryDocument(const QUuid &id,
+                                               const QString &title,
+                                               QByteArray bytes,
+                                               const QString &filePath,
+                                               QString *error)
+{
+    if (id.isNull()) {
+        if (error)
+            *error = tr("安全二进制文档标识无效。");
+        if (!bytes.isEmpty())
+            bytes.fill(0);
+        return false;
+    }
+    cancelLargeTextPromotion();
+    m_promotedLargeDocument = false;
+    m_promotedLargeDirty = false;
+    m_l2PromotionRepresentsDirty = false;
+    m_l2TextPreviewReadOnly = false;
+    m_secureDocumentTransitioning = true;
+    bridgeReparentEditorToStack();
+    clearL2BridgeBaseline();
+    m_l2Mode = false;
+
+    VirtualFileView *view = ensureL2View();
+    QString localError;
+    if (!view->openMemory(std::move(bytes), ViewMode::Hex, &localError)) {
+        m_secureDocumentTransitioning = false;
+        if (error)
+            *error = localError;
+        return false;
+    }
+    setSecurePayloadLimitExclusive(32LL * 1024 * 1024);
+
+    m_filePath = filePath;
+    m_autosavePath.clear();
+    m_secureDocumentId = id;
+    m_secureDocumentTitle = title.trimmed();
+    m_secureDocumentMasked = false;
+    m_secureBinaryDocument = true;
+    m_binaryDocument = true;
+    m_diskVersion = {};
+    m_encoding = TextEncoding::Utf8;
+    m_l2Mode = true;
+    m_l2ReadOnlyByPolicy = false;
+    m_l2TextPreviewReadOnly = false;
+    m_l2SaveNeeded = false;
+    m_lastL2Line = 0;
+    m_lastL2Col = 0;
+    m_lastL2Byte = 0;
+    m_syntax = Syntax::Plain;
+    activateL2Overlay(view);
+    m_editor->setModified(false);
+    m_secureDocumentTransitioning = false;
+    emit l2ModeStatusChanged();
+    emit encodingChanged(m_encoding);
+    emit syntaxChanged(m_syntax);
+    emit titleChanged(tabTitle());
+    emit cursorPositionChanged(0, 0);
+    return true;
+}
+
+bool EditorTab::exportBinaryPayloadBytes(QByteArray *bytes, QString *error)
+{
+    if (bytes)
+        bytes->clear();
+    if (!bytes || !isBinaryDocument() || isSecureDocumentMasked()
+        || !m_l2View || !m_l2View->isOpen()) {
+        if (error)
+            *error = tr("安全二进制文档当前不可读取。");
+        return false;
+    }
+    if (!bridgeFlushOverlayToPatches(error))
+        return false;
+    const qint64 size = m_l2View->virtualFileSize();
+    if (size < 0 || size >= 32LL * 1024 * 1024) {
+        if (error)
+            *error = tr("安全文档必须小于 32 MiB。");
+        return false;
+    }
+    *bytes = m_l2View->readByteRange(0, size);
+    return bytes->size() == size;
+}
+
+void EditorTab::setSecurePayloadLimitExclusive(qint64 limit)
+{
+    m_securePayloadLimitExclusive = qMax<qint64>(0, limit);
+    if (m_l2View)
+        m_l2View->setVirtualSizeLimitExclusive(m_securePayloadLimitExclusive);
+}
+
+void EditorTab::maskSecureDocument()
+{
+    if (!isSecureDocument() || m_secureDocumentMasked)
+        return;
+    m_secureDocumentTransitioning = true;
+    m_secureDocumentMasked = true;
+    if (m_secureBinaryDocument) {
+        bridgeReparentEditorToStack();
+        if (m_l2View && m_l2View->isOpen())
+            m_l2View->closeFile(true);
+        m_l2Mode = false;
+        if (m_stack)
+            m_stack->setCurrentWidget(m_editor);
+        clearL2BridgeBaseline();
+        emit l2ModeStatusChanged();
+    }
+    m_editor->setReadOnly(false);
+    // Disable undo before removing plaintext so neither Ctrl+Z nor Scintilla's
+    // undo buffer can resurrect the secure document while the tab is masked.
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETUNDOCOLLECTION, 0UL);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_CLEARALL);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_EMPTYUNDOBUFFER);
+    m_editor->setText(QStringLiteral(
+        "此加密文档已锁定。\n\n解锁加密数据后可继续编辑。"));
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETUNDOCOLLECTION, 1UL);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_EMPTYUNDOBUFFER);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETSAVEPOINT);
+    m_editor->setModified(false);
+    m_editor->setReadOnly(true);
+    m_secureDocumentTransitioning = false;
+    emit titleChanged(tabTitle());
+}
+
+void EditorTab::setSecureDocumentTitle(const QString &title)
+{
+    if (!isSecureDocument())
+        return;
+    const QString normalized = title.trimmed();
+    if (m_secureDocumentTitle == normalized)
+        return;
+    m_secureDocumentTitle = normalized;
+    emit titleChanged(tabTitle());
+}
+
+void EditorTab::convertToPlainDocument(const QString &filePath)
+{
+    m_metadataModified = false;
+    cancelLargeTextPromotion();
+    m_promotedLargeDocument = false;
+    m_promotedLargeDirty = false;
+    m_l2PromotionRepresentsDirty = false;
+    m_l2TextPreviewReadOnly = false;
+    m_secureDocumentTransitioning = true;
+    clearL2BridgeBaseline();
+    m_secureDocumentId = {};
+    m_secureDocumentTitle.clear();
+    m_secureDocumentMasked = false;
+    m_secureBinaryDocument = false;
+    setSecurePayloadLimitExclusive(0);
+    m_filePath = filePath;
+    m_autosavePath.clear();
+    m_editor->setReadOnly(false);
+    m_editor->setModified(false);
+    m_secureDocumentTransitioning = false;
+    refreshDiskVersionBaseline();
+    emit titleChanged(tabTitle());
+}
+
 TextEncoding EditorTab::encoding() const
 {
     return m_encoding;
@@ -426,6 +1259,16 @@ void EditorTab::setEncoding(TextEncoding enc)
         return;
     m_encoding = enc;
     emit encodingChanged(m_encoding);
+}
+
+QString EditorTab::lineEndingName() const
+{
+    switch (m_editor->eolMode()) {
+    case QsciScintilla::EolWindows: return QStringLiteral("CRLF");
+    case QsciScintilla::EolMac: return QStringLiteral("CR");
+    case QsciScintilla::EolUnix: return QStringLiteral("LF");
+    }
+    return QStringLiteral("LF");
 }
 
 Syntax EditorTab::syntax() const
@@ -646,60 +1489,135 @@ void EditorTab::clearMarkers()
 
 // ============ 搜索 ============
 
-static QRegularExpression buildPattern(const QString &pattern, bool regex,
-                                       bool caseSensitive, bool wholeWord)
-{
-    QRegularExpression::PatternOptions options = QRegularExpression::UseUnicodePropertiesOption;
-    if (!caseSensitive)
-        options |= QRegularExpression::CaseInsensitiveOption;
-
-    QString pat;
-    if (regex) {
-        pat = pattern;
-    } else {
-        pat = QRegularExpression::escape(pattern);
-    }
-    if (wholeWord) {
-        pat = QStringLiteral("(?:^|\\W)") + pat + QStringLiteral("(?:$|\\W)");
-    }
-    QRegularExpression re(pat, options);
-    return re;
-}
-
 QVector<SearchMatch> EditorTab::findAll(const QString &pattern, bool regex,
                                         bool caseSensitive, bool wholeWord)
 {
     QVector<SearchMatch> matches;
-    if (pattern.isEmpty())
+    m_lastFindAllTruncated = false;
+    m_lastSearchError.clear();
+    m_l1SearchCache.clear();
+    m_l1SearchCacheValid = false;
+    m_lastL1MatchIndex = -1;
+    if (pattern.isEmpty()) {
+        m_lastSearchError = QObject::tr("查找文本为空。");
         return matches;
+    }
 
-    QRegularExpression re = buildPattern(pattern, regex, caseSensitive, wholeWord);
-    if (!re.isValid())
+    Pcre2Regex compiled;
+    QString compileError;
+    if (!compiled.compile(pattern, !regex, caseSensitive, wholeWord, &compileError)) {
+        m_lastSearchError = compileError;
         return matches;
+    }
 
-    // 按行搜索
-    int lines = m_editor->lines();
-    for (int lineNum = 0; lineNum < lines; ++lineNum) {
-        QString lineText = m_editor->text(lineNum);
-        // 移除末尾换行符
-        if (lineText.endsWith('\n'))
-            lineText.chop(1);
-        if (lineText.endsWith('\r'))
-            lineText.chop(1);
+    const QByteArray subject = m_editor->text().toUtf8();
+    QString scanError;
+    const Pcre2Regex::ScanResult scanResult = compiled.scan(
+        reinterpret_cast<const uchar *>(subject.constData()), subject.size(),
+        {}, {},
+        [&](qint64 byteOffset, qint64 byteLength) {
+            const int lineNum = int(m_editor->SendScintilla(
+                QsciScintillaBase::SCI_LINEFROMPOSITION, long(byteOffset)));
+            const qint64 lineByteStart = m_editor->SendScintilla(
+                QsciScintillaBase::SCI_POSITIONFROMLINE, lineNum);
+            QString lineText = m_editor->text(lineNum);
+            while (lineText.endsWith('\n') || lineText.endsWith('\r'))
+                lineText.chop(1);
 
-        auto it = re.globalMatch(lineText);
-        while (it.hasNext()) {
-            auto m = it.next();
             SearchMatch match;
             match.line = lineNum;
-            match.index = m.capturedStart();
-            match.length = m.capturedLength();
-            match.text = m.captured(0);
+            match.index = QString::fromUtf8(subject.constData() + lineByteStart,
+                                             byteOffset - lineByteStart).size();
+            match.length = QString::fromUtf8(subject.constData() + byteOffset,
+                                              byteLength).size();
+            match.text = QString::fromUtf8(subject.constData() + byteOffset, byteLength);
             match.context = lineText;
-            matches.append(match);
+            match.byteOffset = byteOffset;
+            match.byteLength = qint32(byteLength);
+            m_l1SearchCache.append({byteOffset, qint32(byteLength)});
+            matches.append(std::move(match));
+            if (matches.size() >= 200000) {
+                m_lastFindAllTruncated = true;
+                return false;
+            }
+            return true;
+        }, &scanError);
+    if (scanResult == Pcre2Regex::ScanResult::Failed) {
+        m_lastSearchError = scanError;
+        matches.clear();
+        m_l1SearchCache.clear();
+        return matches;
+    }
+    if (scanResult == Pcre2Regex::ScanResult::Cancelled
+        && !m_lastFindAllTruncated) {
+        m_lastSearchError = QObject::tr("搜索已取消。");
+        matches.clear();
+        m_l1SearchCache.clear();
+        return matches;
+    }
+    m_l1SearchCachePattern = pattern;
+    m_l1SearchCacheRegex = regex;
+    m_l1SearchCacheCaseSensitive = caseSensitive;
+    m_l1SearchCacheWholeWord = wholeWord;
+    m_l1SearchCacheRevision = m_contentRevision;
+    m_l1SearchCacheValid = true;
+    return matches;
+}
+
+void EditorTab::setSearchHighlights(const QVector<SearchMatch> &matches)
+{
+    if (isL2Mode() || !m_editor)
+        return;
+    constexpr int indicator = 8;
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETINDICATORCURRENT, indicator);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_INDICSETSTYLE, indicator,
+                            QsciScintillaBase::INDIC_ROUNDBOX);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_INDICSETFORE, indicator, 0x00B7FF);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_INDICSETALPHA, indicator, 90);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_INDICATORCLEARRANGE,
+                            0, m_editor->length());
+    for (const SearchMatch &match : matches) {
+        const qint64 start = match.byteOffset >= 0
+            ? match.byteOffset
+            : m_editor->positionFromLineIndex(match.line, match.index);
+        const qint64 end = match.byteOffset >= 0 && match.byteLength >= 0
+            ? match.byteOffset + match.byteLength
+            : m_editor->positionFromLineIndex(match.line,
+                                              match.index + match.length);
+        if (start >= 0 && end > start) {
+            m_editor->SendScintilla(QsciScintillaBase::SCI_INDICATORFILLRANGE,
+                                    long(start), long(end - start));
         }
     }
-    return matches;
+}
+
+void EditorTab::clearSearchHighlights()
+{
+    m_l2SearchHighlights.clear();
+    if (m_l2View)
+        m_l2View->clearSearchHighlights();
+    if (!m_editor)
+        return;
+    constexpr int indicator = 8;
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETINDICATORCURRENT, indicator);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_INDICATORCLEARRANGE,
+                            0, m_editor->length());
+}
+
+void EditorTab::selectSearchMatch(int line, int index, int length)
+{
+    if (isL2Mode()) {
+        setCursorPosition(line, index);
+        return;
+    }
+    const int start = m_editor->positionFromLineIndex(line, index);
+    const int end = m_editor->positionFromLineIndex(line, index + qMax(0, length));
+    if (start >= 0 && end >= start) {
+        m_editor->SendScintilla(QsciScintillaBase::SCI_SETSEL,
+                                static_cast<long>(start), static_cast<long>(end));
+    }
+    m_editor->ensureLineVisible(line);
+    m_editor->setFocus();
 }
 
 // ============ 光标 ============
@@ -875,9 +1793,26 @@ void EditorTab::loadUtf8Chunked(const QByteArray &utf8)
 
 void EditorTab::setWordWrap(bool on)
 {
+    if (windowedReadOnlyActive()) {
+        m_l2View->setWordWrap(on);
+        if (m_windowedReadOnlyProvider->presentation()
+            == WindowedReadOnlyProvider::Presentation::Text) {
+            m_windowedReadOnlyProvider->editor()->setWrapMode(
+                on ? QsciScintilla::WrapWord : QsciScintilla::WrapNone);
+        }
+        return;
+    }
     // L2 模式：委托 VirtualFileView
     if (isL2Mode() && m_l2View) {
         m_l2View->setWordWrap(on);
+        if (m_l2View->viewMode() != ViewMode::Hex) {
+            m_editor->setWrapMode(on ? QsciScintilla::WrapWord
+                                     : QsciScintilla::WrapNone);
+            if (on) {
+                m_editor->setWrapVisualFlags(QsciScintilla::WrapFlagByText);
+                m_editor->setWrapIndentMode(QsciScintilla::WrapIndentSame);
+            }
+        }
         return;
     }
     // L1 模式：QsciScintilla
@@ -900,23 +1835,38 @@ bool EditorTab::wordWrap() const
 void EditorTab::setDisplayEncoding(TextEncoding enc)
 {
     if (isL2Mode() && m_l2View) {
-        // L2：仅改变显示解码方式，不修改文件内容
+        QString error;
+        if (!bridgeFlushOverlayToPatches(&error)) {
+            if (auto *window = qobject_cast<QMainWindow *>(this->window()))
+                window->statusBar()->showMessage(error, 6000);
+            return;
+        }
+        // L2: preserve the virtual byte stream and rebuild only the visible
+        // decoded projection. Pending patches remain attached to byte offsets.
         m_l2View->setDisplayEncoding(enc);
+        const qint64 start = m_l2View->activeWindowByteStart();
+        const qint64 end = m_l2View->activeWindowByteEnd();
+        clearL2BridgeBaseline();
+        if (end > start)
+            bridgePopulateScintilla(start, end);
+        emit encodingChanged(enc);
     } else {
-        // L1：重新以指定编码解码文件字节并加载到编辑器
-        // 读取原始文件字节
-        if (m_filePath.isEmpty()) return;
+        // Secure Text is a logical UTF-8 payload; m_filePath points to its
+        // encrypted KDBX container and must never be decoded as document text.
+        if (m_filePath.isEmpty() || isSecureDocument()) return;
         QFile f(m_filePath);
         if (!f.open(QIODevice::ReadOnly)) return;
         QByteArray raw = f.readAll();
         f.close();
-        // 跳过 BOM
         int skip = 0;
         if (enc == TextEncoding::Utf8Bom && raw.size() >= 3 &&
             (uchar)raw[0] == 0xEF && (uchar)raw[1] == 0xBB && (uchar)raw[2] == 0xBF)
             skip = 3;
-        else if ((enc == TextEncoding::Utf16LE || enc == TextEncoding::Utf16BE) &&
-                 raw.size() >= 2)
+        else if (enc == TextEncoding::Utf16LE && raw.size() >= 2
+                 && uchar(raw[0]) == 0xFF && uchar(raw[1]) == 0xFE)
+            skip = 2;
+        else if (enc == TextEncoding::Utf16BE && raw.size() >= 2
+                 && uchar(raw[0]) == 0xFE && uchar(raw[1]) == 0xFF)
             skip = 2;
         QByteArray body = raw.mid(skip);
         QString text;
@@ -925,19 +1875,11 @@ void EditorTab::setDisplayEncoding(TextEncoding enc)
         case TextEncoding::Utf8Bom:
             text = QString::fromUtf8(body);
             break;
-        case TextEncoding::GBK:
-#ifdef Q_OS_WIN
-            {   int wlen = MultiByteToWideChar(CP_ACP, 0, body.constData(), body.size(), nullptr, 0);
-                if (wlen > 0) {
-                    QVector<wchar_t> wstr(wlen);
-                    MultiByteToWideChar(CP_ACP, 0, body.constData(), body.size(), wstr.data(), wlen);
-                    text = QString::fromWCharArray(wstr.data(), wlen);
-                } }
-#else
-            {   auto dec = QStringDecoder("GB18030");
-                text = dec.isValid() ? dec(body) : QString::fromLatin1(body); }
-#endif
+        case TextEncoding::GBK: {
+            auto decoder = QStringDecoder("GB18030");
+            text = decoder.isValid() ? decoder(body) : QString::fromLatin1(body);
             break;
+        }
         case TextEncoding::Utf16LE:
             text = QString::fromUtf16(reinterpret_cast<const char16_t*>(body.constData()),
                                       body.size() / 2);
@@ -951,8 +1893,13 @@ void EditorTab::setDisplayEncoding(TextEncoding enc)
             break;
         }
         }
+        m_editor->setEolMode(detectLineEndingMode(text));
         m_editor->setText(text);
         m_editor->setModified(false);
+        m_metadataModified = false;
+        m_encoding = enc;
+        refreshDiskVersionBaseline();
+        emit encodingChanged(m_encoding);
     }
 }
 
@@ -968,7 +1915,30 @@ TextEncoding EditorTab::displayEncoding() const
 // ============================================================================
 void EditorTab::setViewModeL2(ViewMode mode)
 {
-    if (m_l2View) m_l2View->setViewMode(mode);
+    if (!m_l2View || m_l2View->viewMode() == mode)
+        return;
+
+    QString error;
+    if (!bridgeFlushOverlayToPatches(&error)) {
+        if (auto *window = qobject_cast<QMainWindow *>(this->window()))
+            window->statusBar()->showMessage(error, 6000);
+        return;
+    }
+
+    m_l2View->setViewMode(mode);
+    if (windowedReadOnlyActive()) {
+        m_windowedReadOnlyProvider->setPresentation(
+            mode == ViewMode::Hex ? WindowedReadOnlyProvider::Presentation::Hex
+                                  : WindowedReadOnlyProvider::Presentation::Text);
+        return;
+    }
+    // The overlay representation changes between decoded text and a reversible
+    // two-digit byte grid. Refill even when the mmap active range did not move.
+    const qint64 start = m_l2View->activeWindowByteStart();
+    const qint64 end = m_l2View->activeWindowByteEnd();
+    clearL2BridgeBaseline();
+    if (end > start)
+        bridgePopulateScintilla(start, end);
 }
 
 ViewMode EditorTab::viewModeL2() const
@@ -992,7 +1962,20 @@ bool EditorTab::isL2Active() const
     // viewport，QStackedWidget 随即自动移除原 L1 page，VFV 的 index 会从 1 变成 0。
     // 用稳定的页面对象身份判断，避免菜单状态和实际编辑模式永久错位。
     return m_l2Mode && m_stack && m_l2View
-        && m_stack->currentWidget() == m_l2View;
+        && (m_stack->currentWidget() == m_l2View
+            || m_stack->currentWidget() == m_windowedReadOnlyProvider);
+}
+
+qint64 EditorTab::currentByteOffset() const
+{
+    // m_lastL2Byte is a compatibility/search cache. Programmatic navigation
+    // and byte selections update VirtualFileView directly, so session state
+    // must read the provider's authoritative 64-bit caret position.
+    if (windowedReadOnlyActive())
+        return m_windowedReadOnlyProvider->globalOffset();
+    if (m_l2Mode && m_l2View)
+        return m_l2View->cursorByte();
+    return m_lastL2Byte;
 }
 
 // ============================================================================
@@ -1012,9 +1995,12 @@ VirtualFileView *EditorTab::ensureL2View()
                 this, [this](int line, int col) {
                     m_lastL2Line = line;
                     m_lastL2Col  = col;
-                    // byteOffset 粗略缓存：用 lineIndex→lineToByteOffset（不准确但用于 findNext 起始足够）
                     if (m_l2View && m_l2View->isOpen()) {
-                        m_lastL2Byte = m_l2View->lineIndex().lineToByteOffset(line) + col;
+                        m_lastL2Byte = m_l2View->viewMode() == ViewMode::Hex
+                            ? qMin(m_l2View->virtualFileSize(),
+                                   qint64(line) * m_l2View->hexBytesPerRow()
+                                       + qint64(col))
+                            : m_l2View->lineIndex().lineToByteOffset(line) + col;
                     }
                     // 转发统一 cursorPositionChanged：MainWindow 状态栏更新走同一个
                     emit cursorPositionChanged(line, col);
@@ -1024,6 +2010,8 @@ VirtualFileView *EditorTab::ensureL2View()
                 this, &EditorTab::l2FileOpenedChanged);
         connect(m_l2View, &VirtualFileView::saveNeededChanged,
                 this, [this](bool needed) {
+                    if (needed)
+                        advanceContentRevision();
                     m_l2SaveNeeded = needed;
                     emit modificationChanged(needed);
                     emit titleChanged(tabTitle());
@@ -1031,12 +2019,300 @@ VirtualFileView *EditorTab::ensureL2View()
                 });
         connect(m_l2View, &VirtualFileView::undoRedoChanged,
                 this, &EditorTab::l2UndoRedoChanged);
+        connect(m_l2View, &VirtualFileView::undoRedoChanged,
+                this, &EditorTab::commandCapabilitiesChanged);
         connect(m_l2View, &VirtualFileView::lineBuildProgress,
                 this, &EditorTab::l2LineBuildProgress);
         connect(m_l2View, &VirtualFileView::lineBuildFinished,
                 this, &EditorTab::l2LineBuildFinished);
     }
     return m_l2View;
+}
+
+WindowedReadOnlyProvider *EditorTab::ensureWindowedReadOnlyProvider()
+{
+    if (!m_windowedReadOnlyProvider) {
+        m_windowedReadOnlyProvider = new WindowedReadOnlyProvider(this);
+        m_windowedReadOnlyProvider->setObjectName(
+            QStringLiteral("productionWindowedReadOnlyProvider"));
+        if (m_stack && m_stack->indexOf(m_windowedReadOnlyProvider) < 0)
+            m_stack->addWidget(m_windowedReadOnlyProvider);
+        connect(m_windowedReadOnlyProvider->editor(),
+                &QsciScintilla::selectionChanged,
+                this, &EditorTab::commandCapabilitiesChanged);
+        connect(m_windowedReadOnlyProvider, &WindowedReadOnlyProvider::windowReady,
+                this, [this](qint64, qint64, qint64 anchor) {
+            m_lastL2Byte = anchor;
+            if (m_l2View && m_l2View->viewMode() == ViewMode::Hex) {
+                const int row = m_windowedReadOnlyProvider->hexBytesPerRow();
+                m_lastL2Line = int(qMin<qint64>(anchor / row, INT_MAX));
+                m_lastL2Col = int(anchor % row);
+            } else {
+                m_lastL2Line = 0;
+                m_lastL2Col = 0;
+            }
+            emit cursorPositionChanged(m_lastL2Line, m_lastL2Col);
+            emit l2CursorPositionChanged(m_lastL2Line, m_lastL2Col);
+        });
+        connect(m_windowedReadOnlyProvider,
+                &WindowedReadOnlyProvider::sourceFileChanged,
+                this, [this](qint64, qint64) {
+            cancelLargeTextPromotion();
+            refreshDiskVersionBaseline();
+            if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
+                window->statusBar()->showMessage(
+                    QObject::tr("源文件已在磁盘上变化；已刷新只读视图并取消旧的编辑准备"),
+                    8000);
+            }
+        });
+        connect(m_windowedReadOnlyProvider,
+                &WindowedReadOnlyProvider::sourceReloadFailed,
+                this, [this](const QString &message) {
+            if (auto *window = qobject_cast<QMainWindow *>(this->window()))
+                window->statusBar()->showMessage(message, 8000);
+        });
+    }
+    return m_windowedReadOnlyProvider;
+}
+
+bool EditorTab::windowedReadOnlyActive() const
+{
+    return m_l2Mode && m_stack && m_windowedReadOnlyProvider
+        && m_stack->currentWidget() == m_windowedReadOnlyProvider;
+}
+
+EditorTab::LargeDocumentRuntimeState EditorTab::largeDocumentRuntimeState() const
+{
+    if (m_promotedLargeDocument && !m_l2Mode)
+        return LargeDocumentRuntimeState::Editable;
+    if (!m_l2Mode)
+        return LargeDocumentRuntimeState::None;
+    if (m_l2PromotionTaskId > 0)
+        return LargeDocumentRuntimeState::PreparingEditor;
+    if (!m_l2FallbackReason.isEmpty())
+        return LargeDocumentRuntimeState::ReadOnlyFallback;
+    if (m_l2ReadOnlyByPolicy)
+        return LargeDocumentRuntimeState::ReadOnlyAnalysis;
+    if (m_l2TextPreviewReadOnly)
+        return LargeDocumentRuntimeState::PreviewReady;
+    // B1 Hex uses the byte provider directly and is already editable; it is
+    // not an S2 preview or promotion state.  Keep None so the status bar can
+    // expose the more useful per-document INS/OVR mode.
+    return LargeDocumentRuntimeState::None;
+}
+
+qint64 EditorTab::contentSizeBytes() const
+{
+    if (windowedReadOnlyActive() && m_windowedReadOnlyProvider)
+        return m_windowedReadOnlyProvider->fileSize();
+    if (m_l2Mode && m_l2View && m_l2View->isOpen())
+        return m_l2View->virtualFileSize();
+    return m_editor ? static_cast<qint64>(m_editor->length()) : 0;
+}
+
+bool EditorTab::ensureWindowedSearchSource(QString *error)
+{
+    if (!windowedReadOnlyActive())
+        return m_l2View && m_l2View->isOpen();
+    if (m_l2View && (m_l2View->isOpen() || m_l2View->mmapSize() > 0))
+        return true;
+    if (m_filePath.isEmpty()) {
+        if (error)
+            *error = QObject::tr("当前大文件没有可搜索的磁盘源。");
+        return false;
+    }
+    VirtualFileView *view = ensureL2View();
+    view->setViewMode(m_windowedReadOnlyProvider->presentation()
+                          == WindowedReadOnlyProvider::Presentation::Hex
+                      ? ViewMode::Hex : ViewMode::Text);
+    QString openError;
+    if (!view->openFile(m_filePath, &openError, this->window())) {
+        if (error)
+            *error = openError;
+        return false;
+    }
+    return true;
+}
+
+void EditorTab::ensureHexAsciiPreview(QWidget *parent)
+{
+    if (!parent)
+        return;
+    if (!m_hexAsciiPreview) {
+        m_hexAsciiPreview = new QPlainTextEdit(parent);
+        m_hexAsciiPreview->setObjectName(QStringLiteral("HexAsciiPreview"));
+        m_hexAsciiPreview->setAccessibleName(QStringLiteral("ASCII 字节预览"));
+        m_hexAsciiPreview->setToolTip(
+            QStringLiteral("字符栏（不可打印字节显示为 .；可直接编辑原始字节）"));
+        m_hexAsciiPreview->setFont(m_editor->font());
+        m_hexAsciiPreview->setReadOnly(isReadOnlyByPolicy());
+        m_hexAsciiPreview->setLineWrapMode(QPlainTextEdit::NoWrap);
+        m_hexAsciiPreview->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        m_hexAsciiPreview->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        m_hexAsciiPreview->document()->setDocumentMargin(0);
+        m_hexAsciiPreview->setStyleSheet(QStringLiteral(
+            "QPlainTextEdit { border: 0; border-left: 1px solid #c8c8c8;"
+            " background: #fafafa; padding-left: 8px; }"));
+        m_hexAsciiPreview->installEventFilter(this);
+        m_hexAsciiPreview->viewport()->installEventFilter(this);
+        connect(m_hexAsciiPreview, &QPlainTextEdit::cursorPositionChanged,
+                this, &EditorTab::syncHexSelectionFromAscii);
+        connect(m_hexAsciiPreview, &QPlainTextEdit::selectionChanged,
+                this, &EditorTab::syncHexSelectionFromAscii);
+    } else if (m_hexAsciiPreview->parentWidget() != parent) {
+        m_hexAsciiPreview->setParent(parent);
+    }
+}
+
+int EditorTab::preferredHexBytesPerRow() const
+{
+    if (!m_l2View || !m_l2View->viewport() || !m_editor)
+        return 16;
+    const int width = m_l2View->viewport()->width();
+    const int charWidth = qMax(7, QFontMetrics(m_editor->font()).horizontalAdvance(
+                                      QLatin1Char('0')));
+    const int addressDigits = qMax(
+        8, QString::number(qMax<qint64>(0, m_l2View->virtualFileSize() - 1), 16).size());
+    // Do not read Scintilla's current margin width here: on first projection it
+    // still belongs to the previous presentation, making the result order-dependent.
+    const int addressWidth = charWidth * (addressDigits + 2) + 16;
+    for (int candidate = 64; candidate >= 8; candidate -= 4) {
+        const int required = addressWidth
+            + charWidth * (candidate * 3 + candidate + 12) + 52;
+        if (required <= width)
+            return candidate;
+    }
+    return 8;
+}
+
+void EditorTab::adaptHexBytesPerRow(bool repopulate)
+{
+    if (!m_l2View || m_l2View->viewMode() != ViewMode::Hex)
+        return;
+    const int desired = preferredHexBytesPerRow();
+    if (desired == m_hexBytesPerRow)
+        return;
+
+    if (m_bridge.windowStart >= 0 && m_editor->isModified()) {
+        QString error;
+        if (!bridgeFlushOverlayToPatches(&error))
+            return;
+    }
+    m_hexBytesPerRow = desired;
+    m_l2View->setHexBytesPerRow(desired);
+    if (repopulate && m_bridge.windowStart >= 0 && m_bridge.windowLen > 0) {
+        bridgePopulateScintilla(m_bridge.windowStart,
+                                m_bridge.windowStart + m_bridge.windowLen);
+    }
+}
+
+void EditorTab::layoutL2Overlay()
+{
+    if (!m_l2View || !m_editor)
+        return;
+    QWidget *viewport = m_l2View->viewport();
+    if (!viewport)
+        return;
+
+    const bool hex = m_l2View->viewMode() == ViewMode::Hex;
+    if (!hex) {
+        if (m_hexAsciiPreview)
+            m_hexAsciiPreview->hide();
+        m_editor->setGeometry(0, 0, viewport->width(), viewport->height());
+        return;
+    }
+
+    ensureHexAsciiPreview(viewport);
+    const int charWidth = qMax(7, QFontMetrics(m_editor->font()).horizontalAdvance(
+                                      QLatin1Char('0')));
+    const int desiredEditorWidth = m_editor->marginWidth(0)
+        // Scintilla reserves additional client padding/caret width beyond the
+        // glyph advances. Keep a full-byte safety margin so the final nibble
+        // never requires a useless internal horizontal scroll.
+        + charWidth * (m_hexBytesPerRow * 3 + 9) + 28;
+    const int desiredPreviewWidth = charWidth * (m_hexBytesPerRow + 2) + 24;
+    const int previewWidth = qMin(qMax(1, viewport->width() - 1),
+                                  qMin(desiredPreviewWidth,
+                                       qMax(120, viewport->width() / 4)));
+    const int editorWidth = qMax(1, qMin(desiredEditorWidth,
+                                         viewport->width() - previewWidth));
+    m_editor->setGeometry(0, 0, editorWidth, viewport->height());
+    m_hexAsciiPreview->setGeometry(editorWidth, 0, previewWidth, viewport->height());
+    m_hexAsciiPreview->show();
+    m_hexAsciiPreview->raise();
+    m_editor->raise();
+}
+
+void EditorTab::activateL2Overlay(VirtualFileView *view)
+{
+    if (!view || !m_stack || !m_editor)
+        return;
+    m_stack->setCurrentWidget(view);
+
+    QWidget *viewport = view->viewport();
+    m_editor->setParent(viewport);
+    m_editor->setGeometry(QRect(QPoint(0, 0), viewport->size()));
+    m_editor->show();
+    m_editor->raise();
+    m_editor->setFocus();
+    viewport->installEventFilter(this);
+    layoutL2Overlay();
+
+    // The provider object is stable for the tab lifetime. Install the bridge
+    // once and reuse it for mmap files and decrypted in-memory binary payloads.
+    if (!m_l2BridgeConnectionsInstalled) {
+        m_bridge.syncVfvDebounce.setSingleShot(true);
+        m_bridge.syncVfvDebounce.setInterval(250);
+        connect(&m_bridge.syncVfvDebounce, &QTimer::timeout,
+                this, &EditorTab::bridgeOnSyncDebounce);
+        QObject::connect(m_editor, &QsciScintilla::SCN_UPDATEUI, this, [this]() {
+            if (Q_UNLIKELY(!m_l2Mode || m_bridge.applying))
+                return;
+            if (m_hexAsciiPreview && m_hexAsciiPreview->isVisible()) {
+                const long first = m_editor->SendScintilla(
+                    QsciScintillaBase::SCI_GETFIRSTVISIBLELINE);
+                m_hexAsciiPreview->verticalScrollBar()->setValue(int(first));
+                syncAsciiSelectionFromHex();
+            }
+            m_bridge.syncVfvDebounce.start();
+        });
+        QObject::connect(view, &VirtualFileView::activeWindowChanged,
+                         this, [this](qint64 byteStart, qint64 byteEnd) {
+            if (m_l2Mode)
+                bridgePopulateScintilla(byteStart, byteEnd);
+        });
+        m_l2BridgeConnectionsInstalled = true;
+    }
+
+    view->syncActiveWindowToCursor(0);
+    const qint64 start = view->activeWindowByteStart();
+    const qint64 end = view->activeWindowByteEnd();
+    if (start >= 0 && end > start)
+        bridgePopulateScintilla(start, end);
+
+    QTimer::singleShot(0, this, [this, view]() {
+        if (!m_l2Mode || !m_l2View)
+            return;
+        if (view->viewport() && m_editor)
+            layoutL2Overlay();
+    });
+}
+
+void EditorTab::clearL2BridgeBaseline()
+{
+    if (m_hexAsciiPreview && m_secureBinaryDocument) {
+        const int previewLength = qMax(0,
+            m_hexAsciiPreview->document()->characterCount() - 1);
+        if (previewLength > 0)
+            m_hexAsciiPreview->setPlainText(QString(previewLength, QLatin1Char('.')));
+        m_hexAsciiPreview->clear();
+    }
+    if (!m_bridge.baseline.isEmpty() && m_secureBinaryDocument)
+        m_bridge.baseline.fill(0);
+    m_bridge.baseline.clear();
+    m_bridge.baseline.squeeze();
+    m_bridge.windowStart = -1;
+    m_bridge.windowLen = 0;
 }
 
 // ============================================================================
@@ -1046,6 +2322,8 @@ VirtualFileView *EditorTab::ensureL2View()
 void EditorTab::bridgeReparentEditorToStack()
 {
     if (!m_stack) return;
+    if (m_hexAsciiPreview)
+        m_hexAsciiPreview->hide();
     // 先卸载 VFV viewport 的 eventFilter（避免 reparent 后仍收到无效 Resize）
     if (m_l2View && m_l2View->viewport())
         m_l2View->viewport()->removeEventFilter(this);
@@ -1071,27 +2349,99 @@ void EditorTab::bridgePopulateScintilla(qint64 s, qint64 e)
     // 桥 2：如果已有有效 baseline 窗口（用户可能做了编辑），先 flush diff 回 patches 再切窗口
     if (m_bridge.windowStart >= 0 && m_bridge.windowLen > 0
         && !(m_bridge.windowStart == s && m_bridge.windowLen == (e - s))) {
-        bridgeFlushOverlayToPatches();
+        QString flushError;
+        if (!bridgeFlushOverlayToPatches(&flushError)) {
+            if (auto *window = qobject_cast<QMainWindow *>(this->window()))
+                window->statusBar()->showMessage(flushError, 6000);
+            return;
+        }
     }
 
+    adaptHexBytesPerRow(false);
     m_bridge.applying = true;
     QByteArray bytes = m_l2View->readByteRange(s, e);
     // 走 SCI_SETTEXT（setText），对于 W_active 上限 8MB，主线程 setText 约 100ms 内完成，
     // 不会触发"UI 线程卡死"；甩滚时 bridge 不频繁触发（VFV debounce 已节流）。
-    m_editor->setText(QString::fromUtf8(bytes));
+    m_editor->setReadOnly(false);
+    if (m_l2View->viewMode() == ViewMode::Hex) {
+        m_editor->setUtf8(true);
+        m_editor->setText(formatHexBytes(bytes, m_hexBytesPerRow));
+        // The row width is chosen to fit the viewport. A reused Scintilla can
+        // retain an x-offset from a previous text/Hex projection, which would
+        // otherwise hide the first bytes while the absolute offset still says 0.
+        m_editor->SendScintilla(QsciScintillaBase::SCI_SETXOFFSET, 0);
+        ensureHexAsciiPreview(m_l2View->viewport());
+        QString ascii = formatAsciiBytes(bytes, m_hexBytesPerRow);
+        const int oldPreviewLength = qMax(0,
+            m_hexAsciiPreview->document()->characterCount() - 1);
+        if (m_secureBinaryDocument && oldPreviewLength > 0) {
+            m_hexAsciiPreview->setPlainText(
+                QString(oldPreviewLength, QLatin1Char('.')));
+        }
+        m_hexAsciiPreview->setPlainText(ascii);
+        m_hexAsciiPreview->setReadOnly(isReadOnlyByPolicy());
+        if (m_secureBinaryDocument && !ascii.isEmpty())
+            ascii.fill(QChar(0));
+        m_editor->setWrapMode(QsciScintilla::WrapNone);
+        m_editor->setMarginLineNumbers(0, false);
+        // QScintilla implements setMarginLineNumbers(false) by forcing a
+        // SymbolMargin, so TextMargin must be applied after that call.
+        m_editor->setMarginType(0, QsciScintilla::TextMargin);
+        const qint64 lastOffset = s + qMax<qint64>(0, bytes.size() - 1);
+        const int addressDigits = qMax(8, QString::number(lastOffset, 16).size());
+        m_editor->setMarginWidth(0, QString(addressDigits + 2, QLatin1Char('0')));
+        const int lines = (bytes.size() + m_hexBytesPerRow - 1) / m_hexBytesPerRow;
+        for (int line = 0; line < lines; ++line) {
+            const QString address = QString::number(
+                                        s + qint64(line) * m_hexBytesPerRow, 16)
+                                        .rightJustified(addressDigits, QLatin1Char('0'))
+                                        .toUpper();
+            m_editor->setMarginText(line, address, 0);
+        }
+        layoutL2Overlay();
+        const long first = m_editor->SendScintilla(
+            QsciScintillaBase::SCI_GETFIRSTVISIBLELINE);
+        m_hexAsciiPreview->verticalScrollBar()->setValue(int(first));
+    } else {
+        if (m_hexAsciiPreview)
+            m_hexAsciiPreview->hide();
+        m_editor->setText(QString::fromUtf8(bytes));
+        m_editor->setWrapMode(m_l2View->wordWrap() ? QsciScintilla::WrapWord
+                                                   : QsciScintilla::WrapNone);
+        m_editor->setMarginType(0, QsciScintilla::NumberMargin);
+        m_editor->setMarginLineNumbers(0, true);
+        const int lineDigits = qMax(6, QString::number(qMax(1, m_editor->lines())).size() + 1);
+        m_editor->setMarginWidth(0, QString(lineDigits, QLatin1Char('9')));
+    }
+    m_editor->setModified(false);
+    m_editor->setReadOnly(isReadOnlyByPolicy());
+    if (!m_bridge.baseline.isEmpty() && m_secureBinaryDocument)
+        m_bridge.baseline.fill(0);
     m_bridge.baseline    = std::move(bytes);
     m_bridge.windowStart = s;
     m_bridge.windowLen   = e - s;
     m_bridge.applying    = false;
+    applyL2SearchHighlightsToOverlay();
 }
 
-void EditorTab::bridgeFlushOverlayToPatches(QString* errMsg)
+bool EditorTab::bridgeFlushOverlayToPatches(QString* errMsg)
 {
-    if (!m_l2View || !m_l2View->isOpen()) return;
-    if (m_bridge.windowStart < 0 || m_bridge.windowLen <= 0) return;
+    if (!m_l2View || !m_l2View->isOpen()) return true;
+    if (isReadOnlyByPolicy()) return true;
+    if (m_bridge.windowStart < 0 || m_bridge.windowLen <= 0) return true;
+    if (!m_editor->isModified()) return true;
 
-    QByteArray now = m_editor->text().toUtf8();
-    if (now == m_bridge.baseline) return;  // 无修改，快出
+    QByteArray now;
+    if (m_l2View->viewMode() == ViewMode::Hex) {
+        if (!parseHexBytes(m_editor->text(), &now, errMsg))
+            return false;
+    } else {
+        now = m_editor->text().toUtf8();
+    }
+    if (now == m_bridge.baseline) {
+        m_editor->setModified(false);
+        return true;
+    }
 
     const qint64 s = m_bridge.windowStart;
     const QByteArray& oldBytes = m_bridge.baseline;
@@ -1123,7 +2473,7 @@ void EditorTab::bridgeFlushOverlayToPatches(QString* errMsg)
     if (qAbs(qint64(newData.size()) - patchOldLen) > HARD_DELTA_BYTES ||
         qint64(newData.size()) > HARD_DELTA_BYTES) {
         if (errMsg) *errMsg = QObject::tr("窗口内单步修改过大（>16MB），请分批操作或缩小窗口后再修改。");
-        return;
+        return false;
     }
 
     const qint64 globByte = s + patchOldStart;
@@ -1131,16 +2481,91 @@ void EditorTab::bridgeFlushOverlayToPatches(QString* errMsg)
     const bool ok = m_l2View->replaceBytes(globByte, qint32(patchOldLen), newData, &localErr);
     if (!ok) {
         if (errMsg) *errMsg = localErr.isEmpty() ? QObject::tr("写入 patch 失败") : localErr;
-        return;
+        return false;
     }
 
     // flush 成功：更新 baseline 为新文本（长度对应 virtualSize）
     // 注意：替换后窗口可能因为前后 patch 变化而长/短，但我们只保存 Scintilla 当前 now 作为
     // baseline，窗口边界以 s~s+virtualChangedLen 为准——下一次切窗口时桥 1 会重新对齐重灌，
     // 所以此处 baseline 按 Scintilla 实际文本即可。
+    if (!m_bridge.baseline.isEmpty() && m_secureBinaryDocument)
+        m_bridge.baseline.fill(0);
     m_bridge.baseline    = now;
     m_bridge.windowStart = s;
     m_bridge.windowLen   = now.size();
+    m_editor->setModified(false);
+    return true;
+}
+
+void EditorTab::advanceContentRevision()
+{
+    ++m_contentRevision;
+    m_l1SearchCacheValid = false;
+    m_l1SearchCache.clear();
+    m_lastL1MatchIndex = -1;
+    m_l2SearchCacheValid = false;
+    clearSearchHighlights();
+    cancelPendingL2SearchForContentChange();
+    emit contentChanged(m_contentRevision);
+}
+
+void EditorTab::cancelPendingL2SearchForContentChange()
+{
+    if (!m_pendingL2Search.active || !m_l2View)
+        return;
+    if (LargeFileSearch *search = m_l2View->searchEngine()) {
+        search->requestCancel();
+        if (search->lastTaskId() > 0)
+            AsyncTaskManager::instance().cancel(search->lastTaskId());
+    }
+}
+
+void EditorTab::applyL2SearchHighlightsToOverlay()
+{
+    if (!m_editor)
+        return;
+    constexpr int indicator = 8;
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETINDICATORCURRENT, indicator);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_INDICSETSTYLE, indicator,
+                            QsciScintillaBase::INDIC_ROUNDBOX);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_INDICSETFORE, indicator, 0x00B7FF);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_INDICSETALPHA, indicator, 90);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_INDICATORCLEARRANGE,
+                            0, m_editor->length());
+    if (!isL2Mode() || m_bridge.windowStart < 0 || m_l2SearchHighlights.isEmpty())
+        return;
+
+    const qint64 windowStart = m_bridge.windowStart;
+    const qint64 windowEnd = windowStart + m_bridge.windowLen;
+    auto first = std::lower_bound(
+        m_l2SearchHighlights.cbegin(), m_l2SearchHighlights.cend(), windowStart,
+        [](const QPair<qint64, qint32> &match, qint64 value) {
+            return match.first < value;
+        });
+    if (first != m_l2SearchHighlights.cbegin())
+        --first;
+
+    auto overlayPosition = [this](qint64 localByte) -> long {
+        if (!m_l2View || m_l2View->viewMode() != ViewMode::Hex)
+            return long(qBound<qint64>(qint64(0), localByte, qint64(LONG_MAX)));
+        const int line = int(qMin<qint64>(localByte / m_hexBytesPerRow, INT_MAX));
+        const int column = int((localByte % m_hexBytesPerRow) * 3);
+        return m_editor->positionFromLineIndex(line, column);
+    };
+    for (auto it = first; it != m_l2SearchHighlights.cend(); ++it) {
+        const qint64 matchStart = it->first;
+        const qint64 matchEnd = matchStart + qMax<qint32>(0, it->second);
+        if (matchStart >= windowEnd)
+            break;
+        if (matchEnd <= windowStart)
+            continue;
+        const long start = overlayPosition(qMax(windowStart, matchStart) - windowStart);
+        const long end = overlayPosition(qMin(windowEnd, matchEnd) - windowStart);
+        if (start >= 0 && end > start) {
+            m_editor->SendScintilla(QsciScintillaBase::SCI_INDICATORFILLRANGE,
+                                    start, end - start);
+        }
+    }
 }
 
 void EditorTab::bridgeOnSyncDebounce()
@@ -1158,115 +2583,1005 @@ void EditorTab::bridgeOnSyncDebounce()
     if (linesOnScreen <= 0) linesOnScreen = 1;
     const int mid = qBound(0, firstLine + linesOnScreen / 2, lineCount - 1);
     // SCI_GETLINESELSTARTPOSITION / CURRENTPOS 太粗糙，直接用 mid 行首 + 当前光标列近似：
-    const long lineStart = m_editor->positionFromLineIndex(mid, 0);
-    const long cursorPos = m_editor->SendScintilla(QsciScintilla::SCI_GETCURRENTPOS);
-    const long centerWinPos = qBound(long(lineStart), cursorPos, long(lineStart));
-    const qint64 globCenter = m_bridge.windowStart + qMax<qint64>(0, centerWinPos);
+    qint64 localByte = 0;
+    if (m_l2View->viewMode() == ViewMode::Hex) {
+        // The byte grid and global provider share one adaptive row width. This keeps
+        // navigation independent of the three display characters per byte.
+        localByte = qint64(mid) * m_hexBytesPerRow;
+    } else {
+        const long lineStart = m_editor->positionFromLineIndex(mid, 0);
+        localByte = qMax<qint64>(0, lineStart);
+    }
+    const qint64 globCenter = m_bridge.windowStart + localByte;
 
     m_l2View->syncActiveWindowToCursor(globCenter);
 }
 
 bool EditorTab::eventFilter(QObject* obj, QEvent* ev)
 {
+    if (m_hexAsciiPreview
+        && (obj == m_hexAsciiPreview || obj == m_hexAsciiPreview->viewport())
+        && ev->type() == QEvent::KeyPress && isL2Mode() && m_l2View
+        && m_l2View->viewMode() == ViewMode::Hex) {
+        if (handleHexAsciiKeyPress(static_cast<QKeyEvent *>(ev)))
+            return true;
+    }
+    if ((obj == m_editor || obj == m_editor->viewport())
+        && ev->type() == QEvent::KeyPress
+        && isL2Mode() && m_l2View
+        && m_l2View->viewMode() == ViewMode::Hex) {
+        auto *keyEvent = static_cast<QKeyEvent *>(ev);
+        if (handleHexKeyPress(keyEvent))
+            return true;
+    }
+
     // 监听 VFV viewport 的 Resize：Scintilla overlay 必须同步跟着 resize，
     // 否则 reparent 后 vp->size() 为 0（stack 刚切，布局未完成）→ Scintilla 0x0 不显示。
     if (ev->type() == QEvent::Resize && m_l2Mode && m_l2View) {
         QWidget* vp = m_l2View->viewport();
         if (obj == vp && m_editor) {
-            m_editor->setGeometry(0, 0, vp->width(), vp->height());
+            adaptHexBytesPerRow(true);
+            layoutL2Overlay();
         }
     }
     return QWidget::eventFilter(obj, ev);
 }
 
-bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg)
+bool EditorTab::asciiSelectionByteRange(qint64 *start, qint64 *end) const
+{
+    if (!start || !end || !m_hexAsciiPreview || !m_l2View
+        || m_l2View->viewMode() != ViewMode::Hex || m_bridge.windowStart < 0) {
+        return false;
+    }
+    const QTextCursor cursor = m_hexAsciiPreview->textCursor();
+    const auto mapPosition = [this](int position) {
+        const QTextBlock block = m_hexAsciiPreview->document()->findBlock(position);
+        if (!block.isValid())
+            return m_bridge.windowLen;
+        const qint64 column = qBound<qint64>(
+            0LL, qint64(position - block.position()),
+            qint64(qMin(m_hexBytesPerRow, block.text().size())));
+        return qMin(m_bridge.windowLen,
+                    qint64(block.blockNumber()) * m_hexBytesPerRow + column);
+    };
+    qint64 localStart = mapPosition(cursor.selectionStart());
+    qint64 localEnd = mapPosition(cursor.selectionEnd());
+    if (localEnd < localStart)
+        std::swap(localStart, localEnd);
+    *start = m_bridge.windowStart + localStart;
+    *end = m_bridge.windowStart + localEnd;
+    return true;
+}
+
+bool EditorTab::handleHexInsertModeKey(QKeyEvent *event)
+{
+    if (!event || event->key() != Qt::Key_Insert
+        || event->modifiers() != Qt::NoModifier || isReadOnlyByPolicy()) {
+        return false;
+    }
+    m_hexOverwriteMode = !m_hexOverwriteMode;
+    emit cursorPositionChanged(m_lastL2Line, m_lastL2Col);
+    if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
+        window->statusBar()->showMessage(
+            m_hexOverwriteMode ? QObject::tr("Hex 覆盖模式 (OVR)")
+                               : QObject::tr("Hex 插入模式 (INS)"),
+            1800);
+    }
+    return true;
+}
+
+void EditorTab::setAsciiCaret(qint64 globalByte)
+{
+    if (!m_hexAsciiPreview || !m_l2View || m_bridge.windowStart < 0)
+        return;
+    globalByte = qBound<qint64>(0, globalByte, m_l2View->virtualFileSize());
+    m_l2View->syncActiveWindowToCursor(globalByte);
+    const qint64 local = qBound<qint64>(0, globalByte - m_bridge.windowStart,
+                                        m_bridge.windowLen);
+    const int line = int(local / m_hexBytesPerRow);
+    const int column = int(local % m_hexBytesPerRow);
+    const QTextBlock block = m_hexAsciiPreview->document()->findBlockByNumber(line);
+    if (!block.isValid())
+        return;
+    QTextCursor cursor(m_hexAsciiPreview->document());
+    cursor.setPosition(qMin(block.position() + column,
+                            block.position() + block.text().size()));
+    m_adjustingAsciiCaret = true;
+    m_hexAsciiPreview->setTextCursor(cursor);
+    m_adjustingAsciiCaret = false;
+    setHexCaret(globalByte, 0);
+    m_lastL2Byte = globalByte;
+}
+
+void EditorTab::syncAsciiSelectionFromHex()
+{
+    if (m_adjustingHexCaret || m_adjustingAsciiCaret || m_bridge.applying
+        || !m_hexAsciiPreview || !m_hexAsciiPreview->isVisible()) {
+        return;
+    }
+    qint64 start = 0;
+    qint64 end = 0;
+    if (!hexSelectionByteRange(&start, &end))
+        return;
+
+    const auto documentPosition = [this](qint64 globalByte) -> int {
+        const qint64 local = qBound<qint64>(
+            0, globalByte - m_bridge.windowStart, m_bridge.windowLen);
+        if (local >= m_bridge.windowLen)
+            return qMax(0, m_hexAsciiPreview->document()->characterCount() - 1);
+        const QTextBlock block = m_hexAsciiPreview->document()->findBlockByNumber(
+            int(local / m_hexBytesPerRow));
+        if (!block.isValid())
+            return qMax(0, m_hexAsciiPreview->document()->characterCount() - 1);
+        return qMin(block.position() + int(local % m_hexBytesPerRow),
+                    block.position() + int(block.text().size()));
+    };
+
+    QTextCursor cursor(m_hexAsciiPreview->document());
+    cursor.setPosition(documentPosition(start));
+    if (end > start)
+        cursor.setPosition(documentPosition(end), QTextCursor::KeepAnchor);
+    m_adjustingAsciiCaret = true;
+    m_hexAsciiPreview->setTextCursor(cursor);
+    m_adjustingAsciiCaret = false;
+    QList<QTextEdit::ExtraSelection> mirroredSelections;
+    if (end > start) {
+        QTextEdit::ExtraSelection mirrored;
+        mirrored.cursor = cursor;
+        mirrored.format.setBackground(QColor(51, 153, 255));
+        mirrored.format.setForeground(Qt::white);
+        mirroredSelections.append(mirrored);
+    }
+    m_hexAsciiPreview->setExtraSelections(mirroredSelections);
+    m_l2View->selectBytes(start, end);
+    m_lastL2Byte = end > start ? end : start;
+}
+
+void EditorTab::syncHexSelectionFromAscii()
+{
+    if (m_adjustingAsciiCaret || m_adjustingHexCaret || m_bridge.applying
+        || !m_hexAsciiPreview) {
+        return;
+    }
+    qint64 start = 0;
+    qint64 end = 0;
+    if (!asciiSelectionByteRange(&start, &end))
+        return;
+
+    const auto overlayPosition = [this](qint64 globalByte) -> long {
+        const qint64 local = qBound<qint64>(
+            0, globalByte - m_bridge.windowStart, m_bridge.windowLen);
+        if (local >= m_bridge.windowLen)
+            return m_editor->length();
+        const int line = int(qMin<qint64>(local / m_hexBytesPerRow, INT_MAX));
+        const int column = int((local % m_hexBytesPerRow) * 3);
+        return m_editor->positionFromLineIndex(line, column);
+    };
+
+    const long first = overlayPosition(start);
+    const long last = overlayPosition(end);
+    if (first < 0 || last < 0)
+        return;
+    m_adjustingHexCaret = true;
+    if (end > start) {
+        m_editor->SendScintilla(QsciScintillaBase::SCI_SETSEL, first, last);
+    } else {
+        m_editor->SendScintilla(QsciScintillaBase::SCI_GOTOPOS, first);
+    }
+    m_adjustingHexCaret = false;
+    m_l2View->selectBytes(start, end);
+    m_lastL2Line = int(qMin<qint64>(start / m_hexBytesPerRow, INT_MAX));
+    m_lastL2Col = int(start % m_hexBytesPerRow);
+    m_lastL2Byte = end > start ? end : start;
+    emit cursorPositionChanged(m_lastL2Line, m_lastL2Col);
+}
+
+bool EditorTab::handleHexAsciiKeyPress(QKeyEvent *event)
+{
+    if (!event || !m_l2View || isReadOnlyByPolicy())
+        return false;
+    if (handleHexInsertModeKey(event))
+        return true;
+    qint64 start = 0;
+    qint64 end = 0;
+    if (!asciiSelectionByteRange(&start, &end))
+        return false;
+    const bool selected = end > start;
+    const auto showError = [this](const QString &message) {
+        if (auto *window = qobject_cast<QMainWindow *>(this->window()))
+            window->statusBar()->showMessage(message, 5000);
+        QApplication::beep();
+    };
+    const auto replace = [this, &showError](qint64 from, qint64 to,
+                                            QByteArray bytes) {
+        QString flushError;
+        if (!bridgeFlushOverlayToPatches(&flushError)) {
+            showError(flushError);
+            return;
+        }
+        QString error;
+        const bool ok = m_l2View->replaceBytes(
+            from, qint32(qMin<qint64>(to - from, INT_MAX)), bytes, &error);
+        const qint64 caret = from + bytes.size();
+        if (m_secureBinaryDocument && !bytes.isEmpty())
+            bytes.fill(0);
+        if (!ok) {
+            showError(error);
+            return;
+        }
+        m_l2View->syncActiveWindowToCursor(caret);
+        bridgePopulateScintilla(m_l2View->activeWindowByteStart(),
+                                m_l2View->activeWindowByteEnd());
+        setAsciiCaret(caret);
+        m_hexAsciiPreview->setFocus(Qt::OtherFocusReason);
+    };
+
+    if (event->matches(QKeySequence::Copy) || event->matches(QKeySequence::Cut)) {
+        if (!selected)
+            return true;
+        QByteArray bytes = m_l2View->readByteRange(start, end);
+        QGuiApplication::clipboard()->setText(QString::fromLatin1(bytes));
+        if (m_secureBinaryDocument && !bytes.isEmpty())
+            bytes.fill(0);
+        if (event->matches(QKeySequence::Cut))
+            replace(start, end, {});
+        return true;
+    }
+    if (event->matches(QKeySequence::Paste)) {
+        const QString text = QGuiApplication::clipboard()->text();
+        for (const QChar ch : text) {
+            if (ch.unicode() > 0xff) {
+                showError(QObject::tr("字符栏粘贴只接受单字节 Latin-1 字符。"));
+                return true;
+            }
+        }
+        const qint64 overwriteEnd = selected || !m_hexOverwriteMode
+            ? end : qMin(m_l2View->virtualFileSize(), start + text.size());
+        replace(start, overwriteEnd, text.toLatin1());
+        return true;
+    }
+    if (event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace) {
+        if (!selected) {
+            if (event->key() == Qt::Key_Backspace && start > 0)
+                --start;
+            end = qMin(m_l2View->virtualFileSize(), start + 1);
+        }
+        if (end > start)
+            replace(start, end, {});
+        return true;
+    }
+    const QString typed = event->text();
+    if (typed.size() == 1
+        && !(event->modifiers() & (Qt::ControlModifier | Qt::AltModifier
+                                  | Qt::MetaModifier))) {
+        if (typed.at(0).unicode() > 0xff) {
+            showError(QObject::tr("字符栏只接受单字节 Latin-1 字符。"));
+            return true;
+        }
+        const qint64 overwriteEnd = selected || !m_hexOverwriteMode
+            ? end : qMin(m_l2View->virtualFileSize(), start + 1);
+        replace(start, overwriteEnd, typed.toLatin1());
+        return true;
+    }
+    return false;
+}
+
+bool EditorTab::hexSelectionByteRange(qint64 *start, qint64 *end,
+                                      int *nibble) const
+{
+    if (!start || !end || !m_editor || !m_l2View
+        || m_l2View->viewMode() != ViewMode::Hex
+        || m_bridge.windowStart < 0) {
+        return false;
+    }
+
+    long selectionStart = m_editor->SendScintilla(
+        QsciScintillaBase::SCI_GETSELECTIONSTART);
+    long selectionEnd = m_editor->SendScintilla(
+        QsciScintillaBase::SCI_GETSELECTIONEND);
+    if (selectionEnd < selectionStart)
+        std::swap(selectionStart, selectionEnd);
+    const bool selected = selectionEnd > selectionStart;
+
+    const auto mapPosition = [this](long position, bool endBoundary,
+                                    int *outNibble) -> qint64 {
+        int line = 0;
+        int column = 0;
+        m_editor->lineIndexFromPosition(position, &line, &column);
+        line = qMax(0, line);
+        column = qMax(0, column);
+        qint64 byteInLine = endBoundary ? (qint64(column) + 2) / 3
+                                        : qint64(column) / 3;
+        int localNibble = column % 3;
+        if (!endBoundary && localNibble == 2) {
+            ++byteInLine;
+            localNibble = 0;
+        }
+        byteInLine = qBound<qint64>(qint64(0), byteInLine,
+                                    qint64(m_hexBytesPerRow));
+        if (outNibble)
+            *outNibble = qBound(0, localNibble, 1);
+        return qint64(line) * m_hexBytesPerRow + byteInLine;
+    };
+
+    int localNibble = 0;
+    qint64 localStart = mapPosition(selectionStart, false, &localNibble);
+    qint64 localEnd = selected
+        ? mapPosition(selectionEnd, true, nullptr)
+        : localStart;
+    const qint64 windowEnd = m_bridge.windowStart + m_bridge.windowLen;
+    *start = qBound(m_bridge.windowStart,
+                    m_bridge.windowStart + localStart, windowEnd);
+    *end = qBound(*start, m_bridge.windowStart + localEnd, windowEnd);
+    if (nibble)
+        *nibble = localNibble;
+    return true;
+}
+
+void EditorTab::setHexCaret(qint64 globalByte, int nibble)
+{
+    if (!m_editor || !m_l2View || m_bridge.windowStart < 0)
+        return;
+    globalByte = qBound<qint64>(0, globalByte, m_l2View->virtualFileSize());
+    m_l2View->syncActiveWindowToCursor(globalByte);
+    if (globalByte < m_bridge.windowStart
+        || globalByte > m_bridge.windowStart + m_bridge.windowLen) {
+        return;
+    }
+
+    qint64 local = globalByte - m_bridge.windowStart;
+    const qint64 size = m_l2View->virtualFileSize();
+    if (globalByte == size && size > 0) {
+        --globalByte;
+        --local;
+        nibble = 1;
+    }
+    const int line = int(qMin<qint64>(local / m_hexBytesPerRow, INT_MAX));
+    const int column = int((local % m_hexBytesPerRow) * 3
+                           + qBound(0, nibble, 1));
+    const long position = m_editor->positionFromLineIndex(line, column);
+    if (position >= 0) {
+        m_adjustingHexCaret = true;
+        m_editor->SendScintilla(QsciScintillaBase::SCI_GOTOPOS, position);
+        m_adjustingHexCaret = false;
+        m_lastL2Line = int(qMin<qint64>(globalByte / m_hexBytesPerRow, INT_MAX));
+        m_lastL2Col = int(globalByte % m_hexBytesPerRow);
+        m_lastL2Byte = globalByte;
+        emit cursorPositionChanged(m_lastL2Line, m_lastL2Col);
+    }
+}
+
+bool EditorTab::handleHexKeyPress(QKeyEvent *event)
+{
+    if (!event || !m_l2View || isReadOnlyByPolicy())
+        return false;
+    if (handleHexInsertModeKey(event))
+        return true;
+
+    const auto showError = [this](const QString &message) {
+        if (auto *window = qobject_cast<QMainWindow *>(this->window()))
+            window->statusBar()->showMessage(message, 5000);
+        QApplication::beep();
+    };
+    const auto refresh = [this](qint64 caretByte, int caretNibble) {
+        m_l2View->syncActiveWindowToCursor(caretByte);
+        bridgePopulateScintilla(m_l2View->activeWindowByteStart(),
+                                m_l2View->activeWindowByteEnd());
+        setHexCaret(caretByte, caretNibble);
+    };
+
+    qint64 start = 0;
+    qint64 end = 0;
+    int nibble = 0;
+    if (!hexSelectionByteRange(&start, &end, &nibble))
+        return false;
+    const bool hasSelection = end > start;
+
+    if (event->matches(QKeySequence::Paste)) {
+        QString flushError;
+        if (!bridgeFlushOverlayToPatches(&flushError)) {
+            showError(flushError);
+            return true;
+        }
+        (void)hexSelectionByteRange(&start, &end, &nibble);
+        QByteArray pasted;
+        QString parseError;
+        if (!parseHexBytes(QGuiApplication::clipboard()->text(), &pasted, &parseError)
+            || pasted.isEmpty()) {
+            showError(parseError.isEmpty()
+                          ? QObject::tr("剪贴板中没有十六进制字节。")
+                          : parseError);
+            return true;
+        }
+        QString error;
+        const qint64 replaced = hasSelection || !m_hexOverwriteMode
+            ? end - start
+            : qMin<qint64>(pasted.size(), m_l2View->virtualFileSize() - start);
+        const qint32 oldLength = qint32(qMin<qint64>(replaced, INT_MAX));
+        if (!m_l2View->replaceBytes(start, oldLength, pasted, &error)) {
+            showError(error);
+            return true;
+        }
+        if (m_secureBinaryDocument && !pasted.isEmpty())
+            pasted.fill(0);
+        refresh(start + pasted.size(), 0);
+        return true;
+    }
+
+    if (event->matches(QKeySequence::Cut)) {
+        if (!hasSelection)
+            return true;
+        QString flushError;
+        if (!bridgeFlushOverlayToPatches(&flushError)) {
+            showError(flushError);
+            return true;
+        }
+        (void)hexSelectionByteRange(&start, &end, &nibble);
+        QByteArray selected = m_l2View->readByteRange(start, end);
+        QGuiApplication::clipboard()->setText(formatHexBytes(selected));
+        if (m_secureBinaryDocument && !selected.isEmpty())
+            selected.fill(0);
+        QString error;
+        if (!m_l2View->replaceBytes(start, qint32(end - start), {}, &error))
+            showError(error);
+        else
+            refresh(start, 0);
+        return true;
+    }
+
+    if (event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace) {
+        QString flushError;
+        if (!bridgeFlushOverlayToPatches(&flushError)) {
+            showError(flushError);
+            return true;
+        }
+        (void)hexSelectionByteRange(&start, &end, &nibble);
+        if (!hasSelection) {
+            if (event->key() == Qt::Key_Backspace && start > 0)
+                --start;
+            end = qMin(m_l2View->virtualFileSize(), start + 1);
+        }
+        if (end <= start)
+            return true;
+        QString error;
+        if (!m_l2View->replaceBytes(start, qint32(end - start), {}, &error))
+            showError(error);
+        else
+            refresh(start, 0);
+        return true;
+    }
+
+    const QString typed = event->text();
+    if (typed.size() == 1 && hexNibble(typed.at(0)) >= 0
+        && !(event->modifiers() & (Qt::ControlModifier | Qt::AltModifier
+                                  | Qt::MetaModifier))) {
+        if (!m_hexOverwriteMode && !hasSelection && nibble == 0) {
+            QString flushError;
+            if (!bridgeFlushOverlayToPatches(&flushError)) {
+                showError(flushError);
+                return true;
+            }
+            QByteArray inserted(1, char(hexNibble(typed.at(0)) << 4));
+            QString insertError;
+            if (!m_l2View->replaceBytes(start, 0, inserted, &insertError)) {
+                showError(insertError);
+                return true;
+            }
+            if (m_secureBinaryDocument)
+                inserted.fill(0);
+            refresh(start, 1);
+            return true;
+        }
+        // Edit exactly one nibble in the fixed projection.  Both nibbles of a
+        // byte are flushed as one byte-level patch on save/window change,
+        // avoiding transient half-byte states and overlapping patches.
+        const qint64 local = start - m_bridge.windowStart;
+        const int line = int(qMin<qint64>(local / m_hexBytesPerRow, INT_MAX));
+        const int column = int((local % m_hexBytesPerRow) * 3 + nibble);
+        const long position = m_editor->positionFromLineIndex(line, column);
+        if (position < 0)
+            return true;
+        m_editor->SendScintilla(QsciScintillaBase::SCI_SETSEL,
+                                position, position + 1);
+        const QByteArray digit = typed.toUpper().toLatin1();
+        m_editor->SendScintilla(QsciScintillaBase::SCI_REPLACESEL,
+                                digit.constData());
+
+        const bool completedByte = nibble == 1;
+        const qint64 nextByte = start + (completedByte ? 1 : 0);
+        const int nextNibble = completedByte ? 0 : 1;
+        const qint64 nextLocal = nextByte - m_bridge.windowStart;
+        const int nextLine = int(qMin<qint64>(nextLocal / m_hexBytesPerRow, INT_MAX));
+        const int nextColumn = int((nextLocal % m_hexBytesPerRow) * 3 + nextNibble);
+        const long nextPosition = m_editor->positionFromLineIndex(nextLine, nextColumn);
+        if (nextPosition >= 0)
+            m_editor->SendScintilla(QsciScintillaBase::SCI_GOTOPOS, nextPosition);
+
+        QByteArray previewBytes;
+        QString previewError;
+        if (parseHexBytes(m_editor->text(), &previewBytes, &previewError)) {
+            QString ascii = formatAsciiBytes(previewBytes, m_hexBytesPerRow);
+            m_adjustingAsciiCaret = true;
+            m_hexAsciiPreview->setPlainText(ascii);
+            m_adjustingAsciiCaret = false;
+            if (m_secureBinaryDocument) {
+                if (!previewBytes.isEmpty()) previewBytes.fill(0);
+                if (!ascii.isEmpty()) ascii.fill(QChar(0));
+            }
+        }
+        m_lastL2Line = int(qMin<qint64>(nextByte / m_hexBytesPerRow, INT_MAX));
+        m_lastL2Col = int(nextByte % m_hexBytesPerRow);
+        m_lastL2Byte = nextByte;
+        emit cursorPositionChanged(m_lastL2Line, m_lastL2Col);
+        syncAsciiSelectionFromHex();
+        return true;
+    }
+
+    // Navigation and application shortcuts remain native. Text-producing keys
+    // are rejected so spaces/newlines cannot corrupt the byte projection.
+    if (!typed.isEmpty()
+        && !(event->modifiers() & (Qt::ControlModifier | Qt::AltModifier
+                                  | Qt::MetaModifier))) {
+        showError(QObject::tr("十六进制视图只接受 0–9、A–F；ASCII 栏为同步预览。"));
+        return true;
+    }
+    return false;
+}
+
+void EditorTab::clearLargeRecoveryOperations(
+    QVector<LargeRecoveryOperation> *operations)
+{
+    if (!operations)
+        return;
+    for (LargeRecoveryOperation &operation : *operations) {
+        if (!operation.insertedBytes.isEmpty())
+            operation.insertedBytes.fill(0);
+    }
+    operations->clear();
+}
+
+void EditorTab::resetLargeRecoveryJournal(const QString &basePath)
+{
+    clearLargeRecoveryOperations(&m_largeRecoveryOperations);
+    clearLargeRecoveryOperations(&m_pendingRecoveryOperations);
+    const QFileInfo info(basePath);
+    m_recoveryBasePath = info.exists() && info.isFile()
+                             ? info.absoluteFilePath() : QString();
+    m_recoveryBaseSize = info.exists() && info.isFile() ? info.size() : -1;
+    m_recoveryBaseMtimeMs = info.exists() && info.isFile()
+                                ? info.lastModified().toMSecsSinceEpoch() : -1;
+    m_recoveryRequiresCheckpoint = false;
+}
+
+bool EditorTab::applyPendingLargeRecovery(QString *error)
+{
+    if (m_pendingRecoveryOperations.isEmpty())
+        return true;
+    m_replayingRecoveryJournal = true;
+    for (const LargeRecoveryOperation &operation : m_pendingRecoveryOperations) {
+        const qint64 documentLength = static_cast<qint64>(directScintilla(
+            m_editor, QsciScintillaBase::SCI_GETLENGTH));
+        if (operation.position < 0 || operation.position > documentLength
+            || (operation.kind == LargeRecoveryOperation::Kind::Delete
+                && operation.deleteLength > documentLength - operation.position)) {
+            m_replayingRecoveryJournal = false;
+            if (error) *error = QObject::tr("恢复日志中的编辑位置已超出文档范围。");
+            clearLargeRecoveryOperations(&m_pendingRecoveryOperations);
+            return false;
+        }
+        directScintilla(m_editor, QsciScintillaBase::SCI_SETTARGETRANGE,
+                        static_cast<ScintillaUnsigned>(operation.position),
+                        static_cast<ScintillaSigned>(
+                            operation.kind == LargeRecoveryOperation::Kind::Delete
+                                ? operation.position + operation.deleteLength
+                                : operation.position));
+        const char *replacement = operation.kind == LargeRecoveryOperation::Kind::Insert
+                                      ? operation.insertedBytes.constData() : "";
+        const qint64 replacementLength = operation.kind == LargeRecoveryOperation::Kind::Insert
+                                             ? operation.insertedBytes.size() : 0;
+        const auto replaced = directScintilla(
+            m_editor, QsciScintillaBase::SCI_REPLACETARGET,
+            static_cast<ScintillaUnsigned>(replacementLength),
+            reinterpret_cast<ScintillaSigned>(replacement));
+        if (replaced < 0) {
+            m_replayingRecoveryJournal = false;
+            if (error) *error = QObject::tr("Scintilla 拒绝应用大文件恢复日志。");
+            clearLargeRecoveryOperations(&m_pendingRecoveryOperations);
+            return false;
+        }
+    }
+    m_replayingRecoveryJournal = false;
+    clearLargeRecoveryOperations(&m_largeRecoveryOperations);
+    m_largeRecoveryOperations = std::move(m_pendingRecoveryOperations);
+    m_pendingRecoveryOperations.clear();
+    m_editor->setModified(true);
+    m_promotedLargeDirty = true;
+    return true;
+}
+
+void EditorTab::cancelLargeTextPromotion()
+{
+    if (m_l2PromotionTaskId > 0)
+        AsyncTaskManager::instance().cancel(m_l2PromotionTaskId);
+    m_l2PromotionTaskId = 0;
+    m_l2PromotionPath.clear();
+}
+
+void EditorTab::startLargeTextPromotion(const QString &path, qint64 sourceBytes)
+{
+    if (!m_l2Mode || !m_l2TextPreviewReadOnly || sourceBytes < 0)
+        return;
+
+    m_l2FallbackReason.clear();
+    const TextEncoding sourceEncoding = sniffLargeTextEncoding(path);
+    const qint64 expectedUtf8Bytes = estimatedUtf8Size(sourceBytes, sourceEncoding);
+    ResourceAdmissionInput input;
+    input.file = FileTierPolicy::classify(sourceBytes, expectedUtf8Bytes);
+    if (input.file.tier == FileTier::HugeReadOnly) {
+        m_l2FallbackReason = QObject::tr(
+            "文件转换为 UTF-8 后预计超过 2 GiB，保持只读分析模式");
+        if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
+            window->statusBar()->showMessage(
+                QObject::tr("文件转换为 UTF-8 后预计超过 2 GiB，保持只读分析模式"), 8000);
+        }
+        emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(),
+                                               m_l2FallbackReason);
+        return;
+    }
+#ifdef Q_OS_WIN
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof(memory);
+    if (::GlobalMemoryStatusEx(&memory)) {
+        input.totalPhysicalBytes = static_cast<qint64>(memory.ullTotalPhys);
+        input.availableCommitBytes = static_cast<qint64>(memory.ullAvailPageFile);
+    }
+#endif
+    const ResourceAdmissionDecision admission = ResourceAdmission::evaluate(input);
+    if (!admission.admitted) {
+        m_l2FallbackReason = admissionFallbackText(admission.reason);
+        if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
+            window->statusBar()->showMessage(admissionFallbackText(admission.reason), 8000);
+        }
+        emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(),
+                                               m_l2FallbackReason);
+        return;
+    }
+
+    constexpr int documentOptions = QsciScintillaBase::SC_DOCUMENTOPTION_STYLES_NONE
+                                    | QsciScintillaBase::SC_DOCUMENTOPTION_TEXT_LARGE;
+    auto *loader = reinterpret_cast<ILoader *>(directScintilla(
+        m_editor, QsciScintillaBase::SCI_CREATELOADER,
+        static_cast<ScintillaUnsigned>(expectedUtf8Bytes),
+        static_cast<ScintillaSigned>(documentOptions)));
+    if (!loader) {
+        m_l2FallbackReason = QObject::tr(
+            "无法建立后台编辑文档，保持只读分析模式");
+        if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
+            window->statusBar()->showMessage(
+                QObject::tr("无法建立后台编辑文档，保持只读分析模式"), 8000);
+        }
+        emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(),
+                                               m_l2FallbackReason);
+        return;
+    }
+
+    m_l2PromotionPath = QFileInfo(path).absoluteFilePath();
+    QPointer<EditorTab> guard(this);
+    QPointer<QObject> application = QCoreApplication::instance();
+    const QString absolutePath = m_l2PromotionPath;
+    m_l2PromotionTaskId = AsyncTaskManager::instance().submit(
+        AsyncTaskType::LargeFileLoad, AsyncTaskPriority::Low,
+        QObject::tr("准备大文件编辑"),
+        QObject::tr("后台构造完整 Scintilla 文档；预计峰值 %1 MiB；当前窗口预览保持可用")
+            .arg(admission.estimatedPeakBytes / (1024 * 1024)),
+        [guard, application, loader, absolutePath, sourceBytes, sourceEncoding](
+            qint64 taskId, AsyncCancelPtr cancel,
+            const std::function<void(qint64, qint64)> &reportProgress,
+            const std::function<void(const AsyncErrorInfo &)> &) {
+            auto postResult = [guard, application, taskId, absolutePath](
+                                  ILoader *resultLoader, TextEncoding encoding,
+                                  const QString &reason) {
+                if (!application) {
+                    if (resultLoader)
+                        resultLoader->Release();
+                    return;
+                }
+                const bool queued = QMetaObject::invokeMethod(
+                    application,
+                    [guard, resultLoader, taskId, absolutePath, encoding, reason]() {
+                        if (guard) {
+                            guard->finishLargeTextPromotion(resultLoader, taskId,
+                                                            absolutePath, encoding, reason);
+                        } else if (resultLoader) {
+                            resultLoader->Release();
+                        }
+                    },
+                    Qt::QueuedConnection);
+                if (!queued && resultLoader)
+                    resultLoader->Release();
+            };
+
+            QFile file(absolutePath);
+            if (!file.open(QIODevice::ReadOnly)) {
+                loader->Release();
+                postResult(nullptr, TextEncoding::Utf8,
+                           QObject::tr("后台读取文件失败，保持只读分析模式"));
+                return;
+            }
+
+            constexpr qsizetype chunkBytes = 4 * 1024 * 1024;
+            QByteArray chunk(chunkBytes, Qt::Uninitialized);
+            Utf8StreamValidator validator;
+            std::unique_ptr<QStringDecoder> decoder;
+            if (sourceEncoding == TextEncoding::Utf16LE)
+                decoder = std::make_unique<QStringDecoder>(QStringConverter::Utf16LE);
+            else if (sourceEncoding == TextEncoding::Utf16BE)
+                decoder = std::make_unique<QStringDecoder>(QStringConverter::Utf16BE);
+            else if (sourceEncoding == TextEncoding::GBK)
+                decoder = std::make_unique<QStringDecoder>(QStringConverter::System);
+            bool firstChunk = true;
+            qint64 consumed = 0;
+            while (!file.atEnd()) {
+                if (cancel && cancel->load(std::memory_order_acquire)) {
+                    loader->Release();
+                    postResult(nullptr, sourceEncoding,
+                               QObject::tr("用户已取消准备编辑，保持只读分析模式"));
+                    return;
+                }
+                const qint64 count = file.read(chunk.data(), chunk.size());
+                if (count < 0) {
+                    loader->Release();
+                    postResult(nullptr, sourceEncoding,
+                               QObject::tr("后台读取文件失败，保持只读分析模式"));
+                    return;
+                }
+                qsizetype offset = 0;
+                if (firstChunk) {
+                    firstChunk = false;
+                    if (sourceEncoding == TextEncoding::Utf8Bom)
+                        offset = 3;
+                    else if (sourceEncoding == TextEncoding::Utf16LE
+                             || sourceEncoding == TextEncoding::Utf16BE)
+                        offset = 2;
+                }
+                const qsizetype payload = static_cast<qsizetype>(count) - offset;
+                QByteArray converted;
+                const char *data = chunk.constData() + offset;
+                qsizetype convertedSize = payload;
+                if (decoder) {
+                    const QString decoded = (*decoder)(QByteArrayView(data, payload));
+                    converted = decoded.toUtf8();
+                    data = converted.constData();
+                    convertedSize = converted.size();
+                } else if (!validator.feed(data, payload)) {
+                    loader->Release();
+                    postResult(nullptr, sourceEncoding,
+                               QObject::tr("文件并非有效 UTF-8，保持只读分析模式"));
+                    return;
+                }
+                if (convertedSize > 0
+                    && loader->AddData(data, static_cast<Sci_Position>(convertedSize)) != 0) {
+                    loader->Release();
+                    postResult(nullptr, sourceEncoding,
+                               QObject::tr("准备完整编辑文档时内存不足，保持只读分析模式"));
+                    return;
+                }
+                consumed += count;
+                reportProgress(consumed, sourceBytes);
+            }
+            if ((!decoder && !validator.complete()) || (decoder && decoder->hasError())) {
+                loader->Release();
+                postResult(nullptr, sourceEncoding,
+                           QObject::tr("文件末尾包含不完整编码字符，保持只读分析模式"));
+                return;
+            }
+            if (cancel && cancel->load(std::memory_order_acquire)) {
+                loader->Release();
+                postResult(nullptr, sourceEncoding,
+                           QObject::tr("用户已取消准备编辑，保持只读分析模式"));
+                return;
+            }
+            postResult(loader, sourceEncoding, {});
+        },
+        0, QStringLiteral("LargeFileLoad"), sourceBytes);
+
+    emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(), {});
+
+    if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
+        window->statusBar()->showMessage(
+            QObject::tr("文件已快速打开；正在后台准备完整编辑，当前为只读预览"), 6000);
+    }
+}
+
+void EditorTab::finishLargeTextPromotion(ILoader *loader, qint64 taskId,
+                                         const QString &path, TextEncoding encoding,
+                                         const QString &fallbackReason)
+{
+    const bool stillCurrent = m_l2PromotionTaskId == taskId
+                              && m_l2PromotionPath == path
+                              && m_l2Mode && m_l2TextPreviewReadOnly;
+    if (!stillCurrent) {
+        if (loader)
+            loader->Release();
+        return;
+    }
+    m_l2PromotionTaskId = 0;
+    m_l2PromotionPath.clear();
+
+    if (!loader) {
+        m_l2FallbackReason = fallbackReason.isEmpty()
+            ? QObject::tr("大文件保持只读分析模式") : fallbackReason;
+        if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
+            window->statusBar()->showMessage(
+                fallbackReason.isEmpty()
+                    ? QObject::tr("大文件保持只读分析模式") : fallbackReason,
+                8000);
+        }
+        emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(),
+                                               m_l2FallbackReason);
+        return;
+    }
+
+    bool restoreDirtyState = m_l2PromotionRepresentsDirty;
+    m_l2PromotionRepresentsDirty = false;
+
+    void *document = loader->ConvertToDocument();
+    if (!document) {
+        loader->Release();
+        m_l2FallbackReason = QObject::tr(
+            "完整编辑文档转换失败，保持只读分析模式");
+        if (auto *window = qobject_cast<QMainWindow *>(this->window()))
+            window->statusBar()->showMessage(m_l2FallbackReason, 8000);
+        emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(),
+                                               m_l2FallbackReason);
+        return;
+    }
+
+    const qint64 restoreByteOffset = windowedReadOnlyActive()
+        ? m_windowedReadOnlyProvider->globalOffset() : m_lastL2Byte;
+    bridgeReparentEditorToStack();
+    m_l2Mode = false;
+    m_l2TextPreviewReadOnly = false;
+    m_l2ReadOnlyByPolicy = false;
+    m_l2FallbackReason.clear();
+    m_promotedLargeDocument = true;
+    m_promotedLargeDirty = restoreDirtyState;
+    m_bridge.syncVfvDebounce.stop();
+    clearL2BridgeBaseline();
+    if (m_l2View && m_l2View->isOpen())
+        m_l2View->closeFile(true);
+    if (m_windowedReadOnlyProvider)
+        m_windowedReadOnlyProvider->closeFile();
+
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETDOCPOINTER, 0UL, document);
+    loader->Release();
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETUNDOCOLLECTION, 1UL);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_EMPTYUNDOBUFFER);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETSAVEPOINT);
+    m_editor->setReadOnly(false);
+    m_editor->setWrapMode(QsciScintilla::WrapNone);
+    m_editor->setFolding(QsciScintilla::NoFoldStyle);
+    m_editor->setAutoCompletionSource(QsciScintilla::AcsNone);
+    m_editor->setLexer(nullptr);
+    m_editor->setModified(false);
+    m_encoding = encoding;
+    if (!m_pendingRecoveryOperations.isEmpty()) {
+        QString recoveryError;
+        if (!applyPendingLargeRecovery(&recoveryError)) {
+            restoreDirtyState = false;
+            m_promotedLargeDirty = false;
+            if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
+                window->statusBar()->showMessage(
+                    recoveryError.isEmpty() ? QObject::tr("大文件恢复日志应用失败")
+                                            : recoveryError,
+                    10000);
+            }
+        } else {
+            restoreDirtyState = true;
+        }
+    }
+    if (m_syntax != Syntax::Plain) {
+        m_syntax = Syntax::Plain;
+        emit syntaxChanged(m_syntax);
+    }
+    const int lineDigits = qMax(6, QString::number(qMax(1, m_editor->lines())).size() + 1);
+    m_editor->setMarginWidth(0, QString(lineDigits, QLatin1Char('9')));
+    if (m_stack)
+        m_stack->setCurrentWidget(m_editor);
+    directScintilla(m_editor, QsciScintillaBase::SCI_GOTOPOS,
+                    static_cast<ScintillaUnsigned>(qMax<qint64>(0, restoreByteOffset)));
+    directScintilla(m_editor, QsciScintillaBase::SCI_SCROLLCARET);
+
+    emit l2ModeStatusChanged();
+    emit l2FileOpenedChanged(false);
+    emit encodingChanged(m_encoding);
+    emit modificationChanged(restoreDirtyState);
+    emit titleChanged(tabTitle());
+    emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(), {});
+    if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
+        window->statusBar()->showMessage(
+            QObject::tr("大文件已准备完成，现在可以完整编辑"), 6000);
+    }
+}
+
+bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
+                                bool allowFullTextPromotion,
+                                L2Presentation presentation,
+                                L2ContentKind contentKind)
 {
     QFileInfo fi(path);
     if (!fi.exists() || !fi.isFile()) {
         if (errMsg) *errMsg = QObject::tr("文件不存在：%1").arg(path);
         return false;
     }
+    cancelLargeTextPromotion();
+    m_promotedLargeDocument = false;
+    m_promotedLargeDirty = false;
+    m_l2PromotionRepresentsDirty = false;
+    m_l2FallbackReason.clear();
+    m_secureBinaryDocument = false;
+    const bool binaryHex = presentation == L2Presentation::Hex;
+    m_binaryDocument = contentKind == L2ContentKind::Binary;
+    const FileTierDecision tier = FileTierPolicy::classify(fi.size());
+    const bool b2HexReadOnlyFallback = binaryHex && tier.mayPromoteToFullEdit();
+    const bool readOnlyByPolicy = tier.isReadOnlyByPolicy() || b2HexReadOnlyFallback;
+    const bool textPreviewReadOnly = !binaryHex && tier.mayPromoteToFullEdit();
+    const bool useWindowedReadOnly = readOnlyByPolicy || textPreviewReadOnly;
+
     VirtualFileView *v = ensureL2View();
+    setSecurePayloadLimitExclusive(0);
+    // Select the representation before openFile starts emitting progress.  A
+    // binary document never needs the text line-index pipeline, even when it
+    // is only a few bytes long and is routed through the mmap/Hex editor.
+    v->setViewMode(binaryHex ? ViewMode::Hex : ViewMode::Text);
     // 确保 VirtualFileView 已加入 stack（ensureL2View 会 addWidget 到 index=1）
     QString localErr;
-    bool ok = v->openFile(path, &localErr, this->window());
-    if (!ok) {
+    if (!useWindowedReadOnly && !v->openFile(path, &localErr, this->window())) {
         if (errMsg) *errMsg = localErr;
-        // 失败：保持 L1 显示（stack 当前仍=0）
         return false;
     }
+    resetLargeRecoveryJournal(path);
     // 成功：切到 L2 视图并标记模式
-    m_filePath = path;
+    m_filePath = fi.absoluteFilePath();
+    refreshDiskVersionBaseline();
     m_l2Mode = true;
+    // B2 binary/unknown files still lack a proven fixed-length write-through
+    // provider.  Keep them useful and predictable in the same single-scroll
+    // mmap view as B3 instead of exposing the legacy double-scroll overlay.
+    // Text S2 documents continue to promote to the full Scintilla editor.
+    m_l2ReadOnlyByPolicy = readOnlyByPolicy;
+    // Every S2 text document starts in the same single-scroll readonly
+    // provider. allowFullTextPromotion controls only whether ILoader starts;
+    // it must never select the legacy editable overlay as a side effect.
+    m_l2TextPreviewReadOnly = textPreviewReadOnly;
     m_l2SaveNeeded = false;
     m_lastL2Line = 0;
     m_lastL2Col  = 0;
     m_lastL2Byte = 0;
-    // 重要：先切到 VFV 页面，再 emit l2ModeStatusChanged。页面索引会在后续
-    // Scintilla reparent 时变化，所以必须按对象选择，不能硬编码 index=1。
-    if (m_stack) m_stack->setCurrentWidget(v);
-
-    // ---- VFV 不绘制方案：Scintilla reparent 到 VFV viewport，占满可视区 ----
-    //   唯一 UI = Scintilla overlay。VFV viewport 仅作为父容器（scrollbars 仍由 VFV 提供，
-    //   用于全局范围虚拟控制 + 3 档节流；VFV paintEvent 已被改成空壳，不画一个像素）。
-    {
-        QWidget* vp = v->viewport();
-        m_editor->setParent(vp);
-        m_editor->setGeometry(QRect(QPoint(0, 0), vp->size()));
-        m_editor->show();
-        m_editor->raise();
-        m_editor->setFocus();
-        // 安装 eventFilter：VFV viewport resize 时同步 Scintilla geometry
-        vp->installEventFilter(this);
-    }
-
-    // 桥 3：Scintilla SCN_UPDATEUI → debounce 250ms → syncActiveWindowToCursor（切到 prev/next chunk）
-    m_bridge.syncVfvDebounce.setSingleShot(true);
-    m_bridge.syncVfvDebounce.setInterval(250);
-    // 注意：不直接连 modificationChanged（太频繁），用 SCN_UPDATEUI（仅滚/光标/选区变化时触发）
-    //
-    // 关键：不要用 Qt::UniqueConnection 接 lambda。Qt6 对 lambda 作为"接收方成员函数指针"
-    //       的校验会报错："unique connections require a pointer to member function of
-    //       a QObject subclass"，结果是 connect 失败，桥接永不触发，Scintilla 0x0 不显示。
-    //       openLargeFileL2 在 Tab 生命周期里只被调用一次（→shutdownL2BeforeClose），
-    //       不需要 "Unique" guard 防重连。
-    connect(&m_bridge.syncVfvDebounce, &QTimer::timeout,
-            this, &EditorTab::bridgeOnSyncDebounce);
-    QObject::connect(m_editor, &QsciScintilla::SCN_UPDATEUI, this, [this]() {
-        if (Q_UNLIKELY(!m_l2Mode || m_bridge.applying)) return;
-        m_bridge.syncVfvDebounce.start();
-    });
-
-    // 桥 1：VFV activeWindowChanged（3 档节流 emit）→ 灌 Scintilla 新窗口
-    QObject::connect(v, &VirtualFileView::activeWindowChanged,
-            this, [this](qint64 byteStart, qint64 byteEnd) {
-                if (!m_l2Mode) return;
-                bridgePopulateScintilla(byteStart, byteEnd);
-            });
-
-    // 首次对齐：以文件 0 字节为中心，计算 W_active 并切到首个窗口 → 灌 Scintilla
-    // 注意：openFile 是异步的（mmap 在 worker 线程），此时 isOpen() 可能仍为 false，
-    //       syncActiveWindowToCursor 会提前返回。真正的首次灌入由 onMmapReady →
-    //       emit activeWindowChanged → bridgePopulateScintilla 完成（上面已 connect）。
-    v->syncActiveWindowToCursor(0);
-    {
-        const qint64 s = v->activeWindowByteStart();
-        const qint64 e = v->activeWindowByteEnd();
-        if (s >= 0 && e > s)
-            bridgePopulateScintilla(s, e);
-    }
-
-    // stack 刚切换，viewport 实际尺寸要等事件循环 layout 后才确定。
-    // 用 singleShot(0) 在 layout 完成后补一次 resize，确保 Scintilla 不是 0x0。
-    QTimer::singleShot(0, this, [this, v]() {
-        if (!m_l2Mode || !m_l2View) return;
-        QWidget* vp = v->viewport();
-        if (vp && m_editor) {
-            m_editor->setGeometry(0, 0, vp->width(), vp->height());
+    if (useWindowedReadOnly) {
+        WindowedReadOnlyProvider *provider = ensureWindowedReadOnlyProvider();
+        QString providerError;
+        const auto providerPresentation = binaryHex
+            ? WindowedReadOnlyProvider::Presentation::Hex
+            : WindowedReadOnlyProvider::Presentation::Text;
+        if (!provider->openFile(path, providerPresentation, &providerError)) {
+            if (v->isOpen())
+                v->closeFile(true);
+            m_l2Mode = false;
+            if (errMsg)
+                *errMsg = providerError;
+            return false;
         }
-    });
+        m_stack->setCurrentWidget(provider);
+        provider->editor()->setFocus();
+    } else {
+        // Transitional editable B2/secure-binary path. S2 text preview and all
+        // S3/B3 documents never enter the legacy double-scroll overlay.
+        activateL2Overlay(v);
+    }
 
     emit l2ModeStatusChanged();
+    emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(), {});
 
     // 根据后缀猜语法（仅用于信号触发；L2 语法高亮 P1 暂不做，P3 补齐轻量词法器）
     Syntax syn = guessSyntaxFromExtension(fi.fileName());
@@ -1278,6 +3593,13 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg)
     emit encodingChanged(m_encoding);
     emit cursorPositionChanged(0, 0);
     emit l2FileOpenedChanged(true);
+    if (isReadOnlyByPolicy())
+        emit modificationChanged(false);
+    if (allowFullTextPromotion && !binaryHex && m_l2TextPreviewReadOnly) {
+        QTimer::singleShot(0, this, [this, path, bytes = fi.size()]() {
+            startLargeTextPromotion(path, bytes);
+        });
+    }
     return true;
 }
 
@@ -1286,6 +3608,18 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
     if (!m_l2Mode || !m_l2View) {
         if (errMsg) *errMsg = QObject::tr("当前非 L2 模式");
         return false;
+    }
+    if (sameDiskFilePath(m_filePath, path)) {
+        const ExternalFileState diskState = externalFileState();
+        if (diskState == ExternalFileState::Changed
+            || diskState == ExternalFileState::Missing
+            || diskState == ExternalFileState::Unreadable) {
+            if (errMsg) {
+                *errMsg = QObject::tr(
+                    "磁盘文件在打开后已变化或当前不可读取。为避免覆盖外部内容，保存已停止。");
+            }
+            return false;
+        }
     }
     // P0-5：保存前强制 flush overlay → patches。最近一次编辑没切窗口时就靠这里回写。
     QString flushErr;
@@ -1317,29 +3651,13 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
         }
         // 释放 mmap（closeFile 内部取消后台构建 + unmap + resetAfterSave）
         m_l2View->closeFile();
-        // 原文件已解锁，可以替换
-        if (!QFile::rename(tempPath, path)) {
-            // Windows fallback：rename 失败（目标文件可能还被 Explorer/杀软锁），改为 copy + remove
-            QString renameErr = QObject::tr("重命名失败");
-            bool copied = false;
-            if (QFile::exists(path)) {
-                if (QFile::remove(path))
-                    copied = QFile::copy(tempPath, path);
-            } else {
-                copied = QFile::copy(tempPath, path);
-            }
-            if (copied) {
-                QFile::remove(tempPath);
-            } else {
-                if (errMsg) {
-                    *errMsg = QObject::tr("保存后写入目标文件失败（rename 且 copy 都不行）：%1。%2")
-                        .arg(path, renameErr);
-                }
-                // 尝试恢复：重新打开原文件（原 mmap 的文件还在，只是内容是旧的——用户可再点保存重试）
-                QString reopenErr;
-                m_l2View->openFile(path, &reopenErr);
-                return false;
-            }
+        // 原文件已解锁，用平台原子替换，禁止“先删除原文件再复制”的数据丢失窗口。
+        QString replaceError;
+        if (!replaceFileAtomically(tempPath, path, &replaceError)) {
+            if (errMsg) *errMsg = replaceError;
+            QString reopenErr;
+            m_l2View->openFile(path, &reopenErr);
+            return false;
         }
         // 重新映射已保存的文件
         QString reopenErr;
@@ -1350,18 +3668,29 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
         }
         m_filePath = path;  // sameFile 路径也同步（openFile 可能没更新 EditorTab::m_filePath，确保 tab 标题/后续状态正确）
     } else {
-        // 不同文件：直接保存（目标文件未被 mmap，QSaveFile 可正常 commit）
+        // 不同文件：先流式保存，再把新文件切成当前 backing store。否则后续编辑
+        // 仍依赖旧文件 mmap，旧文件被移动/修改后会破坏“另存为”文档。
         bool ok = m_l2View->saveAs(path, {}, &cancel, &localErr);
         if (!ok) {
             if (errMsg) *errMsg = localErr;
             return false;
         }
-        m_filePath = path;
+        m_l2View->closeFile();
+        QString reopenErr;
+        ok = m_l2View->openFile(path, &reopenErr, this->window());
+        if (!ok) {
+            if (errMsg)
+                *errMsg = QObject::tr("文件已另存为，但无法切换到新文件：%1").arg(reopenErr);
+            return false;
+        }
+        m_filePath = QFileInfo(path).absoluteFilePath();
     }
 
     setModified(false);
+    resetLargeRecoveryJournal(m_filePath);
     clearAutosaveFile();
     m_autosavePath.clear();
+    refreshDiskVersionBaseline();
     emit titleChanged(tabTitle());
     return true;
 }
@@ -1372,68 +3701,507 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
 
 bool EditorTab::exportToFile(const QString &destPath) const
 {
-    // 原子写入：destPath.tmp → rename 到 destPath（与 saveAsFile 同逻辑）
-    const QString tmpPath = destPath + ".tmp";
-    {
-        QSaveFile sf(tmpPath);
-        sf.setDirectWriteFallback(false);
-        if (!sf.open(QIODevice::WriteOnly))
-            return false;
+    if (isL2Mode() && m_l2View && m_l2View->isOpen()) {
+        QString error;
+        std::atomic<bool> cancel{false};
+        auto *view = const_cast<VirtualFileView *>(m_l2View);
+        return view->saveAs(destPath, {}, &cancel, &error);
+    }
 
-        if (isL2Mode() && m_l2View && m_l2View->isOpen()) {
-            // ---- L2：流式 applyAndSave（VirtualFileView::saveAs 不会调 resetAfterSave / 无副作用）----
-            //   saveAs 内部用 PatchList::applyAndSave 走 4MB/块 + QSaveFile 原子 commit，
-            //   不触碰 patches_ 状态、不 remap、不触发 saveNeededChanged。
-            QString err;
-            std::atomic<bool> cancel{false};
-            // 通过非 const 指针调 saveAs（但我们不修改任何 EditorTab 状态）；
-            // saveAs 本身是 non-const VirtualFileView 方法，但语义上对"未保存状态"不做改动。
-            auto *nonConstView = const_cast<VirtualFileView *>(m_l2View);
-            bool ok = nonConstView->saveAs(tmpPath, {}, &cancel, &err);
-            if (!ok) {
-                sf.cancelWriting();
+    if (m_promotedLargeDocument) {
+        QSaveFile output(destPath);
+        output.setDirectWriteFallback(false);
+        if (!output.open(QIODevice::WriteOnly))
+            return false;
+        QString error;
+        if (!streamPromotedDocumentTo(&output, &error, false)) {
+            output.cancelWriting();
+            return false;
+        }
+        return output.commit();
+    }
+
+    QSaveFile output(destPath);
+    output.setDirectWriteFallback(false);
+    if (!output.open(QIODevice::WriteOnly))
+        return false;
+    QString text = m_editor->text();
+    QByteArray data = encodeText(text, m_encoding);
+    const bool complete = output.write(data) == data.size();
+    if (!text.isEmpty())
+        text.fill(QChar(0));
+    if (!data.isEmpty())
+        data.fill(0);
+    if (!complete) {
+        output.cancelWriting();
+        return false;
+    }
+    return output.commit();
+}
+
+bool EditorTab::exportSnapshotBytes(QByteArray *data) const
+{
+    if (!data || isLargeDocument())
+        return false;
+    QString text = m_editor->text();
+    *data = encodeText(text, m_encoding);
+    if (!text.isEmpty())
+        text.fill(QChar(0));
+    return data->size() < FileTierPolicy::StandardEditLimitBytes;
+}
+
+bool EditorTab::exportRecoveryPayload(QByteArray *data, QString *error) const
+{
+    if (!data) {
+        if (error) *error = QObject::tr("恢复载荷输出参数无效。");
+        return false;
+    }
+    if (!m_promotedLargeDocument)
+        return exportSnapshotBytes(data);
+    if (m_recoveryRequiresCheckpoint
+        || QFileInfo(m_recoveryBasePath).absoluteFilePath()
+               != QFileInfo(m_filePath).absoluteFilePath()
+        || m_recoveryBaseSize < 0 || m_recoveryBaseMtimeMs < 0
+        || m_largeRecoveryOperations.isEmpty()) {
+        if (error) *error = QObject::tr("当前大文件恢复状态需要建立加密检查点。");
+        return false;
+    }
+
+    data->clear();
+    QDataStream stream(data, QIODevice::WriteOnly);
+    stream.setByteOrder(QDataStream::LittleEndian);
+    stream << QByteArray(LargeRecoveryMagic, sizeof(LargeRecoveryMagic))
+           << LargeRecoveryVersion
+           << m_recoveryBaseSize << m_recoveryBaseMtimeMs
+           << qint32(m_encoding)
+           << quint32(m_largeRecoveryOperations.size());
+    for (const LargeRecoveryOperation &operation : m_largeRecoveryOperations) {
+        stream << quint8(operation.kind) << operation.position;
+        if (operation.kind == LargeRecoveryOperation::Kind::Insert)
+            stream << operation.insertedBytes;
+        else
+            stream << operation.deleteLength;
+        if (data->size() >= MaximumLargeRecoveryPayload) {
+            data->fill(0);
+            data->clear();
+            if (error) *error = QObject::tr("大文件编辑日志已达到 32 MiB，需要建立加密检查点。");
+            return false;
+        }
+    }
+    if (stream.status() != QDataStream::Ok) {
+        data->fill(0);
+        data->clear();
+        if (error) *error = QObject::tr("序列化大文件恢复日志失败。");
+        return false;
+    }
+    return true;
+}
+
+bool EditorTab::restoreRecoveryPayload(const QByteArray &data,
+                                       const QString &realFilePath,
+                                       QString *error)
+{
+    QDataStream stream(data);
+    stream.setByteOrder(QDataStream::LittleEndian);
+    QByteArray magic;
+    quint32 version = 0;
+    stream >> magic >> version;
+    if (magic != QByteArray(LargeRecoveryMagic, sizeof(LargeRecoveryMagic)))
+        return loadAutosaveBytes(data, QString());
+    if (version != LargeRecoveryVersion || realFilePath.isEmpty()) {
+        if (error) *error = QObject::tr("大文件恢复日志版本或原文件路径无效。");
+        return false;
+    }
+
+    qint64 baseSize = -1;
+    qint64 baseMtime = -1;
+    qint32 storedEncoding = 0;
+    quint32 operationCount = 0;
+    stream >> baseSize >> baseMtime >> storedEncoding >> operationCount;
+    const QFileInfo base(realFilePath);
+    if (!base.exists() || !base.isFile() || base.size() != baseSize
+        || base.lastModified().toMSecsSinceEpoch() != baseMtime) {
+        if (error) *error = QObject::tr("原始大文件已移动或发生变化，不能安全套用恢复日志。");
+        return false;
+    }
+    if (storedEncoding < qint32(TextEncoding::Utf8)
+        || storedEncoding > qint32(TextEncoding::GBK)
+        || operationCount == 0 || operationCount > 1000000) {
+        if (error) *error = QObject::tr("大文件恢复日志元数据无效。");
+        return false;
+    }
+
+    QVector<LargeRecoveryOperation> parsed;
+    parsed.reserve(int(operationCount));
+    qint64 insertedTotal = 0;
+    for (quint32 i = 0; i < operationCount; ++i) {
+        quint8 kind = 0;
+        LargeRecoveryOperation operation;
+        stream >> kind >> operation.position;
+        if (kind == quint8(LargeRecoveryOperation::Kind::Insert)) {
+            operation.kind = LargeRecoveryOperation::Kind::Insert;
+            stream >> operation.insertedBytes;
+            insertedTotal += operation.insertedBytes.size();
+            if (operation.insertedBytes.isEmpty()
+                || insertedTotal >= MaximumLargeRecoveryPayload) {
+                clearLargeRecoveryOperations(&parsed);
+                if (error) *error = QObject::tr("大文件恢复日志插入数据无效或超限。");
                 return false;
             }
-            // VirtualFileView::saveAs 没走 QSaveFile，它直接写 tmpPath 参数；
-            // 但我们把 tmpPath 传给它了。如果 saveAs 成功，它已经把内容写到 tmpPath
-            // （applyAndSave 内部用 QSaveFile + commit），所以 sf 上不要 commitWriting（否则会覆盖为空）。
-            // 这里 sf 只是占位，cancel 掉它（applyAndSave 已做过原子写）。
-            sf.cancelWriting();
-            // applyAndSave 的原子写：实际写的是 tmpPath → QSaveFile(tmpPath).commit()
-            // 但此时 destPath 还没被替换。所以我们仍需要 tmpPath → destPath 的 rename：
-            // applyAndSave 会直接 commit 到 outPath（即 tmpPath），所以 tmpPath 现在是完整文件。
-            // 最后再 move tmpPath → destPath。
+        } else if (kind == quint8(LargeRecoveryOperation::Kind::Delete)) {
+            operation.kind = LargeRecoveryOperation::Kind::Delete;
+            stream >> operation.deleteLength;
+            if (operation.deleteLength <= 0) {
+                clearLargeRecoveryOperations(&parsed);
+                if (error) *error = QObject::tr("大文件恢复日志删除范围无效。");
+                return false;
+            }
         } else {
-            // ---- L1：用当前编码把 m_editor 文档写出去（不改变 modified/路径）----
-            QString txt = m_editor->text();
-            QByteArray data = encodeText(txt, m_encoding);
-            qint64 written = sf.write(data);
-            if (written != data.size()) {
-                sf.cancelWriting();
+            clearLargeRecoveryOperations(&parsed);
+            if (error) *error = QObject::tr("大文件恢复日志包含未知操作。");
+            return false;
+        }
+        if (operation.position < 0 || stream.status() != QDataStream::Ok) {
+            clearLargeRecoveryOperations(&parsed);
+            if (error) *error = QObject::tr("大文件恢复日志已损坏。");
+            return false;
+        }
+        parsed.push_back(std::move(operation));
+    }
+    if (!stream.atEnd()) {
+        clearLargeRecoveryOperations(&parsed);
+        if (error) *error = QObject::tr("大文件恢复日志尾部包含无效数据。");
+        return false;
+    }
+
+    QString openError;
+    if (!openLargeFileL2(realFilePath, &openError, true)) {
+        clearLargeRecoveryOperations(&parsed);
+        if (error) *error = openError;
+        return false;
+    }
+    clearLargeRecoveryOperations(&m_pendingRecoveryOperations);
+    m_pendingRecoveryOperations = std::move(parsed);
+    m_encoding = TextEncoding(storedEncoding);
+    m_l2PromotionRepresentsDirty = true;
+    m_l2SaveNeeded = true;
+    emit modificationChanged(true);
+    emit titleChanged(tabTitle());
+    return true;
+}
+
+bool EditorTab::exportRecoveryCheckpoint(QIODevice *output, QString *error) const
+{
+    if (!m_promotedLargeDocument || !output || !output->isWritable()) {
+        if (error) *error = QObject::tr("当前文档不能生成流式恢复检查点。");
+        return false;
+    }
+    return streamPromotedDocumentTo(output, error, false);
+}
+
+bool EditorTab::restoreRecoveryCheckpoint(const QString &checkpointPath,
+                                          const QString &realFilePath,
+                                          TextEncoding encoding,
+                                          qint64 plaintextBytes,
+                                          QString *error)
+{
+    if (checkpointPath.isEmpty() || plaintextBytes < FileTierPolicy::StandardEditLimitBytes
+        || plaintextBytes >= FileTierPolicy::LargeEditLimitBytes) {
+        if (error) *error = QObject::tr("恢复检查点大小不属于 S2 可编辑范围。");
+        return false;
+    }
+    const qint64 expectedUtf8Bytes = estimatedUtf8Size(plaintextBytes, encoding);
+    ResourceAdmissionInput input;
+    input.file = FileTierPolicy::classify(plaintextBytes, expectedUtf8Bytes);
+#ifdef Q_OS_WIN
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof(memory);
+    if (::GlobalMemoryStatusEx(&memory)) {
+        input.totalPhysicalBytes = static_cast<qint64>(memory.ullTotalPhys);
+        input.availableCommitBytes = static_cast<qint64>(memory.ullAvailPageFile);
+    }
+#endif
+    const ResourceAdmissionDecision admission = ResourceAdmission::evaluate(input);
+    if (!admission.admitted) {
+        if (error) *error = admissionFallbackText(admission.reason);
+        return false;
+    }
+
+    constexpr int documentOptions = QsciScintillaBase::SC_DOCUMENTOPTION_STYLES_NONE
+                                    | QsciScintillaBase::SC_DOCUMENTOPTION_TEXT_LARGE;
+    auto *loader = reinterpret_cast<ILoader *>(directScintilla(
+        m_editor, QsciScintillaBase::SCI_CREATELOADER,
+        static_cast<ScintillaUnsigned>(expectedUtf8Bytes),
+        static_cast<ScintillaSigned>(documentOptions)));
+    if (!loader) {
+        if (error) *error = QObject::tr("无法建立后台恢复文档。");
+        return false;
+    }
+
+    cancelLargeTextPromotion();
+    resetLargeRecoveryJournal(realFilePath);
+    m_recoveryRequiresCheckpoint = true;
+    m_filePath = realFilePath;
+    refreshDiskVersionBaseline();
+    m_l2Mode = true;
+    m_l2ReadOnlyByPolicy = false;
+    m_l2TextPreviewReadOnly = true;
+    m_promotedLargeDocument = false;
+    m_promotedLargeDirty = false;
+    m_l2SaveNeeded = true;
+    m_l2PromotionRepresentsDirty = true;
+    m_editor->setReadOnly(true);
+    if (m_stack)
+        m_stack->setCurrentWidget(m_editor);
+
+    m_l2PromotionPath = QFileInfo(checkpointPath).absoluteFilePath();
+    const QString absolutePath = m_l2PromotionPath;
+    QPointer<EditorTab> guard(this);
+    QPointer<QObject> application = QCoreApplication::instance();
+    m_l2PromotionTaskId = AsyncTaskManager::instance().submit(
+        AsyncTaskType::LargeFileLoad, AsyncTaskPriority::Low,
+        QObject::tr("恢复大文件编辑"),
+        QObject::tr("后台解密恢复检查点并构造完整 Scintilla 文档"),
+        [guard, application, loader, absolutePath, plaintextBytes, encoding](
+            qint64 taskId, AsyncCancelPtr cancel,
+            const std::function<void(qint64, qint64)> &reportProgress,
+            const std::function<void(const AsyncErrorInfo &)> &) {
+            auto postResult = [guard, application, taskId, absolutePath](
+                                  ILoader *resultLoader, TextEncoding resultEncoding,
+                                  const QString &reason) {
+                if (!application) {
+                    if (resultLoader) resultLoader->Release();
+                    return;
+                }
+                const bool queued = QMetaObject::invokeMethod(
+                    application,
+                    [guard, resultLoader, taskId, absolutePath, resultEncoding, reason]() {
+                        if (guard) {
+                            guard->finishLargeTextPromotion(resultLoader, taskId,
+                                                            absolutePath, resultEncoding,
+                                                            reason);
+                        } else if (resultLoader) {
+                            resultLoader->Release();
+                        }
+                    }, Qt::QueuedConnection);
+                if (!queued && resultLoader)
+                    resultLoader->Release();
+            };
+
+            std::unique_ptr<QStringDecoder> decoder;
+            if (encoding == TextEncoding::Utf16LE)
+                decoder = std::make_unique<QStringDecoder>(QStringConverter::Utf16LE);
+            else if (encoding == TextEncoding::Utf16BE)
+                decoder = std::make_unique<QStringDecoder>(QStringConverter::Utf16BE);
+            else if (encoding == TextEncoding::GBK)
+                decoder = std::make_unique<QStringDecoder>(QStringConverter::System);
+            Utf8StreamValidator validator;
+            bool firstChunk = true;
+            qint64 consumed = 0;
+            QString readError;
+            const bool readOk = DraftStore::readChunks(
+                absolutePath,
+                [&](const QByteArray &chunk, QString *consumerError) {
+                    if (cancel && cancel->load(std::memory_order_acquire)) {
+                        if (consumerError) *consumerError = QObject::tr("恢复已取消。");
+                        return false;
+                    }
+                    qsizetype offset = 0;
+                    if (firstChunk) {
+                        firstChunk = false;
+                        if (encoding == TextEncoding::Utf8Bom)
+                            offset = qMin<qsizetype>(3, chunk.size());
+                        else if (encoding == TextEncoding::Utf16LE
+                                 || encoding == TextEncoding::Utf16BE)
+                            offset = qMin<qsizetype>(2, chunk.size());
+                    }
+                    const char *source = chunk.constData() + offset;
+                    qsizetype sourceSize = chunk.size() - offset;
+                    QByteArray converted;
+                    if (decoder) {
+                        const QString decoded = (*decoder)(QByteArrayView(source, sourceSize));
+                        converted = decoded.toUtf8();
+                        source = converted.constData();
+                        sourceSize = converted.size();
+                    } else if (!validator.feed(source, sourceSize)) {
+                        if (consumerError) *consumerError = QObject::tr("恢复检查点包含无效 UTF-8。");
+                        return false;
+                    }
+                    if (sourceSize > 0
+                        && loader->AddData(source, static_cast<Sci_Position>(sourceSize)) != 0) {
+                        if (consumerError) *consumerError = QObject::tr("恢复大文件时内存不足。");
+                        return false;
+                    }
+                    consumed += chunk.size();
+                    reportProgress(consumed, plaintextBytes);
+                    return true;
+                }, &readError);
+            if (!readOk || (decoder && decoder->hasError())
+                || (!decoder && !validator.complete())) {
+                loader->Release();
+                postResult(nullptr, encoding,
+                           readError.isEmpty() ? QObject::tr("恢复检查点解密或编码转换失败。")
+                                               : readError);
+                return;
+            }
+            postResult(loader, encoding, {});
+        }, 0, QStringLiteral("RecoveryLoad"), plaintextBytes);
+
+    emit l2ModeStatusChanged();
+    emit modificationChanged(true);
+    emit titleChanged(tabTitle());
+    return true;
+}
+
+bool EditorTab::exportBinaryRecoveryJournal(QIODevice *output, QString *error)
+{
+    if (!output || !output->isWritable() || !isBinaryDocument() || isSecureDocument()
+        || !isL2Mode() || !m_l2View || m_filePath.isEmpty()) {
+        if (error) *error = QObject::tr("当前文档不能生成 Binary/Hex 恢复日志。");
+        return false;
+    }
+    QString flushError;
+    if (!bridgeFlushOverlayToPatches(&flushError)) {
+        if (error) *error = flushError;
+        return false;
+    }
+    if (!m_l2View->patches().isModified()) {
+        if (error) *error = QObject::tr("Binary/Hex 文档没有需要恢复的编辑。");
+        return false;
+    }
+    if (externalFileState() != ExternalFileState::Unchanged || !m_diskVersion.valid) {
+        if (error) *error = QObject::tr("原始二进制文件已经变化，不能建立可安全重放的恢复日志。");
+        return false;
+    }
+
+    QDataStream stream(output);
+    stream.setByteOrder(QDataStream::LittleEndian);
+    stream << QByteArray(BinaryRecoveryMagic, sizeof(BinaryRecoveryMagic))
+           << BinaryRecoveryVersion << m_diskVersion.size << m_diskVersion.modifiedMs
+           << m_diskVersion.fileIdentity << m_diskVersion.sampleHash;
+    if (stream.status() != QDataStream::Ok) {
+        if (error) *error = QObject::tr("写入 Binary/Hex 恢复元数据失败。");
+        return false;
+    }
+    return m_l2View->patches().writeRecoveryJournal(output, error);
+}
+
+bool EditorTab::restoreBinaryRecoveryJournal(const QString &journalPath,
+                                             const QString &realFilePath,
+                                             QString *error)
+{
+    if (journalPath.isEmpty() || realFilePath.isEmpty()) {
+        if (error) *error = QObject::tr("Binary/Hex 恢复路径无效。");
+        return false;
+    }
+    QByteArray journal;
+    constexpr qsizetype MaximumJournalBytes = 512 * 1024 * 1024;
+    QString readError;
+    const bool readOk = DraftStore::readChunks(
+        journalPath,
+        [&journal](const QByteArray &chunk, QString *consumerError) {
+            if (journal.size() > MaximumJournalBytes - chunk.size()) {
+                if (consumerError)
+                    *consumerError = QObject::tr("Binary/Hex 恢复日志超过 512 MiB 安全上限。");
                 return false;
             }
-            if (!sf.commit())
-                return false;
+            journal.append(chunk);
+            return true;
+        }, &readError);
+    if (!readOk) {
+        if (error) *error = readError;
+        if (!journal.isEmpty()) journal.fill(0);
+        return false;
+    }
+
+    QBuffer buffer(&journal);
+    buffer.open(QIODevice::ReadOnly);
+    QByteArray magic;
+    quint32 version = 0;
+    qint64 baseSize = -1;
+    qint64 baseModifiedMs = -1;
+    QByteArray baseIdentity;
+    QByteArray baseSampleHash;
+    {
+        QDataStream stream(&buffer);
+        stream.setByteOrder(QDataStream::LittleEndian);
+        stream >> magic >> version >> baseSize >> baseModifiedMs
+               >> baseIdentity >> baseSampleHash;
+        if (stream.status() != QDataStream::Ok
+            || magic != QByteArray(BinaryRecoveryMagic, sizeof(BinaryRecoveryMagic))
+            || version != BinaryRecoveryVersion || baseSize < 0
+            || baseModifiedMs < 0 || baseSampleHash.size() != 32) {
+            if (error) *error = QObject::tr("Binary/Hex 恢复日志元数据已损坏。");
+            journal.fill(0);
+            return false;
         }
     }
 
-    // 如果上面走的是 L1：sf.commit() 已经把 tmpPath 提交为最终的 tmpPath（不是 destPath），
-    //   因为 QSaveFile 写入的是 tmpPath 本身 → commit 时直接更名到 destPath？
-    //   实际上 QSaveFile 打开的文件名就是"最终名"；它内部自动用"最终名.tmp"写再 rename。
-    //   所以上面 L1 路径：QSaveFile sf(tmpPath) → sf.commit() → tmpPath 存在。
-    //   L2 路径：applyAndSave(outPath=tmpPath) 内部也用 QSaveFile+commit → tmpPath 存在。
-    //   因此无论哪个路径，tmpPath 现在都是完整内容，我们还需把它 → destPath。
-    // 注意：如果 destPath == tmpPath（不会发生，因为 tmpPath = destPath + ".tmp"），跳过。
-    if (QFile::exists(destPath))
-        QFile::remove(destPath);
-    if (!QFile::rename(tmpPath, destPath)) {
-        // rename 失败：回退 copy + remove
-        if (!QFile::copy(tmpPath, destPath)) {
-            QFile::remove(tmpPath);
+    DiskFileVersion baseline;
+    baseline.valid = true;
+    baseline.absolutePath = QFileInfo(realFilePath).absoluteFilePath();
+    baseline.size = baseSize;
+    baseline.modifiedMs = baseModifiedMs;
+    baseline.fileIdentity = baseIdentity;
+    baseline.sampleHash = baseSampleHash;
+    if (compareDiskFileVersion(realFilePath, baseline) != ExternalFileState::Unchanged) {
+        if (error) *error = QObject::tr("原始二进制文件已移动或变化，不能安全重放恢复日志。");
+        journal.fill(0);
+        return false;
+    }
+
+    QString openError;
+    if (!openLargeFileL2(realFilePath, &openError, false,
+                         L2Presentation::Hex, L2ContentKind::Binary)) {
+        if (error) *error = openError;
+        journal.fill(0);
+        return false;
+    }
+    // openLargeFileL2 intentionally returns as soon as the asynchronous mmap
+    // task is scheduled.  Recovery patches must not be installed before
+    // onMmapReady(), because normal mmap initialization resets PatchList.
+    // Wait only for this Hex mapping boundary (no line index is required).
+    if (!m_l2View->isOpen()) {
+        bool mapped = false;
+        QEventLoop mapLoop;
+        QTimer mapTimeout;
+        mapTimeout.setSingleShot(true);
+        const auto readyConnection = connect(
+            m_l2View, &VirtualFileView::lineBuildFinished, &mapLoop,
+            [this, &mapped, &mapLoop](bool ok) {
+                mapped = ok && m_l2View && m_l2View->isOpen();
+                mapLoop.quit();
+            });
+        connect(&mapTimeout, &QTimer::timeout, &mapLoop, &QEventLoop::quit);
+        mapTimeout.start(30000);
+        mapLoop.exec(QEventLoop::ExcludeUserInputEvents);
+        disconnect(readyConnection);
+        if (!mapped) {
+            if (error)
+                *error = QObject::tr("Binary/Hex 原文件映射超时或失败，恢复日志未应用。");
+            journal.fill(0);
             return false;
         }
-        QFile::remove(tmpPath);
     }
+    QString patchError;
+    if (!m_l2View->patches().restoreRecoveryJournal(&buffer, &patchError)) {
+        if (error) *error = patchError;
+        journal.fill(0);
+        return false;
+    }
+    journal.fill(0);
+    journal.clear();
+
+    m_l2SaveNeeded = true;
+    clearL2BridgeBaseline();
+    const qint64 start = m_l2View->activeWindowByteStart();
+    const qint64 end = m_l2View->activeWindowByteEnd();
+    if (end > start)
+        bridgePopulateScintilla(start, end);
+    advanceContentRevision();
+    emit l2SaveNeededChanged(true);
+    emit modificationChanged(true);
+    emit titleChanged(tabTitle());
     return true;
 }
 
@@ -1457,62 +4225,35 @@ bool EditorTab::openAutosaveAutoMode(const QString &autosavePath, const QString 
         if (ok && !realFilePath.isEmpty()) {
             // 已有真实路径：对用户显示原名 + 标记"有未保存修改"
             m_filePath = realFilePath;
+            refreshDiskVersionBaseline();
             // 注意：loadAutosave 已经 setModified(true)，所以无需再调
             emit titleChanged(tabTitle());
         }
         return ok;
     }
 
-    // ---- S2/S3 autosave：mmap 到 VirtualFileView，秒开 ----
-    //   不再主线程 readAll(100MB) → 不再阻塞首帧渲染。
-    qDebug("[openAutosaveAutoMode] 选 L2: autosaveSize=%lld KB >= limit=%lld KB. 调 ensureL2View+openFile（mmap 秒开）",
-           size / 1024, limit / 1024);
-    VirtualFileView *v = ensureL2View();
+    // ---- S2/S3 autosave：复用统一 mmap/Scintilla 状态机。 ----
+    // mmap 失败时不能回退到主线程 readAll；恢复一个损坏或无法映射的 2 GiB
+    // autosave 不应让整个应用在启动阶段失去响应。
+    qDebug("[openAutosaveAutoMode] 选 S2/S3: autosaveSize=%lld KB，进入统一 mmap 打开路径",
+           size / 1024);
     QString err;
-    bool ok = v->openFile(autosavePath, &err, this->window());
-    qDebug("[openAutosaveAutoMode] L2 VirtualFileView::openFile 返回 ok=%d err='%s', 耗时=%lld ms（应 < 50ms；若 > 500ms 说明 mmap/quickBuildFirstRange 意外阻塞）",
+    const bool ok = openLargeFileL2(autosavePath, &err, true);
+    qDebug("[openAutosaveAutoMode] 统一 mmap 返回 ok=%d err='%s', 耗时=%lld ms",
            ok ? 1 : 0, qUtf8Printable(err), t.elapsed());
     if (!ok) {
-        // L2 失败（mmap 不支持/极端编码情况）：回退到同步 loadAutosave。
-        //   虽然仍会阻塞，但至少 L2 成功率极高（≥99%），失败才兜底。
-        qWarning("[openAutosaveAutoMode] L2 open 失败，回退 L1 同步 loadAutosave（⚠️ 此时启动会被阻塞!）: %s",
+        qWarning("[openAutosaveAutoMode] mmap 恢复失败，安全跳过且不做同步全量回退: %s",
                  qUtf8Printable(err));
-        t.restart();
-        const bool okL1 = loadAutosave(autosavePath);
-        qWarning("[openAutosaveAutoMode] L1 回退 loadAutosave 耗时=%lld ms, ok=%d",
-                 t.elapsed(), okL1 ? 1 : 0);
-        if (okL1 && !realFilePath.isEmpty()) {
-            m_filePath = realFilePath;
-            emit titleChanged(tabTitle());
-        }
-        return okL1;
+        return false;
     }
 
-    // L2 成功：设置元数据（标题栏显示"原名*"，modified 状态，autosave 关联）
-    m_filePath = realFilePath;         // 保存走 realFilePath；若空则"未命名"由 isUntitled() 判定
-    m_autosavePath = autosavePath;     // 保持 autosave 关联（会话下次恢复、saveAsFile 清空等）
-    m_l2Mode = true;
-    m_l2SaveNeeded = true;             // 有未保存内容
-    m_lastL2Line = 0;
-    m_lastL2Col  = 0;
-    m_lastL2Byte = 0;
-    // 同 openLargeFileL2：先切 stack→1，再 emit（保证 isL2Active()=true 时再通知 MainWindow）
-    if (m_stack) m_stack->setCurrentWidget(v);
-    emit l2ModeStatusChanged();
-
-    // 根据 realFilePath 或 autosavePath 猜语法（L2 暂不做词法，但信号保持统一）
-    const QString &nameForSyntax = !realFilePath.isEmpty() ? realFilePath : autosavePath;
-    Syntax syn = guessSyntaxFromExtension(nameForSyntax);
-    if (syn != m_syntax) {
-        m_syntax = syn;
-        emit syntaxChanged(syn);
-    }
-
-    emit encodingChanged(m_encoding);
-    emit modificationChanged(true);   // autosave 内容 = 有未保存修改
+    m_filePath = realFilePath;
+    refreshDiskVersionBaseline();
+    m_autosavePath = autosavePath;
+    m_l2SaveNeeded = true;
+    m_l2PromotionRepresentsDirty = true;
+    emit modificationChanged(true);
     emit titleChanged(tabTitle());
-    emit cursorPositionChanged(0, 0);
-    emit l2FileOpenedChanged(true);
     emit l2SaveNeededChanged(true);
     return true;
 }
@@ -1523,18 +4264,74 @@ bool EditorTab::openAutosaveAutoMode(const QString &autosavePath, const QString 
 
 void EditorTab::selectAll()
 {
+    if (windowedReadOnlyActive()) {
+        m_windowedReadOnlyProvider->editor()->selectAll();
+        return;
+    }
     if (isL2Mode() && m_l2View) {
-        // L2：从 0 字节跳到文件末尾（长度即 fileSize+patch 字节差。简化：不精确选中但把光标移到末尾）
-        gotoByteOffset(std::numeric_limits<qint64>::max());
+        // Scintilla is the only visible/input surface in L2. Select the active
+        // window; selecting multi-GiB virtual content would be unsafe anyway.
+        m_editor->selectAll();
         return;
     }
     m_editor->selectAll();
 }
 
+bool EditorTab::canModifyCommand() const
+{
+    if (m_secureDocumentMasked || isSecureDocumentTransitioning()
+        || windowedReadOnlyActive() || isReadOnlyByPolicy() || !m_editor) {
+        return false;
+    }
+    return !m_editor->isReadOnly();
+}
+
+bool EditorTab::canUndoCommand() const
+{
+    if (!canModifyCommand())
+        return false;
+    if (isL2Mode() && m_l2View)
+        return m_editor->isUndoAvailable() || m_l2View->canUndo();
+    return m_editor->isUndoAvailable();
+}
+
+bool EditorTab::canRedoCommand() const
+{
+    if (!canModifyCommand())
+        return false;
+    if (isL2Mode() && m_l2View)
+        return m_editor->isRedoAvailable() || m_l2View->canRedo();
+    return m_editor->isRedoAvailable();
+}
+
+bool EditorTab::hasSelectionCommand() const
+{
+    if (m_secureDocumentMasked)
+        return false;
+    if (windowedReadOnlyActive()) {
+        return m_windowedReadOnlyProvider->selectionEndOffset()
+               > m_windowedReadOnlyProvider->selectionStartOffset();
+    }
+    if (!m_editor)
+        return false;
+    if (isL2Mode() && m_l2View && m_l2View->viewMode() == ViewMode::Hex) {
+        qint64 start = 0;
+        qint64 end = 0;
+        return hexSelectionByteRange(&start, &end) && end > start;
+    }
+    return m_editor->hasSelectedText();
+}
+
 void EditorTab::undo()
 {
+    if (isReadOnlyByPolicy()) return;
     if (isL2Mode() && m_l2View) {
-        m_l2View->undo(nullptr);
+        if (m_editor->isUndoAvailable()) {
+            m_editor->undo();
+        } else if (m_l2View->undo(nullptr)) {
+            bridgePopulateScintilla(m_l2View->activeWindowByteStart(),
+                                    m_l2View->activeWindowByteEnd());
+        }
         return;
     }
     m_editor->undo();
@@ -1542,8 +4339,14 @@ void EditorTab::undo()
 
 void EditorTab::redo()
 {
+    if (isReadOnlyByPolicy()) return;
     if (isL2Mode() && m_l2View) {
-        m_l2View->redo(nullptr);
+        if (m_editor->isRedoAvailable()) {
+            m_editor->redo();
+        } else if (m_l2View->redo(nullptr)) {
+            bridgePopulateScintilla(m_l2View->activeWindowByteStart(),
+                                    m_l2View->activeWindowByteEnd());
+        }
         return;
     }
     m_editor->redo();
@@ -1551,9 +4354,14 @@ void EditorTab::redo()
 
 void EditorTab::cut()
 {
+    if (isReadOnlyByPolicy()) return;
     if (isL2Mode() && m_l2View) {
-        // L2：简化为 copy → delete 选中字节区间（P5 先不做剪贴版深度对接，此处给个最小：copy 即可）
-        m_l2View->copy();
+        if (m_l2View->viewMode() == ViewMode::Hex) {
+            QKeyEvent event(QEvent::KeyPress, Qt::Key_X, Qt::ControlModifier);
+            (void)handleHexKeyPress(&event);
+            return;
+        }
+        m_editor->cut();
         return;
     }
     m_editor->cut();
@@ -1561,8 +4369,28 @@ void EditorTab::cut()
 
 void EditorTab::copy()
 {
+    if (windowedReadOnlyActive()) {
+        QString error;
+        if (!m_windowedReadOnlyProvider->copySelection(&error) && !error.isEmpty()) {
+            if (auto *window = qobject_cast<QMainWindow *>(this->window()))
+                window->statusBar()->showMessage(error, 5000);
+            QApplication::beep();
+        }
+        return;
+    }
     if (isL2Mode() && m_l2View) {
-        m_l2View->copy();
+        if (m_l2View->viewMode() == ViewMode::Hex) {
+            qint64 start = 0;
+            qint64 end = 0;
+            if (hexSelectionByteRange(&start, &end) && end > start) {
+                QByteArray selected = m_l2View->readByteRange(start, end);
+                QGuiApplication::clipboard()->setText(formatHexBytes(selected));
+                if (m_secureBinaryDocument && !selected.isEmpty())
+                    selected.fill(0);
+            }
+            return;
+        }
+        m_editor->copy();
         return;
     }
     m_editor->copy();
@@ -1570,14 +4398,14 @@ void EditorTab::copy()
 
 void EditorTab::paste()
 {
+    if (isReadOnlyByPolicy()) return;
     if (isL2Mode() && m_l2View) {
-        // 从系统剪贴板取文本 → 转 UTF-8 字节 → pasteBytes
-        QClipboard *cb = QGuiApplication::clipboard();
-        if (!cb) return;
-        QString txt = cb->text();
-        if (txt.isEmpty()) return;
-        QByteArray bytes = txt.toUtf8();
-        m_l2View->pasteBytes(bytes, nullptr);
+        if (m_l2View->viewMode() == ViewMode::Hex) {
+            QKeyEvent event(QEvent::KeyPress, Qt::Key_V, Qt::ControlModifier);
+            (void)handleHexKeyPress(&event);
+            return;
+        }
+        m_editor->paste();
         return;
     }
     m_editor->paste();
@@ -1585,8 +4413,12 @@ void EditorTab::paste()
 
 void EditorTab::setFocusEditor()
 {
+    if (windowedReadOnlyActive()) {
+        m_windowedReadOnlyProvider->editor()->setFocus();
+        return;
+    }
     if (isL2Mode() && m_l2View) {
-        m_l2View->setFocus();
+        m_editor->setFocus();
         return;
     }
     m_editor->setFocus();
@@ -1594,27 +4426,65 @@ void EditorTab::setFocusEditor()
 
 void EditorTab::gotoByteOffset(qint64 byteOffset, int selectLength)
 {
+    if (windowedReadOnlyActive()) {
+        byteOffset = qBound<qint64>(
+            0, byteOffset,
+            qMax<qint64>(0, m_windowedReadOnlyProvider->fileSize() - 1));
+        m_windowedReadOnlyProvider->goToOffset(byteOffset, selectLength);
+        m_lastL2Byte = byteOffset;
+        m_windowedReadOnlyProvider->editor()->setFocus();
+        return;
+    }
     if (isL2Mode() && m_l2View) {
+        QString flushError;
+        if (!bridgeFlushOverlayToPatches(&flushError)) {
+            if (auto *window = qobject_cast<QMainWindow *>(this->window()))
+                window->statusBar()->showMessage(flushError, 6000);
+            return;
+        }
+        byteOffset = qBound<qint64>(0, byteOffset, m_l2View->virtualFileSize());
+        m_l2View->syncActiveWindowToCursor(byteOffset);
+        const qint64 local = qMax<qint64>(0, byteOffset - m_bridge.windowStart);
+        auto overlayPosition = [this](qint64 localByte) -> long {
+            if (m_l2View->viewMode() != ViewMode::Hex)
+                return long(qMin<qint64>(localByte, LONG_MAX));
+            const int line = int(qMin<qint64>(localByte / m_hexBytesPerRow, INT_MAX));
+            const int column = int((localByte % m_hexBytesPerRow) * 3);
+            return m_editor->positionFromLineIndex(line, column);
+        };
+        const long start = overlayPosition(local);
         if (selectLength > 0) {
-            // 真·选中 [byteOffset, byteOffset+selectLength)（findNext/findPrev / replace 路径用）
             m_l2View->selectBytes(byteOffset, byteOffset + qint64(selectLength));
+            const long end = overlayPosition(local + selectLength);
+            m_editor->SendScintilla(QsciScintillaBase::SCI_SETSEL, start, end);
         } else {
             m_l2View->gotoByteOffset(byteOffset, false);
+            m_editor->SendScintilla(QsciScintillaBase::SCI_GOTOPOS, start);
         }
+        m_editor->ensureCursorVisible();
+        m_editor->setFocus();
         return;
     }
     // L1：用 Scintilla SCI_GOTOPOS（字节偏移，UTF-8）定位，然后读取 line/col 更新
     if (byteOffset < 0) byteOffset = 0;
     if (byteOffset > INT_MAX) byteOffset = INT_MAX;
-    m_editor->SendScintilla(QsciScintillaBase::SCI_GOTOPOS,
-                            static_cast<long>(byteOffset));
+    if (selectLength > 0) {
+        const qint64 end = qMin<qint64>(m_editor->length(),
+                                        byteOffset + selectLength);
+        m_editor->SendScintilla(QsciScintillaBase::SCI_SETSEL,
+                                static_cast<long>(byteOffset),
+                                static_cast<long>(end));
+    } else {
+        m_editor->SendScintilla(QsciScintillaBase::SCI_GOTOPOS,
+                                static_cast<long>(byteOffset));
+    }
     int line, col;
     m_editor->getCursorPosition(&line, &col);
     emit cursorPositionChanged(line, col);
 }
 
 // ============================================================================
-//  搜索分流：L1=Qsci/逐行扫描；L2=LargeFileSearch 异步转同步
+//  搜索分流：L1=PCRE2 内存快照；L2=PCRE2 mmap/patch 快照
 // ============================================================================
 
 namespace {  // 匿名：L2 findAll 同步等待 helper
@@ -1625,53 +4495,46 @@ struct L2SearchAwaiter {
     QString    err;
 };
 
-// 秒开：LineIndex 未全量构建完之前，阻塞 UI 线程但允许重绘/交互的等待器。
-// 仅当 LineIndex 真的 incomplete 才等待；若构建已完成（lineBuildFinished 已发过）则瞬间返回。
-// 返回 true 表示等完且 LineIndex 完整；false 表示 view 中途失效
-bool waitForL2LineIndex(VirtualFileView *view, QWidget *progressParentForContext) {
-    if (!view) return false;
-    if (!view->isOpen()) return false;
-    if (!view->lineIndex().isIncomplete()) return true;
-
-    // 状态栏同步显示（仅当 progressParent 存在时提示，避免测试环境）
-    if (auto *mw = qobject_cast<QMainWindow*>(progressParentForContext ? progressParentForContext->window() : nullptr)) {
-        mw->statusBar()->showMessage(QObject::tr("等待行索引构建完成…"), 0);
-    }
-    QEventLoop loop;
-    auto conn = QObject::connect(view, &VirtualFileView::lineBuildFinished, &loop,
-                                 [&](bool){ loop.quit(); });
-    loop.exec(QEventLoop::AllEvents);
-    QObject::disconnect(conn);
-    if (!view->isOpen()) return false;
-    return !view->lineIndex().isIncomplete();
-}
-
 } // namespace
 
 SearchResultsModel* EditorTab::findAllL2(const QString& pattern, bool regex,
                                           bool caseSensitive, bool wholeWord,
-                                          QObject* parentForModel)
+                                          QObject* parentForModel,
+                                          bool hexBytes)
 {
+    m_lastSearchError.clear();
     if (!isL2Mode() || !m_l2View || pattern.isEmpty())
         return nullptr;
-
-    // 秒开：搜索必须拿到准确的行号，所以等 LineIndex 完整构建（QEventLoop 本身 NOT modal，
-    // 允许用户继续操作/滚动/切换 tab；注意：这里已没有 WindowModal QProgressDialog block 交互）
-    if (!waitForL2LineIndex(m_l2View, this->window()))
+    if (m_pendingL2Search.active)
         return nullptr;
+
+    QString sourceError;
+    if (!ensureWindowedSearchSource(&sourceError)) {
+        m_lastSearchError = sourceError;
+        return nullptr;
+    }
+
+    QString flushError;
+    if (!bridgeFlushOverlayToPatches(&flushError)) {
+        m_lastSearchError = flushError;
+        if (auto *mw = qobject_cast<QMainWindow*>(this->window()))
+            mw->statusBar()->showMessage(QObject::tr("无法准备搜索快照：%1").arg(flushError), 5000);
+        return nullptr;
+    }
+    const quint64 searchRevision = m_contentRevision;
+
+    // Byte offsets are authoritative. An incomplete LineIndex may postpone the
+    // row label, but must never postpone scanning or exact navigation.
 
     LargeFileSearch *s = m_l2View->searchEngine();  // 懒创建 + setSource 已内部完成
     if (!s) return nullptr;
 
     LargeFileSearch::Options opts;
-    opts.caseSensitive = caseSensitive;
-    opts.wholeWord     = wholeWord;
-    if (regex) {
-        QRegularExpression::PatternOptions ropts;
-        if (!caseSensitive) ropts |= QRegularExpression::CaseInsensitiveOption;
-        opts.regex = QRegularExpression(pattern, ropts);
-        if (!opts.regex.isValid()) return nullptr;
-    }
+    opts.regexMode     = regex;
+    opts.hexBytesMode  = hexBytes;
+    opts.byteContextMode = isBinaryDocument();
+    opts.caseSensitive = hexBytes ? true : caseSensitive;
+    opts.wholeWord     = hexBytes ? false : wholeWord;
 
     // 非模态：进度显示在 MainWindow 状态栏（若有）；不再弹 WindowModal QProgressDialog
     auto *mw = qobject_cast<QMainWindow*>(this->window());
@@ -1699,11 +4562,31 @@ SearchResultsModel* EditorTab::findAllL2(const QString& pattern, bool regex,
     aw.loop.exec();
 
     QObject::disconnect(c1); QObject::disconnect(c2); QObject::disconnect(c3);
+    if (m_contentRevision != searchRevision)
+        return nullptr;
     if (!aw.err.isEmpty() || aw.total <= 0) {
         // 0 匹配也返回空的 model（Dock 可以显示 0 结果）
     }
     auto *model = new SearchResultsModel(parentForModel);
-    model->setResults(s->memoryMatches(), s->overrunFilePath(), s->overrunCount());
+    model->setBytePositionMode(isBinaryDocument());
+    model->setResults(s->memoryMatches(), s->overrunFilePath(), s->overrunCount(),
+                      s->overrunCheckpoints(), s->overrunGroupedCount(), 2);
+    if (!aw.err.isEmpty())
+        model->setIncompleteReason(aw.err);
+    m_lastSearchError = aw.err;
+    m_l2SearchCachePattern = pattern;
+    m_l2SearchCacheRegex = regex;
+    m_l2SearchCacheCaseSensitive = caseSensitive;
+    m_l2SearchCacheWholeWord = wholeWord;
+    m_l2SearchCacheHexBytes = hexBytes;
+    m_l2SearchCacheRevision = m_contentRevision;
+    m_l2SearchCacheValid = aw.err.isEmpty();
+    m_l2SearchHighlights.clear();
+    m_l2SearchHighlights.reserve(s->memoryMatches().size());
+    for (const auto &match : s->memoryMatches())
+        m_l2SearchHighlights.append(qMakePair(match.byteOffset, match.length));
+    m_l2View->setSearchHighlights(m_l2SearchHighlights);
+    applyL2SearchHighlightsToOverlay();
     return model;
 }
 
@@ -1714,6 +4597,7 @@ void EditorTab::resetPendingL2Search()
 {
     QObject::disconnect(m_pendingL2Search.waitLineBuildConn);
     QObject::disconnect(m_pendingL2Search.searchProgressConn);
+    QObject::disconnect(m_pendingL2Search.searchPartialConn);
     QObject::disconnect(m_pendingL2Search.searchFinishedConn);
     QObject::disconnect(m_pendingL2Search.searchFailedConn);
     m_pendingL2Search = PendingL2Search{};
@@ -1725,37 +4609,34 @@ void EditorTab::startPendingL2Search()
         resetPendingL2Search();
         return;
     }
-    // LineIndex 仍未完整：不应进入此处（应由 findAllL2Async 在 incomplete 时先等信号）
-    if (m_l2View->lineIndex().isIncomplete()) {
-        emit findAllL2Progress(-1, 0, 0);  // -1 表示仍在等 LineIndex
+    if (m_contentRevision != m_pendingL2Search.contentRevision) {
+        const QString pattern = m_pendingL2Search.pattern;
+        const QString name = fileName();
+        resetPendingL2Search();
+        emit findAllL2Finished(nullptr, pattern, name);
         return;
     }
-
     LargeFileSearch *s = m_l2View->searchEngine();
     if (!s) {
         auto *empty = new SearchResultsModel(m_pendingL2Search.parentForModel);
+        empty->setBytePositionMode(isBinaryDocument());
         emit findAllL2Finished(empty, m_pendingL2Search.pattern, fileName());
         resetPendingL2Search();
         return;
     }
 
     LargeFileSearch::Options opts;
-    opts.caseSensitive = m_pendingL2Search.caseSensitive;
-    opts.wholeWord     = m_pendingL2Search.wholeWord;
-    if (m_pendingL2Search.regex) {
-        QRegularExpression::PatternOptions ropts;
-        if (!m_pendingL2Search.caseSensitive) ropts |= QRegularExpression::CaseInsensitiveOption;
-        opts.regex = QRegularExpression(m_pendingL2Search.pattern, ropts);
-        if (!opts.regex.isValid()) {
-            auto *empty = new SearchResultsModel(m_pendingL2Search.parentForModel);
-            emit findAllL2Finished(empty, m_pendingL2Search.pattern, fileName());
-            resetPendingL2Search();
-            return;
-        }
-    }
+    opts.regexMode     = m_pendingL2Search.regex;
+    opts.hexBytesMode  = m_pendingL2Search.hexBytes;
+    opts.byteContextMode = isBinaryDocument();
+    opts.caseSensitive = m_pendingL2Search.hexBytes
+        ? true : m_pendingL2Search.caseSensitive;
+    opts.wholeWord     = m_pendingL2Search.hexBytes
+        ? false : m_pendingL2Search.wholeWord;
 
     // 先把之前可能残留的连接断开
     QObject::disconnect(m_pendingL2Search.searchProgressConn);
+    QObject::disconnect(m_pendingL2Search.searchPartialConn);
     QObject::disconnect(m_pendingL2Search.searchFinishedConn);
     QObject::disconnect(m_pendingL2Search.searchFailedConn);
 
@@ -1763,6 +4644,7 @@ void EditorTab::startPendingL2Search()
     QObject* parentForModel = m_pendingL2Search.parentForModel;
     QString patternCopy    = m_pendingL2Search.pattern;
     QString fileNameCopy   = fileName();
+    const quint64 revisionCopy = m_pendingL2Search.contentRevision;
 
     m_pendingL2Search.searchProgressConn = QObject::connect(
         s, &LargeFileSearch::progress, this,
@@ -1772,12 +4654,44 @@ void EditorTab::startPendingL2Search()
             emit findAllL2Progress(pct, done, total);
         });
 
+    m_pendingL2Search.searchPartialConn = QObject::connect(
+        s, &LargeFileSearch::partialBatch, this,
+        [this, that, patternCopy, fileNameCopy](
+            const QVector<LargeFileSearchMatch> &batch) {
+            if (!that || !that->m_pendingL2Search.active
+                || that->m_pendingL2Search.previewMatchesPublished >= 5000) {
+                return;
+            }
+            const int remaining = 5000 - that->m_pendingL2Search.previewMatchesPublished;
+            const QVector<LargeFileSearchMatch> preview = batch.size() <= remaining
+                ? batch : batch.mid(0, remaining);
+            that->m_pendingL2Search.previewMatchesPublished += preview.size();
+            emit that->findAllL2Partial(preview, patternCopy, fileNameCopy);
+        });
+
     m_pendingL2Search.searchFinishedConn = QObject::connect(
         s, &LargeFileSearch::finished, this,
-        [this, that, s, parentForModel, patternCopy, fileNameCopy](qint64 /*total*/) {
+        [this, that, s, parentForModel, patternCopy, fileNameCopy,
+         revisionCopy](qint64 /*total*/) {
             if (!that) return;
+            if (that->m_contentRevision != revisionCopy) {
+                that->clearSearchHighlights();
+                that->resetPendingL2Search();
+                emit that->findAllL2Finished(nullptr, patternCopy, fileNameCopy);
+                return;
+            }
             auto *model = new SearchResultsModel(parentForModel);
-            model->setResults(s->memoryMatches(), s->overrunFilePath(), s->overrunCount());
+            model->setBytePositionMode(that->isBinaryDocument());
+            model->setResults(s->memoryMatches(), s->overrunFilePath(), s->overrunCount(),
+                              s->overrunCheckpoints(), s->overrunGroupedCount(), 2);
+            that->m_l2SearchCachePattern = patternCopy;
+            that->m_l2SearchCacheRegex = that->m_pendingL2Search.regex;
+            that->m_l2SearchCacheCaseSensitive = that->m_pendingL2Search.caseSensitive;
+            that->m_l2SearchCacheWholeWord = that->m_pendingL2Search.wholeWord;
+            that->m_l2SearchCacheHexBytes = that->m_pendingL2Search.hexBytes;
+            that->m_l2SearchCacheRevision = revisionCopy;
+            that->m_l2SearchCacheValid = true;
+            that->m_lastSearchError.clear();
             // 把匹配位置传给 VirtualFileView 用于正文区域染色
             if (that->m_l2View) {
                 QVector<QPair<qint64, qint32>> highlights;
@@ -1786,7 +4700,9 @@ void EditorTab::startPendingL2Search()
                 for (const auto& m : memMatches) {
                     highlights.append(qMakePair(m.byteOffset, m.length));
                 }
+                that->m_l2SearchHighlights = highlights;
                 that->m_l2View->setSearchHighlights(highlights);
+                that->applyL2SearchHighlightsToOverlay();
             }
             emit findAllL2Finished(model, patternCopy, fileNameCopy);
             that->resetPendingL2Search();
@@ -1794,11 +4710,27 @@ void EditorTab::startPendingL2Search()
 
     m_pendingL2Search.searchFailedConn = QObject::connect(
         s, &LargeFileSearch::failed, this,
-        [this, that, parentForModel, patternCopy, fileNameCopy](const QString& /*msg*/) {
+        [this, that, s, parentForModel, patternCopy, fileNameCopy,
+         revisionCopy](const QString& msg) {
             if (!that) return;
-            // 失败也返回空 model（让 Dock 显示 0 结果，避免 UI 不一致）
-            auto *empty = new SearchResultsModel(parentForModel);
-            emit findAllL2Finished(empty, patternCopy, fileNameCopy);
+            if (that->m_contentRevision != revisionCopy) {
+                that->clearSearchHighlights();
+                that->resetPendingL2Search();
+                emit that->findAllL2Finished(nullptr, patternCopy, fileNameCopy);
+                return;
+            }
+            if (auto *mw = qobject_cast<QMainWindow*>(that->window());
+                mw && mw->statusBar()) {
+                mw->statusBar()->showMessage(QObject::tr("搜索失败：%1").arg(msg), 8000);
+            }
+            that->m_l2SearchCacheValid = false;
+            that->m_lastSearchError = msg;
+            auto *partial = new SearchResultsModel(parentForModel);
+            partial->setBytePositionMode(that->isBinaryDocument());
+            partial->setResults(s->memoryMatches(), s->overrunFilePath(), s->overrunCount(),
+                                s->overrunCheckpoints(), s->overrunGroupedCount(), 2);
+            partial->setIncompleteReason(msg);
+            emit findAllL2Finished(partial, patternCopy, fileNameCopy);
             that->resetPendingL2Search();
         });
 
@@ -1808,18 +4740,32 @@ void EditorTab::startPendingL2Search()
 
 bool EditorTab::findAllL2Async(const QString& pattern, bool regex,
                                bool caseSensitive, bool wholeWord,
-                               QObject* parentForModel)
+                               QObject* parentForModel,
+                               bool hexBytes)
 {
+    m_lastSearchError.clear();
     if (!isL2Mode() || !m_l2View || pattern.isEmpty())
         return false;
 
-    // 若已有进行中的搜索：先重置（disconnect + 取消 AsyncTaskManager 的上一次搜索任务）
+    // One search owns the shared mmap/PatchList snapshot until it finishes.
+    // The UI disables duplicate starts; refusing a programmatic overlap avoids
+    // reading a PatchList while another request flushes edits into it.
     if (m_pendingL2Search.active) {
-        LargeFileSearch *oldS = m_l2View->searchEngine();
-        if (oldS && oldS->lastTaskId() > 0) {
-            AsyncTaskManager::instance().cancel(oldS->lastTaskId());
-        }
-        resetPendingL2Search();
+        return false;
+    }
+
+    QString sourceError;
+    if (!ensureWindowedSearchSource(&sourceError)) {
+        m_lastSearchError = sourceError;
+        return false;
+    }
+
+    QString flushError;
+    if (!bridgeFlushOverlayToPatches(&flushError)) {
+        m_lastSearchError = flushError;
+        if (auto *mw = qobject_cast<QMainWindow*>(this->window()))
+            mw->statusBar()->showMessage(QObject::tr("无法准备搜索快照：%1").arg(flushError), 5000);
+        return false;
     }
 
     m_pendingL2Search.active        = true;
@@ -1827,63 +4773,117 @@ bool EditorTab::findAllL2Async(const QString& pattern, bool regex,
     m_pendingL2Search.regex         = regex;
     m_pendingL2Search.caseSensitive = caseSensitive;
     m_pendingL2Search.wholeWord     = wholeWord;
+    m_pendingL2Search.hexBytes      = hexBytes;
+    m_pendingL2Search.contentRevision = m_contentRevision;
     m_pendingL2Search.parentForModel = parentForModel;
 
-    if (!m_l2View->lineIndex().isIncomplete()) {
-        // LineIndex 已完整：立即启动
+    if (m_l2View->isOpen()) {
+        // Search starts from the stable byte snapshot immediately. Line/column
+        // decoration is optional and may still be building in the background.
         startPendingL2Search();
         return true;
     }
+    resetPendingL2Search();
+    return false;
+}
 
-    // LineIndex 还在后台构建：先发 -1 进度（UI 显示"等待行索引构建"），
-    // 等 l2LineBuildFinished 信号再启动搜索。
-    emit findAllL2Progress(-1, 0, 0);
-    QPointer<EditorTab> that(this);
-    m_pendingL2Search.waitLineBuildConn = QObject::connect(
-        this, &EditorTab::l2LineBuildFinished, this,
-        [this, that](bool ok) {
-            if (!that) return;
-            QObject::disconnect(that->m_pendingL2Search.waitLineBuildConn);
-            that->m_pendingL2Search.waitLineBuildConn = QMetaObject::Connection{};
-            if (!ok || !that->m_l2View || that->m_l2View->lineIndex().isIncomplete()) {
-                // LineIndex 构建失败：返回空 model
-                auto *empty = new SearchResultsModel(that->m_pendingL2Search.parentForModel);
-                emit findAllL2Finished(empty,
-                                       that->m_pendingL2Search.pattern,
-                                       that->fileName());
-                that->resetPendingL2Search();
-                return;
-            }
-            that->startPendingL2Search();
-        });
-    return true;
+void EditorTab::cancelFindAllL2()
+{
+    if (!m_pendingL2Search.active)
+        return;
+    cancelPendingL2SearchForContentChange();
 }
 
 bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
-                         bool wholeWord, bool forward, bool wrap)
+                         bool wholeWord, bool forward, bool wrap,
+                         bool hexBytes)
 {
     if (pattern.isEmpty()) return false;
     if (!isL2Mode()) {
-        // L1 原逻辑
-        bool re = regex;
-        bool cs = caseSensitive;
-        bool wo = wholeWord;
-        bool found = false;
-        if (forward) {
-            int line, index;
-            m_editor->getCursorPosition(&line, &index);
-            found = m_editor->findFirst(pattern, re, cs, wo, wrap, true, line, index, true);
-        } else {
-            int line, index;
-            m_editor->getCursorPosition(&line, &index);
-            found = m_editor->findFirst(pattern, re, cs, wo, wrap, false, line, index, true);
+        m_lastSearchError.clear();
+        if (hexBytes) {
+            m_lastSearchError = QObject::tr("十六进制字节搜索仅适用于 Binary/Hex 文档。");
+            return false;
         }
-        return found;
+        const bool cacheMatches = m_l1SearchCacheValid
+            && m_l1SearchCacheRevision == m_contentRevision
+            && m_l1SearchCachePattern == pattern
+            && m_l1SearchCacheRegex == regex
+            && m_l1SearchCacheCaseSensitive == caseSensitive
+            && m_l1SearchCacheWholeWord == wholeWord;
+        if (!cacheMatches)
+            findAll(pattern, regex, caseSensitive, wholeWord);
+        if (!m_l1SearchCacheValid || !m_lastSearchError.isEmpty()
+            || m_l1SearchCache.isEmpty()) {
+            return false;
+        }
+
+        const qint64 selectionStart = m_editor->SendScintilla(
+            QsciScintillaBase::SCI_GETSELECTIONSTART);
+        const qint64 selectionEnd = m_editor->SendScintilla(
+            QsciScintillaBase::SCI_GETSELECTIONEND);
+        int chosen = -1;
+        const bool lastStillSelected = m_lastL1MatchIndex >= 0
+            && m_lastL1MatchIndex < m_l1SearchCache.size()
+            && selectionStart == m_l1SearchCache.at(m_lastL1MatchIndex).byteOffset
+            && selectionEnd == selectionStart
+                               + m_l1SearchCache.at(m_lastL1MatchIndex).byteLength;
+        if (lastStillSelected) {
+            chosen = m_lastL1MatchIndex + (forward ? 1 : -1);
+        } else if (forward) {
+            const qint64 from = selectionStart == selectionEnd
+                ? selectionEnd : qMax(selectionStart, selectionEnd);
+            const auto found = std::lower_bound(
+                m_l1SearchCache.cbegin(), m_l1SearchCache.cend(), from,
+                [](const L1SearchHit &hit, qint64 offset) {
+                    return hit.byteOffset < offset;
+                });
+            chosen = int(std::distance(m_l1SearchCache.cbegin(), found));
+        } else {
+            const qint64 from = selectionStart == selectionEnd
+                ? selectionStart : qMin(selectionStart, selectionEnd);
+            const auto found = std::lower_bound(
+                m_l1SearchCache.cbegin(), m_l1SearchCache.cend(), from,
+                [](const L1SearchHit &hit, qint64 offset) {
+                    return hit.byteOffset < offset;
+                });
+            chosen = int(std::distance(m_l1SearchCache.cbegin(), found)) - 1;
+        }
+        if (chosen < 0 || chosen >= m_l1SearchCache.size()) {
+            if (!wrap)
+                return false;
+            chosen = forward ? 0 : m_l1SearchCache.size() - 1;
+        }
+
+        const L1SearchHit &hit = m_l1SearchCache.at(chosen);
+        m_editor->SendScintilla(QsciScintillaBase::SCI_SETSEL,
+                                long(hit.byteOffset),
+                                long(hit.byteOffset + hit.byteLength));
+        const int line = int(m_editor->SendScintilla(
+            QsciScintillaBase::SCI_LINEFROMPOSITION, long(hit.byteOffset)));
+        m_editor->ensureLineVisible(line);
+        m_editor->ensureCursorVisible();
+        m_editor->setFocus();
+        m_lastL1MatchIndex = chosen;
+        return true;
     }
-    // L2 路径：先做 findAll 同步（缓存到内存+溢出），然后 findNext/findPrev
-    auto *model = findAllL2(pattern, regex, caseSensitive, wholeWord, nullptr);
-    if (!model) return false;
-    delete model;  // 不需要 model 了，LargeFileSearch 内部已保留结果集
+    m_lastSearchError.clear();
+    // L2 路径：同一查询/同一内容修订复用已有结果。旧实现每按一次 F3
+    // 都重新扫描整文件，在 2G+ 日志上等同于功能不可用。
+    const bool cacheMatches = m_l2SearchCacheValid
+        && m_l2SearchCacheRevision == m_contentRevision
+        && m_l2SearchCachePattern == pattern
+        && m_l2SearchCacheRegex == regex
+        && m_l2SearchCacheCaseSensitive == caseSensitive
+        && m_l2SearchCacheWholeWord == wholeWord
+        && m_l2SearchCacheHexBytes == hexBytes;
+    if (!cacheMatches) {
+        auto *model = findAllL2(pattern, regex, caseSensitive, wholeWord,
+                                nullptr, hexBytes);
+        if (!model) return false;
+        delete model;  // 搜索引擎保留有界内存结果与磁盘 spool
+        if (!m_lastSearchError.isEmpty()) return false;
+    }
     LargeFileSearch *s = m_l2View->searchEngine();
     if (!s) return false;
     LargeFileSearchMatch m;
@@ -1896,9 +4896,28 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
     }
     if (off < 0) return false;
     gotoByteOffset(m.byteOffset, m.length);
-    // 从下一次查找的「从 off+1 继续」语义（对齐 notepad++：findNext 从匹配末尾之后的字节开始）
-    m_lastL2Byte = m.byteOffset + qint64(m.length);
+    m_lastL2Byte = m.byteOffset;
     return true;
+}
+
+void EditorTab::resetSearchPosition(bool forward)
+{
+    if (isL2Mode() && m_l2View) {
+        m_lastL2Byte = forward ? -1 : std::numeric_limits<qint64>::max();
+        if (forward)
+            m_l2View->gotoByteOffset(0);
+        else
+            m_l2View->gotoByteOffset(std::numeric_limits<qint64>::max());
+        return;
+    }
+    if (forward) {
+        m_lastL1MatchIndex = -1;
+        m_editor->setCursorPosition(0, 0);
+    } else {
+        m_lastL1MatchIndex = -1;
+        const int lastLine = qMax(0, m_editor->lines() - 1);
+        m_editor->setCursorPosition(lastLine, m_editor->text(lastLine).size());
+    }
 }
 
 void EditorTab::replaceCurrent(const QString &replaceText)
@@ -1928,16 +4947,31 @@ int EditorTab::replaceAll(const QString &find, const QString &replace, bool rege
 {
     if (find.isEmpty()) return 0;
     if (!isL2Mode()) {
-        m_editor->setCursorPosition(0, 0);
-        int count = 0;
-        bool found = m_editor->findFirst(find, regex, caseSensitive, wholeWord,
-                                         false, true, 0, 0, false);
-        while (found) {
-            m_editor->replace(replace);
-            ++count;
-            found = m_editor->findNext();
+        findAll(find, regex, caseSensitive, wholeWord);
+        if (!m_lastSearchError.isEmpty() || !m_l1SearchCacheValid)
+            return 0;
+        const QVector<L1SearchHit> hits = m_l1SearchCache;
+        if (std::any_of(hits.cbegin(), hits.cend(), [](const L1SearchHit &hit) {
+                return hit.byteLength == 0;
+            })) {
+            m_lastSearchError = QObject::tr(
+                "批量替换暂不接受零长度匹配；请让表达式至少消费一个字符。");
+            return 0;
         }
-        return count;
+        const QByteArray replacement = replace.toUtf8();
+        m_editor->SendScintilla(QsciScintillaBase::SCI_BEGINUNDOACTION);
+        for (auto it = hits.crbegin(); it != hits.crend(); ++it) {
+            m_editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETSTART,
+                                    long(it->byteOffset));
+            m_editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETEND,
+                                    long(it->byteOffset + it->byteLength));
+            m_editor->SendScintilla(QsciScintillaBase::SCI_REPLACETARGET,
+                                    static_cast<uintptr_t>(replacement.size()),
+                                    replacement.constData());
+        }
+        m_editor->SendScintilla(QsciScintillaBase::SCI_ENDUNDOACTION);
+        m_editor->setCursorPosition(0, 0);
+        return hits.size();
     }
     // L2：调 LargeFileSearch::replaceAll 分段原子替换（临时仍同步执行，但移除 WindowModal 进度窗避免阻塞）
     if (!m_l2View) return 0;
@@ -1945,14 +4979,9 @@ int EditorTab::replaceAll(const QString &find, const QString &replace, bool rege
     if (!s) return 0;
 
     LargeFileSearch::Options opts;
+    opts.regexMode     = regex;
     opts.caseSensitive = caseSensitive;
     opts.wholeWord     = wholeWord;
-    if (regex) {
-        QRegularExpression::PatternOptions ropts;
-        if (!caseSensitive) ropts |= QRegularExpression::CaseInsensitiveOption;
-        opts.regex = QRegularExpression(find, ropts);
-        if (!opts.regex.isValid()) return 0;
-    }
 
     auto *mw = qobject_cast<QMainWindow*>(this->window());
     LargeFileSearch::ReplaceCallbacks cb;

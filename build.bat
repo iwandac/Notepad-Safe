@@ -20,6 +20,12 @@ set "SCRIPT_DIR=%~dp0"
 set "SOURCE_DIR=%SCRIPT_DIR%."
 set "BUILD_DIR=%SCRIPT_DIR%build"
 
+REM Prefer English diagnostics where the installed compiler supports VSLANG.
+REM UTF-8 console output is also required: otherwise CMake can store a mojibake
+REM /showIncludes prefix and Ninja silently records zero header dependencies.
+set "VSLANG=1033"
+chcp 65001 >nul
+
 if not defined NOTEPADSAFE_WITH_KDBX (
     set "NOTEPADSAFE_WITH_KDBX=ON"
 )
@@ -49,6 +55,11 @@ if defined NOTEPADSAFE_QT6_DIR (
 )
 
 echo === [2/4] Preparing locked dependencies ===
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%tools\bootstrap_pcre2.ps1"
+if errorlevel 1 (
+    echo ERROR: PCRE2 dependency bootstrap failed
+    exit /b 1
+)
 if /I "%NOTEPADSAFE_WITH_KDBX%"=="ON" (
     powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%tools\bootstrap_crypto_deps.ps1"
     if errorlevel 1 (
