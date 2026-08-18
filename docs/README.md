@@ -127,12 +127,12 @@ notepad-safe/
 
 - 供应链版本锁定、更新验证、SBOM 和退出策略（机器锁见 `../third_party/dependencies.lock.json`，操作规程见 `SUPPLY_CHAIN.md`）。
 - 小于 32 MiB：Scintilla 完整编辑。
-- 32 MiB–2 GiB：mmap 立即预览，后台 ILoader 构建，资源允许后晋升完整编辑。
-- 大于 2 GiB：窗口化 Scintilla 只读查看和搜索，不再维护 Patch 编辑器。
+- 32 MiB–2 GiB：窗口化 mmap 只读查看、复制和搜索，不编辑、不替换。
+- 大于 2 GiB：相同的窗口化 mmap 只读分析能力；S2/S3 仅保留尺寸分级。
 - 字面搜索可并行；完整正则统一 PCRE2，以稳定快照保证跨块正确性。
 - KeePassXC Core + Botan + KDBX 4.x 的加密笔记和账号保险库。
 
-当前仓库仍包含旧 PatchList/L2 编辑链及相关测试，它们是迁移期代码，不再代表目标架构。
+旧 S2 ILoader 后台晋升和独立 promotion 测试目标已禁用/移除；PatchList 仅服务小型 Hex 兼容路径，不代表大文件编辑能力。
 
 ## 6. 许可证 & 第三方
 

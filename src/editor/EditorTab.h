@@ -29,7 +29,6 @@ class VirtualFileView;
 class WindowedReadOnlyProvider;
 class QStackedWidget;
 class QIODevice;
-class ILoader;
 class QKeyEvent;
 class QInputMethodEvent;
 class QPlainTextEdit;
@@ -70,11 +69,7 @@ public:
     using ExternalFileState = DiskFileState;
     enum class LargeDocumentRuntimeState {
         None,
-        PreviewReady,
-        PreparingEditor,
-        Editable,
         ReadOnlyAnalysis,
-        ReadOnlyFallback,
     };
     Q_ENUM(LargeDocumentRuntimeState)
 
@@ -100,7 +95,7 @@ public:
     bool isUntitled() const;
     QString filePath() const;
     void setFilePath(const QString &path);
-    // Bounded on-disk version tracking shared by text, promoted S2 and mmap/Hex.
+    // Bounded on-disk version tracking shared by editable S1 and mmap/Hex views.
     // A save must never silently replace a file that changed after it was opened.
     ExternalFileState externalFileState() const;
     void refreshDiskVersionBaseline();
@@ -257,8 +252,8 @@ public:
     bool hasSelectionCommand() const;
     bool canModifyCommand() const;
     // Current user-visible payload size in bytes.  The windowed mmap provider
-    // owns the authoritative 64-bit size before an S2 document is promoted;
-    // Scintilla owns it after promotion and for ordinary/secure documents.
+    // owns the authoritative 64-bit size for S2/S3 read-only analysis;
+    // Scintilla owns it only for sub-32-MiB ordinary/secure documents.
     qint64 contentSizeBytes() const;
 
     // 焦点设置（跳转后对用户可见）
@@ -272,39 +267,32 @@ public:
     // 当前是否处于 L2 模式
     bool isL2Mode() const { return m_l2Mode; }
     bool isLargeDocument() const {
-        return (m_l2Mode && !m_secureBinaryDocument) || m_promotedLargeDocument;
+        return m_l2Mode && !m_secureBinaryDocument;
     }
     bool isReadOnlyByPolicy() const {
-        return m_l2ReadOnlyByPolicy || (m_l2Mode && m_l2TextPreviewReadOnly);
+        return m_l2ReadOnlyByPolicy;
     }
     LargeDocumentRuntimeState largeDocumentRuntimeState() const;
-    QString largeDocumentFallbackReason() const { return m_l2FallbackReason; }
-    bool isLargeFilePreparationRunning() const { return m_l2PromotionTaskId > 0; }
     // 获取 L2 视图（未 openLargeFileL2 时返回 nullptr）
     VirtualFileView* l2View() const { return m_l2View; }
     WindowedReadOnlyProvider *windowedReadOnlyProvider() const {
         return m_windowedReadOnlyProvider;
     }
-    // 显式打开大文件为 L2 模式（创建 VirtualFileView 实例 + openFile）。
-    // 成功后 isL2Mode()=true；失败时回退到 L1 模式并返回 false，此时可走 loadFile 原路径。
-    // 注意：loadFile() 不变（永远走 L1），只有显式调用本函数才走 L2。
-    // errMsg：失败原因（可读），传 nullptr 忽略。
+    // 显式进入 mmap 路径。生产路由仅用于 32 MiB 以上文件，并始终只读；
+    // presentation/contentKind 只决定文本或 Hex 投影，不改变能力边界。
     bool openLargeFileL2(const QString &path, QString *errMsg = nullptr,
-                         bool allowFullTextPromotion = true,
                          L2Presentation presentation = L2Presentation::Text,
                          L2ContentKind contentKind = L2ContentKind::Text);
-    // 保存 L2 视图到指定路径（用 applyAndSaveThenReset 流程）
+    // 仅供 S1 兼容 Hex 路径保存；32 MiB 以上由策略门禁拒绝。
     bool saveL2As(const QString &path, QString *errMsg = nullptr);
 
-    // ==== 会话恢复/保存专用：零副作用 + L1/L2 自动分流 ====
-    // · exportToFile：将当前内容（L1 文档 或 L2 mmap+patch）完整写入 destPath。
-    //   不改变 modified 状态、不改变 m_filePath/m_autosavePath、不清空 L2 patches、
-    //   不 remap。用于 SessionManager::saveSession 周期性 autosave。
+    // ==== 会话恢复/保存专用：零副作用 + S1/只读 mmap 自动分流 ====
+    // · exportToFile：S1 导出编辑内容；只读 mmap 仅复制原文件，不存在 patch。
     bool exportToFile(const QString &destPath) const;
     // S1 恢复专用：导出原编码字节到内存，交给 DraftStore 立即加密。
     // 大文件必须走后续分块恢复日志，避免构造 GiB 级 QByteArray。
     bool exportSnapshotBytes(QByteArray *data) const;
-    // 加密恢复载荷：S1 为完整原编码快照；已晋升的 S2 为相对原文件的有界编辑日志。
+    // 加密恢复载荷：仅 S1 生成完整原编码快照；S2/S3 永久只读。
     bool exportRecoveryPayload(QByteArray *data, QString *error = nullptr) const;
     bool restoreRecoveryPayload(const QByteArray &data, const QString &realFilePath,
                                 QString *error = nullptr);
@@ -415,27 +403,6 @@ private:
     // ---- L2 私有（懒创建 VirtualFileView，避免影响 L1 默认路径）----
     bool               m_l2Mode = false;
     bool               m_l2ReadOnlyByPolicy = false;
-    bool               m_l2TextPreviewReadOnly = false;
-    bool               m_promotedLargeDocument = false;
-    bool               m_promotedLargeDirty = false;
-    bool               m_l2PromotionRepresentsDirty = false;
-    qint64             m_l2PromotionTaskId = 0;
-    QString            m_l2PromotionPath;
-    QString            m_l2FallbackReason;
-    struct LargeRecoveryOperation {
-        enum class Kind : quint8 { Insert = 1, Delete = 2 };
-        Kind kind = Kind::Insert;
-        qint64 position = 0;
-        QByteArray insertedBytes;
-        qint64 deleteLength = 0;
-    };
-    QVector<LargeRecoveryOperation> m_largeRecoveryOperations;
-    QVector<LargeRecoveryOperation> m_pendingRecoveryOperations;
-    qint64             m_recoveryBaseSize = -1;
-    qint64             m_recoveryBaseMtimeMs = -1;
-    QString            m_recoveryBasePath;
-    bool               m_recoveryRequiresCheckpoint = false;
-    bool               m_replayingRecoveryJournal = false;
     DiskFileVersion    m_diskVersion;
     // Scintilla has a save-point model for text edits but cannot be forced
     // dirty by metadata-only changes such as an encoding conversion.
@@ -500,17 +467,6 @@ private:
     void resetPendingL2Search();
     void advanceContentRevision();
     void cancelPendingL2SearchForContentChange();
-    void startLargeTextPromotion(const QString &path, qint64 sourceBytes);
-    void finishLargeTextPromotion(ILoader *loader, qint64 taskId,
-                                  const QString &path, TextEncoding encoding,
-                                  const QString &fallbackReason);
-    void cancelLargeTextPromotion();
-    void resetLargeRecoveryJournal(const QString &basePath);
-    void clearLargeRecoveryOperations(QVector<LargeRecoveryOperation> *operations);
-    bool applyPendingLargeRecovery(QString *error);
-    bool savePromotedLargeAs(const QString &path, QString *errMsg);
-    bool streamPromotedDocumentTo(QIODevice *output, QString *errMsg,
-                                  bool yieldUi) const;
 
     // ============================================================================
     //  L2ScintillaBridge —— VFV 不做任何绘制；Scintilla overlay 盖满 VFV viewport，

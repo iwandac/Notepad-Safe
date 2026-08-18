@@ -1,4 +1,4 @@
-#include "LargeFileVerticalSlice.h"
+#include "WindowedReadOnlyProvider.h"
 #include "EditorSurfaceStyle.h"
 #include "ByteClipboard.h"
 
@@ -15,12 +15,9 @@
 #include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QKeySequence>
-#include <QLabel>
 #include <QMouseEvent>
 #include <QPlainTextEdit>
-#include <QProgressBar>
 #include <QScrollBar>
-#include <QStackedWidget>
 #include <QTextBlock>
 #include <QTextCursor>
 #include <QThread>
@@ -32,7 +29,7 @@
 #include <Qsci/qsciscintilla.h>
 #include <Qsci/qsciscintillabase.h>
 
-#include "ILoader.h"
+#include "Sci_Position.h"
 #include "SharedReadOnlyFile.h"
 
 namespace {
@@ -1445,239 +1442,5 @@ void WindowedReadOnlyProvider::setHexSourceSelection(qint64 anchor, qint64 caret
     syncAsciiSelectionFromHex();
 }
 
-LargeFileVerticalSlice::LargeFileVerticalSlice(QWidget *parent)
-    : QWidget(parent)
-{
-    setObjectName(QStringLiteral("largeFileVerticalSlice"));
-    auto *layout = new QVBoxLayout(this);
-    layout->setContentsMargins(0, 0, 0, 0);
-    auto *statusRow = new QHBoxLayout;
-    m_phaseLabel = new QLabel(tr("未打开"), this);
-    m_phaseLabel->setObjectName(QStringLiteral("largeFilePhaseLabel"));
-    m_progress = new QProgressBar(this);
-    m_progress->setObjectName(QStringLiteral("largeFilePromotionProgress"));
-    m_progress->setRange(0, 1000);
-    m_progress->hide();
-    statusRow->addWidget(m_phaseLabel);
-    statusRow->addWidget(m_progress, 1);
-    layout->addLayout(statusRow);
-
-    m_stack = new QStackedWidget(this);
-    m_stack->setObjectName(QStringLiteral("largeFileProviderStack"));
-    m_preview = new WindowedReadOnlyProvider(m_stack);
-    m_fullEditor = new QsciScintilla(m_stack);
-    m_fullEditor->setObjectName(QStringLiteral("promotedScintillaEditor"));
-    m_fullEditor->setUtf8(true);
-    m_fullEditor->setWrapMode(QsciScintilla::WrapNone);
-    m_fullEditor->setFolding(QsciScintilla::NoFoldStyle);
-    m_stack->addWidget(m_preview);
-    m_stack->addWidget(m_fullEditor);
-    m_stack->setCurrentWidget(m_preview);
-    layout->addWidget(m_stack, 1);
-
-    connect(&m_promotionWatcher, &QFutureWatcher<bool>::finished,
-            this, &LargeFileVerticalSlice::finishPromotion);
-    connect(m_preview, &WindowedReadOnlyProvider::windowReady, this,
-            [this](qint64, qint64, qint64 anchor) {
-        if (m_state == State::PreviewReady || m_state == State::ReadOnlyFallback) {
-            m_phaseLabel->setText(
-                tr("%1 · byte %2 / %3")
-                    .arg(stateText())
-                    .arg(anchor)
-                    .arg(m_preview->fileSize()));
-        }
-    });
-}
-
-LargeFileVerticalSlice::~LargeFileVerticalSlice()
-{
-    cancelPromotion();
-    if (m_promotionWatcher.isRunning())
-        m_promotionWatcher.waitForFinished();
-    if (m_loader) {
-        m_loader->Release();
-        m_loader = nullptr;
-    }
-}
-
-bool LargeFileVerticalSlice::openS2Text(const QString &path, QString *error,
-                                        bool beginPromotion)
-{
-    if (!m_preview->openFile(path, WindowedReadOnlyProvider::Presentation::Text, error))
-        return false;
-    m_path = path;
-    m_fallbackReason.clear();
-    m_stack->setCurrentWidget(m_preview);
-    setState(State::Mapped);
-    setState(State::PreviewReady);
-    if (beginPromotion)
-        QMetaObject::invokeMethod(this, &LargeFileVerticalSlice::startPromotion,
-                                  Qt::QueuedConnection);
-    return true;
-}
-
-bool LargeFileVerticalSlice::openS3Hex(const QString &path, QString *error)
-{
-    if (!m_preview->openFile(path, WindowedReadOnlyProvider::Presentation::Hex, error))
-        return false;
-    m_path = path;
-    m_fallbackReason.clear();
-    m_stack->setCurrentWidget(m_preview);
-    setState(State::Mapped);
-    setState(State::PreviewReady);
-    return true;
-}
-
-void LargeFileVerticalSlice::startPromotion()
-{
-    if (m_state != State::PreviewReady && m_state != State::ReadOnlyFallback)
-        return;
-    if (m_promotionWatcher.isRunning())
-        return;
-
-    constexpr int options = QsciScintillaBase::SC_DOCUMENTOPTION_STYLES_NONE
-                            | QsciScintillaBase::SC_DOCUMENTOPTION_TEXT_LARGE;
-    m_loader = reinterpret_cast<ILoader *>(directScintilla(
-        m_fullEditor, QsciScintillaBase::SCI_CREATELOADER,
-        static_cast<ScintillaUnsigned>(m_preview->fileSize()), options));
-    if (!m_loader) {
-        enterFallback(tr("无法分配 Scintilla 后台文档"));
-        return;
-    }
-
-    m_cancelPromotion.storeRelease(false);
-    m_progress->setValue(0);
-    m_progress->show();
-    setState(State::Reading);
-    const QString path = m_path;
-    const qint64 total = m_preview->fileSize();
-    ILoader *loader = m_loader;
-    QPointer<LargeFileVerticalSlice> guard(this);
-    m_promotionWatcher.setFuture(QtConcurrent::run([this, guard, path, total, loader]() {
-        QFile input(path);
-        if (!input.open(QIODevice::ReadOnly))
-            return false;
-        QByteArray chunk(4 * 1024 * 1024, Qt::Uninitialized);
-        qint64 completed = 0;
-        while (!input.atEnd()) {
-            if (m_cancelPromotion.loadAcquire())
-                return false;
-            const qint64 count = input.read(chunk.data(), chunk.size());
-            if (count < 0)
-                return false;
-            if (count > 0 && loader->AddData(chunk.constData(), count) != 0)
-                return false;
-            completed += count;
-            if (guard) {
-                QMetaObject::invokeMethod(guard, [guard, completed, total]() {
-                    if (!guard)
-                        return;
-                    guard->m_progress->setValue(total > 0
-                        ? int((static_cast<long double>(completed) * 1000) / total) : 0);
-                    emit guard->promotionProgress(completed, total);
-                }, Qt::QueuedConnection);
-            }
-        }
-        if (guard) {
-            QMetaObject::invokeMethod(guard, [guard]() {
-                if (guard)
-                    guard->setState(State::BuildingDocument);
-            }, Qt::QueuedConnection);
-        }
-        return !m_cancelPromotion.loadAcquire();
-    }));
-}
-
-void LargeFileVerticalSlice::cancelPromotion()
-{
-    m_cancelPromotion.storeRelease(true);
-}
-
-QString LargeFileVerticalSlice::stateText() const
-{
-    switch (m_state) {
-    case State::Closed: return tr("未打开");
-    case State::Mapped: return tr("已映射");
-    case State::PreviewReady: return tr("只读预览可用");
-    case State::Reading: return tr("读取/解码");
-    case State::BuildingDocument: return tr("构建编辑文档");
-    case State::Attaching: return tr("附加编辑文档");
-    case State::Editable: return tr("可编辑");
-    case State::ReadOnlyFallback: return tr("只读分析：%1").arg(m_fallbackReason);
-    }
-    return {};
-}
-
-qint64 LargeFileVerticalSlice::fullDocumentLength() const
-{
-    return directScintilla(m_fullEditor, QsciScintillaBase::SCI_GETLENGTH);
-}
-
-qint64 LargeFileVerticalSlice::fullEditorPosition() const
-{
-    return directScintilla(m_fullEditor, QsciScintillaBase::SCI_GETCURRENTPOS);
-}
-
-int LargeFileVerticalSlice::visibleVerticalScrollBarCount() const
-{
-    int count = 0;
-    const auto bars = findChildren<QScrollBar *>();
-    for (const QScrollBar *bar : bars) {
-        if (bar->orientation() == Qt::Vertical && bar->isVisibleTo(this))
-            ++count;
-    }
-    return count;
-}
-
-void LargeFileVerticalSlice::setState(State state)
-{
-    m_state = state;
-    m_phaseLabel->setText(stateText());
-    emit stateChanged(state);
-}
-
-void LargeFileVerticalSlice::enterFallback(const QString &reason)
-{
-    m_fallbackReason = reason;
-    m_progress->hide();
-    m_stack->setCurrentWidget(m_preview);
-    setState(State::ReadOnlyFallback);
-}
-
-void LargeFileVerticalSlice::finishPromotion()
-{
-    if (!m_loader)
-        return;
-    if (!m_promotionWatcher.result() || m_cancelPromotion.loadAcquire()) {
-        m_loader->Release();
-        m_loader = nullptr;
-        enterFallback(m_cancelPromotion.loadAcquire() ? tr("用户已取消准备编辑")
-                                                       : tr("读取或构建编辑文档失败"));
-        return;
-    }
-
-    setState(State::Attaching);
-    const qint64 restoreOffset = m_preview->globalOffset();
-    void *document = m_loader->ConvertToDocument();
-    if (!document) {
-        m_loader->Release();
-        m_loader = nullptr;
-        enterFallback(tr("转换 Scintilla 文档失败"));
-        return;
-    }
-    m_fullEditor->SendScintilla(QsciScintillaBase::SCI_SETDOCPOINTER, 0UL, document);
-    m_loader->Release();
-    m_loader = nullptr;
-    m_fullEditor->SendScintilla(QsciScintillaBase::SCI_SETVSCROLLBAR, 1UL);
-    m_fullEditor->SendScintilla(QsciScintillaBase::SCI_SETUNDOCOLLECTION, 1UL);
-    m_fullEditor->SendScintilla(QsciScintillaBase::SCI_EMPTYUNDOBUFFER);
-    m_fullEditor->SendScintilla(QsciScintillaBase::SCI_SETSAVEPOINT);
-    m_fullEditor->setReadOnly(false);
-    directScintilla(m_fullEditor, QsciScintillaBase::SCI_GOTOPOS,
-                    static_cast<ScintillaUnsigned>(restoreOffset));
-    directScintilla(m_fullEditor, QsciScintillaBase::SCI_SCROLLCARET);
-    m_stack->setCurrentWidget(m_fullEditor);
-    m_progress->setValue(1000);
-    m_progress->hide();
-    setState(State::Editable);
-}
+// S2 and S3 both use this provider and never construct a complete Scintilla
+// document in the background.

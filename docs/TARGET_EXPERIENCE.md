@@ -30,7 +30,7 @@
 4. **日常操作不要求理解加密。** 新建默认安全；打开只有一个入口；保存保持当前类型；只有“另存为”承担安全文档与普通文件之间的显式转换。
 5. **文件大小不产生第二套编辑器。** S1/S2/S3 Text 共用同一 EditorSurface，B1/B2/B3
    Binary 共用同一 HexView；Tier 只改变数据源、任务状态和写入 capability。字体、gutter、
-   正文、滚动条位置、选择、搜索高亮、菜单和主题必须一致，S2 晋升/回退不得发生可见换页。
+   正文、滚动条位置、选择、搜索高亮、菜单和主题必须一致；S2/S3 始终是同一只读表面。
 
 不追求的范围：IDE 调试器、终端、语言服务器、工程构建、Git 工作流、远程开发、插件市场、云同步和浏览器自动填充。参考 VS Code 是为了学习编辑、恢复、搜索和状态反馈，不是把产品扩展成 IDE。
 
@@ -43,7 +43,7 @@
 | ContentKind | Text / Bytes / Accounts | 用户在操作正文、原始字节还是账号条目 |
 | PersistenceKind | PlainFile / SecureKdbx / SecureDraft / AccountsKdbx | 保存、恢复、冲突检测和格式转换 |
 | Presentation | Text / Hex / Accounts | 屏幕如何呈现内容；Text/Hex 可由用户重新解释 |
-| ProviderState | S1 Editable / S2 Preview / S2 Editable / S2 Fallback / S3 ReadOnly / Locked | 当前可用命令和资源状态 |
+| ProviderState | S1 Editable / Large ReadOnly / Locked | 当前可用命令和资源状态 |
 
 核心不变量：
 
@@ -137,12 +137,10 @@ flowchart LR
 | 状态 | 打开后体验 | 编辑/替换 | 搜索 |
 |---|---|---|---|
 | S1 `<32 MiB` | 完整 Scintilla，立即编辑 | 全部支持 | 当前/全部打开；目录留待发布后独立立项 |
-| S2 `32 MiB–2 GiB` Preview | 按需随机读首屏和全文件连续浏览，后台准备编辑 | 暂时禁用 | 立即可搜索，不等待完整索引 |
-| S2 Editable | 晋升完整 Scintilla，位置和选择保持 | 全部支持 | 与 S1 同语义 |
-| S2 Fallback | 资源不足/取消/失败后稳定只读分析 | 禁用并说明原因 | 与 S3 同语义，可重试晋升 |
+| S2 `32 MiB–2 GiB` | 按需随机读首屏和全文件连续浏览 | 永久禁用 | 与 S3 同一只读搜索路径 |
 | S3 `>2 GiB` | 永久窗口化只读分析 | 禁用 | 全文件 literal/PCRE2、渐进结果 |
 
-快速打开的定义不是“`openFile()` 很快返回”，而是窗口在预算内显示正确首屏，立刻响应滚动/搜索/复制，并且后台任务最终能证明 Provider 已进入 Editable 或明确的 ReadOnlyFallback。
+快速打开的定义不是“`openFile()` 很快返回”，而是窗口在预算内显示正确首屏，并立刻响应滚动、搜索和复制。32 MiB 以上不得创建“准备编辑”后台任务或切换到完整 Scintilla 文档。
 
 ### 6.2 窗口化浏览连续性
 
@@ -156,14 +154,11 @@ Windowed Provider 是一个无限文档的有限投影，必须模拟普通编�
 - 横向 extent 不能只由当前投影中偶然出现的短行决定。超长行跨窗口时，需要 line-aware range、延迟测量或专用长行视图，确保最右内容可达。
 - 文件追加时可选择 Tail 模式；用户手工向上滚动即暂停跟随，并提供明确“回到末尾”，不能抢回位置。
 
-### 6.3 S2 晋升
+### 6.3 S2/S3 统一只读
 
-- SourceReady → PreviewReady → Reading → Decoding → BuildingDocument → Attaching → Editable 阶段在任务中心可见；是否使用 mmap 是内部实现，不进入用户心智。
-- 进度显示源字节、总字节、吞吐和取消能力；不以线程数冒充进度，也不因 mmap 单线程足够快而强制多线程。
-- 晋升期间预览持续可操作；最后一次用户位置胜过 worker 开始时保存的旧位置。
-- 附加完整 Scintilla 文档后，当前位置、选区、搜索高亮、编码、EOL、主题和菜单能力一次性切换，不闪白、不回到文件头。
-- 资源准入在分配前进行；发生交换风暴风险时主动留在 S2 Fallback，而不是让系统假死。
-- Preview 背后不得存在未展示的第二套 mmap/索引引擎；任务取消、编码失败或资源拒绝后状态必须明确收敛为 ReadOnlyFallback，预览正文继续可滚动、搜索和复制。
+- 32 MiB 以上始终保持 `Large ReadOnly`，不创建后台编辑文档、不做资源准入、不提供重试晋升。
+- 任务中心只显示真实发生的搜索、索引或文件刷新任务，不得出现“准备大文件编辑”。
+- Preview 背后不得存在未展示的第二套编辑器或完整文件副本；浏览、搜索和复制共用同一位置真值。
 
 ### 6.4 本次方案验证结论与关闭状态
 
@@ -175,7 +170,7 @@ Windowed Provider 是一个无限文档的有限投影，必须模拟普通编�
 | `LF-UX-002` | **Round 9 已关闭。** wheel/pixelDelta 在窗口内逐行移动，只在重叠边界换页 | 小幅滚轮显示相邻行；跨窗口无重复、gap、闪回和大跳 | 五个窗口双向滚轮/触控板、末尾稳定等待与 4.59 GiB 搜索跳转通过；`gui-largefile-200dpi-round9.txt` |
 | `HEX-UX-001` | **Round 3 已关闭核心阻断。** offset/Hex/ASCII 共用 byte selection，B1 编辑/Undo/保存与搜索跳转已动态验收；字节通配符和 Inspector 留作后续增强 | offset、Hex、ASCII、caret、selection、编辑、搜索和保存形成一致模型 | `gui-hex-round3-slice.txt`、`gui-hex-search-final.txt` 与逐字节 round-trip 均通过 |
 | `HEX-UX-002` | **Round 9 已关闭。** B1/B2/B3 均按 viewport 选择完整 4-byte 分组；宽窄重排不裁切首末 nibble，也不继承旧横向偏移 | 依据窗口宽度采用合适 bytes-per-row；窄/宽窗口紧凑可读 | 默认/窄宽截图及实际 200% DPI 编辑—保存—重开、崩溃恢复 4/4 通过；`gui-hex-200dpi-round9.txt` |
-| `TIER-UX-003` | **部分关闭。** Binary 可见契约已统一：B1/B2/B3 均为地址 margin、纯 Hex 网格、独立 ASCII pane、两表面同步滚轮和唯一全局纵向滚动条；Binary→Text 后统一切换为文本行号。内部 Provider 仍不同，Text S1/S2/S3 的几何与模式迁移一致性尚未关闭 | Text 各 Tier 共用 EditorSurface；Binary 各 Tier 共用 HexView 可见契约；只允许 capability/状态文案不同 | `windowedHexUsesUnifiedThreeColumnByteContract`、`windowedHexBothPanesWheelInLockstep`、Binary→Text gutter/会话恢复、真实 228MB/4.9GB 样本与 B1 邻接回归通过；Text 同内容切片及 S2 Preview→Editable/Fallback 逐帧无几何变化仍待证明 |
+| `TIER-UX-003` | **部分关闭。** Binary 可见契约已统一：B1/B2/B3 均为地址 margin、纯 Hex 网格、独立 ASCII pane、两表面同步滚轮和唯一全局纵向滚动条；Binary→Text 后统一切换为文本行号。内部 Provider 仍不同，Text S1/S2/S3 的几何与模式迁移一致性尚未关闭 | Text 各 Tier 共用 EditorSurface；Binary 各 Tier 共用 HexView 可见契约；只允许 capability/状态文案不同 | `windowedHexUsesUnifiedThreeColumnByteContract`、`windowedHexBothPanesWheelInLockstep`、Binary→Text gutter/会话恢复、真实 228MB/4.9GB 样本与 B1 邻接回归通过；Text 同内容切片及 S1 可编辑表面与 S2/S3 只读表面的逐帧几何一致性仍待证明 |
 
 除上述已复现项外，下面是必须主动探索的风险。它们不表示已经观察到缺陷，但在关闭对应旅程前必须用动态测试证明不存在：
 
@@ -279,7 +274,7 @@ Binary/Hex 文档中未勾选“正则表达式”的普通文本查询必须始
 
 ### 8.2 语义一致性
 
-- Text 的 literal/whole word/PCRE2 在 S1、S2 Preview、S2 Editable、S3 和 Secure Text 上语义一致。
+- Text 的 literal/whole word/PCRE2 在 S1、S2/S3 ReadOnly 和 Secure Text 上语义一致。
 - Hex 的 byte/text 查询在 B1/B2/B3 和 Secure Binary 上语义一致。
 - 搜索不以完整 LineIndex 为启动条件；line/column/context 可以稍后装饰，Match 的 64 位 byte range 先成立。
 - 编码转换由 PositionMapper 管理；UTF-8/GBK/UTF-16、中文、emoji、CRLF、跨块和 2 GiB 后的位置都不能用裸 int 猜测。
@@ -289,7 +284,7 @@ Binary/Hex 文档中未勾选“正则表达式”的普通文本查询必须始
 ### 8.3 替换
 
 - 当前文件 Replace/Replace All 作用于当前可编辑 target，并形成可撤销操作组。
-- 全部打开文件先生成 eligible/skipped/failed manifest，再对 S1、已晋升 S2 和 Secure Text 等兼容目标执行；S3/B3/S2 Preview 明确跳过。
+- 全部打开文件先生成 eligible/skipped/failed manifest，再对 S1 和 Secure Text 等兼容目标执行；S2/S3/B2/B3 明确跳过替换。
 - 批量替换成功后保持各自 PersistenceKind，只标脏、不自动把安全文件解密保存或把普通文件加密。
 - Replace 在当前命中已经选中时先替换该命中，再选择下一处；不得先 Find Next 而跳过用户看到的
   当前项。Literal replacement 中 `$1`、`${name}`、`\1`、`\n` 全部按字面写入；Regex
@@ -364,7 +359,7 @@ Binary/Hex 文档中未勾选“正则表达式”的普通文本查询必须始
 
 - Text：语言、长度/行数、Ln/Col/byte、EOL、编码、INS/OVR、dirty/只读。
 - Hex：文件大小、absolute offset、selection bytes、B1/B2/B3、INS/OVR 或只读。
-- S2/S3：档位、Preview/Preparing/Editable/ReadOnlyFallback、全局 64 位位置；不显示两个互相冲突的滚动百分比。
+- S2/S3：档位、只读分析、全局 64 位位置；不显示 Preview/Preparing/Editable/ReadOnlyFallback 等已废止状态，也不显示两个互相冲突的滚动百分比。
 - Accounts：不显示文档行列/编码；只显示必要的身份/会话或同步状态。
 - 无文档：隐藏上一文件元数据。
 
@@ -389,7 +384,7 @@ Binary/Hex 文档中未勾选“正则表达式”的普通文本查询必须始
 | Text 编辑 | 输入、选择、Undo、剪贴板、行操作、书签 | 菜单和快捷键各执行，文件 round-trip |
 | Text 呈现 | wrap、长行横滚、zoom、主题、lexer | 长行最右字符、主题/DPI、切换后位置保持 |
 | 编码/EOL | 检测、重开、转换、BOM、状态栏 | UTF-8/16/GBK 与 CRLF/LF golden 保存重开 |
-| S2 | 快速预览、连续浏览、晋升、回退 | 256 MiB 与接近 2 GiB 的头/中/尾浏览编辑保存 |
+| S2 | 快速只读、连续浏览、搜索、复制 | 256 MiB 与接近 2 GiB 的头/中/尾浏览；确认无编辑后台任务 |
 | S3 | 全范围只读、搜索、Tail 可选 | 4.59 GiB/10+ GiB 滚动、搜索、跳转、取消 |
 | Hex | 三栏、nibble/ASCII、选择、复制、Go to、Find | 0–255、EOF、跨窗口、B1 写入与 B2/B3 只读 |
 | 查找 | 当前/全部打开、literal/regex/byte；目录明确不在本版 | 真实对话框输入、F3、范围切换、取消 |
@@ -435,7 +430,7 @@ SecurityIdentityId / KeyVersion（只记录非秘密 ID）/ SessionState
 TaskId / Phase / CompletedBytes / TotalBytes / CancelState
 ```
 
-这些字段用于区分“搜索找到错位置”“窗口载入错内容”“旧异步请求覆盖”“晋升回到旧位置”和“保存转换错格式”，不得写入密码、FileKey、TOTP seed 或安全正文。
+这些字段用于区分“搜索找到错位置”“窗口载入错内容”“旧异步请求覆盖”和“保存转换错格式”，不得写入密码、FileKey、TOTP seed 或安全正文。
 
 ### 13.3 视觉与设备矩阵
 
@@ -487,9 +482,9 @@ TaskId / Phase / CompletedBytes / TotalBytes / CancelState
 
 打开 2 GiB+ 日志→首屏立即可见→滚轮连续浏览→当前文件 Find All→渐进 Dock→双击多个远距离结果精确高亮→切到全部打开文件→取消→手工滚动位置不被旧任务覆盖。
 
-### Journey H：S2 晋升与回退
+### Journey H：S2/S3 统一只读
 
-打开 256 MiB/近 2 GiB 文本→预览时浏览和搜索→任务中心显示阶段→晋升后位置不变并编辑头/中/尾→保存重开；低资源/取消/故障则稳定留在可浏览搜索的 fallback。
+打开 256 MiB/近 2 GiB 文本→连续浏览和搜索→确认任务中心没有准备编辑任务→输入、粘贴、删除、替换和保存修改均不可用→原文件 hash 不变。
 
 ## 15. 自主探索闭环
 

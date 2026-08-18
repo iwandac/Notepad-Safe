@@ -2,7 +2,7 @@
 #include "EditorSurfaceStyle.h"
 #include "ByteClipboard.h"
 #include "VirtualFileView.h"
-#include "LargeFileVerticalSlice.h"
+#include "WindowedReadOnlyProvider.h"
 #include "FileTierPolicy.h"
 #include "SearchResultsModel.h"
 #include "Pcre2Regex.h"
@@ -43,6 +43,8 @@
 #include <QScrollBar>
 #include <QSignalBlocker>
 #include <QScopeGuard>
+
+#include "Sci_Position.h"
 #include <QBuffer>
 #include <algorithm>
 #include <limits>
@@ -53,7 +55,6 @@
 #include <stdexcept>
 #include <string>
 
-#include <ILoader.h>
 
 #ifdef Q_OS_WIN
 #ifndef NOMINMAX
@@ -101,8 +102,6 @@ QsciScintilla::EolMode detectLineEndingMode(const QString &text)
 }
 
 constexpr char LargeRecoveryMagic[] = "NotepadSafe.LargeEditJournal.v1";
-constexpr quint32 LargeRecoveryVersion = 1;
-constexpr qsizetype MaximumLargeRecoveryPayload = 32 * 1024 * 1024;
 constexpr char BinaryRecoveryMagic[] = "NotepadSafe.BinaryPatchJournal.v1";
 constexpr quint32 BinaryRecoveryVersion = 1;
 
@@ -301,61 +300,6 @@ private:
     int remaining_ = 0;
 };
 
-TextEncoding sniffLargeTextEncoding(const QString &path)
-{
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly))
-        return TextEncoding::Utf8;
-    const QByteArray sample = file.read(1024 * 1024);
-    if (sample.size() >= 3
-        && static_cast<unsigned char>(sample[0]) == 0xef
-        && static_cast<unsigned char>(sample[1]) == 0xbb
-        && static_cast<unsigned char>(sample[2]) == 0xbf) {
-        return TextEncoding::Utf8Bom;
-    }
-    if (sample.size() >= 2
-        && static_cast<unsigned char>(sample[0]) == 0xff
-        && static_cast<unsigned char>(sample[1]) == 0xfe) {
-        return TextEncoding::Utf16LE;
-    }
-    if (sample.size() >= 2
-        && static_cast<unsigned char>(sample[0]) == 0xfe
-        && static_cast<unsigned char>(sample[1]) == 0xff) {
-        return TextEncoding::Utf16BE;
-    }
-    Utf8StreamValidator validator;
-    return validator.feed(sample.constData(), sample.size())
-               ? TextEncoding::Utf8 : TextEncoding::GBK;
-}
-
-qint64 estimatedUtf8Size(qint64 sourceBytes, TextEncoding encoding)
-{
-    if (sourceBytes < 0)
-        return -1;
-    if (encoding == TextEncoding::Utf8 || encoding == TextEncoding::Utf8Bom)
-        return sourceBytes;
-    // UTF-16 and the Windows system codepage can expand when represented as UTF-8.
-    // 1.5x is the conservative common-language bound used for admission; overflow
-    // saturates so the file safely remains in analysis mode.
-    if (sourceBytes > (std::numeric_limits<qint64>::max() / 3) * 2)
-        return std::numeric_limits<qint64>::max();
-    return sourceBytes + sourceBytes / 2;
-}
-
-QString admissionFallbackText(ResourceAdmissionReason reason)
-{
-    switch (reason) {
-    case ResourceAdmissionReason::PhysicalMemoryBudgetExceeded:
-        return QObject::tr("当前物理内存不足，保持只读分析模式");
-    case ResourceAdmissionReason::CommitReserveInsufficient:
-        return QObject::tr("当前可提交内存不足，保持只读分析模式");
-    case ResourceAdmissionReason::InvalidMemorySnapshot:
-        return QObject::tr("无法确认安全内存余量，保持只读分析模式");
-    default:
-        return QObject::tr("当前文件不能晋升为完整编辑模式");
-    }
-}
-
 } // namespace
 
 EditorTab::ExternalFileState EditorTab::externalFileState() const
@@ -401,17 +345,6 @@ EditorTab::EditorTab(QWidget *parent)
             this, &EditorTab::commandCapabilitiesChanged);
     connect(m_editor, &QsciScintilla::textChanged,
             this, &EditorTab::commandCapabilitiesChanged);
-    connect(&AsyncTaskManager::instance(), &AsyncTaskManager::taskFinished,
-            this, [this](qint64 taskId, AsyncTaskState state) {
-        // A queued task can be canceled before its worker body ever runs, so
-        // worker-side cancellation checks alone cannot complete the UI state.
-        if (taskId != m_l2PromotionTaskId || state != AsyncTaskState::Canceled)
-            return;
-        const QString path = m_l2PromotionPath;
-        finishLargeTextPromotion(
-            nullptr, taskId, path, TextEncoding::Utf8,
-            QObject::tr("用户已取消准备编辑，保持只读分析模式"));
-    });
 }
 
 EditorTab::~EditorTab() {
@@ -425,9 +358,6 @@ EditorTab::~EditorTab() {
     //
     //  此处析构体里仅做 dtor-safe 兜底：如果 MainWindow 路径没执行到（如异常析构），
     //  手动调 closeFile(false)—— 禁止 processEvents，保守等待 500ms 让 worker 自退出。
-    cancelLargeTextPromotion();
-    clearLargeRecoveryOperations(&m_largeRecoveryOperations);
-    clearLargeRecoveryOperations(&m_pendingRecoveryOperations);
     bridgeReparentEditorToStack();
     clearL2BridgeBaseline();
     if (m_windowedReadOnlyProvider)
@@ -438,7 +368,6 @@ EditorTab::~EditorTab() {
 }
 
 void EditorTab::shutdownL2BeforeClose() {
-    cancelLargeTextPromotion();
     if (m_windowedReadOnlyProvider)
         m_windowedReadOnlyProvider->closeFile();
     if (Q_LIKELY(!m_l2Mode || !m_l2View)) return;
@@ -541,45 +470,12 @@ void EditorTab::setupEditor()
         emit titleChanged(tabTitle());
     });
     connect(m_editor, &QsciScintilla::SCN_MODIFIED, this,
-            [this](int position, int modificationType, const char *text, int length, int,
+            [this](int, int modificationType, const char *, int, int,
                    int, int, int, int, int) {
         constexpr int contentChanges = QsciScintillaBase::SC_MOD_INSERTTEXT
                                        | QsciScintillaBase::SC_MOD_DELETETEXT;
-        if (!m_bridge.applying && (modificationType & contentChanges)) {
+        if (!m_bridge.applying && (modificationType & contentChanges))
             advanceContentRevision();
-            if (m_promotedLargeDocument && !m_replayingRecoveryJournal && length > 0) {
-                if ((modificationType & QsciScintillaBase::SC_MOD_INSERTTEXT) && text) {
-                    const QByteArray inserted(text, length);
-                    if (!m_largeRecoveryOperations.isEmpty()) {
-                        auto &last = m_largeRecoveryOperations.last();
-                        if (last.kind == LargeRecoveryOperation::Kind::Insert
-                            && last.position + last.insertedBytes.size() == position) {
-                            last.insertedBytes.append(inserted);
-                            return;
-                        }
-                    }
-                    LargeRecoveryOperation operation;
-                    operation.kind = LargeRecoveryOperation::Kind::Insert;
-                    operation.position = position;
-                    operation.insertedBytes = inserted;
-                    m_largeRecoveryOperations.push_back(std::move(operation));
-                } else if (modificationType & QsciScintillaBase::SC_MOD_DELETETEXT) {
-                    if (!m_largeRecoveryOperations.isEmpty()) {
-                        auto &last = m_largeRecoveryOperations.last();
-                        if (last.kind == LargeRecoveryOperation::Kind::Delete
-                            && last.position == position) {
-                            last.deleteLength += length;
-                            return;
-                        }
-                    }
-                    LargeRecoveryOperation operation;
-                    operation.kind = LargeRecoveryOperation::Kind::Delete;
-                    operation.position = position;
-                    operation.deleteLength = length;
-                    m_largeRecoveryOperations.push_back(std::move(operation));
-                }
-            }
-        }
     });
 }
 
@@ -587,12 +483,6 @@ bool EditorTab::loadFile(const QString &path)
 {
     m_metadataModified = false;
     m_binaryDocument = false;
-    cancelLargeTextPromotion();
-    resetLargeRecoveryJournal(QString());
-    m_promotedLargeDocument = false;
-    m_promotedLargeDirty = false;
-    m_l2PromotionRepresentsDirty = false;
-    m_l2TextPreviewReadOnly = false;
     QElapsedTimer t; t.start();
     const qint64 size = QFileInfo(path).size();
     const FileTierDecision tier = FileTierPolicy::classify(size);
@@ -627,7 +517,7 @@ bool EditorTab::loadFile(const QString &path)
     m_autosavePath.clear();  // 加载正式文件，清除 autosave 关联
 
     // 大文件分块加载：避免 setText() 一次性重建整个文档导致 UI 长时间卡死
-    // （Notepad++ / Scintilla 的 ILoader 也是增量加载，此处用 SCI_APPENDTEXT 分块追加）
+    // This bounded chunk append belongs to the S1 path only.
     const int largeThreshold = 2 * 1024 * 1024; // 2MB 以上走分块路径
     if (data.size() < largeThreshold) {
         // 重置 scrollWidth：tracking 模式只增不减，切换文件时需手动归零
@@ -708,11 +598,6 @@ bool EditorTab::loadAutosaveBytes(const QByteArray &data, const QString &backing
     m_binaryDocument = false;
     if (data.size() >= FileTierPolicy::StandardEditLimitBytes)
         return false;
-    cancelLargeTextPromotion();
-    m_promotedLargeDocument = false;
-    m_promotedLargeDirty = false;
-    m_l2PromotionRepresentsDirty = false;
-    m_l2TextPreviewReadOnly = false;
 
     DecodeResult result = decodeBytes(data);
     m_encoding = result.encoding;
@@ -779,8 +664,6 @@ bool EditorTab::saveAsFile(const QString &path, QString *errMsg)
     }
     if (isL2Mode())
         return saveL2As(path, errMsg);
-    if (m_promotedLargeDocument)
-        return savePromotedLargeAs(path, errMsg);
 
     QByteArray data = encodeText(m_editor->text(), m_encoding);
 
@@ -815,137 +698,12 @@ bool EditorTab::saveAsFile(const QString &path, QString *errMsg)
     return true;
 }
 
-bool EditorTab::savePromotedLargeAs(const QString &path, QString *errMsg)
-{
-    if (!m_promotedLargeDocument || path.isEmpty()) {
-        if (errMsg)
-            *errMsg = QObject::tr("大文件保存参数无效。");
-        return false;
-    }
-
-    QSaveFile output(path);
-    output.setDirectWriteFallback(false);
-    if (!output.open(QIODevice::WriteOnly)) {
-        if (errMsg)
-            *errMsg = QObject::tr("无法建立原子保存文件：%1").arg(output.errorString());
-        return false;
-    }
-
-    m_editor->setReadOnly(true);
-    const auto restoreEditable = [this]() { m_editor->setReadOnly(false); };
-    if (!streamPromotedDocumentTo(&output, errMsg, true)) {
-        output.cancelWriting();
-        restoreEditable();
-        return false;
-    }
-    if (!output.commit()) {
-        restoreEditable();
-        if (errMsg)
-            *errMsg = QObject::tr("原子提交大文件失败：%1").arg(output.errorString());
-        return false;
-    }
-
-    restoreEditable();
-    if (auto *window = qobject_cast<QMainWindow *>(this->window()))
-        window->statusBar()->showMessage(QObject::tr("大文件已保存"), 3000);
-    m_filePath = QFileInfo(path).absoluteFilePath();
-    m_editor->SendScintilla(QsciScintillaBase::SCI_SETSAVEPOINT);
-    m_editor->setModified(false);
-    m_promotedLargeDirty = false;
-    resetLargeRecoveryJournal(m_filePath);
-    clearAutosaveFile();
-    m_autosavePath.clear();
-    refreshDiskVersionBaseline();
-    emit titleChanged(tabTitle());
-    return true;
-}
-
-bool EditorTab::streamPromotedDocumentTo(QIODevice *output, QString *errMsg,
-                                         bool yieldUi) const
-{
-    if (!output || !output->isWritable()) {
-        if (errMsg)
-            *errMsg = QObject::tr("大文件输出设备不可写。");
-        return false;
-    }
-
-    QByteArray bom;
-    switch (m_encoding) {
-    case TextEncoding::Utf8Bom:  bom = QByteArray("\xef\xbb\xbf", 3); break;
-    case TextEncoding::Utf16LE:  bom = QByteArray("\xff\xfe", 2); break;
-    case TextEncoding::Utf16BE:  bom = QByteArray("\xfe\xff", 2); break;
-    default: break;
-    }
-    if (!bom.isEmpty() && output->write(bom) != bom.size()) {
-        if (errMsg)
-            *errMsg = QObject::tr("写入文件编码标记失败。");
-        return false;
-    }
-
-    std::unique_ptr<QStringDecoder> decoder;
-    std::unique_ptr<QStringEncoder> encoder;
-    if (m_encoding != TextEncoding::Utf8 && m_encoding != TextEncoding::Utf8Bom) {
-        decoder = std::make_unique<QStringDecoder>(QStringConverter::Utf8);
-        if (m_encoding == TextEncoding::Utf16LE)
-            encoder = std::make_unique<QStringEncoder>(QStringConverter::Utf16LE);
-        else if (m_encoding == TextEncoding::Utf16BE)
-            encoder = std::make_unique<QStringEncoder>(QStringConverter::Utf16BE);
-        else
-            encoder = std::make_unique<QStringEncoder>(QStringConverter::System);
-    }
-
-    const qint64 total = static_cast<qint64>(directScintilla(
-        m_editor, QsciScintillaBase::SCI_GETLENGTH));
-    constexpr qint64 chunkBytes = 8LL * 1024 * 1024;
-    auto *window = yieldUi ? qobject_cast<QMainWindow *>(this->window()) : nullptr;
-    for (qint64 position = 0; position < total;) {
-        const qint64 length = qMin(chunkBytes, total - position);
-        const char *data = reinterpret_cast<const char *>(directScintilla(
-            m_editor, QsciScintillaBase::SCI_GETRANGEPOINTER,
-            static_cast<ScintillaUnsigned>(position),
-            static_cast<ScintillaSigned>(length)));
-        if (!data) {
-            if (errMsg)
-                *errMsg = QObject::tr("读取 Scintilla 大文件快照失败。");
-            return false;
-        }
-        QByteArray encoded;
-        if (decoder && encoder) {
-            const QString decoded = (*decoder)(QByteArrayView(data, length));
-            encoded = (*encoder)(QStringView(decoded));
-            data = encoded.constData();
-            if (decoder->hasError() || encoder->hasError()) {
-                if (errMsg)
-                    *errMsg = QObject::tr("按原编码转换大文件时遇到无效字符。");
-                return false;
-            }
-        }
-        const qint64 outputLength = encoded.isNull() ? length : encoded.size();
-        if (output->write(data, outputLength) != outputLength) {
-            if (errMsg)
-                *errMsg = QObject::tr("流式写入大文件失败。");
-            return false;
-        }
-        position += length;
-        if (window && window->statusBar()) {
-            window->statusBar()->showMessage(
-                QObject::tr("正在保存大文件… %1%").arg(
-                    total > 0 ? int((position * 100) / total) : 100));
-        }
-        if (yieldUi)
-            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-    }
-    return true;
-}
-
 bool EditorTab::isModified() const
 {
     if (isL2Mode())
         // Overlay edits become PatchList entries at the next window switch or
         // save. They must still participate in close prompts immediately.
         return m_l2SaveNeeded || m_editor->isModified() || m_metadataModified;
-    if (m_promotedLargeDocument)
-        return m_promotedLargeDirty || m_editor->isModified() || m_metadataModified;
     return m_editor->isModified() || m_metadataModified;
 }
 
@@ -954,19 +712,6 @@ void EditorTab::setModified(bool m)
     if (isL2Mode()) {
         const bool before = isModified();
         m_l2SaveNeeded = m;
-        if (!m) {
-            m_metadataModified = false;
-            m_editor->setModified(false);
-        }
-        if (before != isModified()) {
-            emit modificationChanged(isModified());
-            emit titleChanged(tabTitle());
-        }
-        return;
-    }
-    if (m_promotedLargeDocument) {
-        const bool before = isModified();
-        m_promotedLargeDirty = m;
         if (!m) {
             m_metadataModified = false;
             m_editor->setModified(false);
@@ -1033,11 +778,6 @@ void EditorTab::initializeSecureDocument(const QUuid &id, const QString &title,
 {
     Q_ASSERT(!id.isNull());
     m_metadataModified = false;
-    cancelLargeTextPromotion();
-    m_promotedLargeDocument = false;
-    m_promotedLargeDirty = false;
-    m_l2PromotionRepresentsDirty = false;
-    m_l2TextPreviewReadOnly = false;
     m_secureDocumentTransitioning = true;
     bridgeReparentEditorToStack();
     clearL2BridgeBaseline();
@@ -1093,11 +833,6 @@ bool EditorTab::initializeSecureBinaryDocument(const QUuid &id,
             bytes.fill(0);
         return false;
     }
-    cancelLargeTextPromotion();
-    m_promotedLargeDocument = false;
-    m_promotedLargeDirty = false;
-    m_l2PromotionRepresentsDirty = false;
-    m_l2TextPreviewReadOnly = false;
     m_secureDocumentTransitioning = true;
     bridgeReparentEditorToStack();
     clearL2BridgeBaseline();
@@ -1124,7 +859,6 @@ bool EditorTab::initializeSecureBinaryDocument(const QUuid &id,
     m_encoding = TextEncoding::Utf8;
     m_l2Mode = true;
     m_l2ReadOnlyByPolicy = false;
-    m_l2TextPreviewReadOnly = false;
     m_l2SaveNeeded = false;
     m_lastL2Line = 0;
     m_lastL2Col = 0;
@@ -1224,11 +958,6 @@ void EditorTab::setSecureDocumentTitle(const QString &title)
 void EditorTab::convertToPlainDocument(const QString &filePath)
 {
     m_metadataModified = false;
-    cancelLargeTextPromotion();
-    m_promotedLargeDocument = false;
-    m_promotedLargeDirty = false;
-    m_l2PromotionRepresentsDirty = false;
-    m_l2TextPreviewReadOnly = false;
     m_secureDocumentTransitioning = true;
     clearL2BridgeBaseline();
     m_secureDocumentId = {};
@@ -1710,8 +1439,8 @@ void EditorTab::loadUtf8Chunked(const QByteArray &utf8)
     // 比 setText(整个文本) 快很多倍：setText 会一次性重建行索引、
     // 触发全量重排，而 SCI_APPENDTEXT 是增量追加，Scintilla 内部只做最小化更新。
     //
-    // 参考：Notepad++ / Scintilla 的 ILoader 也是增量加载机制，
-    //       QScintilla 2.14 未直接暴露 ILoader API，故用 SCI_APPENDTEXT 替代。
+    // This bounded chunk append belongs to the S1 path only and must not be
+    // reused to build a complete S2/S3 document.
     //
     // !! 重要：不能调用 setReadOnly(true) 来防止用户在加载期间编辑 !!
     // 因为 Scintilla 的 Document::InsertString 内部会检查 cb.IsReadOnly()，
@@ -2070,7 +1799,6 @@ WindowedReadOnlyProvider *EditorTab::ensureWindowedReadOnlyProvider()
         connect(m_windowedReadOnlyProvider,
                 &WindowedReadOnlyProvider::sourceFileChanged,
                 this, [this](qint64, qint64) {
-            cancelLargeTextPromotion();
             refreshDiskVersionBaseline();
             if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
                 window->statusBar()->showMessage(
@@ -2096,20 +1824,12 @@ bool EditorTab::windowedReadOnlyActive() const
 
 EditorTab::LargeDocumentRuntimeState EditorTab::largeDocumentRuntimeState() const
 {
-    if (m_promotedLargeDocument && !m_l2Mode)
-        return LargeDocumentRuntimeState::Editable;
     if (!m_l2Mode)
         return LargeDocumentRuntimeState::None;
-    if (m_l2PromotionTaskId > 0)
-        return LargeDocumentRuntimeState::PreparingEditor;
-    if (!m_l2FallbackReason.isEmpty())
-        return LargeDocumentRuntimeState::ReadOnlyFallback;
     if (m_l2ReadOnlyByPolicy)
         return LargeDocumentRuntimeState::ReadOnlyAnalysis;
-    if (m_l2TextPreviewReadOnly)
-        return LargeDocumentRuntimeState::PreviewReady;
     // B1 Hex uses the byte provider directly and is already editable; it is
-    // not an S2 preview or promotion state.  Keep None so the status bar can
+    // not an S2/S3 analysis state. Keep None so the status bar can
     // expose the more useful per-document INS/OVR mode.
     return LargeDocumentRuntimeState::None;
 }
@@ -4176,387 +3896,15 @@ bool EditorTab::handleHexKeyPress(QKeyEvent *event)
     return false;
 }
 
-void EditorTab::clearLargeRecoveryOperations(
-    QVector<LargeRecoveryOperation> *operations)
-{
-    if (!operations)
-        return;
-    for (LargeRecoveryOperation &operation : *operations) {
-        if (!operation.insertedBytes.isEmpty())
-            operation.insertedBytes.fill(0);
-    }
-    operations->clear();
-}
-
-void EditorTab::resetLargeRecoveryJournal(const QString &basePath)
-{
-    clearLargeRecoveryOperations(&m_largeRecoveryOperations);
-    clearLargeRecoveryOperations(&m_pendingRecoveryOperations);
-    const QFileInfo info(basePath);
-    m_recoveryBasePath = info.exists() && info.isFile()
-                             ? info.absoluteFilePath() : QString();
-    m_recoveryBaseSize = info.exists() && info.isFile() ? info.size() : -1;
-    m_recoveryBaseMtimeMs = info.exists() && info.isFile()
-                                ? info.lastModified().toMSecsSinceEpoch() : -1;
-    m_recoveryRequiresCheckpoint = false;
-}
-
-bool EditorTab::applyPendingLargeRecovery(QString *error)
-{
-    if (m_pendingRecoveryOperations.isEmpty())
-        return true;
-    m_replayingRecoveryJournal = true;
-    for (const LargeRecoveryOperation &operation : m_pendingRecoveryOperations) {
-        const qint64 documentLength = static_cast<qint64>(directScintilla(
-            m_editor, QsciScintillaBase::SCI_GETLENGTH));
-        if (operation.position < 0 || operation.position > documentLength
-            || (operation.kind == LargeRecoveryOperation::Kind::Delete
-                && operation.deleteLength > documentLength - operation.position)) {
-            m_replayingRecoveryJournal = false;
-            if (error) *error = QObject::tr("恢复日志中的编辑位置已超出文档范围。");
-            clearLargeRecoveryOperations(&m_pendingRecoveryOperations);
-            return false;
-        }
-        directScintilla(m_editor, QsciScintillaBase::SCI_SETTARGETRANGE,
-                        static_cast<ScintillaUnsigned>(operation.position),
-                        static_cast<ScintillaSigned>(
-                            operation.kind == LargeRecoveryOperation::Kind::Delete
-                                ? operation.position + operation.deleteLength
-                                : operation.position));
-        const char *replacement = operation.kind == LargeRecoveryOperation::Kind::Insert
-                                      ? operation.insertedBytes.constData() : "";
-        const qint64 replacementLength = operation.kind == LargeRecoveryOperation::Kind::Insert
-                                             ? operation.insertedBytes.size() : 0;
-        const auto replaced = directScintilla(
-            m_editor, QsciScintillaBase::SCI_REPLACETARGET,
-            static_cast<ScintillaUnsigned>(replacementLength),
-            reinterpret_cast<ScintillaSigned>(replacement));
-        if (replaced < 0) {
-            m_replayingRecoveryJournal = false;
-            if (error) *error = QObject::tr("Scintilla 拒绝应用大文件恢复日志。");
-            clearLargeRecoveryOperations(&m_pendingRecoveryOperations);
-            return false;
-        }
-    }
-    m_replayingRecoveryJournal = false;
-    clearLargeRecoveryOperations(&m_largeRecoveryOperations);
-    m_largeRecoveryOperations = std::move(m_pendingRecoveryOperations);
-    m_pendingRecoveryOperations.clear();
-    m_editor->setModified(true);
-    m_promotedLargeDirty = true;
-    return true;
-}
-
-void EditorTab::cancelLargeTextPromotion()
-{
-    if (m_l2PromotionTaskId > 0)
-        AsyncTaskManager::instance().cancel(m_l2PromotionTaskId);
-    m_l2PromotionTaskId = 0;
-    m_l2PromotionPath.clear();
-}
-
-void EditorTab::startLargeTextPromotion(const QString &path, qint64 sourceBytes)
-{
-    if (!m_l2Mode || !m_l2TextPreviewReadOnly || sourceBytes < 0)
-        return;
-
-    m_l2FallbackReason.clear();
-    const TextEncoding sourceEncoding = sniffLargeTextEncoding(path);
-    const qint64 expectedUtf8Bytes = estimatedUtf8Size(sourceBytes, sourceEncoding);
-    ResourceAdmissionInput input;
-    input.file = FileTierPolicy::classify(sourceBytes, expectedUtf8Bytes);
-    if (input.file.tier == FileTier::HugeReadOnly) {
-        m_l2FallbackReason = QObject::tr(
-            "文件转换为 UTF-8 后预计超过 2 GiB，保持只读分析模式");
-        if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
-            window->statusBar()->showMessage(
-                QObject::tr("文件转换为 UTF-8 后预计超过 2 GiB，保持只读分析模式"), 8000);
-        }
-        emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(),
-                                               m_l2FallbackReason);
-        return;
-    }
-#ifdef Q_OS_WIN
-    MEMORYSTATUSEX memory{};
-    memory.dwLength = sizeof(memory);
-    if (::GlobalMemoryStatusEx(&memory)) {
-        input.totalPhysicalBytes = static_cast<qint64>(memory.ullTotalPhys);
-        input.availableCommitBytes = static_cast<qint64>(memory.ullAvailPageFile);
-    }
-#endif
-    const ResourceAdmissionDecision admission = ResourceAdmission::evaluate(input);
-    if (!admission.admitted) {
-        m_l2FallbackReason = admissionFallbackText(admission.reason);
-        if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
-            window->statusBar()->showMessage(admissionFallbackText(admission.reason), 8000);
-        }
-        emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(),
-                                               m_l2FallbackReason);
-        return;
-    }
-
-    constexpr int documentOptions = QsciScintillaBase::SC_DOCUMENTOPTION_STYLES_NONE
-                                    | QsciScintillaBase::SC_DOCUMENTOPTION_TEXT_LARGE;
-    auto *loader = reinterpret_cast<ILoader *>(directScintilla(
-        m_editor, QsciScintillaBase::SCI_CREATELOADER,
-        static_cast<ScintillaUnsigned>(expectedUtf8Bytes),
-        static_cast<ScintillaSigned>(documentOptions)));
-    if (!loader) {
-        m_l2FallbackReason = QObject::tr(
-            "无法建立后台编辑文档，保持只读分析模式");
-        if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
-            window->statusBar()->showMessage(
-                QObject::tr("无法建立后台编辑文档，保持只读分析模式"), 8000);
-        }
-        emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(),
-                                               m_l2FallbackReason);
-        return;
-    }
-
-    m_l2PromotionPath = QFileInfo(path).absoluteFilePath();
-    QPointer<EditorTab> guard(this);
-    QPointer<QObject> application = QCoreApplication::instance();
-    const QString absolutePath = m_l2PromotionPath;
-    m_l2PromotionTaskId = AsyncTaskManager::instance().submit(
-        AsyncTaskType::LargeFileLoad, AsyncTaskPriority::Low,
-        QObject::tr("准备大文件编辑"),
-        QObject::tr("后台构造完整 Scintilla 文档；预计峰值 %1 MiB；当前窗口预览保持可用")
-            .arg(admission.estimatedPeakBytes / (1024 * 1024)),
-        [guard, application, loader, absolutePath, sourceBytes, sourceEncoding](
-            qint64 taskId, AsyncCancelPtr cancel,
-            const std::function<void(qint64, qint64)> &reportProgress,
-            const std::function<void(const AsyncErrorInfo &)> &) {
-            auto postResult = [guard, application, taskId, absolutePath](
-                                  ILoader *resultLoader, TextEncoding encoding,
-                                  const QString &reason) {
-                if (!application) {
-                    if (resultLoader)
-                        resultLoader->Release();
-                    return;
-                }
-                const bool queued = QMetaObject::invokeMethod(
-                    application,
-                    [guard, resultLoader, taskId, absolutePath, encoding, reason]() {
-                        if (guard) {
-                            guard->finishLargeTextPromotion(resultLoader, taskId,
-                                                            absolutePath, encoding, reason);
-                        } else if (resultLoader) {
-                            resultLoader->Release();
-                        }
-                    },
-                    Qt::QueuedConnection);
-                if (!queued && resultLoader)
-                    resultLoader->Release();
-            };
-
-            QFile file(absolutePath);
-            if (!file.open(QIODevice::ReadOnly)) {
-                loader->Release();
-                postResult(nullptr, TextEncoding::Utf8,
-                           QObject::tr("后台读取文件失败，保持只读分析模式"));
-                return;
-            }
-
-            constexpr qsizetype chunkBytes = 4 * 1024 * 1024;
-            QByteArray chunk(chunkBytes, Qt::Uninitialized);
-            Utf8StreamValidator validator;
-            std::unique_ptr<QStringDecoder> decoder;
-            if (sourceEncoding == TextEncoding::Utf16LE)
-                decoder = std::make_unique<QStringDecoder>(QStringConverter::Utf16LE);
-            else if (sourceEncoding == TextEncoding::Utf16BE)
-                decoder = std::make_unique<QStringDecoder>(QStringConverter::Utf16BE);
-            else if (sourceEncoding == TextEncoding::GBK)
-                decoder = std::make_unique<QStringDecoder>(QStringConverter::System);
-            bool firstChunk = true;
-            qint64 consumed = 0;
-            while (!file.atEnd()) {
-                if (cancel && cancel->load(std::memory_order_acquire)) {
-                    loader->Release();
-                    postResult(nullptr, sourceEncoding,
-                               QObject::tr("用户已取消准备编辑，保持只读分析模式"));
-                    return;
-                }
-                const qint64 count = file.read(chunk.data(), chunk.size());
-                if (count < 0) {
-                    loader->Release();
-                    postResult(nullptr, sourceEncoding,
-                               QObject::tr("后台读取文件失败，保持只读分析模式"));
-                    return;
-                }
-                qsizetype offset = 0;
-                if (firstChunk) {
-                    firstChunk = false;
-                    if (sourceEncoding == TextEncoding::Utf8Bom)
-                        offset = 3;
-                    else if (sourceEncoding == TextEncoding::Utf16LE
-                             || sourceEncoding == TextEncoding::Utf16BE)
-                        offset = 2;
-                }
-                const qsizetype payload = static_cast<qsizetype>(count) - offset;
-                QByteArray converted;
-                const char *data = chunk.constData() + offset;
-                qsizetype convertedSize = payload;
-                if (decoder) {
-                    const QString decoded = (*decoder)(QByteArrayView(data, payload));
-                    converted = decoded.toUtf8();
-                    data = converted.constData();
-                    convertedSize = converted.size();
-                } else if (!validator.feed(data, payload)) {
-                    loader->Release();
-                    postResult(nullptr, sourceEncoding,
-                               QObject::tr("文件并非有效 UTF-8，保持只读分析模式"));
-                    return;
-                }
-                if (convertedSize > 0
-                    && loader->AddData(data, static_cast<Sci_Position>(convertedSize)) != 0) {
-                    loader->Release();
-                    postResult(nullptr, sourceEncoding,
-                               QObject::tr("准备完整编辑文档时内存不足，保持只读分析模式"));
-                    return;
-                }
-                consumed += count;
-                reportProgress(consumed, sourceBytes);
-            }
-            if ((!decoder && !validator.complete()) || (decoder && decoder->hasError())) {
-                loader->Release();
-                postResult(nullptr, sourceEncoding,
-                           QObject::tr("文件末尾包含不完整编码字符，保持只读分析模式"));
-                return;
-            }
-            if (cancel && cancel->load(std::memory_order_acquire)) {
-                loader->Release();
-                postResult(nullptr, sourceEncoding,
-                           QObject::tr("用户已取消准备编辑，保持只读分析模式"));
-                return;
-            }
-            postResult(loader, sourceEncoding, {});
-        },
-        0, QStringLiteral("LargeFileLoad"), sourceBytes);
-
-    emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(), {});
-
-    if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
-        window->statusBar()->showMessage(
-            QObject::tr("文件已快速打开；正在后台准备完整编辑，当前为只读预览"), 6000);
-    }
-}
-
-void EditorTab::finishLargeTextPromotion(ILoader *loader, qint64 taskId,
-                                         const QString &path, TextEncoding encoding,
-                                         const QString &fallbackReason)
-{
-    const bool stillCurrent = m_l2PromotionTaskId == taskId
-                              && m_l2PromotionPath == path
-                              && m_l2Mode && m_l2TextPreviewReadOnly;
-    if (!stillCurrent) {
-        if (loader)
-            loader->Release();
-        return;
-    }
-    m_l2PromotionTaskId = 0;
-    m_l2PromotionPath.clear();
-
-    if (!loader) {
-        m_l2FallbackReason = fallbackReason.isEmpty()
-            ? QObject::tr("大文件保持只读分析模式") : fallbackReason;
-        if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
-            window->statusBar()->showMessage(
-                fallbackReason.isEmpty()
-                    ? QObject::tr("大文件保持只读分析模式") : fallbackReason,
-                8000);
-        }
-        emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(),
-                                               m_l2FallbackReason);
-        return;
-    }
-
-    bool restoreDirtyState = m_l2PromotionRepresentsDirty;
-    m_l2PromotionRepresentsDirty = false;
-
-    void *document = loader->ConvertToDocument();
-    if (!document) {
-        loader->Release();
-        m_l2FallbackReason = QObject::tr(
-            "完整编辑文档转换失败，保持只读分析模式");
-        if (auto *window = qobject_cast<QMainWindow *>(this->window()))
-            window->statusBar()->showMessage(m_l2FallbackReason, 8000);
-        emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(),
-                                               m_l2FallbackReason);
-        return;
-    }
-
-    const qint64 restoreByteOffset = windowedReadOnlyActive()
-        ? m_windowedReadOnlyProvider->globalOffset() : m_lastL2Byte;
-    bridgeReparentEditorToStack();
-    m_l2Mode = false;
-    m_l2TextPreviewReadOnly = false;
-    m_l2ReadOnlyByPolicy = false;
-    m_l2FallbackReason.clear();
-    m_promotedLargeDocument = true;
-    m_promotedLargeDirty = restoreDirtyState;
-    m_bridge.syncVfvDebounce.stop();
-    clearL2BridgeBaseline();
-    if (m_l2View && m_l2View->isOpen())
-        m_l2View->closeFile(true);
-    if (m_windowedReadOnlyProvider)
-        m_windowedReadOnlyProvider->closeFile();
-
-    m_editor->SendScintilla(QsciScintillaBase::SCI_SETDOCPOINTER, 0UL, document);
-    loader->Release();
-    m_editor->SendScintilla(QsciScintillaBase::SCI_SETUNDOCOLLECTION, 1UL);
-    m_editor->SendScintilla(QsciScintillaBase::SCI_EMPTYUNDOBUFFER);
-    m_editor->SendScintilla(QsciScintillaBase::SCI_SETSAVEPOINT);
-    m_editor->setReadOnly(false);
-    m_editor->setWrapMode(QsciScintilla::WrapNone);
-    m_editor->setFolding(QsciScintilla::NoFoldStyle);
-    m_editor->setAutoCompletionSource(QsciScintilla::AcsNone);
-    m_editor->setLexer(nullptr);
-    m_editor->setModified(false);
-    m_encoding = encoding;
-    if (!m_pendingRecoveryOperations.isEmpty()) {
-        QString recoveryError;
-        if (!applyPendingLargeRecovery(&recoveryError)) {
-            restoreDirtyState = false;
-            m_promotedLargeDirty = false;
-            if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
-                window->statusBar()->showMessage(
-                    recoveryError.isEmpty() ? QObject::tr("大文件恢复日志应用失败")
-                                            : recoveryError,
-                    10000);
-            }
-        } else {
-            restoreDirtyState = true;
-        }
-    }
-    if (m_syntax != Syntax::Plain) {
-        m_syntax = Syntax::Plain;
-        emit syntaxChanged(m_syntax);
-    }
-    const int lineDigits = qMax(6, QString::number(qMax(1, m_editor->lines())).size() + 1);
-    m_editor->setMarginWidth(0, QString(lineDigits, QLatin1Char('9')));
-    if (m_stack)
-        m_stack->setCurrentWidget(m_editor);
-    directScintilla(m_editor, QsciScintillaBase::SCI_GOTOPOS,
-                    static_cast<ScintillaUnsigned>(qMax<qint64>(0, restoreByteOffset)));
-    directScintilla(m_editor, QsciScintillaBase::SCI_SCROLLCARET);
-
-    emit l2ModeStatusChanged();
-    emit l2FileOpenedChanged(false);
-    emit encodingChanged(m_encoding);
-    emit modificationChanged(restoreDirtyState);
-    emit titleChanged(tabTitle());
-    emit largeDocumentRuntimeStateChanged(largeDocumentRuntimeState(), {});
-    if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
-        window->statusBar()->showMessage(
-            QObject::tr("大文件已准备完成，现在可以完整编辑"), 6000);
-    }
-}
+// S2 background ILoader promotion was removed after real-user validation.
+// Files >= 32 MiB remain on WindowedReadOnlyProvider for their entire lifetime.
 
 bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
-                                bool allowFullTextPromotion,
                                 L2Presentation presentation,
                                 L2ContentKind contentKind)
 {
+    // S2 promotion is deliberately disabled: all mapped documents >= 32 MiB
+    // use the same read-only provider as S3.
     const bool inheritedWordWrap = m_editor
         && m_editor->wrapMode() != QsciScintilla::WrapNone;
     QFileInfo fi(path);
@@ -4564,19 +3912,12 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
         if (errMsg) *errMsg = QObject::tr("文件不存在：%1").arg(path);
         return false;
     }
-    cancelLargeTextPromotion();
-    m_promotedLargeDocument = false;
-    m_promotedLargeDirty = false;
-    m_l2PromotionRepresentsDirty = false;
-    m_l2FallbackReason.clear();
     m_secureBinaryDocument = false;
     const bool binaryHex = presentation == L2Presentation::Hex;
     m_binaryDocument = contentKind == L2ContentKind::Binary;
     const FileTierDecision tier = FileTierPolicy::classify(fi.size());
-    const bool b2HexReadOnlyFallback = binaryHex && tier.mayPromoteToFullEdit();
-    const bool readOnlyByPolicy = tier.isReadOnlyByPolicy() || b2HexReadOnlyFallback;
-    const bool textPreviewReadOnly = !binaryHex && tier.mayPromoteToFullEdit();
-    const bool useWindowedReadOnly = readOnlyByPolicy || textPreviewReadOnly;
+    const bool readOnlyByPolicy = tier.isReadOnlyByPolicy();
+    const bool useWindowedReadOnly = readOnlyByPolicy;
 
     VirtualFileView *v = ensureL2View();
     v->setFullLineIndexBuildEnabled(!useWindowedReadOnly);
@@ -4592,20 +3933,14 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
         if (errMsg) *errMsg = localErr;
         return false;
     }
-    resetLargeRecoveryJournal(path);
     // 成功：切到 L2 视图并标记模式
     m_filePath = fi.absoluteFilePath();
     refreshDiskVersionBaseline();
     m_l2Mode = true;
-    // B2 binary/unknown files still lack a proven fixed-length write-through
-    // provider.  Keep them useful and predictable in the same single-scroll
-    // mmap view as B3 instead of exposing the legacy double-scroll overlay.
-    // Text S2 documents continue to promote to the full Scintilla editor.
+    // S2 and S3 intentionally expose the same capability: bounded mmap browse,
+    // search and copy, with every mutation command disabled. The size tier is
+    // retained only for diagnostics and possible future experiments.
     m_l2ReadOnlyByPolicy = readOnlyByPolicy;
-    // Every S2 text document starts in the same single-scroll readonly
-    // provider. allowFullTextPromotion controls only whether ILoader starts;
-    // it must never select the legacy editable overlay as a side effect.
-    m_l2TextPreviewReadOnly = textPreviewReadOnly;
     m_l2SaveNeeded = false;
     m_lastL2Line = 0;
     m_lastL2Col  = 0;
@@ -4629,8 +3964,8 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
         m_stack->setCurrentWidget(provider);
         provider->editor()->setFocus();
     } else {
-        // Transitional editable B2/secure-binary path. S2 text preview and all
-        // S3/B3 documents never enter the legacy double-scroll overlay.
+        // Only sub-32-MiB B1/secure-binary compatibility paths can reach the
+        // legacy editable overlay. S2/S3 and B2/B3 never do.
         activateL2Overlay(v);
     }
 
@@ -4649,11 +3984,6 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
     emit l2FileOpenedChanged(true);
     if (isReadOnlyByPolicy())
         emit modificationChanged(false);
-    if (allowFullTextPromotion && !binaryHex && m_l2TextPreviewReadOnly) {
-        QTimer::singleShot(0, this, [this, path, bytes = fi.size()]() {
-            startLargeTextPromotion(path, bytes);
-        });
-    }
     return true;
 }
 
@@ -4661,6 +3991,13 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
 {
     if (!m_l2Mode || !m_l2View) {
         if (errMsg) *errMsg = QObject::tr("当前非 L2 模式");
+        return false;
+    }
+    if (isReadOnlyByPolicy()) {
+        if (errMsg) {
+            *errMsg = QObject::tr(
+                "32 MiB 以上文件为只读分析模式，不能保存或另存编辑结果。");
+        }
         return false;
     }
     if (sameDiskFilePath(m_filePath, path)) {
@@ -4675,7 +4012,8 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
             return false;
         }
     }
-    // P0-5：保存前强制 flush overlay → patches。最近一次编辑没切窗口时就靠这里回写。
+    // 以下 patch 保存路径只服务 32 MiB 以下的 B1 兼容 Hex 编辑。
+    // 上面的策略门禁保证 S2/S3 永远不能进入这里。
     QString flushErr;
     bridgeFlushOverlayToPatches(&flushErr);
     if (!flushErr.isEmpty()) {
@@ -4788,7 +4126,6 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
     }
 
     setModified(false);
-    resetLargeRecoveryJournal(m_filePath);
     clearAutosaveFile();
     m_autosavePath.clear();
     refreshDiskVersionBaseline();
@@ -4813,18 +4150,6 @@ bool EditorTab::exportToFile(const QString &destPath) const
         return view->saveAs(destPath, {}, &cancel, &error);
     }
 
-    if (m_promotedLargeDocument) {
-        QSaveFile output(destPath);
-        output.setDirectWriteFallback(false);
-        if (!output.open(QIODevice::WriteOnly))
-            return false;
-        QString error;
-        if (!streamPromotedDocumentTo(&output, &error, false)) {
-            output.cancelWriting();
-            return false;
-        }
-        return output.commit();
-    }
 
     QSaveFile output(destPath);
     output.setDirectWriteFallback(false);
@@ -4857,55 +4182,18 @@ bool EditorTab::exportSnapshotBytes(QByteArray *data) const
 
 bool EditorTab::exportRecoveryPayload(QByteArray *data, QString *error) const
 {
-    if (!data) {
-        if (error) *error = QObject::tr("恢复载荷输出参数无效。");
-        return false;
-    }
-    if (!m_promotedLargeDocument)
-        return exportSnapshotBytes(data);
-    if (m_recoveryRequiresCheckpoint
-        || QFileInfo(m_recoveryBasePath).absoluteFilePath()
-               != QFileInfo(m_filePath).absoluteFilePath()
-        || m_recoveryBaseSize < 0 || m_recoveryBaseMtimeMs < 0
-        || m_largeRecoveryOperations.isEmpty()) {
-        if (error) *error = QObject::tr("当前大文件恢复状态需要建立加密检查点。");
-        return false;
-    }
-
-    data->clear();
-    QDataStream stream(data, QIODevice::WriteOnly);
-    stream.setByteOrder(QDataStream::LittleEndian);
-    stream << QByteArray(LargeRecoveryMagic, sizeof(LargeRecoveryMagic))
-           << LargeRecoveryVersion
-           << m_recoveryBaseSize << m_recoveryBaseMtimeMs
-           << qint32(m_encoding)
-           << quint32(m_largeRecoveryOperations.size());
-    for (const LargeRecoveryOperation &operation : m_largeRecoveryOperations) {
-        stream << quint8(operation.kind) << operation.position;
-        if (operation.kind == LargeRecoveryOperation::Kind::Insert)
-            stream << operation.insertedBytes;
-        else
-            stream << operation.deleteLength;
-        if (data->size() >= MaximumLargeRecoveryPayload) {
-            data->fill(0);
-            data->clear();
-            if (error) *error = QObject::tr("大文件编辑日志已达到 32 MiB，需要建立加密检查点。");
-            return false;
-        }
-    }
-    if (stream.status() != QDataStream::Ok) {
-        data->fill(0);
-        data->clear();
-        if (error) *error = QObject::tr("序列化大文件恢复日志失败。");
-        return false;
-    }
-    return true;
+    if (exportSnapshotBytes(data))
+        return true;
+    if (error)
+        *error = QObject::tr("S2/S3 为只读分析模式，不生成大文件编辑恢复日志。");
+    return false;
 }
 
 bool EditorTab::restoreRecoveryPayload(const QByteArray &data,
                                        const QString &realFilePath,
                                        QString *error)
 {
+    Q_UNUSED(realFilePath)
     QDataStream stream(data);
     stream.setByteOrder(QDataStream::LittleEndian);
     QByteArray magic;
@@ -4913,95 +4201,20 @@ bool EditorTab::restoreRecoveryPayload(const QByteArray &data,
     stream >> magic >> version;
     if (magic != QByteArray(LargeRecoveryMagic, sizeof(LargeRecoveryMagic)))
         return loadAutosaveBytes(data, QString());
-    if (version != LargeRecoveryVersion || realFilePath.isEmpty()) {
-        if (error) *error = QObject::tr("大文件恢复日志版本或原文件路径无效。");
-        return false;
+    Q_UNUSED(version)
+    if (error) {
+        *error = QObject::tr(
+            "旧版 S2 大文件编辑恢复日志已禁用；当前 32 MiB 以上文件只能只读打开。");
     }
-
-    qint64 baseSize = -1;
-    qint64 baseMtime = -1;
-    qint32 storedEncoding = 0;
-    quint32 operationCount = 0;
-    stream >> baseSize >> baseMtime >> storedEncoding >> operationCount;
-    const QFileInfo base(realFilePath);
-    if (!base.exists() || !base.isFile() || base.size() != baseSize
-        || base.lastModified().toMSecsSinceEpoch() != baseMtime) {
-        if (error) *error = QObject::tr("原始大文件已移动或发生变化，不能安全套用恢复日志。");
-        return false;
-    }
-    if (storedEncoding < qint32(TextEncoding::Utf8)
-        || storedEncoding > qint32(TextEncoding::GBK)
-        || operationCount == 0 || operationCount > 1000000) {
-        if (error) *error = QObject::tr("大文件恢复日志元数据无效。");
-        return false;
-    }
-
-    QVector<LargeRecoveryOperation> parsed;
-    parsed.reserve(int(operationCount));
-    qint64 insertedTotal = 0;
-    for (quint32 i = 0; i < operationCount; ++i) {
-        quint8 kind = 0;
-        LargeRecoveryOperation operation;
-        stream >> kind >> operation.position;
-        if (kind == quint8(LargeRecoveryOperation::Kind::Insert)) {
-            operation.kind = LargeRecoveryOperation::Kind::Insert;
-            stream >> operation.insertedBytes;
-            insertedTotal += operation.insertedBytes.size();
-            if (operation.insertedBytes.isEmpty()
-                || insertedTotal >= MaximumLargeRecoveryPayload) {
-                clearLargeRecoveryOperations(&parsed);
-                if (error) *error = QObject::tr("大文件恢复日志插入数据无效或超限。");
-                return false;
-            }
-        } else if (kind == quint8(LargeRecoveryOperation::Kind::Delete)) {
-            operation.kind = LargeRecoveryOperation::Kind::Delete;
-            stream >> operation.deleteLength;
-            if (operation.deleteLength <= 0) {
-                clearLargeRecoveryOperations(&parsed);
-                if (error) *error = QObject::tr("大文件恢复日志删除范围无效。");
-                return false;
-            }
-        } else {
-            clearLargeRecoveryOperations(&parsed);
-            if (error) *error = QObject::tr("大文件恢复日志包含未知操作。");
-            return false;
-        }
-        if (operation.position < 0 || stream.status() != QDataStream::Ok) {
-            clearLargeRecoveryOperations(&parsed);
-            if (error) *error = QObject::tr("大文件恢复日志已损坏。");
-            return false;
-        }
-        parsed.push_back(std::move(operation));
-    }
-    if (!stream.atEnd()) {
-        clearLargeRecoveryOperations(&parsed);
-        if (error) *error = QObject::tr("大文件恢复日志尾部包含无效数据。");
-        return false;
-    }
-
-    QString openError;
-    if (!openLargeFileL2(realFilePath, &openError, true)) {
-        clearLargeRecoveryOperations(&parsed);
-        if (error) *error = openError;
-        return false;
-    }
-    clearLargeRecoveryOperations(&m_pendingRecoveryOperations);
-    m_pendingRecoveryOperations = std::move(parsed);
-    m_encoding = TextEncoding(storedEncoding);
-    m_l2PromotionRepresentsDirty = true;
-    m_l2SaveNeeded = true;
-    emit modificationChanged(true);
-    emit titleChanged(tabTitle());
-    return true;
+    return false;
 }
 
 bool EditorTab::exportRecoveryCheckpoint(QIODevice *output, QString *error) const
 {
-    if (!m_promotedLargeDocument || !output || !output->isWritable()) {
-        if (error) *error = QObject::tr("当前文档不能生成流式恢复检查点。");
-        return false;
-    }
-    return streamPromotedDocumentTo(output, error, false);
+    Q_UNUSED(output)
+    if (error)
+        *error = QObject::tr("S2/S3 为只读分析模式，不生成大文件编辑检查点。");
+    return false;
 }
 
 bool EditorTab::restoreRecoveryCheckpoint(const QString &checkpointPath,
@@ -5010,158 +4223,21 @@ bool EditorTab::restoreRecoveryCheckpoint(const QString &checkpointPath,
                                           qint64 plaintextBytes,
                                           QString *error)
 {
-    if (checkpointPath.isEmpty() || plaintextBytes < FileTierPolicy::StandardEditLimitBytes
-        || plaintextBytes >= FileTierPolicy::LargeEditLimitBytes) {
-        if (error) *error = QObject::tr("恢复检查点大小不属于 S2 可编辑范围。");
-        return false;
+    Q_UNUSED(checkpointPath)
+    Q_UNUSED(realFilePath)
+    Q_UNUSED(encoding)
+    Q_UNUSED(plaintextBytes)
+    if (error) {
+        *error = QObject::tr(
+            "S2 大文件编辑与后台完整加载已禁用，不能恢复旧的大文件编辑检查点。");
     }
-    const qint64 expectedUtf8Bytes = estimatedUtf8Size(plaintextBytes, encoding);
-    ResourceAdmissionInput input;
-    input.file = FileTierPolicy::classify(plaintextBytes, expectedUtf8Bytes);
-#ifdef Q_OS_WIN
-    MEMORYSTATUSEX memory{};
-    memory.dwLength = sizeof(memory);
-    if (::GlobalMemoryStatusEx(&memory)) {
-        input.totalPhysicalBytes = static_cast<qint64>(memory.ullTotalPhys);
-        input.availableCommitBytes = static_cast<qint64>(memory.ullAvailPageFile);
-    }
-#endif
-    const ResourceAdmissionDecision admission = ResourceAdmission::evaluate(input);
-    if (!admission.admitted) {
-        if (error) *error = admissionFallbackText(admission.reason);
-        return false;
-    }
-
-    constexpr int documentOptions = QsciScintillaBase::SC_DOCUMENTOPTION_STYLES_NONE
-                                    | QsciScintillaBase::SC_DOCUMENTOPTION_TEXT_LARGE;
-    auto *loader = reinterpret_cast<ILoader *>(directScintilla(
-        m_editor, QsciScintillaBase::SCI_CREATELOADER,
-        static_cast<ScintillaUnsigned>(expectedUtf8Bytes),
-        static_cast<ScintillaSigned>(documentOptions)));
-    if (!loader) {
-        if (error) *error = QObject::tr("无法建立后台恢复文档。");
-        return false;
-    }
-
-    cancelLargeTextPromotion();
-    resetLargeRecoveryJournal(realFilePath);
-    m_recoveryRequiresCheckpoint = true;
-    m_filePath = realFilePath;
-    refreshDiskVersionBaseline();
-    m_l2Mode = true;
-    m_l2ReadOnlyByPolicy = false;
-    m_l2TextPreviewReadOnly = true;
-    m_promotedLargeDocument = false;
-    m_promotedLargeDirty = false;
-    m_l2SaveNeeded = true;
-    m_l2PromotionRepresentsDirty = true;
-    m_editor->setReadOnly(true);
-    if (m_stack)
-        m_stack->setCurrentWidget(m_editor);
-
-    m_l2PromotionPath = QFileInfo(checkpointPath).absoluteFilePath();
-    const QString absolutePath = m_l2PromotionPath;
-    QPointer<EditorTab> guard(this);
-    QPointer<QObject> application = QCoreApplication::instance();
-    m_l2PromotionTaskId = AsyncTaskManager::instance().submit(
-        AsyncTaskType::LargeFileLoad, AsyncTaskPriority::Low,
-        QObject::tr("恢复大文件编辑"),
-        QObject::tr("后台解密恢复检查点并构造完整 Scintilla 文档"),
-        [guard, application, loader, absolutePath, plaintextBytes, encoding](
-            qint64 taskId, AsyncCancelPtr cancel,
-            const std::function<void(qint64, qint64)> &reportProgress,
-            const std::function<void(const AsyncErrorInfo &)> &) {
-            auto postResult = [guard, application, taskId, absolutePath](
-                                  ILoader *resultLoader, TextEncoding resultEncoding,
-                                  const QString &reason) {
-                if (!application) {
-                    if (resultLoader) resultLoader->Release();
-                    return;
-                }
-                const bool queued = QMetaObject::invokeMethod(
-                    application,
-                    [guard, resultLoader, taskId, absolutePath, resultEncoding, reason]() {
-                        if (guard) {
-                            guard->finishLargeTextPromotion(resultLoader, taskId,
-                                                            absolutePath, resultEncoding,
-                                                            reason);
-                        } else if (resultLoader) {
-                            resultLoader->Release();
-                        }
-                    }, Qt::QueuedConnection);
-                if (!queued && resultLoader)
-                    resultLoader->Release();
-            };
-
-            std::unique_ptr<QStringDecoder> decoder;
-            if (encoding == TextEncoding::Utf16LE)
-                decoder = std::make_unique<QStringDecoder>(QStringConverter::Utf16LE);
-            else if (encoding == TextEncoding::Utf16BE)
-                decoder = std::make_unique<QStringDecoder>(QStringConverter::Utf16BE);
-            else if (encoding == TextEncoding::GBK)
-                decoder = std::make_unique<QStringDecoder>(QStringConverter::System);
-            Utf8StreamValidator validator;
-            bool firstChunk = true;
-            qint64 consumed = 0;
-            QString readError;
-            const bool readOk = DraftStore::readChunks(
-                absolutePath,
-                [&](const QByteArray &chunk, QString *consumerError) {
-                    if (cancel && cancel->load(std::memory_order_acquire)) {
-                        if (consumerError) *consumerError = QObject::tr("恢复已取消。");
-                        return false;
-                    }
-                    qsizetype offset = 0;
-                    if (firstChunk) {
-                        firstChunk = false;
-                        if (encoding == TextEncoding::Utf8Bom)
-                            offset = qMin<qsizetype>(3, chunk.size());
-                        else if (encoding == TextEncoding::Utf16LE
-                                 || encoding == TextEncoding::Utf16BE)
-                            offset = qMin<qsizetype>(2, chunk.size());
-                    }
-                    const char *source = chunk.constData() + offset;
-                    qsizetype sourceSize = chunk.size() - offset;
-                    QByteArray converted;
-                    if (decoder) {
-                        const QString decoded = (*decoder)(QByteArrayView(source, sourceSize));
-                        converted = decoded.toUtf8();
-                        source = converted.constData();
-                        sourceSize = converted.size();
-                    } else if (!validator.feed(source, sourceSize)) {
-                        if (consumerError) *consumerError = QObject::tr("恢复检查点包含无效 UTF-8。");
-                        return false;
-                    }
-                    if (sourceSize > 0
-                        && loader->AddData(source, static_cast<Sci_Position>(sourceSize)) != 0) {
-                        if (consumerError) *consumerError = QObject::tr("恢复大文件时内存不足。");
-                        return false;
-                    }
-                    consumed += chunk.size();
-                    reportProgress(consumed, plaintextBytes);
-                    return true;
-                }, &readError);
-            if (!readOk || (decoder && decoder->hasError())
-                || (!decoder && !validator.complete())) {
-                loader->Release();
-                postResult(nullptr, encoding,
-                           readError.isEmpty() ? QObject::tr("恢复检查点解密或编码转换失败。")
-                                               : readError);
-                return;
-            }
-            postResult(loader, encoding, {});
-        }, 0, QStringLiteral("RecoveryLoad"), plaintextBytes);
-
-    emit l2ModeStatusChanged();
-    emit modificationChanged(true);
-    emit titleChanged(tabTitle());
-    return true;
+    return false;
 }
 
 bool EditorTab::exportBinaryRecoveryJournal(QIODevice *output, QString *error)
 {
     if (!output || !output->isWritable() || !isBinaryDocument() || isSecureDocument()
-        || !isL2Mode() || !m_l2View || m_filePath.isEmpty()) {
+        || !isL2Mode() || !m_l2View || m_filePath.isEmpty() || isReadOnlyByPolicy()) {
         if (error) *error = QObject::tr("当前文档不能生成 Binary/Hex 恢复日志。");
         return false;
     }
@@ -5256,16 +4332,23 @@ bool EditorTab::restoreBinaryRecoveryJournal(const QString &journalPath,
     }
 
     QString openError;
-    if (!openLargeFileL2(realFilePath, &openError, false,
+    if (!openLargeFileL2(realFilePath, &openError,
                          L2Presentation::Hex, L2ContentKind::Binary)) {
         if (error) *error = openError;
         journal.fill(0);
         return false;
     }
-    // openLargeFileL2 intentionally returns as soon as the asynchronous mmap
-    // task is scheduled.  Recovery patches must not be installed before
-    // onMmapReady(), because normal mmap initialization resets PatchList.
-    // Wait only for this Hex mapping boundary (no line index is required).
+    if (isReadOnlyByPolicy()) {
+        if (error) {
+            *error = QObject::tr(
+                "32 MiB 以上 Binary/Hex 文件为只读分析模式，不能恢复编辑日志。");
+        }
+        journal.fill(0);
+        return false;
+    }
+    // This recovery branch is reachable only for editable B1 Hex. Its mmap is
+    // initialized asynchronously, so wait for that bounded mapping before
+    // installing the B1 PatchList. S2/S3/B2/B3 have already returned above.
     if (!m_l2View->isOpen()) {
         bool mapped = false;
         QEventLoop mapLoop;
@@ -5343,7 +4426,7 @@ bool EditorTab::openAutosaveAutoMode(const QString &autosavePath, const QString 
     qDebug("[openAutosaveAutoMode] 选 S2/S3: autosaveSize=%lld KB，进入统一 mmap 打开路径",
            size / 1024);
     QString err;
-    const bool ok = openLargeFileL2(autosavePath, &err, true);
+    const bool ok = openLargeFileL2(autosavePath, &err);
     qDebug("[openAutosaveAutoMode] 统一 mmap 返回 ok=%d err='%s', 耗时=%lld ms",
            ok ? 1 : 0, qUtf8Printable(err), t.elapsed());
     if (!ok) {
@@ -5356,7 +4439,6 @@ bool EditorTab::openAutosaveAutoMode(const QString &autosavePath, const QString 
     refreshDiskVersionBaseline();
     m_autosavePath = autosavePath;
     m_l2SaveNeeded = true;
-    m_l2PromotionRepresentsDirty = true;
     emit modificationChanged(true);
     emit titleChanged(tabTitle());
     emit l2SaveNeededChanged(true);

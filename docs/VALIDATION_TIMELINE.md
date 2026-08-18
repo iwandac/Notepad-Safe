@@ -4,6 +4,10 @@
 `GUI_TEST_COVERAGE_MATRIX.md` 的完整功能契约。开始一个新批次时先查本文，只有命中“重跑触发”
 时才重复邻近冒烟；发现缺陷后把它加入对应永久哨兵，而不是不断扩写用户旅程。
 
+> 2026-08-18 边界更正：S2 编辑和后台 ILoader 装载经真实用户验证判定为未实现且不可用，
+> 已从生产路径移除。下文早期提交中涉及“晋升/Editable/资源准入”的记录只说明当时测试过什么，
+> 不再是有效能力证据；当前 S2/S3 均为窗口化 mmap 只读分析。
+
 ## 1. 状态口径
 
 - **切片通过**：代表输入和正式 GUI 路径通过，只能关闭该切片。
@@ -24,6 +28,7 @@
 | 2026-08-17 `55fcad6` | B1/B2/B3 可见 Hex 三栏、单滚动、ASCII 同步和交互契约 | `windowedHexUsesUnifiedThreeColumnByteContract`、`windowedHexBothPanesWheelInLockstep`、真实 B2/B3 | Hex 布局、选择、滚轮、bytes-per-row 或 Provider 变化 | 跨窗口鼠标拖选、保存失败、全部搜索分支 |
 | 2026-08-18 `4e9159e` | Hex 输入/选择/IME/剪贴板成熟度；搜索三态、Literal/Regex/Hex、整词、替换模板、S3 真实搜索；不可见 byte 往返；B1 Text 行号 | H0/H1/S0/S1（见第 3 节）；`tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers` | `EditorTab`、Hex/ASCII 投影、FindReplaceDialog、LargeFileSearch、PCRE2 或搜索结果模型变化 | 全部打开文件的完整动态竞态；编码 PositionMapper；S2 真实资源门禁 |
 | 2026-08-18 工作树 | 加密专项：胶囊丢失立即失效、Secure Text 复制条件清理、锁定态标题脱敏、编辑区快捷键/右键统一入口 | C0；`secureClipboardIsConditionalAndClearedOnLock`；完整 security unit/GUI slice | SecuritySessionService、MainWindow 剪贴板/锁定、EditorTab secure title、VaultDock 变化 | 抗同用户恶意进程；操作系统剪贴板历史/云同步中已经复制出去的历史副本 |
+| 2026-08-18 工作树 | 禁用未实现的 S2 编辑：S2/S3 capability 统一只读，删除 LargeFileLoad、ILoader 晋升、资源准入、编辑保存/恢复分支和独立 promotion target | `test_filetierpolicy`；40 MiB 动态浏览/输入/直调保存拒绝；`mmapS2RemainsReadOnlyAndStartsNoBackgroundLoad`、`s2DoesNotQueueBackgroundEditLoad`、`invalidEncodingDoesNotStartBackgroundLoader`、`nearTwoGiBReadOnlyReachesHeadMiddleAndTailWithoutEditLoad`；真实 `smalltestfile` 的 `realB2BinaryRemainsReadOnlyAndStartsNoBackgroundLoad`；恢复导出与旧日志拒绝；KDBX=ON 生产目标构建 | FileTierPolicy、EditorTab L2、Windowed Provider、任务类型或 capability 变化 | 本批不宣称 S2/S3 已具备成熟的全量搜索、wrap 和持续增长日志体验 |
 
 ## 3. 可复用最小冒烟集合
 
@@ -54,7 +59,7 @@
 
 - `windowedHexUsesUnifiedThreeColumnByteContract`
 - `windowedHexBothPanesWheelInLockstep`
-- `b2BinaryUsesStableSingleScrollFallback`
+- `realB2BinaryRemainsReadOnlyAndStartsNoBackgroundLoad`
 - `s3ProductionProviderDragMatchesRenderedHex`
 - `tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers`
 
@@ -85,17 +90,16 @@
 
 触发：SearchSession、目标枚举、generation/revision、Dock、双击导航、spool 或 Provider 搜索变化。
 
-### L0：S2/S3 浏览与晋升
+### L0：S2/S3 只读能力边界
 
 - `editorSurfaceBaselineMatchesFullAndWindowedProviders`
-- `mmapPreviewPromotesToEditableScintilla`
-- `cancelingQueuedOrRunningPromotionKeepsPreviewUsable`
-- `invalidEncodingDuringPromotionFallsBackWithoutLosingPreview`
+- `mmapS2RemainsReadOnlyAndStartsNoBackgroundLoad`
+- `s2DoesNotQueueBackgroundPromotion`
 - `nearTwoGiBPreviewReachesHeadMiddleAndTailWithoutPromotion`
 - `windowedTextWrapReachesPhysicalEofAndKeepsGutter`
 - `windowedProviderRemapsAppendAndTruncate`
 
-触发：门限、预览、解码、Scintilla attach、资源准入、wrap、EOF 或文件变化处理。
+触发：门限、只读 capability、L2 打开、任务类型、wrap、EOF 或文件变化处理。
 
 ### C0：安全文档与账户代表链路
 
@@ -122,7 +126,7 @@
 
 起点：`4e9159e`。状态：进行中。
 
-目标：在正式 MainWindow 中证明 Text/Hex × S1/S2 Preview/S2 Editable/S3/Secure × 当前/全部
+目标：在正式 MainWindow 中证明 Text/Hex × S1/S2 ReadOnly/S3 ReadOnly/Secure × 当前/全部
 打开文件共享同一 query、generation、PositionSpace 和导航契约；运行中新增/关闭/编辑目标、
 快速 A/B/C 跳转、取消/重跑和锁定清理不会产生旧结果覆盖或错误 selection。
 

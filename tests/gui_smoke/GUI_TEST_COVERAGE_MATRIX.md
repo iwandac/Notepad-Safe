@@ -35,7 +35,7 @@
 | T06 | 长行/wrap/标尺 | nowrap/wrap、超长行、横向末端、top/middle/EOF、resize | nowrap 全行可达；wrap 无横向条且滚动连续；display/source 映射正确 |
 | T07 | 语言/高亮 | Plain、C/C++、Python、JSON、HTML、XML、SQL、YAML、Markdown | 菜单互斥、建议/手选/会话恢复正确；Hex/Accounts/只读能力符合设计 |
 | T08 | 编码/EOL | UTF-8/BOM、UTF-16LE/BE、GB18030、CRLF/LF/CR/无尾换行 | 检测、重开、转换和磁盘字节正确；脏重开有保存/放弃/取消；状态栏准确 |
-| L00 | Text 跨 Tier 同界面 | 同一文本切片分别进入 S1、S2 Preview/Editable/Fallback、S3；宽窄/DPI/主题 | 共用 EditorSurface 视觉契约；字体/gutter/正文/滚动条/选择/高亮/菜单几何一致；只允许 capability 和状态文案不同 |
+| L00 | Text 跨 Tier 同界面 | 同一文本切片分别进入 S1、S2 只读、S3 只读；宽窄/DPI/主题 | 共用 EditorSurface 视觉契约；字体/gutter/正文/滚动条/选择/高亮/菜单几何一致；只允许可编辑能力和档位文案不同 |
 | H01 | Hex 统一布局 | B1/B2/B3/Secure Binary、宽窄/DPI/主题 | 各 Tier 同一视觉语言；地址/Hex/ASCII 铺满；无大片空白或多余控件 |
 | H02 | Hex 滚动/地址 | 0/25/50/75/100%、滚轮/Page/方向、窗口边界/EOF | 恰好一条纵向滚动条；首行地址、global offset、正文一致；不回弹/假 EOF |
 | H03 | Hex caret/选择 | Hex 高低 nibble、ASCII、正反向跨行/跨窗、末字节 | 两输入面 caret/selection 镜像同一 source byte range；状态栏 64 位 offset 正确 |
@@ -43,8 +43,8 @@
 | H05 | Hex 删除/剪贴板 | Backspace/Delete/Cut/Paste、nibble 中间、selection、边界/EOF | 控制键先按语义处理，不被十六进制字符校验吞掉；目标字节/长度/Undo 正确 |
 | H06 | Hex 保存/恢复 | 0/1/15/16/17 B、9 MiB、窗口边界修改、失败/崩溃 | 逐字节保存与重开一致；未修改 no-op；失败保原文件；patch 恢复正确 |
 | H07 | Text/Hex 呈现 | Binary→Text→Hex、Text→Hex→Text、dirty/会话恢复 | 只改变呈现不改变 payload；位置/selection 可解释；保存仍按内容身份 |
-| L01 | S2 即时预览 | 32 MiB 边界、256 MiB、不同编码/长行 | 首屏及时可操作；左侧全局导航信息存在；预览不依赖完整加载/索引 |
-| L02 | S2 晋升编辑 | 成功、取消、解码失败、资源拒绝、接近 2 GiB | 阶段/字节/速度可见；成功位置不变且可编辑；失败稳定留在可搜索只读预览 |
+| L01 | S2 即时只读 | 32 MiB 边界、256 MiB、不同编码/长行 | 首屏及时可操作；左侧全局导航信息存在；浏览不依赖完整加载/索引 |
+| L02 | S2/S3 能力边界 | 32 MiB−1/等于/加1、2 GiB−1/等于/加1、解码失败、低内存 | S1 以下可编辑；S2/S3 始终只读且不创建后台编辑装载任务；输入/粘贴/删除/替换/保存修改均不可用，源 hash 不变 |
 | L03 | S3/B2/B3 只读 | 2 GiB 边界、保留真实大文件、Text/Hex | 全文可浏览/搜索/有界复制；编辑/替换显式禁用；不创建完整内存副本 |
 | L04 | 大文件连续浏览 | 拖动、滚轮、pixelDelta、Page、wrap、横向长行、静置 | 单滚动；窗口间无 gap/重复/回跳；物理 EOF 可达；UI heartbeat 持续 |
 | L05 | 文件增长/轮转 | 追加、截断、同路径替换、搜索运行中变化 | 新尾可达；位置钳制；generation 正确失效/增量；无持久锁阻止外部替换 |
@@ -64,9 +64,9 @@
 | A03 | 密码/TOTP | 生成/强度、遮罩/显示、复制、30 秒、剪贴板被用户替换 | 秘密短时可见；只清除匹配内容；TOTP 更新正确；日志/截图默认不泄露 |
 | A04 | 历史/回收站 | 多次轮换、恢复旧版、反向恢复、删除/恢复/永久删除 | KeePass 历史完整；误删可恢复；永久删除明确确认且数据库持久化正确 |
 | A05 | 外来 KDBX | 密码/key file、七天重开、外部冲突、保存失败 | 兼容打开；不创建空库；原子保存；错误/冲突保留旧库与当前修改 |
-| U01 | QAction/capability | Empty/Text/Hex/S2 Preview/S2 Editable/S3/Accounts/Security | 菜单/工具栏/快捷键同一动作；enabled/checked/visible 与实际可执行能力一致 |
+| U01 | QAction/capability | Empty/Text/Hex/S2 ReadOnly/S3 ReadOnly/Accounts/Security | 菜单/工具栏/快捷键同一动作；enabled/checked/visible 与实际可执行能力一致 |
 | U02 | 状态栏 | 各 Provider、无标签/Accounts、最长文案、临时消息、任务 chip | 位置/编码/语言/大小/tier/dirty 准确；文字不重叠、裁切或残留旧标签信息 |
-| U03 | 后台任务 | 加载/晋升/索引/搜索/保存、排队/运行/取消/失败/完成 | 阶段与真实状态一致；取消及时；0 任务无线程噪音；详情脱敏且可清理 |
+| U03 | 后台任务 | 索引/搜索/保存、排队/运行/取消/失败/完成；S2/S3 打开 | 阶段与真实状态一致；取消及时；S2/S3 打开不产生编辑装载任务；0 任务无线程噪音；详情脱敏且可清理 |
 | U04 | Dock/工具栏/状态栏 | 显隐、关闭重开、中央工作区切换、重启恢复 | 布局和动作勾选一致；Accounts/Security 不显示无关 Dock；返回文档恢复合理 |
 | U05 | 主题/DPI/无障碍 | System/Light/Dark/高对比、900–1800px、100–200% DPI | 正文/菜单/焦点/禁用态可读；核心动作可达；Tab 顺序、accessible name 正确 |
 | U06 | 设置/会话 | 正常/损坏设置、多显示器移除、混合标签、缺失文件 | 安全默认回退；窗口不离屏；渐进恢复且当前/位置/呈现/dirty 正确 |

@@ -763,7 +763,7 @@ void FindReplaceDialog::onReplaceAll()
         }
 
         const QString skipSummary = QStringLiteral(
-            "跳过：只读/未晋升大文件 %1 个，Binary/Hex %2 个，锁定文档 %3 个。")
+            "跳过：只读大文件 %1 个，Binary/Hex %2 个，锁定文档 %3 个。")
                 .arg(skippedReadOnly).arg(skippedBinary).arg(skippedLocked);
         if (plan.isEmpty()) {
             const QString message = QStringLiteral("没有可替换的匹配。%1").arg(skipSummary);

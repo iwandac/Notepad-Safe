@@ -36,7 +36,7 @@
 #include "EditorTab.h"
 #include "FindReplaceDialog.h"
 #include "VirtualFileView.h"
-#include "LargeFileVerticalSlice.h"
+#include "WindowedReadOnlyProvider.h"
 #include "LineIndex.h"
 #include "PatchList.h"
 #include "SearchResultsDock.h"
@@ -927,7 +927,7 @@ void SmokeFindReplace::tc_fr_011_hex_byte_find_all_highlight_and_double_click()
     content[40] = 'Z';
     const QString path = createSmallTestFile(content, "fr-011-binary.bin");
     QString error;
-    QVERIFY2(tab()->openLargeFileL2(path, &error, false,
+    QVERIFY2(tab()->openLargeFileL2(path, &error,
                                     L2Presentation::Hex,
                                     L2ContentKind::Binary), qPrintable(error));
     QApplication::processEvents(QEventLoop::AllEvents, 200);
@@ -1026,7 +1026,7 @@ void SmokeFindReplace::tc_fr_012_hex_byte_all_open_filters_text_targets()
     auto *lockedTab = new EditorTab(&workspace);
     QString error;
     QVERIFY(textTab->loadFile(textPath));
-    QVERIFY2(binaryTab->openLargeFileL2(binaryPath, &error, false,
+    QVERIFY2(binaryTab->openLargeFileL2(binaryPath, &error,
                                         L2Presentation::Hex,
                                         L2ContentKind::Binary), qPrintable(error));
     workspace.addTab(textTab, QStringLiteral("Text"));
@@ -1291,7 +1291,7 @@ void SmokeFindReplace::tc_fr_015_all_open_replace_transaction_and_skip_summary()
         QStringLiteral("secure %1\r\n").arg(marker));
     QVERIFY(secure->isSecureDocument());
     QString error;
-    QVERIFY2(l2->openLargeFileL2(l2Path, &error, false), qPrintable(error));
+    QVERIFY2(l2->openLargeFileL2(l2Path, &error), qPrintable(error));
     QVERIFY(l2->isL2Mode());
     QVERIFY(!l2->isReadOnlyByPolicy());
     workspace.addTab(first, QStringLiteral("first"));
@@ -1355,7 +1355,7 @@ void SmokeFindReplace::tc_fr_015_all_open_replace_transaction_and_skip_summary()
     QVERIFY(sawCompletion);
     QVERIFY(confirmationText.contains(QStringLiteral("4 个可编辑文本文件")));
     QVERIFY(confirmationText.contains(QStringLiteral("5 处匹配")));
-    QVERIFY(confirmationText.contains(QStringLiteral("只读/未晋升大文件 0 个")));
+    QVERIFY(confirmationText.contains(QStringLiteral("只读大文件 0 个")));
     QCOMPARE(first->editor()->text().count(replacement), 2);
     QCOMPARE(second->editor()->text().count(replacement), 1);
     QCOMPARE(secure->editor()->text().count(replacement), 1);
@@ -1652,7 +1652,7 @@ void SmokeFindReplace::tc_fr_019_query_option_state_machine_exhaustive()
     QVERIFY(textTab->loadFile(textPath));
     QString openError;
     QVERIFY2(binaryTab->openLargeFileL2(
-                 binaryPath, &openError, false,
+                 binaryPath, &openError,
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(openError));
     workspace.addTab(textTab, QStringLiteral("Text"));
@@ -2017,7 +2017,7 @@ void SmokeFindReplace::tc_fr_022_hex_query_formats_errors_and_navigation()
         content, QStringLiteral("fr-022-hex-formats.bin"));
     QString openError;
     QVERIFY2(tab()->openLargeFileL2(
-                 path, &openError, false,
+                 path, &openError,
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(openError));
 
@@ -2398,7 +2398,7 @@ void SmokeFindReplace::tc_fr_027_real_s3_find_all_dock_double_click()
 
     QString error;
     QVERIFY2(tab()->openLargeFileL2(
-                 path, &error, false,
+                 path, &error,
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(error));
     QVERIFY(tab()->isReadOnlyByPolicy());
@@ -2508,7 +2508,7 @@ void SmokeFindReplace::tc_fr_028_real_s3_find_next_preparation_and_repeat_bounda
 
     QString error;
     QVERIFY2(tab()->openLargeFileL2(
-                 path, &error, false,
+                 path, &error,
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(error));
     auto *provider = tab()->windowedReadOnlyProvider();
@@ -2668,7 +2668,7 @@ void SmokeFindReplace::tc_fr_030_sparse_s3_text_regex_after_two_gib()
 
     QString error;
     QVERIFY2(tab()->openLargeFileL2(
-                 path, &error, false,
+                 path, &error,
                  L2Presentation::Text, L2ContentKind::Text),
              qPrintable(error));
     QVERIFY(tab()->isL2Mode());
@@ -2798,7 +2798,7 @@ void SmokeFindReplace::tc_fr_031_real_s3_default_literal_is_not_regex()
 
     QString error;
     QVERIFY2(tab()->openLargeFileL2(
-                 path, &error, false,
+                 path, &error,
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(error));
     auto *provider = tab()->windowedReadOnlyProvider();
@@ -2864,7 +2864,7 @@ void SmokeFindReplace::tc_fr_032_invalid_utf8_binary_default_literal_portable()
 
     QString error;
     QVERIFY2(tab()->openLargeFileL2(
-                 path, &error, false,
+                 path, &error,
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(error));
     auto *provider = tab()->windowedReadOnlyProvider();

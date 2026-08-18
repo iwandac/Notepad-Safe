@@ -337,7 +337,7 @@ static bool openTabAutoMode(EditorTab *tab, const QString &path)
     // recent files, drag/drop and session restore cannot disagree.
     if (looksLikeBinaryFile(path)) {
         QString error;
-        if (!tab->openLargeFileL2(path, &error, false,
+        if (!tab->openLargeFileL2(path, &error,
                                   L2Presentation::Hex,
                                   L2ContentKind::Binary)) {
             qWarning("[openTabAutoMode] binary mmap open failed: path='%s', error='%s'",
@@ -367,7 +367,7 @@ static bool openSessionFile(EditorTab *tab, const SessionTab &state)
         return false;
     if (state.presentation == QLatin1String("hex")) {
         QString error;
-        if (!tab->openLargeFileL2(state.filePath, &error, false,
+        if (!tab->openLargeFileL2(state.filePath, &error,
                                   L2Presentation::Hex,
                                   L2ContentKind::Binary)) {
             qWarning("[session] explicit Hex restore failed: path='%s', error='%s'",
@@ -380,9 +380,9 @@ static bool openSessionFile(EditorTab *tab, const SessionTab &state)
         && looksLikeBinaryFile(state.filePath)) {
         QString error;
         // The user explicitly overrode Binary/Unknown classification with a
-        // text presentation. Preserve that choice across restart without
-        // promoting a potentially huge/arbitrary byte stream into Scintilla.
-        if (!tab->openLargeFileL2(state.filePath, &error, false,
+        // text presentation. Preserve that choice across restart while keeping
+        // a potentially huge/arbitrary byte stream on the read-only provider.
+        if (!tab->openLargeFileL2(state.filePath, &error,
                                   L2Presentation::Text,
                                   L2ContentKind::Binary)) {
             qWarning("[session] explicit Text restore failed: path='%s', error='%s'",
@@ -4451,7 +4451,7 @@ void MainWindow::updateStatusBar()
     case FileTier::StandardEdit:
         tierName = hexMode ? QStringLiteral("B1") : QStringLiteral("S1");
         break;
-    case FileTier::LargeEditPreview:
+    case FileTier::LargeReadOnly:
         tierName = hexMode ? QStringLiteral("B2") : QStringLiteral("S2");
         break;
     case FileTier::HugeReadOnly:
@@ -4461,20 +4461,8 @@ void MainWindow::updateStatusBar()
     }
     QString capability = tierName;
     switch (tab->largeDocumentRuntimeState()) {
-    case EditorTab::LargeDocumentRuntimeState::PreviewReady:
-        capability += QStringLiteral(" · 预览");
-        break;
-    case EditorTab::LargeDocumentRuntimeState::PreparingEditor:
-        capability += QStringLiteral(" · 准备编辑");
-        break;
-    case EditorTab::LargeDocumentRuntimeState::Editable:
-        capability += QStringLiteral(" · 可编辑");
-        break;
     case EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis:
         capability += QStringLiteral(" · 只读分析");
-        break;
-    case EditorTab::LargeDocumentRuntimeState::ReadOnlyFallback:
-        capability += QStringLiteral(" · 只读回退");
         break;
     case EditorTab::LargeDocumentRuntimeState::None:
         if (tab->isReadOnlyByPolicy())
@@ -4485,7 +4473,7 @@ void MainWindow::updateStatusBar()
                               ? sizeStr
                               : QStringLiteral("%1 · %2").arg(sizeStr, capability));
     m_statusSize->setToolTip(
-        QStringLiteral("当前文档内容大小；S1 直接编辑，S2 大文件预览/编辑，S3 超大文件只读"));
+        QStringLiteral("当前文档内容大小；S1 直接编辑，S2/S3 均为 mmap 只读分析"));
 
     m_statusModified->setText(tab->isModified() ? QStringLiteral("● 已修改") : QStringLiteral(""));
 }
@@ -4869,7 +4857,7 @@ void MainWindow::restoreNextSessionTab()
     } else if (!st.filePath.isEmpty() && QFileInfo::exists(st.filePath)) {
         // ===== 关键修复：不再直接 tab->loadFile(st.filePath) =====
         //   原 bug：即便 100MB 也走 L1 全量 readAll + 主线程分块；
-        //   新逻辑：openTabAutoMode → ≥ 32MB 自动 openLargeFileL2 (mmap + 后台 AsyncTaskManager)
+        //   新逻辑：openTabAutoMode → ≥ 32MB 自动 openLargeFileL2（窗口化只读，无后台编辑加载）
         const qint64 realSize = QFileInfo(st.filePath).size();
         const qint64 limit = FileTierPolicy::StandardEditLimitBytes;
         const FileTierDecision tier = FileTierPolicy::classify(realSize);

@@ -349,7 +349,7 @@ void test_binary_hex_patch_recovery_is_encrypted_and_restorable()
     SessionManager sm(dir);
     auto source = std::make_unique<EditorTab>();
     QString error;
-    CHECK(source->openLargeFileL2(sourcePath, &error, false,
+    CHECK(source->openLargeFileL2(sourcePath, &error,
                                   L2Presentation::Hex,
                                   L2ContentKind::Binary),
           "Binary fixture 进入 Hex provider");

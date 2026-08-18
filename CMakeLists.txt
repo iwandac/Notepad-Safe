@@ -171,7 +171,7 @@ add_executable(notepad-safe WIN32
     src/search/LargeFileSearch.cpp
     src/search/SearchResultsModel.cpp
     src/editor/VirtualFileView.cpp
-    src/editor/LargeFileVerticalSlice.cpp
+    src/editor/WindowedReadOnlyProvider.cpp
     src/async/AsyncTask.cpp
     src/async/AsyncThreadPool.cpp
     src/async/AsyncTaskManager.cpp
@@ -345,7 +345,7 @@ add_executable(test_session
     src/search/LargeFileSearch.cpp
     src/search/SearchResultsModel.cpp
     src/editor/VirtualFileView.cpp
-    src/editor/LargeFileVerticalSlice.cpp
+    src/editor/WindowedReadOnlyProvider.cpp
     src/async/AsyncTask.cpp
     src/async/AsyncThreadPool.cpp
     src/async/AsyncTaskManager.cpp
@@ -413,7 +413,7 @@ qt_import_plugins(test_largefile
     INCLUDE Qt6::QWindowsIntegrationPlugin
 )
 
-# Test 6: exact S1/S2/S3 boundaries and deterministic promotion admission.
+# Test 6: exact S1/S2/S3 boundaries and permanent large-file read-only policy.
 add_executable(test_filetierpolicy
     tests/test_filetierpolicy.cpp
 )
@@ -590,7 +590,7 @@ target_link_libraries(diag_save_l2_chain PRIVATE
 set(GUI_SMOKE_SHARED_SOURCES
     tests/gui_smoke/SmokeTestBase.cpp
     src/editor/VirtualFileView.cpp
-    src/editor/LargeFileVerticalSlice.cpp
+    src/editor/WindowedReadOnlyProvider.cpp
     src/editor/PatchList.cpp
     src/editor/LineIndex.cpp
     src/search/LargeFileSearch.cpp
@@ -634,16 +634,17 @@ add_executable(gui_smoke_findreplace
     ${GUI_SMOKE_SHARED_SOURCES}
 )
 
-# S2 acceptance: mmap first paint -> background ILoader promotion -> real keyboard edit -> atomic save.
-add_executable(gui_smoke_s2_promotion
-    tests/gui_smoke/smoke_s2_promotion.cpp
+# Large-file acceptance: S2/S3 mmap browse/search/copy stay read-only and no
+# background task constructs a full Scintilla document.
+add_executable(gui_smoke_large_readonly
+    tests/gui_smoke/smoke_large_readonly.cpp
     ${GUI_SMOKE_SHARED_SOURCES}
 )
-target_compile_definitions(gui_smoke_s2_promotion PRIVATE
+target_compile_definitions(gui_smoke_large_readonly PRIVATE
     NOTEPADSAFE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
-target_include_directories(gui_smoke_s2_promotion PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
-target_link_libraries(gui_smoke_s2_promotion PRIVATE
+target_include_directories(gui_smoke_large_readonly PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_large_readonly PRIVATE
     notepadsafe_domain
     notepadsafe_search_runtime
     Qt6::Core
@@ -658,31 +659,6 @@ target_link_libraries(gui_smoke_s2_promotion PRIVATE
     ${QSCINTILLA_LIB}
 )
 
-# Architecture proof: one visible global scrollbar for mmap S2/S3 preview,
-# real 256 MiB ILoader promotion, and direct readonly search in the retained
-# 4.59 GiB fixture. This target intentionally does not link the legacy L2 bridge.
-add_executable(gui_smoke_largefile_vertical_slice
-    tests/gui_smoke/smoke_largefile_vertical_slice.cpp
-    src/editor/LargeFileVerticalSlice.cpp
-)
-target_compile_definitions(gui_smoke_largefile_vertical_slice PRIVATE
-    NOTEPADSAFE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-)
-target_include_directories(gui_smoke_largefile_vertical_slice PRIVATE
-    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR}
-)
-target_link_libraries(gui_smoke_largefile_vertical_slice PRIVATE
-    Qt6::Core
-    Qt6::Gui
-    Qt6::Widgets
-    Qt6::Concurrent
-    Qt6::Test
-    ${QSCINTILLA_LIB}
-)
-if(WIN32)
-    target_link_libraries(gui_smoke_largefile_vertical_slice PRIVATE ${WIN_SYSTEM_LIBS})
-endif()
-qt_import_plugins(gui_smoke_largefile_vertical_slice INCLUDE Qt6::QWindowsIntegrationPlugin)
 target_include_directories(gui_smoke_findreplace PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_findreplace PRIVATE
     notepadsafe_domain
@@ -802,8 +778,7 @@ endif()
 # CTest 注册（可选；日常由 run_all_gui_smoke.bat 直跑更直观）
 add_test(NAME gui_smoke_coord        COMMAND gui_smoke_coord)
 add_test(NAME gui_smoke_findreplace  COMMAND gui_smoke_findreplace)
-add_test(NAME gui_smoke_s2_promotion COMMAND gui_smoke_s2_promotion)
-add_test(NAME gui_smoke_largefile_vertical_slice COMMAND gui_smoke_largefile_vertical_slice)
+add_test(NAME gui_smoke_large_readonly COMMAND gui_smoke_large_readonly)
 add_test(NAME gui_smoke_smallfixes   COMMAND gui_smoke_smallfixes)
 add_test(NAME gui_smoke_vault        COMMAND gui_smoke_vault)
 if(TARGET gui_smoke_secure_documents)
@@ -811,12 +786,9 @@ if(TARGET gui_smoke_secure_documents)
     set_tests_properties(gui_smoke_secure_documents PROPERTIES LABELS "gui;security;vault")
 endif()
 set_tests_properties(
-    gui_smoke_coord gui_smoke_findreplace gui_smoke_s2_promotion
+    gui_smoke_coord gui_smoke_findreplace gui_smoke_large_readonly
     gui_smoke_smallfixes gui_smoke_vault
     PROPERTIES RUN_SERIAL TRUE TIMEOUT 60
-)
-set_tests_properties(gui_smoke_largefile_vertical_slice PROPERTIES
-    RUN_SERIAL TRUE TIMEOUT 300 LABELS "gui;large-file;vertical-slice"
 )
 if(TARGET gui_smoke_secure_documents)
     set_tests_properties(gui_smoke_secure_documents PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)

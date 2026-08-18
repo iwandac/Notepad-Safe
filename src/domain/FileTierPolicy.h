@@ -5,7 +5,10 @@
 enum class FileTier {
     Invalid,
     StandardEdit,
-    LargeEditPreview,
+    // 32 MiB..2 GiB is intentionally a read-only mapped analysis tier.
+    // It currently has exactly the same editing capability as HugeReadOnly;
+    // the separate tier only preserves the product size boundary.
+    LargeReadOnly,
     HugeReadOnly
 };
 
@@ -16,52 +19,23 @@ struct FileTierDecision {
 
     bool isValid() const { return tier != FileTier::Invalid; }
     bool usesMappedPreview() const {
-        return tier == FileTier::LargeEditPreview || tier == FileTier::HugeReadOnly;
+        return tier == FileTier::LargeReadOnly || tier == FileTier::HugeReadOnly;
     }
-    bool mayPromoteToFullEdit() const { return tier == FileTier::LargeEditPreview; }
-    bool isReadOnlyByPolicy() const { return tier == FileTier::HugeReadOnly; }
+    bool isReadOnlyByPolicy() const { return usesMappedPreview(); }
 };
 
-// Stable product boundaries. Hardware-dependent decisions belong to
-// ResourceAdmission and must never silently move these size thresholds.
+// Stable product boundaries. Hardware-dependent state must never silently move
+// these thresholds or make a mapped tier editable.
 class FileTierPolicy final {
 public:
     static constexpr qint64 StandardEditLimitBytes = 32LL * 1024 * 1024;
     static constexpr qint64 LargeEditLimitBytes = 2LL * 1024 * 1024 * 1024;
+    // Do not infer an editable S2 path from the 2 GiB classification boundary.
+    // The former background ILoader promotion proved unusable and is disabled.
+    static constexpr bool LargeFileEditingEnabled = false;
 
     // estimatedUtf8Bytes is optional. When decoding/transcoding expands the
     // document, classification uses the larger of the source and estimate.
     static FileTierDecision classify(qint64 sourceBytes,
                                      qint64 estimatedUtf8Bytes = -1);
-};
-
-enum class ResourceAdmissionReason {
-    Admitted,
-    NotLargeEditTier,
-    InvalidMemorySnapshot,
-    PhysicalMemoryBudgetExceeded,
-    CommitReserveInsufficient
-};
-
-struct ResourceAdmissionInput {
-    FileTierDecision file;
-    qint64 totalPhysicalBytes = 0;
-    qint64 availableCommitBytes = 0;
-};
-
-struct ResourceAdmissionDecision {
-    bool admitted = false;
-    ResourceAdmissionReason reason = ResourceAdmissionReason::NotLargeEditTier;
-    qint64 estimatedPeakBytes = 0;
-    qint64 physicalBudgetBytes = 0;
-    qint64 requiredCommitBytes = 0;
-};
-
-class ResourceAdmission final {
-public:
-    static constexpr qint64 CommitReserveBytes = 2LL * 1024 * 1024 * 1024;
-
-    // Deterministic, conservative estimate for promoting an S2 document from
-    // bounded window preview into a complete Scintilla document. This does not allocate.
-    static ResourceAdmissionDecision evaluate(const ResourceAdmissionInput &input);
 };

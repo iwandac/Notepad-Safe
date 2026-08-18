@@ -54,7 +54,6 @@ QString AsyncTask::typeText() const
     case AsyncTaskType::FileEncrypt:    return QObject::tr("文件加密");
     case AsyncTaskType::FileDecrypt:    return QObject::tr("文件解密");
     case AsyncTaskType::LargeFileSave:  return QObject::tr("大文件保存");
-    case AsyncTaskType::LargeFileLoad:  return QObject::tr("准备大文件编辑");
     default: return QObject::tr("其他");
     }
 }

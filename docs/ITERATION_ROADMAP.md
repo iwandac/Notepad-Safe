@@ -15,7 +15,7 @@
 
 1. 新建默认安全 Note，七天会话内编辑/保存/恢复无加密提示。
 2. 用同一打开入口打开普通文本、安全 Note、未知二进制和账户 KDBX，路由正确。
-3. S1 完整编辑；S2 立即浏览并在资源允许时晋升；资源不足自动保持可用只读；S3 能连续浏览和分析全文。
+3. S1 完整编辑；S2/S3 均以同一窗口化 mmap Provider 连续浏览和分析全文，全部修改与替换命令禁用。
 4. 当前文件和全部打开文件搜索语义一致，结果 Dock 一眼可读，双击精确跳转；目录树批处理留给发布后独立立项。
 5. Plain/Secure 只通过另存为转换；保存永远保持当前类型；失败不破坏原文件。
 6. 账户 CRUD、搜索、生成器、TOTP、历史/回收站和敏感信息短时访问形成完整工作流。
@@ -42,7 +42,7 @@
 |---:|---|---|---|
 | 0 | 参考与收敛基线 | 参考采用/拒绝清单、最终目标、风险和动态验收协议 | `REFERENCE_BASELINE.md`、本路线、现有正式构建基线 |
 | 1 | S2/S3 浏览器成熟切片 | 单一纵向位置；滚轮跨窗口连续；长行横向可达；Hex 自适应有效宽度 | 40 MiB 文本、`smalltestfile`、`bigtestfile` 的拖动/滚轮/横向/缩放 GUI 证据 |
-| 2 | S2 晋升与资源准入 | UTF-8/16/GBK 估算、ILoader 阶段、取消、失败/内存不足回退、位置保持 | 32 MiB 边界、数百 MiB、近 2 GiB 稀疏/真实样本；UI 可操作且回退可浏览 |
+| 2 | S2/S3 只读能力锁定 | 删除后台 ILoader、资源准入、编辑晋升和虚假进度；统一只读 Provider 与能力门禁 | 32 MiB 边界、数百 MiB、近 2 GiB 样本；打开不产生完整加载任务，所有修改入口禁用，原文件不变 |
 | 3 | Hex Provider 核心成熟 | B1 nibble/ASCII、选择、撤销、插入/覆盖、保存；B2/B3 只读导航/复制/搜索一致 | 结构化夹具逐字节回读；窄/宽/DPI GUI；数据无错位 |
 | 4 | 统一文档生命周期 | 全入口 OpenDispatcher、标签/脏状态、编码/EOL、外部修改、会话/最近文件、原子保存 | Shell/拖放/CLI/最近/恢复同路由；重启及失败注入验证 |
 | 5 | 统一搜索与替换 | PCRE2 查询，当前/全部打开，增量 Dock、取消、精确跳转、可编辑目标事务替换 | S1/S2/S3/Text/Hex/Secure 混合范围；跨块正则；双击可见选区；撤销和磁盘不隐式保存复核 |
@@ -70,7 +70,7 @@
 - `DESIGN.md`、`TARGET_EXPERIENCE.md`、参考基线、菜单/状态功能总账与正式软件一致。
 - 统一打开和 Save/Save As 类型保持规则不存在旁路。
 - S2/S3 没有双滚动条、回跳、不可达区域或搜索结果无法精确定位。
-- S2 晋升失败不会失去已打开内容；S3 永不伪装成可编辑。
+- S2/S3 始终只读且不创建后台编辑装载任务；任何界面和状态都不得伪装成可编辑或“准备编辑”。
 - Find/Find All/Replace 的范围、正则、取消、增量和结果失效语义一致。
 - 搜索控件采用参数契约验证：正则、大小写、整词、循环、范围、文本/字节模式均以两态判别语料
   贯穿查找、查找全部和适用的替换路径；Provider 只能更换执行策略，不能重解释选项。
@@ -90,14 +90,14 @@
 任何旧截图、通过计数或 ZIP 都不能覆盖本节末尾的复审缺陷。
 
 - 第 0 轮：**完成**。参考产品采用/拒绝边界、供应链锁、用户旅程、动态 GUI 协议和十轮停止条件已建立，并在后续各轮按实现证据校正。
-- 第 1 轮：**完成**。窗口内滚动改为 Scintilla 逐行滚动，只在边界用重叠窗口换页；文本长行启用横向宽度跟踪并把完整逻辑行扩展到有界投影；Hex 按窗口宽度在完整 4-byte 分组上选择 bytes/row；补齐触控板 `pixelDelta`、Page Up/Down 跨窗、64 位源选区/复制。外部变化路径最终收敛为无持久文件句柄的按需随机读，避免 Windows 长期 mmap/文件 watcher 阻塞原子替换；追加、替换/截断、位置钳制和新头尾显示已通过真实 GUI。正式 Qt 6.11.1 Release GUI 报告 `build/gui-s2-round2.txt` 为 10/10，通过 40 MiB S2 晋升、真实滚轮/触控板、跨窗口选择复制、长行横向、宽窄 Hex、文件变化、UTF-16、加密日志与检查点恢复。关键截图包括 `build/gui-production-s2-preview-dynamic.png`、`build/gui-s2-long-line-horizontal.png`、`build/gui-windowed-remap-truncated.png`、`build/gui-production-s3-dynamic.png`、`build/gui-production-b2-dynamic.png`。
-- 第 2 轮：**完成**。正式路由不再在窗口 Provider 背后启动隐藏 `VirtualFileView`/全文件 mmap；33 MiB 打开期间外部原子替换成功。资源预算改按有界投影计算，运行态明确区分 Preview/Preparing/Editable/ReadOnlyAnalysis/ReadOnlyFallback；1.5 GiB UTF-16 扩张越界在分配前回退，任务中心取消和读取途中无效 UTF-8 均稳定回退且保留预览，`2 GiB−4 KiB` 稀疏文本在 1.5 秒预算内打开并可直接到达头/中/尾。`build/gui-s2-round2-final.txt` 为 15/15 通过；正式 KDBX=ON Release 已重链，E2E 文件路由 11 ms、连续三帧正文可见。旧 mmap 搜索源仅在显式搜索时按需打开，列为第 5 轮必须消除的过渡债务。
+- 第 1 轮：**历史验证，当前仅保留只读浏览结论**。窗口化 Provider 的滚轮、长行、Hex 布局、64 位位置和外部变化曾通过自动化切片；其中关于“S2 晋升、完整编辑、加密编辑日志”的结论已被 2026-08-18 真实用户验证否决，不得作为当前能力证据。
+- 第 2 轮：**历史方案已否决**。Preview/Preparing/Editable/ReadOnlyFallback、资源准入和 ILoader 后台装载在真实使用中不可用，现已从生产代码和当前验收中移除。当前只接受一项结论：32 MiB 以上使用同一窗口化只读 Provider，不能启动后台编辑装载。
 - 第 3 轮：**完成，2026-08-17 追加界面一致性修复**。B1 的 64 位 offset、Hex 网格和 ASCII 栏已共享同一 source-byte 坐标与双向 selection；两栏均可输入，Insert 在每标签切换 OVR/INS，nibble、ASCII、粘贴、删除、Undo/Redo 和 PatchList 保存保持逐字节一致。bytes-per-row 依据真实 viewport 以 4-byte 对齐自适应，宽窄重排会先安全 flush，首/末 nibble 不裁切，复用 Scintilla 时不继承错误水平偏移；状态栏按 B1/B2/B3 显示并在可编辑 B1 标注 OVR/INS。Hex byte Find All 的 Dock 分组、高亮、双击 64 位跳转及 ASCII 镜像选区已通过；混合“全部打开文件”只调度 Binary 并报告跳过 Text。B2/B3 保持只读、不暴露未证明的写穿，但已删除地址/Hex/ASCII 拼接投影，改为与 B1 相同的地址 margin、纯 Hex 网格、独立 ASCII pane 和唯一全局滚动条；真实 228MB/4.9GB 样本及双向选区、nibble 导航、Copy、Ctrl+A、窄宽重排契约通过。正式 GUI 证据：`build/gui-hex-round3-slice.txt`、`build/gui-hex-search-final.txt`、`build/gui-hex-b2-b3-round3.txt`；截图 `build/gui-hex-roundtrip.png`、`build/gui-windowed-hex-unified.png`、`build/gui-production-b2-dynamic.png`、`build/gui-production-s3-dynamic.png`。正式 KDBX=ON Release 已重链，E2E 文件路由 13 ms、连续三帧正文可见。
 - 第 4 轮：**完成**。文件菜单、拖放/CLI 调用、最近文件和会话恢复共享统一内容探测与文件身份；同一文件的规范路径/硬链接只激活既有标签，二进制的 Text/Hex 呈现选择跨重启保持。最近文件在设置加载后立即重建，按磁盘身份去重，缺失项无阻塞提示并同步持久化删除。普通文本显式检测主导 CRLF/LF/CR，新键入换行继承并在状态栏与编码共同显示；UTF-8 CRLF 经真实键盘编辑、菜单保存、转 UTF-16LE、BOM/正文/行尾磁盘回读通过。编码元数据变化拥有独立 dirty 状态，不会因 Scintilla save-point 限制静默丢失，“以编码重新打开”则正确清除放弃内容后的 dirty。外部改写保存冲突、重新加载、原文件不被覆盖，以及最近/会话/统一打开邻接回归均通过。正式 GUI 证据 `build/gui-round4-lifecycle-final.txt` 为 8/8；正式 KDBX=ON Release 已重链，E2E 首帧约 196 ms、40 MiB 路由 11 ms、连续三帧正文可见。
 - 第 5 轮：**完成**。当前文件/全部打开文件共用 Text、PCRE2 Regex 与 Hex byte 查询入口；F3/Shift+F3、Find All、Dock 高亮和双击跳转服从同一显式范围。全部打开文件按事件循环和后台任务增量调度，支持运行中加入/关闭目标、取消后保留完成结果、内容 revision 失效与重跑。S2/S3 搜索不再等待完整 LineIndex：先发布 64 位 byte range 和有界上下文，索引随后到达时 Dock 原位补齐行号且不重搜。全部打开文件 Replace All 先冻结 revision 和完整预检，经一次确认后对所有兼容的 S1 Plain/Secure Text 各形成一个 undo step；任一目标失败会逆序回滚，L2/只读、Hex 和锁定文档显式跳过，成功不自动保存。正式搜索 GUI `build/gui-search-round5-full.txt` 为 18/18；搜索逻辑 32/32、PCRE2 0 failure；正式 KDBX=ON Release 已重链，E2E 40 MiB 路由 12 ms、连续三帧正文可见。目录树搜索/替换不属于本次发布边界，未来必须作为带枚举、权限、备份和原子提交的独立工作流立项，不得塞进“全部打开文件”。
 - 第 6 轮：**完成**。新建与无可恢复会话的启动兜底默认建立安全 Note；未命名正文自动保存到 `.nsafe-draft`，普通 Save 保持该加密 backing，只有 Save As 显式选择安全/未加密并完成格式转换。七天 DPAPI capsule 可跨 MainWindow/进程重启静默恢复安全草稿和异地凭据；Windows 锁屏会清空正文、Undo、查找框/结果与账户解密对象，解锁后凭 capsule 无提示恢复，显式锁定则删除 capsule。当前会话不匹配的安全文档和账户 KDBX 共用“文件密码/恢复密钥”对话框，成功后按 identityId+keyVersion 记入密封会话，后续文件及重启不再询问；身份/恢复单元门禁覆盖 AppData 丢失后的文件内恢复槽、密码轮换和历史版本。Text payload 新增 KDBX 加密的精确 UTF-8 附件，同时保留 Notes 可读镜像，修复 CRLF 经 XML 往返变 LF 的同构缺口；旧 Notes-only 文件兼容读取并在下次保存迁移。正式 GUI `build/gui-secure-round6-full.txt` 为 7/7，身份、KDBX、会话门禁通过（会话 59/59）；正式 KDBX=ON Release 已重链，E2E 40 MiB 路由 12 ms、连续三帧正文可见。
 - 第 7 轮：**完成**。账户已是与文档并列的中央工作区，覆盖首次空状态、列表/详情、账号 CRUD、结构化脱敏搜索、KeePassXC 密码生成/强度、TOTP、按需秘密访问、30 秒受控剪贴板、回收站恢复/永久删除和外来账户文件的七天无提示重开。保存现有账号会由 KeePassXC Entry History 保留旧版本；历史列表只显示时间、标题和用户名，恢复旧密码后被替代的当前版本仍可反向恢复。适配层避免把 KeePassXC `setTotp()` 的内部历史事务嵌套到账号外层事务；新建账号和安全文档静默保存不产生伪历史。`Ctrl+F` 在账户页聚焦账号搜索，`Ctrl+S` 只在当前账号有未保存编辑时启用并保存；940px 窄窗口动作完整可达。正式账户 GUI `build/gui-account-round7-full.txt` 为 7/7，统一安全文档/账户会话 GUI `build/gui-secure-round7-full.txt` 为 7/7，真实 KDBX 后端更新—历史—密码恢复—再次原子保存门禁通过；视觉证据为 `gui-account-history.png` 与 `gui-foreign-account-recovery-narrow.png`。
-- 第 8 轮：**完成**。八个顶级菜单和核心 QAction 已有稳定 Command ID，工具栏/菜单复用同一动作；Undo/Redo、Cut/Copy/Paste、全选、行操作和排序按真实 selection、history、clipboard 与 Provider 可写能力即时启停。窗口化 mmap 的状态栏大小改取 64 位 provider 真值，S2 持续显示预览/准备编辑/可编辑/只读回退，S3/B3 显示只读分析，可编辑 B1 保留 INS/OVR。后台任务 model 修复 Qt begin/end 结构协议并加入致命 model tester，任务中心覆盖运行、失败、取消、清理和安全任务脱敏。视图聚合、System/Light/Dark、工具栏/状态栏/面板持久化和中央工作区切换已收敛；Windows 高对比度优先使用平台 palette，不被应用 stylesheet 覆盖。状态栏 accessible name、About 供应链版本/上游/GPLv3 已完成；本版明确不增加重复“首选项”、空命令面板或不可用目录搜索入口。正式 GUI `build/gui-shell-round8-final.txt` 为 23/23；150% DPI 高对比度截图为 `build/gui-system-high-contrast.png`，About 截图为 `build/gui-about-supply-chain.png`。
+- 第 8 轮：**历史验证，S2 状态结论已失效**。Shell、Command ID、任务 model、主题、布局和 About 的验证记录仍可用于邻接回归；S2 的“预览/准备编辑/可编辑/只读回退”状态已删除，当前 S2/S3 只显示只读分析，且不得出现后台编辑任务。
 - 第 9 轮：**历史门禁完成，发布结论撤回**。当时正式 KDBX=ON Release 的 11 个单元/契约/供应链测试目标通过，并生成过 0.3.1 ZIP；但后续真实操作证明测试矩阵存在重大盲区，尤其把“数值 offset 正确”误当成“正文可连续浏览”、把局部 Hex 输入回读误当成完整 Hex 编辑器成熟。该 ZIP 只保留为历史构建物，不是可发布候选，也不得再声明“零 P0/P1”。
 
 ### 6.1 2026-08-17 真实操作复审（当前真值）
@@ -116,13 +116,13 @@
 | 范围 | 当前结论 | 本批处理 | 发布状态 |
 |---|---|---|---|
 | S2/S3 Text 窗口化浏览 | 旧实现把滚动条最大值当“最后一个 anchor”，没有保证最后一屏就是物理 EOF；自动换行又把 display line 错当 document line | 改为按实际可见坐标反算源 offset，wrapped display line 使用 Scintilla 映射；最大值强制最后一屏覆盖物理 EOF；滚轮/Page/拖动共用同一投影位置；预览 gutter 显示精确全局 byte offset | 本批缺陷已修，仍需在更多真实编码、长行和搜索跳转组合中继续复审 |
-| S2 早期预览导航 | Windowed Provider 未配置 margin，早期界面像“正文左侧信息消失” | Text 预览增加全局 byte-offset gutter；完整行索引/晋升完成后再使用原生行号，禁止用窗口局部 1..N 冒充全局行号 | 本批正式 exe 已验证 |
+| S2/S3 只读导航 | Windowed Provider 未配置 margin，早期界面像“正文左侧信息消失” | Text 只读视图增加全局 byte-offset gutter；完整行索引完成后可显示真实全局行号，禁止用窗口局部 1..N 冒充全局行号 | 需继续以正式 exe 验证 |
 | 状态栏 | `showMessage()` 与普通 widget 共占左侧区域，进度/提示会压到文档 segment 上 | 光标、编码/EOL、语法/呈现、大小/分级、脏状态和任务 chip 全部改为 permanent widgets；左侧只属于临时消息 | 本批正式 exe 已验证 |
 | B1/约 9 MiB 未知二进制保存 | 即使文档未修改也进入保存路径；旧 B1 同路径保存还会产生固定名称 `.notepad-safe-save-tmp` | 已命名且未修改时 Save 为严格 no-op，Save 动作禁用；已修改且小于 32 MiB 时使用有界快照 + `QSaveFile` 原子提交，不再产生固定可见临时副本 | 保存共因已修并回归；不是 Hex 编辑器成熟证明 |
 | B1 Hex 编辑器 | 仍依赖 `VirtualFileView + QScintilla overlay`，用户已复现双滚动、空白布局和视图互相带动 | 第一切片已隐藏 Scintilla 内部纵/横滚动条，以唯一全局 scrollbar 为位置真值；Hex/ASCII 两 pane 铺满 viewport；窗口起点按 bytes/row 对齐。真实 handle 拖到 70% 与滚轮后，首行绝对地址均精确一致。底层仍是待替换迁移架构，键盘跨窗、完整选择/撤销/搜索矩阵尚未复审 | **P0，部分收敛，未完成** |
-| S1/S2/S3 与 B1/B2/B3 界面一致性 | 当前各 Tier 虽复用部分 QScintilla 配置，但 Windowed Provider、完整编辑器和 B1 overlay 仍可能表现为不同产品 | 架构收敛为 Text 共用 EditorSurface、Binary 共用 HexView；数据装载和只读能力通过 adapter/capability 注入，晋升/回退不更换可见表面。首批已提取共享字体、margin、caret、selection、缩进、wrap 与滚动宽度配置，S1/Windowed 合同测试和 wrap/EOF 回归通过；完整 geometry/differential 与 HexView 合并仍待完成。测试矩阵新增 `L00/K13` 和强化 `H01/K07` | **P0，部分落地，未完成** |
+| S1/S2/S3 与 B1/B2/B3 界面一致性 | 当前各 Tier 虽复用部分 QScintilla 配置，但 Windowed Provider、完整编辑器和 B1 overlay 仍可能表现为不同产品 | 架构收敛为 Text 共用 EditorSurface、Binary 共用 HexView；数据装载和只读能力通过 adapter/capability 注入。S1 可编辑，S2/S3 只读，但不更换为另一套可见表面。完整 geometry/differential 与 HexView 合并仍待完成 | **P0，部分落地，未完成** |
 | 搜索/查找全部 | 旧通过记录不足以证明各种文件/大小/呈现切换后，Dock 高亮、增量结果、双击精确跳转都符合真实使用 | 保留统一 SearchSession 方向，但所有 Text/Hex/S1/S2/S3/Secure 与当前/全部打开范围重新进入动态复审 | **P0，未完成** |
-| S2 可编辑（接近 2 GiB） | mmap 预览已可用，完整编辑仍受 ILoader 内存和资源准入约束；不能把快速预览等同于 2 GiB 可编辑 | 资源不足继续明确回退同一 S3 风格只读 Provider，绝不回到旧 patch 编辑器 | **P0，未完成** |
+| S2 可编辑（接近 2 GiB） | 真实用户验证确认未实现，后台完整装载不可用，且会造成错误能力暗示 | 从当前产品边界关闭：S2 与 S3 等价只读；删除 loader、资源准入、编辑状态、保存和恢复旁路 | **已明确禁用，不是已完成功能** |
 
 本批新增的有效证据包括：正式程序 `gui-formal-s2-early-status.png` 中全局 gutter 与无重叠
 状态栏；`gui-formal-s2-eof.png` 中实际尾标记；`gui-formal-s3-wrap-eof.png` 中 2 GiB+

@@ -1,5 +1,7 @@
 #pragma once
 
+// Bounded mmap-backed read-only provider shared by S2 and S3.
+
 #include <QAtomicInteger>
 #include <QDateTime>
 #include <QFutureWatcher>
@@ -7,15 +9,11 @@
 
 #include "SharedReadOnlyFile.h"
 
-class QLabel;
 class QFileSystemWatcher;
-class QProgressBar;
 class QPlainTextEdit;
 class QScrollBar;
-class QStackedWidget;
 class QTimer;
 class QsciScintilla;
-class ILoader;
 
 class WindowedReadOnlyProvider final : public QWidget
 {
@@ -134,60 +132,3 @@ private:
     qint64 m_lastSearchResult = -1;
     QByteArray m_searchNeedle;
 };
-
-class LargeFileVerticalSlice final : public QWidget
-{
-    Q_OBJECT
-
-public:
-    enum class State {
-        Closed,
-        Mapped,
-        PreviewReady,
-        Reading,
-        BuildingDocument,
-        Attaching,
-        Editable,
-        ReadOnlyFallback
-    };
-
-    explicit LargeFileVerticalSlice(QWidget *parent = nullptr);
-    ~LargeFileVerticalSlice() override;
-
-    bool openS2Text(const QString &path, QString *error = nullptr, bool beginPromotion = true);
-    bool openS3Hex(const QString &path, QString *error = nullptr);
-    void startPromotion();
-    void cancelPromotion();
-
-    State state() const { return m_state; }
-    QString stateText() const;
-    QString fallbackReason() const { return m_fallbackReason; }
-    WindowedReadOnlyProvider *preview() const { return m_preview; }
-    QsciScintilla *fullEditor() const { return m_fullEditor; }
-    qint64 fullDocumentLength() const;
-    qint64 fullEditorPosition() const;
-    int visibleVerticalScrollBarCount() const;
-
-signals:
-    void stateChanged(LargeFileVerticalSlice::State state);
-    void promotionProgress(qint64 completedBytes, qint64 totalBytes);
-
-private:
-    void setState(State state);
-    void enterFallback(const QString &reason);
-    void finishPromotion();
-
-    WindowedReadOnlyProvider *m_preview = nullptr;
-    QsciScintilla *m_fullEditor = nullptr;
-    QStackedWidget *m_stack = nullptr;
-    QLabel *m_phaseLabel = nullptr;
-    QProgressBar *m_progress = nullptr;
-    QString m_path;
-    QString m_fallbackReason;
-    State m_state = State::Closed;
-    ILoader *m_loader = nullptr;
-    QFutureWatcher<bool> m_promotionWatcher;
-    QAtomicInteger<bool> m_cancelPromotion = false;
-};
-
-Q_DECLARE_METATYPE(LargeFileVerticalSlice::State)

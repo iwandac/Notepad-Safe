@@ -1,11 +1,17 @@
 # Notepad Safe 架构设计
 
 > 状态：已决策，作为后续开发的唯一架构基线
-> 版本：3.1
-> 更新日期：2026-08-17
+> 版本：3.2
+> 更新日期：2026-08-18
 > 产品许可证：GPLv3
 
 本文替代旧版“L1/L2 + mmap + Patch 编辑”方案，以及“记事本 + 保险箱 Dock + `.nsk` 旁车文件”方案。旧代码仍可用于回归和迁移，但不再代表目标产品或架构。
+
+> **当前强制边界（2026-08-18 用户实测裁决）：S2 编辑没有实现。**
+> 32 MiB 及以上文件统一使用窗口化 mmap 只读分析，S2 与 S3 的浏览、搜索、复制和禁止
+> 修改能力完全相同。后台 ILoader 完整加载、资源准入、编辑晋升及其独立验证切片已从
+> 生产路由禁用/移除。本文后文或历史时间线中出现的“S2 晋升、准备编辑、Editable、
+> ReadOnlyFallback”均是已否决的历史方案，不得作为当前能力、实现任务或验收依据。
 
 用户可见目标、跨入口体验不变量、功能总账和真实 GUI 动态验收方法见 `docs/TARGET_EXPERIENCE.md`；外部产品和上游组件的采用/拒绝边界见 `docs/REFERENCE_BASELINE.md`；最终目标、迭代轮次和停止条件见 `docs/ITERATION_ROADMAP.md`。本文负责架构与安全边界，后续阶段只有同时满足全部基线才能标记完成。
 
@@ -35,10 +41,10 @@ Notepad Safe 是 Windows 优先、离线优先的 Qt 桌面产品，提供三组
 | 档位 | 判定 | 产品能力 |
 |---|---:|---|
 | S1 标准编辑 | 小于 32 MiB | Scintilla 完整编辑，全部编辑功能 |
-| S2 大文件编辑 | 32 MiB 至 2 GiB（含） | 按需随机读立即只读预览；后台准备完整 Scintilla 文档；资源允许后晋升为完整编辑 |
+| S2 大文件分析 | 32 MiB 至 2 GiB（含） | 与 S3 相同：窗口化 mmap 只读查看、导航、复制、字面和正则搜索；不编辑、不替换 |
 | S3 超大文件分析 | 大于 2 GiB | 窗口化随机读/短期分段 mmap 只读查看、导航、字面搜索和正则搜索；不编辑、不替换 |
 
-边界统一使用二进制单位：32 MiB = 32 × 1024² 字节，2 GiB = 2 × 1024³ 字节。编码转换可能扩大文本时，以 max(文件字节数, 预计 UTF-8 编辑字节数) 进行编辑档位判定。
+边界统一使用二进制单位：32 MiB = 32 × 1024² 字节，2 GiB = 2 × 1024³ 字节。S2/S3 仍保留不同名称以记录尺寸和性能测试范围，但不表示编辑能力不同。
 
 ### 1.1 当前阶段不做
 
@@ -59,8 +65,8 @@ Notepad Safe 是 Windows 优先、离线优先的 Qt 桌面产品，提供三组
 | ADR-002 | Scintilla 是编辑内核供应商，QScintilla 是可替换 Qt 适配层 | 保留成熟编辑体验，同时避免被包装层版本锁死 |
 | ADR-003 | KeePassXC Core + Botan 是 KDBX 生产实现 | 写入、历史、附件、KDF 和兼容性成熟；不自行实现密码学 |
 | ADR-004 | Rust/Tauri 保险库保留为原型，不进入正式桌面构建 | 当前 keepass-rs 写入成熟度和现有 Qt 产品边界不匹配 |
-| ADR-005 | S2 使用“窗口化按需预览 + ILoader 后台装载 + 单向晋升” | 兼得快速打开、外部原子替换兼容和成熟编辑，避免 Patch 编辑器复杂度 |
-| ADR-006 | S3 永久只读 | 保留十几 GiB 日志分析价值，不承担编辑器内核重写成本 |
+| ADR-005 | S2 与 S3 均使用窗口化 mmap 只读 Provider；禁用 ILoader 后台晋升 | 用户实测证明后台完整加载不可用；代码和 UI 不得继续暗示 32 MiB–2 GiB 可编辑 |
+| ADR-006 | 32 MiB 及以上永久只读 | 保留大日志分析价值，不承担编辑器内核重写成本 |
 | ADR-007 | 正则统一为 PCRE2 | 三档语义一致；不混用 Scintilla 正则、QRegularExpression 和自制分块语义 |
 | ADR-008 | 安全文档使用自包含的 KDBX4 文件，密钥槽写入 `PublicCustomData` | 继续复用 KeePassXC/KDBX，不再依赖易丢失的 `.nsk` 旁车文件 |
 | ADR-009 | 新建和未命名草稿默认加密；普通保存保持原格式 | 用户不需要在日常编辑中理解或选择加解密 |
@@ -178,7 +184,7 @@ flowchart LR
 
 - Qt/QScintilla/Scintilla 与 KeePassXC/Botan 不在同一常规变更中升级。
 - KeePassXC 升级必须通过双向 KDBX golden corpus：旧版本创建、新版本打开保存、KeePass/KeePassXC 再次打开。
-- Scintilla 升级必须通过编辑命令、IME、编码、撤销、32 MiB 边界、ILoader 和性能基线。
+- Scintilla 升级必须通过编辑命令、IME、编码、撤销、32 MiB 只读边界和性能基线。
 - PCRE2 升级必须通过三档同语义正则语料和 ReDoS 资源限制测试。
 - 例行依赖每季度评估；严重安全问题立即评估，不能等待季度窗口。
 - 发布产物生成 SPDX/CycloneDX SBOM、源代码对应物、构建器版本和 SHA-256。
@@ -245,7 +251,7 @@ flowchart TD
 
 当前迁移实现已经让文件菜单、最近文件、拖放和命令行复用同一个打开入口，并在创建标签前完成已打开文档判定：普通 Text/Hex/S2/S3 使用规范路径和 Windows volume serial + file index 文件身份，硬链接或路径大小写差异仍定位到原标签；安全文档使用公开头中的 DocumentId，副本或别名不会创建第二个竞争写入句柄。命中现有文档时保持编辑状态、选择和视图模式，只激活标签并给出短暂状态提示。显式“从磁盘重新加载”携带目标标签，跳过去重并重新执行完整格式/分级路由。最近文件在设置加载后立即按同一身份规则归一化/去重并重建菜单；缺失项点击后非模态移除并立刻持久化，不能让历史列表阻塞编辑旅程。
 
-L2 打开接口必须保持三个正交决策：`L2ContentKind::Text/Binary` 记录 payload 的内容身份并约束保存/转换，`L2Presentation::Text/Hex` 决定当前解释、行索引和搜索语义，`allowFullTextPromotion` 只决定 S2 Text 是否后台提升为完整 Scintilla 编辑器。禁止再以单个布尔值同时表达内容类型、展示方式和提升策略；Binary payload 可以显式使用 Text 呈现但保存时仍保持原始 Binary 身份，`Text + false` 是合法的 mmap 文本视图，`Hex + false` 是原始字节视图。当前迁移代码已按此边界拆分，既避免 Hex 不建立行索引而 Text 搜索永久等待的模式死锁，也避免用户把二进制切到文本视图后重启又被自动探测强制切回 Hex。
+映射打开接口只保留两个正交决策：`L2ContentKind::Text/Binary` 记录 payload 的内容身份，`L2Presentation::Text/Hex` 决定当前解释、行索引和搜索语义。历史 `allowFullTextPromotion` 参数已从接口删除，禁止重新引入后台装载开关。Binary payload 可以显式使用 Text 呈现但仍保持原始 Binary 身份；32 MiB 以上的 Text 和 Hex 呈现都使用 mmap 窗口化只读视图。
 
 ### 5.3 未知二进制与十六进制模式
 
@@ -254,7 +260,7 @@ L2 打开接口必须保持三个正交决策：`L2ContentKind::Text/Binary` 记
 | 文件大小 | 十六进制能力 |
 |---:|---|
 | B1 < 32 MiB | 完整十六进制编辑、选择、覆盖/插入、撤销、搜索、保存 |
-| B2 32 MiB–2 GiB | mmap 快速预览；资源允许时后台准备可编辑字节文档；不足时保持只读 |
+| B2 32 MiB–2 GiB | mmap 窗口化只读查看、跳转、字节搜索和复制 |
 | B3 > 2 GiB | 分段 mmap 只读查看、跳转、字节/十六进制搜索、导出选择 |
 
 十六进制编辑器要求：
@@ -266,7 +272,7 @@ L2 打开接口必须保持三个正交决策：`L2ContentKind::Text/Binary` 记
 - “以文本重新打开”要求选择/确认显示编码，仅改变视图；发生文本编辑后，保存会按所选编码重建字节，因此状态栏必须显示编码。
 - “以十六进制重新打开”优先保持光标对应的原始 byte offset；存在未保存文本编辑时必须先保存、放弃或取消，不能静默丢失重编码后的内容。
 - 二进制搜索支持字节串、带空格的十六进制模式和 ASCII/UTF-8 文本；PCRE2 正则只用于文本解释，不对任意字节承诺 Unicode 语义。
-- B2/B3 的窗口化、资源准入、保存冲突和取消机制复用 S2/S3 基础设施，不建立第二套 mmap/Patch 引擎。
+- B2/B3 的窗口化、搜索和取消机制复用 S2/S3 基础设施，不建立第二套 mmap/Patch 编辑引擎。
 
 #### 5.3.1 当前迁移实现（2026-08-15）
 
@@ -310,46 +316,39 @@ L2 打开接口必须保持三个正交决策：`L2ContentKind::Text/Binary` 记
 stateDiagram-v2
     [*] --> Probing
     Probing --> EditableReady: S1 装载完成
-    Probing --> PreviewReady: S2/S3 mmap 完成
-    PreviewReady --> PreparingEditor: S2 且资源准入
-    PreparingEditor --> EditableReady: ILoader 文档附加成功
-    PreparingEditor --> PreviewReady: 取消/失败/资源不足
-    PreviewReady --> ReadOnlyReady: S3 或取消晋升
+    Probing --> ReadOnlyReady: S2/S3 mmap 窗口完成
     EditableReady --> Dirty: 用户编辑
     Dirty --> Saving: 保存
     Saving --> EditableReady: 原子提交成功
     Saving --> Dirty: 失败，原文不变
 ```
 
-安全文档在 `Probing` 和上述装载状态之间增加 `ResolvingKey`；未知密钥进入 `PasswordRequired`，取消后关闭本次打开而不创建空标签。十六进制文档复用状态机，但使用 `HexEditableReady/HexPreviewReady` 的 EditorProvider 实现。
+安全文档在 `Probing` 和上述装载状态之间增加 `ResolvingKey`；未知密钥进入 `PasswordRequired`，取消后关闭本次打开而不创建空标签。十六进制文档复用状态机：B1 可进入 `HexEditableReady`，B2/B3 只进入 `ReadOnlyReady`。
 
 每个异步结果携带 DocumentId、Revision 和 CancellationToken。结果到达时 revision 不一致则丢弃，禁止旧搜索或旧装载覆盖新状态。
 
 ## 6. S1：小于 32 MiB 的标准编辑
 
-- 使用后台 Scintilla ILoader 装载，完成后在 UI 线程通过 pointer-sized ScintillaGateway 附加文档。
-- 不再执行 QFile::readAll → QString → QByteArray → SCI_APPENDTEXT 的多重复制和 UI 串行追加。
-- 默认启用完整撤销、语法高亮、折叠、换行、多选和书签。
-- 文件读取、编码识别和 UTF-8 流式转换在 worker 完成；Scintilla UI 对象只在主线程使用。
-- ILoader 由单个 worker 顺序 AddData。一个文件不使用多个线程向同一个 loader 写入。
+- 使用当前已验证的 QScintilla 完整文档路径；打开完成后启用撤销、语法高亮、折叠、换行、多选和书签。
+- 当前实现的分块追加只属于 S1，不代表可复用的大文件后台装载能力。
+- 任何未来 S1 装载优化都必须保持 32 MiB 边界，不能暗中为 S2/S3 创建完整文档。
 
-## 7. S2：32 MiB 至 2 GiB 的大文件编辑
+## 7. S2：32 MiB 至 2 GiB 的大文件只读分析
 
 ### 7.1 打开流程
 
-1. FileProbe 读取文件身份、大小、BOM、编码样本和可用内存。
+1. FileProbe 读取文件身份、大小、BOM和编码样本。
 2. WindowedByteSource 只探测文件元数据，不长期占用源文件；读取当前窗口时以共享只读句柄按绝对位置读取 2–8 MiB 并立即关闭。仅对不会与外部轮转/原子保存竞争的内部扫描允许短期 mmap。
 3. WindowedReadOnlyView 将光标附近窗口装入只读 Scintilla，先显示内容，不等待全量行索引。Windows 上不得以长期 mmap 或 `QFileSystemWatcher` 的文件句柄阻止日志轮转、截断或其它编辑器的原子替换。
 4. SparseLineIndex 在后台单线程顺序扫描；滚动条以字节位置工作，因此索引未完成也可自由滚动。
-5. 通过资源准入后，后台 ILoader 构建完整 Scintilla 文档。
-6. 完成后 UI 保存当前全局 byte offset/选择，附加新文档并恢复到对应位置；切换是单向的。
+5. 与 S3 相同，始终停留在只读 Provider；不得启动后台完整加载或创建第二份 Scintilla 文档。
 
-预览期间可以滚动、复制、跳转、字面搜索和正则搜索，但编辑、粘贴和替换保持禁用。用户可以取消“准备编辑”，继续只读分析。
+打开后可以滚动、复制、跳转、字面搜索和正则搜索；编辑、粘贴、保存修改和替换永久禁用。
 
 #### 7.1.0 S1/S2/S3 共用同一编辑器表面
 
 文件大小分级只允许改变数据装载方式和 capability，禁止改变产品界面。Text 的 S1 完整文档、
-S2 预览/晋升/回退和 S3 只读必须进入同一个 `EditorSurface`；用户可见结构和交互契约保持一致：
+S2 和 S3 只读必须进入同一个 `EditorSurface`；用户可见结构和交互契约保持一致：
 
 - 同一字体、字号、颜色、正文边距、当前行、selection、search indicator 和 caret 风格；
 - 同一左侧 gutter 槽位。完整索引时显示精确行号；索引未完成时在相同槽位显示“约/计算中”或
@@ -358,10 +357,9 @@ S2 预览/晋升/回退和 S3 只读必须进入同一个 `EditorSurface`；用�
   一条；换行、缩放、标尺、空白符显示和右键菜单使用同一视图配置；
 - 同一查找高亮、书签、复制、标签、状态栏和 Dock 跳转表现。只读 Tier 通过 capability 禁用
   Cut/Paste/Undo/Replace/Save 等命令，不能换成简陋的“大文件查看器”；
-- S2 从 Preview/Preparing 到 Editable 或 ReadOnlyFallback 时，EditorSurface 本身不被替换、
-  不闪白、不改变几何。只在后台重新绑定 Windowed/Full document model，并恢复同一全局 top、
-  caret、selection、horizontal offset、wrap、zoom、bookmark 和 active search match；
-- Tier/准备/只读原因仅在状态栏和任务中心表达。正文区域不得增加常驻大文件横幅、水印、第二套
+- S2/S3 不发生 Provider 晋升或编辑器表面替换；滚动、搜索和外部文件刷新始终保留同一全局
+  top、caret、selection、horizontal offset、wrap、zoom、bookmark 和 active search match；
+- Tier/只读能力仅在状态栏表达。正文区域不得增加常驻大文件横幅、水印、第二套
   工具栏或不同的上下文菜单来暴露内部实现。
 
 Hex 同理：B1/B2/B3/Secure Binary 必须共用一个 `HexView`（地址、Hex、ASCII、滚动、选择、
@@ -375,9 +373,6 @@ S2 预览不得把带自身滚动条的 QScintilla 叠放在 `QAbstractScrollAre
 - 预览期隐藏 Scintilla 内部纵向滚动条，只保留一条与编辑区视觉一体的全局滚动条；该滚动条映射 64 位 `SourceBytes` 位置，是鼠标拖动、滚轮、PageUp/PageDown、键盘导航和搜索跳转的唯一位置真值。
 - Scintilla 只负责当前窗口的文本渲染、选择、indicator 和输入法，不拥有独立的“当前窗口滚动到末尾”语义。滚轮和键盘事件先转换为全局导航请求，再决定是否切换窗口。
 - 切换窗口前保存全局 top/caret/anchor/selection；窗口 ready 后按同一全局锚点恢复局部首行和选区。禁止用 `setText()` 后的默认局部位置覆盖用户全局位置，禁止滚动到底自动跳回窗口开头。
-- ILoader 晋升成功后把同一 `EditorSurface` 重新绑定到完整 `TextEditorProvider`。内部可以从全局
-  滚动代理切换到 Scintilla 文档滚动，但对用户暴露的滚动条槽位、geometry/style/pageStep 和
-  当前 thumb 位置不得改变；晋升前后全局位置、选择、水平位置和活动搜索命中保持不变。
 - 任何主题、DPI、Text/Hex 呈现和窄窗口下，编辑区可见且可操作的纵向滚动条计数必须严格等于 1。
 
 2026-08-17 审计确认当前 `VirtualFileView(QAbstractScrollArea) + viewport 内 QScintilla overlay` 违反该不变量：两套滚动范围互相独立，局部窗口重灌会重置 Scintilla 可视位置。该路径标记为**不可验收的迁移实现**，不得继续通过同步两个滚动条或增加 debounce 修补；只能提取可复用的按绝对位置读取逻辑后替换视图容器。
@@ -388,56 +383,38 @@ S2 预览不得把带自身滚动条的 QScintilla 叠放在 `QAbstractScrollAre
 
 `WindowedReadOnlyProvider` 中的 Scintilla 文档只是原文件某个 byte range 的有界显示投影，局部 position 可以可靠换算成绝对 `SourceBytes`。这种换算只足以支持导航、选择、搜索高亮，以及 Hex 中**不改变字节长度**的覆盖写；它不能让普通文本插入/删除直接写回 mmap：一次变长编辑会移动其后全部字节，并使后续位置、撤销、搜索结果、编码边界和崩溃恢复同时失效。
 
-因此生产路径明确禁止“在窗口内编辑后把相对地址直接写回文件”的通用文本方案，也不再恢复 PatchList/piece-table 实验。S2 Text 只有在完整 ILoader 文档附加成功后才获得编辑、替换和撤销能力；附加前与失败后始终是可浏览、可搜索、可复制的只读投影。B2 Hex 的等长覆盖可作为独立能力继续评估，但不得据此宣称支持变长文本编辑。
+因此生产路径明确禁止“在窗口内编辑后把相对地址直接写回文件”的通用文本方案，也不再恢复 PatchList/piece-table 实验。S2 Text 始终是可浏览、可搜索、可复制的只读投影。B2 Hex 当前同样只读；任何未来等长覆盖实验也不得据此宣称支持变长文本编辑。
 
-### 7.2 资源准入
+### 7.2 编辑能力锁定
 
-2 GiB 是功能上限，不是无条件内存承诺。ResourceAdmission 估计：
-
-- 解码后文本容量。
-- Scintilla 文本、行结构和最小样式开销。
-- 保存/搜索临时预算。
-- 撤销预算和系统保留内存。
-
-只有预计峰值不超过物理内存的 60%，且系统仍能保留至少 2 GiB 可提交空间时自动晋升。用户可在 2 GiB 内请求强制准备，但仍不能越过会导致系统失稳的硬性保留线。推荐 64 位系统、16 GiB 起步，接近 2 GiB 文件推荐 32 GiB RAM。
-
-峰值估算不再把源文件大小等同于常驻物理内存：生产预览只保留 2–8 MiB 投影，晋升 worker 使用 4 MiB 有界解码块；预算计入 Scintilla 文档/间隙、行与样式、搜索/保存 scratch、撤销和 32 MiB 预览解码余量。`LargeDocumentRuntimeState` 对 UI 明确暴露 `PreviewReady / PreparingEditor / Editable / ReadOnlyAnalysis / ReadOnlyFallback`；编码扩张越界、内存拒绝、任务取消、读取/解码失败和 ILoader 失败都必须落到带持久原因的 `ReadOnlyFallback`，不能只显示一条会消失的状态栏消息。
-
-资源拒绝、用户取消、读取/解码错误、ILoader 分配失败或附加失败时，文档的领域尺寸仍为 `SizeTier::S2`，运行时 Provider 状态收敛为 `ReadOnlyFallback`（UI 文案为“只读分析”）。它复用 S3 的单滚动窗口浏览和搜索能力，但不能伪装成 `SizeTier::S3`，也不能无限显示“正在准备编辑”。任务中心保留失败/取消原因和重试入口；资源恢复后可重新请求晋升，期间所有编辑与替换命令保持禁用。
+S2 不再执行资源准入，因为无论机器内存多少都不允许后台晋升。`LargeDocumentRuntimeState`
+只暴露 `None / ReadOnlyAnalysis`；任务中心不得出现“准备大文件编辑”。代码中的 2 GiB 边界只用于
+区分 S2/S3 性能和测试样本，不是编辑承诺。旧版加密大文件编辑检查点不再加载为可编辑文档，
+必须明确报告该恢复格式已禁用，不能重新启用 ILoader 绕过此边界。
 
 正式 `EditorTab` 不得为了搜索或历史兼容在窗口 Provider 背后预先打开隐藏 `VirtualFileView`。2026-08-17 GUI 防线已证明 33 MiB 正式打开路径的隐藏映射大小为 0，外部 `QSaveFile` 可在标签打开时原子替换源文件。0.3.1 仅在用户显式发起搜索时按需建立 mmap/patch 搜索快照，以换取 GiB 文件的全量扫描吞吐；它不创建第二个可见编辑器、不参与滚动真值，内容 revision/外部变化会使结果失效。将该兼容快照改名或抽成独立 `SearchSource` 是发布后内部重构，不得扩散回打开路径或形成第二套搜索语义。
 
-### 7.3 分级关闭昂贵功能
+### 7.3 只读功能边界
 
-| 预计编辑字节 | 默认能力 |
+| 文件字节 | 默认能力 |
 |---:|---|
-| 32–128 MiB | 完整编辑；语法高亮可用 |
-| 128–256 MiB | 高亮只按可见区/增量进行；关闭全文重着色 |
-| 256 MiB–2 GiB | 默认关闭语法高亮、折叠、自动换行、文档地图和全文件变化历史 |
+| 32 MiB–2 GiB | 窗口化浏览、复制、跳转、字面/正则搜索；禁止所有修改和替换 |
+| >2 GiB | 与 S2 相同能力，使用更大的性能与边界测试样本 |
 
-用户可以手动开启部分功能，但 UI 必须显示内存影响。撤销内存使用独立预算，默认 min(512 MiB, 物理内存 10%)；达到预算后建立保存点并明确提示，不允许静默耗尽系统内存。
+### 7.4 大文件接入约束
 
-### 7.4 Scintilla 接入约束
-
-- 使用 SCI_CREATELOADER / ILoader::AddData / ConvertToDocument / SCI_SETDOCPOINTER。
-- loader worker 不访问 QWidget，不发送普通 QScintilla long 返回值承载指针。
-- ScintillaGateway 使用 SCI_GETDIRECTFUNCTION + SCI_GETDIRECTPOINTER，所有位置和指针采用 intptr_t、uintptr_t、Sci_Position。
-- 装载阶段使用 SC_DOCUMENTOPTION_STYLES_NONE；需要高亮时再创建样式数据。
-- 装载完成前禁用 undo，附加后清空装载历史并建立 save point。
-- 单个 ILoader 由一个有序 writer 调用 `AddData`；读取和可安全分块的解码可以进入有界流水线并行，但不得从多个线程无序写同一 loader。多线程是吞吐实现手段，不是以线程数代替用户可见完成状态。
-- 后台晋升使用显式状态机 `SourceReady → PreviewReady → Reading/Decoding → BuildingDocument → Attaching → Editable`，失败进入带原因的 `PreviewReadOnly`，取消进入 `PreviewReadOnly`；不得无限停留在“准备中”。`Mapped` 只可作为内部实现状态，不能成为 UI 或生命周期契约。
-- 任务中心必须显示当前阶段、已处理源字节/总字节、速度、活动 worker 和可取消状态。预览正文保持可交互；附加 Document 的 UI 线程工作必须受 50 ms 门槛约束或拆分为可解释的最终短暂停顿。
+- S2/S3 只把当前有界窗口投影到只读 Scintilla 表面；不得创建完整 Scintilla document。
+- 所有源位置、选择和搜索命中使用 64 位绝对位置，窗口 generation 防止旧异步读取覆盖最后一次导航。
+- 打开 S2/S3 不创建 `LargeFileLoad`/ILoader 任务，不显示“准备编辑”、资源准入或失败回退状态。
+- 索引与搜索仍可按需后台执行，但任务类型、进度和取消必须准确表示索引/搜索，不能伪装成编辑装载。
 
 ### 7.5 保存与外部冲突
 
-- 从 Scintilla 按固定窗口流式读取，按原编码流式编码到同目录随机临时文件，不构造整文件副本。
-- FlushFileBuffers 后使用 ReplaceFileW/等价原子替换；失败保留临时文件并保持原文件不变。
-- 打开时记录文件 ID、大小、mtime 和首/中/尾有界采样 hash；保存前变化则进入冲突状态，不静默覆盖。
-- 大规模替换如果预计撤销成本超预算，使用“离线流式替换 → 备份 → 原子提交 → 重新加载”，并明确说明不能用 Ctrl+Z、只能从备份恢复。
+S2/S3 没有修改态，也没有普通保存、流式替换或恢复日志。可用操作仅为导出选择、另存为只读内容副本，以及显式“以 S1 可承受的小文件副本打开”；任何可能改写原文件的命令都必须由 capability 层禁用。外部文件发生变化时重新探测或刷新窗口和搜索 revision，不静默保留过期结果。
 
 #### 7.5.1 当前迁移实现（2026-08-15）
 
-普通 Text S1、已晋升的 S2 Scintilla 文档、mmap Text/Hex 共用领域层 `DiskFileVersion`：Windows 文件身份使用 volume serial + file index，再结合大小、毫秒 mtime 和最多 3 × 64 KiB 采样 SHA-256。主窗口在保存前统一给出“重新加载磁盘版本 / 另存为… / 取消”；原文件丢失或无法验证时不提供覆盖逃生口。即使调用者绕过主窗口，`saveFile/saveAsFile/saveL2As` 也会在写入前再次拒绝已变化的原路径。重新加载始终回到统一 Open 路由，因此外部改变后的 KDBX 头、二进制特征和文件分级会重新判定；旧搜索结果同时清空，避免双击跳转到过期位置。
+普通 Text S1 与 mmap Text/Hex 共用领域层 `DiskFileVersion`：Windows 文件身份使用 volume serial + file index，再结合大小、毫秒 mtime 和最多 3 × 64 KiB 采样 SHA-256。S1 保存前统一处理磁盘冲突；S2/S3 没有写回路径。重新加载始终回到统一 Open 路由，因此外部改变后的 KDBX 头、二进制特征和文件分级会重新判定；旧搜索结果同时清空，避免双击跳转到过期位置。
 
 安全文档的密文冲突由 `SecureDocumentService` 自身持有基线，不借用明文 `EditorTab` 状态。当前 Text/S2/Hex/KDBX 已共用领域层 `DiskFileVersion` 的同一探测实现；KDBX 普通保存和自动保存在写入前都再检查密文版本。冲突时自动保存静默暂停并保持 dirty；用户保存/关闭时进入与普通文件一致的“重新加载磁盘版本 / 另存为… / 取消”。重新加载必须先用原文档凭据解锁并校验相同 DocumentId，成功后才替换内存正文和基线；失败保留当前未保存内容，仍可另存为新安全文档。
 
@@ -472,7 +449,7 @@ WindowedReadOnlyView 保留 Scintilla 的字体、选择、IME、行号和 indic
 - 光标进入窗口前后 25% 区域时异步预取下一窗口。
 - 窗口边界对齐完整字符和尽量完整的行。
 - 全局位置始终是 64 位原文件 byte offset；局部 Scintilla offset 仅存在于视图内部。
-- 与 S2 预览复用 7.1.1 的单滚动条不变量。S3 没有“晋升后切换滚动条”阶段，因此从打开到关闭始终只有同一条全局滚动条；搜索跳转、手工滚动和窗口预取必须更新同一位置状态。
+- S2/S3 共同遵守 7.1.1 的单滚动条不变量。从打开到关闭始终只有同一条全局滚动条；搜索跳转、手工滚动和窗口预取必须更新同一位置状态。
 
 旧 L2ScintillaBridge 的“显示窗口”部分可以迁移；diff 回写 PatchList、虚拟坐标编辑和 patch 保存链全部废止。
 
@@ -513,8 +490,7 @@ SparseLineIndex 每固定行数保存一个 64 位锚点，并为可见窗口建
 | 目标 | SearchTarget / 快照 | 查询语义 | 结果导航 |
 |---|---|---|---|
 | S1 Text | 当前 revision 的 UTF-8 编辑快照 | Literal/Regex/整词 | TextEditorProvider |
-| S2 Text 预览或未修改 | 原文件 mmap | Literal/Regex/整词 | 当前视图或晋升后的编辑器 |
-| S2 Text 已编辑 | 按 revision 复用或异步生成只读搜索快照 | Literal/Regex/整词 | TextEditorProvider |
+| S2 Text 只读 | 原文件 mmap/分段 mmap | Literal/Regex/整词 | WindowedReadOnlyProvider |
 | S3 Text | 原文件 mmap/分段 mmap | Literal/Regex/整词 | WindowedReadOnlyProvider |
 | B1/B2/B3 Hex | 内存字节源或 mmap/分段 mmap | Hex bytes、ASCII、UTF-8 literal；Regex 使用显式 byte/text 模式 | HexEditorProvider/WindowedHexProvider |
 | 安全 Text/Binary | 已解锁 payload 的短期内存快照 | 分别复用 Text/Byte 语义 | 对应 Text/Hex Provider；结果只在内存 |
@@ -543,8 +519,8 @@ SparseLineIndex 每固定行数保存一个 64 位锚点，并为可见窗口建
 - 用户随后按“查找全部”时可以复用已编译 pattern、快照和已验证的部分结果，但结果发布顺序及去重仍由 SearchSession 保证。
 - 修改 query、scope、编码策略或文件筛选会创建新 session；仅移动光标或切换 Dock 不会。
 - 跨文件 F3 到达命中后，通过同一个 `SearchNavigationController` 激活/打开目标并精确选中。不存在 Scintilla `findFirst()`、L2 `findAll()` 和 Dock 自建搜索三条并行语义。
-- Replace/Replace All 复用同一 SearchSession，但按 scope 解析独立的 `ReplacePlan`。当前文件直接作用于当前可编辑 target；“全部打开文件”对所有查询语义兼容且可编辑的目标执行批量替换。S3、资源准入失败的 S2、只读文件、未解锁安全文档和不兼容 Text/Byte target 必须在执行前列入可解释的跳过清单，不能禁用整个范围或静默遗漏。
-- 全部打开文件替换先冻结 manifest/revision、编译一次查询并为每个 target 生成有序反向替换计划；全部 preflight 成功后才开始修改。每个文档形成一个 undo group，协调器在中途失败/取消时撤销本批已触及文档；成功后只标记各文档 dirty，不自动保存。S2 只有在 ILoader 晋升为正式可编辑 Provider 后参与，禁止回退到 PatchList 批量修改。
+- Replace/Replace All 复用同一 SearchSession，但按 scope 解析独立的 `ReplacePlan`。当前文件直接作用于当前可编辑 target；“全部打开文件”对所有查询语义兼容且可编辑的目标执行批量替换。S2/S3/B2/B3 永久只读；它们与其他只读文件、未解锁安全文档和不兼容 Text/Byte target 必须在执行前列入可解释的跳过清单，不能禁用整个范围或静默遗漏。
+- 全部打开文件替换先冻结 manifest/revision、编译一次查询并为每个可编辑 S1/安全 Text target 生成有序反向替换计划；全部 preflight 成功后才开始修改。每个文档形成一个 undo group，协调器在中途失败/取消时撤销本批已触及文档；成功后只标记各文档 dirty，不自动保存。S2/S3 必须列入 skipped manifest，禁止回退到 PatchList 批量修改。
 - 文件夹范围提供独立的“在文件中替换”命令：默认先展示文件/命中预览，逐文件备份与原子替换，失败报告可恢复路径。它不与全部打开文档的内存 undo 事务混为一谈；在该流程完成前，文件夹替换控件可以标记“尚未实现”，但不能把全部打开文件替换一并禁用。
 
 ### 9.1.2 全局调度、背压与增量更新
@@ -561,7 +537,7 @@ SparseLineIndex 每固定行数保存一个 64 位锚点，并为可见窗口建
 增量更新分为三个明确层次：
 
 1. **扫描增量**：Find All 从首个 batch 开始渐进显示文件组、命中数和高亮上下文，不等待其他文件或完整行索引；这是所有大小档的默认行为。
-2. **内容增量**：每个 target 拥有独立 `TargetGeneration`。S1/S2 编辑后立即把旧组标为 stale 并禁用旧跳转；用户停止输入 300 ms 且预计代价在交互预算内时，只重建该 target 的 snapshot/结果，不重扫其他文件。大文件完整重扫超预算时显示“刷新此文件”，不在每次按键后自动扫 GiB 数据。
+2. **内容增量**：每个 target 拥有独立 `TargetGeneration`。S1 编辑后立即把旧组标为 stale 并禁用旧跳转；用户停止输入 300 ms 且预计代价在交互预算内时，只重建该 target 的 snapshot/结果，不重扫其他文件。S2/S3 只读 target 仅在外部文件 revision 变化后失效；大文件完整重扫超预算时显示“刷新此文件”。
 3. **追加增量**：S3 日志保持同一文件身份、旧长度不缩小且前缀校验一致时，从旧 EOF 减去 pattern overlap 继续扫描，只合并新增 MatchId；文件替换、截断、编码变化或前缀不一致必须使该组失效并全量重跑。
 
 “全部打开文件”的 scope membership 也使用增量 generation：搜索运行期间新打开的可搜索标签加入队列；关闭标签取消其未完成任务并把已完成组标记“已关闭”（允许通过原路径重新打开）；标签重排只改变下一次 session 的遍历顺序，不重排正在阅读的结果。所有这些更新只影响对应 target，不取消其他文件已经完成的结果。
@@ -611,16 +587,12 @@ PatchList，再以 flush 后的 revision 启动任务。有编辑发生时取消
 - ResultStore 按 target 的安全策略分区：KDBX/安全文档/账号内容不落 spool，只允许内存结果上限；混合搜索的普通文件 offsets 可以落无查询、无上下文的 spool，但整个会话历史在锁定时清除。
 - 高亮只应用于当前可见窗口和有限邻域，禁止在 GiB 文件上创建每个匹配的永久 indicator。
 
-L2 过渡实现只把内存预算内且与当前活动窗口相交的 byte ranges 转换为 Scintilla
-indicator；窗口切换或搜索结果跳转后重新应用可见高亮。Patch 后搜索范围必须使用
-`PatchList::virtualSize(mmapSize)` 的精确值，禁止以固定额外 512 MiB/若干 GiB 作为
-猜测上界，否则轻微编辑也会产生无意义的额外扫描。Patch 后的行上下文先通过
-`virtToOrig` 找原始稀疏索引锚点，再由 `origToVirtForLineStart` 回到虚拟位置；新增换行
-的完全动态行号仍由后续 PositionMapper/SparseLineIndex 增量层负责。
+S2/S3 只把内存预算内且与当前活动窗口相交的 byte ranges 转换为 Scintilla
+indicator；窗口切换或搜索结果跳转后重新应用可见高亮。搜索上界始终是当前稳定文件快照的物理长度，不存在 PatchList 虚拟长度或编辑后行号映射。
 
 ### 9.5 替换
 
-- S1/S2 EditableReady 才允许替换；S2 预览和 S3 禁止替换。
+- 仅 S1/已解锁安全 Text 的 EditableReady 允许替换；S2/S3 始终禁止替换。
 - 替换计划绑定 revision；提交前 revision 变化则作废并重新搜索。
 - 可承受的替换从高 offset 向低 offset 应用，锁定编辑输入并放入一个 Scintilla undo action；取消时回滚整个 action。
 - “全部打开文件”先对完整 target manifest 做 capability/revision preflight，再以稳定标签顺序执行；成功摘要同时报告修改文档数、替换数、跳过数与原因。任一目标在 preflight 后变化时停止并回滚本批，不产生一半成功却无法解释的状态。
@@ -636,12 +608,9 @@ indicator；窗口切换或搜索结果跳转后重新应用可见高亮。Patch
   authoritative range 调用 `SCI_REPLACETARGET`；已选命中不会被 Replace 按钮跳过。
 - L2 Find Next/Previous 区分“当前命中选区、任意选区、无选区”，reset 在移动 caret 后重设
   BOF/EOF sentinel，修复了 byte 0 命中被跳过和旧选区污染新 query 的问题。
-- `Pcre2Regex::expandReplacementAt()` 是 S1 与兼容 L2 patch 路径唯一模板展开器；所有命中先在
+- `Pcre2Regex::expandReplacementAt()` 是可编辑 S1 Text 的唯一模板展开器；所有命中先在
   同一不可变 subject 上展开，模板错误在 mutation 前失败。Literal replacement 完全不展开。
-- 兼容 L2 patch 的 Replace All 完成后必须经 `VirtualFileView::notifyExternalPatchMutation()`
-  发布 dirty、revision、Undo/Redo、scroll range 与 repaint，不能只改 PatchList 而让标签仍显示 clean。
-- 全部打开文件 eligibility 只看 Text/可写/解锁 capability，不再把所有 `isL2Mode()` 文档
-  一律当只读；正式 S2 Preview/S3 仍由 `isReadOnlyByPolicy()` 排除。
+- 全部打开文件 eligibility 只看 Text/可写/解锁 capability；S2/S3/B2/B3 一律由 `isReadOnlyByPolicy()` 排除并列入 skipped manifest。
 - 正式 S2/S3/B2/B3 可见 Provider 与隐藏 mmap 搜索后端分离。搜索源可用性按文档能力判定，
   不再依赖 `QStackedWidget::currentWidget()`；首次查找按异步 mmap 的“已接受/映射就绪”两阶段
   运行，准备期保持 busy/可取消，映射失败产生明确不完整结果，不能伪装成 0 命中。
@@ -923,17 +892,12 @@ DPAPI 的同用户/同设备约束也意味着：已在相同 Windows 用户上�
   `VirtualFileView`，在 insert/replace 生成 patch 之前按虚拟字节数拒绝。这样自动保存不会
   接收到一个已经无法持久化的安全文档状态。打开与最终持久化仍保留服务层校验作为纵深防御。
 - 打开普通文本后的崩溃恢复副本也必须加密；正常“保存”仍写回原明文文件。
-- S1 可保存完整加密恢复快照。S2/B2 不允许每次复制 GiB 全文，应使用只服务于恢复的分块 AEAD 修改日志和周期性加密 checkpoint；它不是实时编辑 Patch 引擎，也不是用户文件格式。
-- S3/B3 永久只读，不产生正文恢复数据。
+- S1 可保存完整加密恢复快照。S2/S3/B2/B3 永久只读，不产生正文恢复数据。
 - 恢复索引仅保存 DocumentId、原路径、持久化类型、revision、光标、恢复文件路径和时间；标题/正文摘要不得出现在 `session.json`。
 
 当前落地状态：S1 普通文档已经使用版本化 `.ndraft`，由 Windows DPAPI
-CurrentUser 密封并以原子替换提交，恢复时仅在内存解密。S2 文本晋升后优先保存
-相对原文件的加密插入/删除日志；旧快照迁移、日志超限或基线不能安全复用时，使用
-1 MiB 独立认证块组成的加密完整检查点，并在后台解密后直接送入 Scintilla ILoader，
-不生成明文临时文件。块记录绑定随机流 ID、顺序、类型和编码，结尾认证总长度以拒绝
-截断、重排及跨文件替换。旧 `.tmp` 仅在新的加密日志/检查点原子提交成功后删除；
-S3/B3 只读文档仍不生成正文恢复数据。
+CurrentUser 密封并以原子替换提交，恢复时仅在内存解密。S2/S3/B2/B3 不产生编辑日志或
+完整检查点；旧版本遗留的大文件恢复载荷必须明确拒绝，不能暗中恢复已禁用的编辑能力。
 
 普通 Binary/Hex 的当前迁移实现使用 `BinaryPatchJournal v1`：会话保存前先把 Scintilla Hex 投影严格解析并 flush 到 `PatchList`，再把原文件 `DiskFileVersion`、排序后的 64 位 byte patch 与新字节载荷流式写入 DPAPI CurrentUser 分块恢复文件。日志不含原文件全文，不生成明文临时文件；只在文件身份、大小、mtime 和有界采样 hash 仍一致时重放，原文件变化则拒绝重放而不猜测合并。异步 mmap 必须先完成正常初始化，恢复 patch 随后应用，避免 mmap ready 回调重置已恢复修改。恢复不带跨进程 undo 历史。
 
@@ -1241,7 +1205,7 @@ Hex 的 cut/copy/paste/select all 按字节语义实现；行操作在 Hex 和�
 - `转换为`：GBK、UTF-8、UTF-8 BOM、UTF-16 LE、UTF-16 BE。改变文档编码并标脏，保存时重编码。
 - `以编码重新打开`：同五种编码。重新解释原始字节，不改变文件；存在未保存编辑时必须保存、放弃或取消。
 
-Hex 和 Accounts 禁用整个编码菜单；S2/S3 预览允许“以编码重新打开”，不允许“转换为”；完成 S2 编辑晋升后才允许转换。菜单勾选必须来自当前 DocumentPresentation，而不是全局 QAction 残留状态。
+Hex 和 Accounts 禁用整个编码菜单；S2/S3 只读视图允许“以编码重新打开”，不允许“转换为”。菜单勾选必须来自当前 DocumentPresentation，而不是全局 QAction 残留状态。
 
 当前迁移实现已阻断旧路径的数据丢失风险：L1 文档存在未保存修改时，“以编码重新打开”必须选择“保存并重新打开 / 放弃修改并重新打开 / 取消”，取消保持正文、修改状态和菜单勾选不变；放弃才重新读取磁盘。安全 Text 不读取外层 KDBX 密文字节，Hex/Accounts/未命名草稿不暴露无效的编码重开动作。UTF-16 仅在真实 BOM 存在时跳过 BOM，GBK 固定使用 GB18030 解码器而不是依赖 Windows 当前代码页。L2 Text 在刷新可见投影前先把编辑 overlay 回写到 byte patch，改变解码方式不丢未保存字节；Hex→Text 后会立即重算编码菜单能力。真实 GUI 证据为 `build-codex-kdbx-default/gui-encoding-reopen-unsaved.png`。
 
@@ -1257,7 +1221,7 @@ Hex 和 Accounts 禁用整个编码菜单；S2/S3 预览允许“以编码重新
 
 旧“建立本地安全身份”只在首次使用和安全中心出现；旧“打开加密数据”删除并由 `file.open` 取代；旧“显示加密文档导航”删除；旧“锁定加密文档”改为全局“立即锁定”。
 
-本次发布不增加空壳“首选项”窗口：外观、换行、标尺、面板和工具栏均在“视图”中直接设置并持久化；会话、恢复和主密码策略属于“安全中心”；大文件资源准入由运行时自动判断并在状态栏/任务中心解释。只有出现至少一组无法由这些现有入口自然承载、且用户确实需要手动覆盖的设置后，才引入独立首选项页。
+本次发布不增加空壳“首选项”窗口：外观、换行、标尺、面板和工具栏均在“视图”中直接设置并持久化；会话、恢复和主密码策略属于“安全中心”；大文件大小分级和只读状态由运行时自动判断并在状态栏解释，不存在可启用编辑的资源准入。只有出现至少一组无法由这些现有入口自然承载、且用户确实需要手动覆盖的设置后，才引入独立首选项页。
 
 ### 11.6 现有 VaultDock 内部功能去向
 
@@ -1298,7 +1262,7 @@ Hex 和 Accounts 禁用整个编码菜单；S2/S3 预览允许“以编码重新
 | 位置 | 行、列；有选择时字符数 | 64 位 offset；选择字节数 | 全局 byte offset，行号可显示“约/计算中” | 账号数量或隐藏 | 点击可打开跳转 |
 | 编码/呈现 | UTF-8/GBK/UTF-16 + EOL | HEX，16 bytes/row | Text 编码或 HEX | 隐藏 | 点击打开编码/呈现菜单 |
 | 语言 | 当前 lexer | 隐藏 | 仅可编辑文本显示 | 隐藏 | 点击打开语言菜单 |
-| 大小/能力 | B/KB/MB + S1 | B/KB/MB + B1 | S2/S3/B2/B3、只读或准备编辑 | 隐藏 | tooltip 解释资源策略 |
+| 大小/能力 | B/KB/MB + S1 | B/KB/MB + B1 | S2/S3/B2/B3 + 只读分析 | 隐藏 | tooltip 解释大小分级与只读边界 |
 | 文档状态 | 已修改/保存中/冲突/只读 | 同左 | 同左 | 账号保存状态 | 不显示“已加密”常驻徽章 |
 | 后台任务 chip | 无任务时隐藏或静默 | 同左 | `后台任务 N` | 同左 | 点击打开任务中心；tooltip 显示活跃/上限线程 |
 
@@ -1311,8 +1275,8 @@ Hex 和 Accounts 禁用整个编码菜单；S2/S3 预览允许“以编码重新
 `FindReplaceDialog` 保持非模态并复用一个实例，由全局搜索会话驱动。顶部固定为 query、查询类型和范围；本次发布范围控件默认“当前文件”，显式支持“全部打开文件 (N)”，不能因用户上次做过全局搜索而跨会话保持昂贵范围。查询类型明确显示 Text literal、Regex 或 Hex bytes，不根据第一个标签静默改变其他文件语义。目录树范围保留为未来独立立项，不在当前 UI 中展示不可用入口。
 
 - Text：查找/替换文本，正则、区分大小写、整词、循环；按钮为上一个、下一个、替换、全部替换、查找全部。上一个/下一个和查找全部都服从所选范围。
-- Hex：查询类型为 Hex bytes/ASCII/UTF-8；Hex 模式支持字节通配符，正则仅在 Text 查询类型启用。替换只在 B1/B2 Editable 且替换长度规则可安全执行时启用。
-- Preview/S3/B3：保留上下查找和查找全部，隐藏/禁用替换。
+- Hex：查询类型为 Hex bytes/ASCII/UTF-8；Hex 模式支持字节通配符，正则仅在 Text 查询类型启用。替换只在 B1 Editable 且替换长度规则可安全执行时启用。
+- S2/S3/B2/B3 只读分析：保留上下查找和查找全部，隐藏/禁用替换。
 - Accounts：Ctrl+F 聚焦账号搜索；若选择“全部打开文件”，Accounts target 只搜索 9.1 定义的非秘密字段并使用结构化结果导航。
 - Replace 模式保留用户显式 scope。当前文件直接替换；全部打开文件先显示 eligible/skipped 数量并执行 9.1.1 的 ReplacePlan。混合范围中存在 S3/只读目标只影响这些目标，不得禁用其他可编辑文档。未来目录替换必须进入独立结果预览、备份和原子提交流程。
 - 搜索运行期间只禁用会改变当前查询的控件，保留关闭和取消；取消通过 AsyncTaskManager，不等待不可取消 worker。
@@ -1347,7 +1311,7 @@ Hex 和 Accounts 禁用整个编码菜单；S2/S3 预览允许“以编码重新
 
 `CommandStateController` 根据当前 `DocumentCapabilities` 唯一决定 enabled/checked/visible，业务 slot 不再依赖 early return 掩盖错误 UI。
 
-| 功能族 | Text Editable | Text Preview/S3 | Hex Editable | Hex Preview/B3 | Secure Text/Hex | Accounts |
+| 功能族 | Text Editable | Large Text ReadOnly | Hex Editable | Large Hex ReadOnly | Secure Text/Hex | Accounts |
 |---|---|---|---|---|---|---|
 | 保存/另存为 | 是/是 | 否/是 | 是/是 | 否/是 | 是/是 | 由 AccountService 保存 |
 | 撤销/重做/剪切/粘贴 | 是 | 否 | 是 | 否 | 按当前 Provider | 仅详情编辑控件 |
@@ -1374,13 +1338,13 @@ Hex 和 Accounts 禁用整个编码菜单；S2/S3 预览允许“以编码重新
 |---|---|
 | P0 | 原子保存提交/失败恢复、密钥清除、用户取消 |
 | P1 | 文件头探测、KeyResolver、交互式 find next、账号秘密租约 |
-| P2 | S1/S2/B1/B2 文档装载、KDBX 保存、用户发起 find all |
+| P2 | S1/B1 文档装载、S2/S3/B2/B3 窗口索引与预取、KDBX 保存、用户发起 find all |
 | P3 | SparseLineIndex、预取、语法增量高亮 |
 | P4 | 依赖扫描、缓存清理等维护任务 |
 
 主线程单次工作目标小于 16 ms，硬上限 50 ms；超过 500 ms 的任务必须有进度/不确定进度状态和取消。取消是协作式的，worker 每个 I/O 块或可控匹配步骤检查 token。
 
-S2 编辑准备不能只登记一个笼统的“后台加载”百分比。任务模型至少公开 `Mapping/PreviewReady/Reading/Decoding/BuildingDocument/Attaching/Editable/PreviewReadOnly` 阶段；每次阶段变化、源字节进度、吞吐和取消能力必须同步到任务 chip 与任务中心。任务完成时还要由 Provider 状态证明 Scintilla Document 已附加且长度/当前位置正确，不能以 worker 返回或进度达到 100% 代替正文实际更新。
+S2/S3/B2/B3 不存在“编辑准备”任务，也不创建完整 Scintilla Document。任务中心只登记确实发生的稀疏行索引、搜索、有界预取或文件刷新，并报告真实的源字节进度和取消能力。出现 `PreviewReady/Reading/Decoding/BuildingDocument/Attaching/Editable/PreviewReadOnly` 之类旧晋升阶段是回归。
 
 全局搜索按 9.1.2 只登记一个父 `SearchSession` 任务和可展开的 per-target 子状态，共享应用级 CPU/I/O/内存预算；禁止“每打开一个文件各自启动 min(核心数, 8) 个 worker”。活动文件的 Find Next 延迟优先，但原子保存、密钥清理和用户取消仍可抢占；目录枚举、FileProbe、文本/字节扫描和行号装饰使用同一背压队列。
 
@@ -1393,7 +1357,7 @@ S2 编辑准备不能只登记一个笼统的“后台加载”百分比。任�
 | 标签状态 | 是 | `session.json`：DocumentId、路径、PresentationKind、SizeTier、光标/选择和 revision |
 | 未命名安全草稿 | 是 | DraftStore 中的 `.nsafe-draft`，正文始终加密 |
 | 普通文本 S1 恢复副本 | 是 | 加密 DraftStore；原文件仍按 PlainFile 保存 |
-| S2/B2 修改恢复 | 是 | Text 使用分块加密操作日志/checkpoint；Binary/Hex 使用绑定 `DiskFileVersion` 的 DPAPI 分块 `BinaryPatchJournal`；不写明文整文件 |
+| S2/S3/B2/B3 修改恢复 | 否 | 永久只读，不存在修改、patch journal 或正文恢复旁路 |
 | 安全文件路径、keyVersion ID | 是 | 非秘密元数据；不保存标题/正文摘要 |
 | 主密码 | 否 | 只在输入和派生期间存在，随后清零 |
 | SessionKeyRing | 是，密封后 | DPAPI CurrentUser Capsule；七天绝对过期 |
@@ -1414,14 +1378,14 @@ S2 编辑准备不能只登记一个笼统的“后台加载”百分比。任�
 - editor-golden：编码、EOL、IME、多选、撤销、长行、边界大小和保存往返。
 - probe-golden：KDBX3/4、产品 KDBX、BOM、UTF-8/16/32、无扩展文本、伪装扩展名、NUL/控制字符、截断文件，验证路由稳定且不按扩展名误判。
 - hex-golden：0–255 全字节、插入/覆盖、撤销、64 位偏移、B1/B2/B3 边界、以文本/十六进制重开和原始字节保存往返。
-- search-golden：同一语料在 S1、S2 mmap、S2 编辑快照、S3 上产生相同语义的 typed positions；包括 UTF-8/GBK/UTF-16、中文/emoji、同一行多次命中、超长行、跨 16 MiB 与 2 GiB 边界、文件末尾和零长度正则。
+- search-golden：同一语料在 S1 可编辑快照、S2/S3 物理只读快照上产生相同语义的 typed positions；包括 UTF-8/GBK/UTF-16、中文/emoji、同一行多次命中、超长行、跨 16 MiB 与 2 GiB 边界、文件末尾和零长度正则。
 - search-scope-golden：当前文件、全部打开文件、递归目录在固定 manifest 上目标枚举、排序、去重和计数一致；混合 Text/Hex/Secure/Accounts、同名文件、符号链接、权限失败、include/exclude 和逐 target 失效均有覆盖。
 - search-results-golden：分页追加/读取、按行分组、可见区间查询、spool 重开/清理、取消/截断/失败状态、Revision 失效和 byte-to-glyph 映射；百万结果不得被全量转换为 QString/QModel 行。
 - search-scheduler-golden：固定虚拟时钟下验证 worker 总上限、per-target 公平性、活动 Find Next 优先级、batch 排序/背压、取消后零迟到发布以及 TargetGeneration 淘汰。
 - search-incremental-golden：S1 连续编辑 debounce、S2 超预算 stale、S3 append overlap 合并、truncate/replace 全量失效、标签加入/关闭和刷新中 NavigationRequest 校验。
 - windowed-scroll-golden：64 位全局滚动位置与滑块归一化映射、窗口边界前后 top/caret/selection 保持、0/25/50/75/100% 跳转、滚轮/PageDown 单调性和全区间覆盖；同一视图任何时刻只有一个可见纵向滚动条。
-- s2-promotion-golden：`Mapped → PreviewReady → Reading/Decoding → BuildingDocument → Attaching → Editable/PreviewReadOnly` 的合法转换、阶段进度单调、取消/资源拒绝/ILoader 失败收敛、附加后 document length 与位置保持。
-- replace-scope-golden：当前/全部打开/文件夹三个 scope 的 eligible/skipped/failed manifest；S1、已晋升 S2、安全 Text、只读/S3、Text/Byte 混合目标；反向替换计划、每文档单 undo group、跨文档失败回滚和普通保存保持类型。
+- large-readonly-golden：32 MiB 和 2 GiB 两个边界的路由、只读 capability、零编辑装载任务、输入/粘贴/删除/替换无修改、源文件 hash 不变，以及 S2/S3 浏览和搜索语义等价。
+- replace-scope-golden：当前/全部打开/文件夹三个 scope 的 eligible/skipped/failed manifest；S1、安全 Text、S2/S3 只读、Text/Byte 混合目标；反向替换计划、每文档单 undo group、跨文档失败回滚和普通保存保持类型。
 - regex-adversarial：灾难性回溯、深层递归、巨大捕获、无界跨行和取消。
 - kdbx-golden：KDBX3/4、AES/ChaCha20、Argon2d/id、历史、附件、自定义字段、Unicode、损坏/截断文件。
 - key-envelope-golden：PublicCustomData 往返、错误 AEAD tag、槽替换、多个 keyVersion、主密码/恢复密钥恢复、AppData 全毁恢复和 `.nsk` 迁移。
@@ -1448,7 +1412,7 @@ S2 编辑准备不能只登记一个笼统的“后台加载”百分比。任�
 | 结果面板滚动 | 百万匹配语料无 QWidget-per-row、无全量物化，连续滚动不出现超过 50 ms 的 UI 卡顿 |
 | 全部打开文件调度 | 总 worker 不超过应用预算；任一单文件不饿死其他文件；结果 batch UI 发布不超过每帧一次 |
 | 增量结果一致性 | 旧 generation 取消后零迟到行；追加扫描跨 overlap 不漏报/重复；局部刷新不重扫未变化文件 |
-| S2 编辑晋升 | 吞吐和峰值内存纳入版本基线；升级不得退化超过 10% |
+| S2/S3 只读打开 | 首屏时间、滚动响应和峰值内存纳入版本基线；不得产生与文件大小成比例的完整编辑副本 |
 | 10+ GiB 滚动 | 预取命中时保持交互流畅，无全文件复制 |
 | KDBX 保存 | 任意注入失败点均保留一个可验证的旧库或新库 |
 | 文件头探测 | 本地常规文件 P95 < 50 ms；不读取全文 |
@@ -1546,47 +1510,36 @@ GUI 验证分三层，三层都需要：
 | `GUI-SEARCH-GLOBAL-018` | 全局结果存在时编辑 S1、打开/关闭标签、向 S3 追加、随后截断文件；刷新瞬间双击旧行 | 只更新变化 target；S1 debounce、append overlap、truncate stale 符合 9.1.2；旧 generation 双击被拒绝，新结果双击精确选中 | generation/revision/navigation trace + 前后截图 |
 | `GUI-LARGE-SCROLL-019` | 256 MiB 可控文本 S2 在预览阶段，用真实鼠标检查编辑区并拖动滚动条到 0/25/50/75/100% | 每一时刻恰好一条可见纵向滚动条；正文 marker 与全局 64 位位置对应；松手并等待 1 秒后 value/topByte 不回弹 | 五个落点截图 + 可见 scrollbar widget 清单 + top/caret trace |
 | `GUI-LARGE-SCROLL-020` | S2/S3 连续滚轮、PageDown/PageUp 跨越至少三个窗口并在窗口边界点击/选择 | topByte 单调且往返对称；可见 byte 区间无 gap；光标/选区不跳回局部窗口开头 | 输入事件录像 + windowReady/requestId/coverage trace |
-| `GUI-S2-PROMOTION-021` | 256 MiB UTF-8 日志打开后停在 70% marker，同时打开任务中心等待晋升 | 首屏在交互门槛内出现；阶段/字节/速度单调可见；预览可滚动；晋升后仍显示并选中同一 marker，编辑区仍只有一条滚动条 | Preview/任务中心/Editable 三阶段截图 + provider/document length trace |
-| `GUI-S2-PROMOTION-022` | 在文件头、中部、EOF 前分别编辑、撤销、重做、保存并重新打开；另测取消、资源拒绝和 ILoader 失败 | 三处内容与预期逐字节一致；保存保持编码/EOL；失败均稳定留在单滚动只读预览并给出原因，不无限“准备中” | hash/offset/undo 记录 + 成功与三种回退截图 |
-| `GUI-S2-NEAR2G-023` | 32 GiB RAM 基准机打开接近 2 GiB 的可控文本 fixture；16 GiB 机器执行资源回退 | 基准机完成 ILoader 附加、可在头/中/尾编辑；低资源机不发生交换风暴/崩溃，保持可搜索预览；峰值内存和各阶段耗时有记录 | 性能轨迹 + 三位置 GUI 截图 + admission 记录 |
+| `GUI-LARGE-READONLY-021` | 256 MiB UTF-8 日志打开后停在 70% marker，同时观察任务中心并尝试键入/粘贴/删除 | 首屏在交互门槛内出现；浏览和搜索可用；没有编辑装载任务；修改命令不可用；源文件 hash 不变 | 窗口/任务中心截图 + capability/源 hash 记录 |
+| `GUI-LARGE-READONLY-022` | 在 S2/S3 文件头、中部、EOF 分别尝试输入、删除、替换和保存修改，并执行搜索跳转 | 三处均不能修改；搜索和复制仍可用；状态始终为只读分析，不出现“准备编辑”或回退原因 | offset/selection/hash + 状态截图 |
+| `GUI-S2-NEAR2G-023` | 不同内存机器打开接近 2 GiB 的可控文本 fixture | 均使用相同只读 Provider；不发生交换风暴/崩溃或完整内存副本；头/中/尾可浏览和搜索 | 性能/内存轨迹 + 三位置 GUI 截图 + 零编辑装载任务记录 |
 | `GUI-S3-REAL-024` | 只读打开保留的 4.59 GiB `bigtestfile`，以 Hex 在头/中/尾搜索已登记 byte signature 并双击结果 | 始终一条全局滚动条；可浏览全范围；结果使用 64 位 offset；双击等待正确窗口后精确选中，不回跳；编辑/替换始终禁用 | fixture manifest/hash + 三位置截图 + selection bytes |
-| `GUI-SEARCH-REPLACE-025` | 同时打开 S1、已晋升 S2、安全 Text 和 S3，范围选择“全部打开文件”，真实点击 Find All 与 Replace All | Find All 覆盖全部可搜索目标；ReplacePlan 修改三个 eligible 文档、明确跳过 S3；计数正确、每文档一次 Undo 可恢复、均保持原保存类型 | scope/eligible/skipped manifest + 替换前后 Dock/正文截图 |
-| `GUI-SEARCH-CONCURRENT-026` | S2 晋升、全部打开文件搜索、快速跨结果双击和手工拖动全局滚动条并发进行，然后取消搜索 | UI 心跳持续；任务阶段可见；旧 windowReady/generation 不覆盖最后请求；取消后结果停止增长，滚动位置不回弹 | 事件循环心跳、线程/任务、generation trace + 最终截图 |
+| `GUI-SEARCH-REPLACE-025` | 同时打开 S1、安全 Text、S2 和 S3，范围选择“全部打开文件”，真实点击 Find All 与 Replace All | Find All 覆盖全部可搜索目标；ReplacePlan 只修改两个 editable 文档、明确跳过 S2/S3；计数正确、每文档一次 Undo 可恢复、均保持原保存类型 | scope/eligible/skipped manifest + 替换前后 Dock/正文截图 |
+| `GUI-SEARCH-CONCURRENT-026` | S2/S3 全部打开文件搜索、快速跨结果双击和手工拖动全局滚动条并发进行，然后取消搜索 | UI 心跳持续；任务阶段只表示搜索/索引；旧 windowReady/generation 不覆盖最后请求；取消后结果停止增长，滚动位置不回弹 | 事件循环心跳、线程/任务、generation trace + 最终截图 |
 
-日常 smoke 使用含相同边界语义的 64 MiB fixture 保持反馈速度；S2 每个相关批次至少使用 256 MiB 可控文本完成单滚动/晋升 GUI，发布/夜间基线必须使用接近 2 GiB 的可控文本和真实 2 GiB+ 生成日志，不能仅以 mock TextSource、40 MiB 首行编辑或 worker 完成信号声称通过大文件 GUI。测试记录同时保存搜索 snapshotId、DocumentId/Revision、MatchId、全局 byte range、窗口全局范围、滚动条 value/max、ProviderState、ILoader document length 和局部 selection，便于区分搜索、窗口装载、晋升与绘制错误。
+日常 smoke 使用含相同边界语义的 64 MiB fixture 保持反馈速度；S2 每个相关批次至少使用 256 MiB 可控文本完成单滚动/只读 GUI，发布/夜间基线必须使用接近 2 GiB 的可控文本和真实 2 GiB+ 生成日志，不能仅以 mock TextSource 或函数返回声称通过大文件 GUI。测试记录同时保存搜索 snapshotId、DocumentId/Revision、MatchId、全局 byte range、窗口全局范围、滚动条 value/max、ProviderState、后台任务清单和局部 selection，便于区分搜索、窗口装载与绘制错误。
 
 本机项目根目录还固定保留两份不纳入 Git 的真实体量测试资产，任何“清理临时文件/构建垃圾”操作都必须排除它们：
 
 | 资产 | 大小与档位 | 回归职责 |
 |---|---|---|
-| `F:\projects\notepadsafe\smalltestfile` | 228,451,550 bytes（约 217.9 MiB），S2 | mmap 首屏、后台准备/资源准入、完整编辑、搜索、保存及无法晋升时的只读回退 |
+| `F:\projects\notepadsafe\smalltestfile` | 228,451,550 bytes（约 217.9 MiB），S2 | mmap 首屏、只读浏览/Hex 路由、搜索、零编辑装载任务和源文件不变 |
 | `F:\projects\notepadsafe\bigtestfile` | 4,928,168,473 bytes（约 4.59 GiB），S3 | 2 GiB+ 窗口化只读、自由滚动、64 位位置、字节/Hex 搜索、结果双击跳转与长期资源稳定性 |
 
-这两份文件当前是二进制模型数据，适合验证未知二进制探测、Hex 路由和真实大文件 I/O，不替代带可控 marker 的文本日志 fixture。`smalltestfile` 不能单独证明 S2 Text 的解码/ILoader 晋升，`bigtestfile` 不能单独证明 S3 Unicode/正则语义；必须与上述可控文本 fixture 配套。所有会写入文件的 GUI/集成测试必须操作独立副本，禁止修改或删除原件；只读测试可以直接打开原件。
+这两份文件当前是二进制模型数据，适合验证未知二进制探测、Hex 路由和真实大文件 I/O，不替代带可控 marker 的文本日志 fixture。它们不能单独证明 Unicode/正则语义；必须与上述可控文本 fixture 配套。所有会写入文件的 GUI/集成测试必须操作独立副本，禁止修改或删除原件；只读测试可以直接打开原件。
 
 ### 14.5.1 单滚动 S2/S3 垂直切片结论（2026-08-17）
 
-为避免继续在旧双滚动桥上投入，仓库增加独立目标 `gui_smoke_largefile_vertical_slice`。它直接组合 QScintilla/Scintilla、`QFile::map`、唯一全局纵向滚动条和 `SCI_CREATELOADER/ILoader`，不链接 `VirtualFileView`、`EditorTab` 或 PatchList。该切片的职责是先证明目标机制，再把通过的 Provider 接入统一 Document/Search 架构。
-
-本机 Release 真实 GUI 全量运行结果为 **4 passed / 0 failed**：
-
-| 场景 | 实测 | 已证明 |
-|---|---:|---|
-| 256 MiB UTF-8 S2 mmap 首屏 | 10 ms | 打开不等待完整 Scintilla 文档；预览只有一条可见纵向滚动条 |
-| 256 MiB S2 ILoader 晋升 | 425 ms | 阶段依次经过 Reading/BuildingDocument/Attaching/Editable；70% byte 位置保持；晋升后可键入且仍只有一条纵向滚动条 |
-| S2 用户取消晋升 | 小于 10 s 验收门槛内收敛 | 状态进入 `ReadOnlyFallback`，原因可见，原位置与单滚动只读预览保留 |
-| 4,928,168,473-byte S3 mmap/Hex 首屏 | 11 ms | 真实 4.59 GiB 文件无需装入 Scintilla；0/25/50/75/EOF 均可建立覆盖 anchor 的窗口 |
-| S3 从 byte 0 搜到 75% 的 32-byte signature | 异步派发 0 ms；命中 1,519 ms | GUI 调用不阻塞；使用 64 位 offset；命中后装入正确 Hex 窗口并选中对应字节 |
-
-GUI 使用真实鼠标拖动全局滚动条，并在松手后等待 1 秒确认 `globalOffset` 不回弹；S2/S3 都检查可见纵向滚动条数量恒为 1。测试曾在 EOF 暴露“Hex 行向下对齐后遗漏末尾 15 字节”的真实缺陷，现改为对齐后强制窗口覆盖请求 anchor，并由 EOF 断言保护。视觉证据为 `gui-s2-slice-preview.png`、`gui-s2-slice-loading.png`、`gui-s2-slice-editable.png`、`gui-s2-slice-fallback.png` 和 `gui-s3-slice-real.png`；机器可读报告为 `slice-final-report.txt`。
-
-结论：**目标机制可行，可以据此替换旧双滚动桥**。这份独立切片的历史结论不等于 P8/P9 已完成；后续生产接入状态记录如下。
+该切片曾同时验证单滚动只读浏览和独立 ILoader 晋升。2026-08-18 的真实用户验证证明，
+独立切片的晋升结果没有形成可用的生产 S2 编辑能力，因此相关 target、实现和截图已移除，
+也不得再用它推断“后台加载可用”。仍有效的结论只有：窗口化 Provider 可以作为 S2/S3
+只读浏览与搜索的基础；其动态滚动、EOF、wrap、Hex 和搜索跳转仍须在正式 `EditorTab` 中逐项验收。
 
 #### 14.5.2 生产 EditorTab 接入状态（2026-08-17）
 
 `WindowedReadOnlyProvider` 已进入正式 `EditorTab`/`notepad-safe.exe` 构建，而不再只存在于独立切片：
 
-- S2 Text 打开后立即显示 mmap 有界投影；`allowFullTextPromotion` 只控制是否启动 ILoader，不再暗中切回旧 overlay。晋升成功后切换到完整 Scintilla 文档，并恢复晋升前的 64 位 byte 位置；失败或取消继续留在同一个只读 Provider。
+- S2 Text 打开后立即显示 mmap 有界投影；接口中不存在后台晋升参数，不得启动 ILoader 或切换到完整 Scintilla 文档。
 - S3/B3 从打开到关闭都使用同一个全局纵向滚动条；Scintilla 投影的内部纵向滚动条关闭，拖动、滚轮、PageUp/PageDown、搜索跳转和直接 byte 跳转都汇入 `globalOffset`。
 - 真实 `smalltestfile` 属于 B2 二进制。其固定长度 mmap 写穿尚未达到可交付门槛，因此当前明确进入**单滚动只读 Hex 回退**，而不是继续暴露旧双滚动可编辑 overlay；这项能力降级在状态/命令上按只读处理。B2 Hex 等长覆盖只有在独立 Provider、恢复日志和保存回归全部通过后才重新启用。
 - `VirtualFileView` 当前只保留为 mmap/索引/搜索兼容后端，不再承担上述 S2 Preview、B2 fallback、S3/B3 的可见编辑器容器；旧 overlay 只剩小型安全 Binary/B1 等尚未迁移分支，禁止继续扩展。
@@ -1595,11 +1548,11 @@ GUI 使用真实鼠标拖动全局滚动条，并在松手后等待 1 秒确认 
 
 | 生产场景 | 动态验收 |
 |---|---|
-| 40 MiB S2 Text | 真实鼠标拖至约 68%；实际渲染前 128 bytes 与源文件对应窗口逐字节一致；静置 1 秒不回跳；ILoader 晋升后 caret 与拖动前 byte offset 误差不超过 1；可编辑、保存后原文件长度关系正确 |
+| 40 MiB S2 Text | 真实鼠标拖至约 68%；实际渲染内容与源窗口逐字节一致；静置不回跳；始终只读且不产生编辑装载任务 |
 | 228,451,550-byte `smalltestfile` B2 Hex | 正式 `EditorTab::openLargeFileL2` 路由为只读单滚动 Provider；拖动后渲染首行 64 位地址和首字节与 mmap 源一致；静置 1 秒位置和正文不变 |
 | 4,928,168,473-byte `bigtestfile` B3 Hex | 正式路由使用单滚动 Provider；拖至约 73% 后渲染首行地址/首字节与源一致且不回弹；再跳到精确 75% byte，窗口覆盖目标 offset |
 
-视觉证据为 `build/gui-production-s2-preview-dynamic.png`、`build/gui-production-b2-dynamic.png` 和 `build/gui-production-s3-dynamic.png`。这些结果证明生产 EditorTab 的单滚动浏览、B2 稳定回退和 S2 晋升位置保持已经落地，但仍**不等于 P8/P9 完成**：接近 2 GiB 的可编辑 S2 资源准入/峰值内存、Provider 主题与编码 PositionMapper、任务中心完整阶段、跨窗口 PCRE2/全部打开文件 SearchSession、结果 Dock 全量高亮与双击导航仍须按 14.5 的发布门槛完成。旧 `QAbstractScrollArea + overlay` 只能随剩余 Provider 迁移逐步删除，不能作为正式大文件体验重新启用。
+旧视觉证据只能证明当时覆盖到的只读窗口内容，不再证明 S2 晋升或编辑。当前仍需完成 Provider 主题与编码 PositionMapper、跨窗口 PCRE2/全部打开文件 SearchSession、结果 Dock 全量高亮与双击导航。旧 `QAbstractScrollArea + overlay` 不能作为正式大文件体验重新启用。
 
 同日用户在正式 exe 中完成参与式验证，确认该 Provider 能浏览完整大文件，方案方向成立；同时确认大文件 Text 横向滚动无法到达完整长行、鼠标滚轮不能连续浏览、Hex 交互细节未成熟以及宽屏存在大量无用途空白。上述结果不是视觉精修建议，而是产品可用性门槛；已登记为 `TARGET_EXPERIENCE.md` 的 `LF-UX-001/002`、`HEX-UX-001/002`，后续必须以真实 wheel/scrollbar/nibble/selection 输入和实际渲染内容验收，不能只检查 64 位 offset。
 
@@ -1653,8 +1606,8 @@ GUI 使用真实鼠标拖动全局滚动条，并在松手后等待 1 秒确认 
 | `loadFile/loadAutosave/openLargeFileL2` | 外移到 DocumentLoader；EditorProvider 只接收已选定的数据源/文档句柄 | 文件探测、密钥解析不进入 QWidget |
 | `saveFile/saveAsFile/saveL2As/exportToFile` | 外移到 SaveRouter/Writer；EditorTab 提供只读快照接口 | 保存类型不会因 UI 模式分叉 |
 | `m_l2Mode/isL2Mode/isL2Active` | 替换为 SizeTier + EditorState/Capabilities | 不再出现互相矛盾的布尔组合 |
-| `loadUtf8Chunked()` | S1 过渡保留；最终用 Scintilla ILoader worker | 100 MiB 不在 UI 线程循环 APPENDTEXT |
-| 现有 `ViewMode::Hex` | 提取为独立 HexEditorProvider；共享 MappedByteSource | B1 可编辑、B2 预览/晋升、B3 只读 |
+| `loadUtf8Chunked()` | 仅服务 S1 过渡路径；不得复用为 S2/S3 完整装载 | S2/S3 打开不调用该路径 |
+| 现有 `ViewMode::Hex` | 提取为独立 HexEditorProvider；共享 MappedByteSource | B1 可编辑、B2/B3 只读 |
 | `setDisplayEncoding/reloadWithEncoding` | 归入 TextPresentation；记录原始 byte mapping 和解码错误 | 以文本重开时编码行为可预测 |
 | 行操作/书签/语法/编码 QAction | 通过 `DocumentCapabilities` 启停 | Account、Hex、只读预览不会触发无效命令 |
 | `findNext/findAll/replaceAll` 的 L1/L2 内部分支 | 查找全部移到全局 SearchSession；EditorTab 只提供 SearchTargetSnapshot，替换只消费当前 editable target | Find Next 与 Find All 跨 S1/S2/S3/Text/Hex 使用同一结果和位置契约 |
@@ -1716,7 +1669,7 @@ GUI 使用真实鼠标拖动全局滚动条，并在松手后等待 1 秒确认 
 |---|---|
 | `VirtualFileView` mmap 和窗口显示 | 只保留 mmap/有界 range 读取成果；删除 `QAbstractScrollArea + QScintilla overlay` 双滚动结构，拆出单滚动 `MappedByteSource + WindowedReadOnlyProvider` |
 | `LineIndex` | 改为 SparseLineIndex；不永久保存每行 offset |
-| `PatchList` 及冷热溢出 | 冻结；S2 ILoader 晋升完成并通过回归后删除 |
+| `PatchList` 及冷热溢出 | 仅保留 B1 Hex 兼容用途；禁止用于 S2/S3 写穿或大文件恢复 |
 | `LargeFileSearch` | 提取 TextSource/ByteSource；修正跨块字面搜索，正则走统一 PCRE2 正确路径 |
 | 各 EditorTab/Provider 的独立 find 状态 | 新建全局 `SearchController`、`SearchTargetResolver`、`SearchCoordinator` 和 `SearchCursor`；scope manifest 统一覆盖当前/全部打开/目录 |
 | 每个文件/搜索路径自行启动 QtConcurrent | 收口到 `SearchScheduler` 有界池、父任务/per-target work item、公平调度、batch 背压和 generation cancellation |
@@ -1735,7 +1688,7 @@ GUI 使用真实鼠标拖动全局滚动条，并在松手后等待 1 秒确认 
 | 搜索等待完整 `LineIndex` | 移除依赖；byte range 首先发布，`SparseLineIndex` 后台/按需解析行列并触发局部 model update |
 | `FindReplaceDialog` | 增加当前/全部打开/文件夹 scope 和目录筛选；根据混合 target capabilities 显示 Text/Regex/Hex/byte regex；当前文件与全部打开文件支持 ReplacePlan，文件夹替换进入独立预览/备份流程 |
 | Hex 搜索 | 新增 byte pattern parser；支持 `DE AD ?? EF` 等有界通配符语法，语法错误不得退化为无匹配 |
-| S2/B2 晋升 | 共享 ResourceAdmission 和后台 loader；不共享文本编码语义 |
+| S2/B2 大文件编辑旧入口 | 删除/禁用 ResourceAdmission、后台 loader、保存与恢复旁路；统一只读 capability |
 
 当前过渡实现（2026-08-15）已经先封住会导致产品失稳的旧路径：`LargeFileSearch`
 按 1000 条有界发布，producer 常驻结果预算为 8–32 MiB，连同分组 model 的总目标
@@ -1750,13 +1703,11 @@ revision 的已完成 spool，并从稀疏 checkpoint 定位，不重复全文�
 S1 过渡 provider 的“查找全部”最多发布 200,000 处并明确标记截断，避免稠密
 表达式在统一 SearchSession 完成前重新制造无界 QWidget/QString 压力。
 
-PCRE2 10.47 的 8-bit provider 已接入统一搜索执行路径。未编辑的大文件直接把 mmap
+PCRE2 10.47 的 8-bit provider 已接入统一搜索执行路径。S2/S3 直接以稳定的物理文件快照
 作为完整 subject，以 offset window 限制候选起点，匹配本身可自然跨读取边界和换行；
-存在 L2 patch 时先按虚拟坐标流式生成临时快照并重新 mmap，避免把 GiB 内容复制进
-内存，也不把搜索静默降级到原始文件。S1“查找全部”和 L2/S3 共用 Unicode、大小写、
-整词、零长度推进和错误语义。PCRE2 match/depth/heap 均有上限，自动 callout 接入同一
-取消 token；无效 UTF-8 和资源上限形成可见失败，不能伪装成零结果。L2 批量替换在完整反向分页计划落地前，
-超过常驻安全匹配上限必须拒绝并提示缩小范围，禁止重新引入无界 `QVector`。
+不再存在 L2 patch、虚拟快照或批量替换路径。S1“查找全部”和 S2/S3 共用 Unicode、大小写、
+整词、零长度推进和错误语义。PCRE2 match/depth/heap 均有上限，取消检查接入同一
+token；无效 UTF-8 和资源上限形成可见失败，不能伪装成零结果。
 
 S1 的“查找全部”、F3/Shift+F3 和批量替换已共用同一 PCRE2 provider 与 byte-range
 缓存，内容 revision 变化时统一失效；跨行命中不再用单行 `line/index/length` 近似导航，
@@ -1772,7 +1723,7 @@ S1 的“查找全部”、F3/Shift+F3 和批量替换已共用同一 PCRE2 prov
 | `StatusBarTaskWidget::m_threadLabel` | 从默认状态栏删除；线程占用移到任务 chip tooltip/任务中心 | 0 任务时无实现噪音，任务运行时一眼可见 |
 | `StatusBarTaskWidget::m_tasksBtn` | 改为 `TaskStatusChip`，0 任务隐藏，失败显示可访问的错误态 | 点击、键盘聚焦和屏幕阅读器名称可用 |
 | `AsyncTaskPanelDialog` | 保留非模态；增加取消全部；详情统一脱敏；修复取消按钮视觉/点击区域单一实现 | 排队/运行/完成/失败/取消五态截图和交互通过 |
-| `AsyncTaskManager` | 任务类型与 11.9 对齐；支持 phase-aware cancellable、S2 晋升阶段/字节/速度/worker 和 opaque resource ID | 原子提交阶段不显示虚假可取消按钮；任务 100% 后 Provider 必须实际进入 Editable 或明确 PreviewReadOnly |
+| `AsyncTaskManager` | 任务类型与 11.9 对齐；支持索引、搜索和保存的 phase-aware cancellable 与 opaque resource ID；删除 S2 编辑装载类型 | S2/S3 打开不产生任务；其它任务阶段与真实结果一致 |
 | `FindReplaceDialog::m_statusLabel` | 只显示当前查询上下文进度和取消；不再同步写同一百分比到 MainWindow status message | 对话框关闭后任务仍可在任务中心管理 |
 | `SearchResultsDock` 双 model/widget | 按 9.6–9.7 合并为统一分页模型、搜索会话层级、渐进状态和 revision 失效态 | 14.5 全套：Dock 打开、渲染高亮、精确 hit-test、异步正文选中和百万结果 |
 | VaultDock UI | AccountsWorkspace + SecurityCenter 完成后删除 | 主窗口截图不存在保险箱拼接感 |
@@ -1793,8 +1744,8 @@ S1 的“查找全部”、F3/Shift+F3 和批量替换已共用同一 PCRE2 prov
 SecurityCenter 真正隐藏行列、编码、语言、大小和修改等文档 segment，只保留工作区名称；
 任务 chip 仍按全局任务状态独立出现，返回 Documents 后完整恢复文档 segment。
 窗口化 mmap Provider 是 S2/S3/B2/B3 的大小真值，不能读取尚未打开的旧 VirtualFileView
-而显示 `0 B`；S2 运行态持续区分“预览 / 准备编辑 / 可编辑 / 只读回退”，S3/B3 显示
-“只读分析”，可编辑 B1 则显示更有用的 INS/OVR。运行态变化会同时重算状态栏和命令能力。
+而显示 `0 B`；S2/S3/B2/B3 统一显示“只读分析”，可编辑 B1 则显示更有用的 INS/OVR。
+运行态变化会同时重算状态栏和命令能力。
 Accounts 的用户名、密码和 TOTP 复制均通过同一临时消息通道即时反馈；密码与验证码明确提示
 30 秒清除期限，避免用户点击后不知道是否成功。保护剪贴板仍以内容指纹为条件清理，不会
 删除用户随后复制的其他内容。移动到回收站、恢复和永久删除也使用同一非模态状态通道反馈，
@@ -1817,9 +1768,9 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 - 旧接口每删除一个，必须先有等价的新单元测试和 GUI smoke。
 - 旧“Vault Dock”用户路径删除门槛：AccountsWorkspace CRUD、旧 KDBX 打开、账号迁移、安全剪贴板和 GUI smoke 全部通过。0.3.1 已无可见 Dock/保险箱入口；`VaultDock` 类名仅是嵌入中央 AccountsWorkspace 的迁移 facade，后续重命名不构成发布阻断。
 - `.nsk` 写路径删除门槛：新 key slot 创建/恢复、AppData 全毁、旧 `.nsk` 只读迁移通过；迁移读取器至少保留两个主要版本周期。
-- 旧 S2 mmap+PatchList 写穿路径删除门槛：S2 预览、后台 ILoader 晋升、流式保存、资源不足回退和搜索快照全部通过。0.3.1 的 S2/S3 正式路由已不把 PatchList 当作大文件编辑内核；该类型仍服务有界 B1/兼容搜索快照，不能仅为消除类名而在发布轮冒险改写。
+- 旧 S2 mmap+PatchList/ILoader 写穿路径必须保持删除或不可达；PatchList 仅服务有界 B1/兼容搜索快照，任何新调用都要证明不会扩散为大文件编辑。
 - 旧 L2 双滚动桥删除门槛不是“两个滚动条同步得足够像”，而是 `GUI-LARGE-SCROLL-019/020` 证明目标 Provider 任一时刻只存在一个可见纵向滚动条且可遍历全文。旧桥在此之前不得标记为可交付，也不得作为 S3 正式实现复用。
-- S2 完成门槛必须同时通过 256 MiB 日常真实 GUI 与接近 2 GiB 基准机 GUI；40 MiB fixture、首行编辑、直接调用导航函数或只检查 ILoader worker 完成均不能替代。
+- S2 完成门槛必须同时通过 256 MiB 日常真实 GUI 与接近 2 GiB 基准机 GUI；需证明完整浏览/搜索、零编辑装载任务、修改入口禁用和源文件不变，不能仅检查打开函数返回。
 - 全局搜索完成门槛包括“全部打开文件”查找与 eligible 文档批量替换；若 S3/只读目标被跳过，GUI 必须展示逐类数量和原因。当前 scope 整体禁用替换不算完成。
 - 任何阶段都必须保持仓库可构建、现有文件可打开、保存故障不损坏原文件。
 - Qt 所有权析构阶段不得再发出会访问同级控件的工作区状态信号：`VaultDock` 析构先阻断信号，`MainWindow` 析构先置 teardown guard、停止安全计时器并断开账户回调。该约束由 `NOTEPADSAFE_ENABLE_ASAN=ON` 的独立 MSVC AddressSanitizer 构建验证，避免把释放期 use-after-free 误判为加密库故障。
@@ -1837,14 +1788,14 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 | P4 GUI 融合批次 | 八个顶级菜单、五按钮工具栏、状态栏、任务中心、全局 SearchController/范围选择/搜索面板、统一新建/打开/保存/另存为 | 11.5–11.11 全量 GUI matrix 通过；Find 与 Find All 无独立 UI 状态、无 Vault 拼接感、无快捷键冲突、无重复进度 |
 | P5 现代账号工作区 | AccountService、AccountsWorkspace、搜索、SecretLease、TOTP、回收站、安全中心 | 账号功能不依赖 VaultDock；密码显示/剪贴板/窄屏/深浅主题真实 GUI 通过 |
 | P6 旧数据迁移 | `.nsk` 迁移、中心 KDBX SecureNote 导出、兼容 KDBX 工作区 | 复制后验证、可回滚、旧文件不被静默删除 |
-| P7 编辑装载与 Hex 优化 | ScintillaGateway + ILoader、正式 HexEditorProvider、B1/B2/B3、Text/Byte SearchTarget | 100 MiB 文本不再 UI 串行装载；Text/Hex 的 Find/Find All 接入同一 SearchSession；GUI 稳定 |
-| P8 S2 大文件编辑 | 单滚动 WindowedReadOnlyProvider、mmap 首屏、可观察的分阶段 ILoader 晋升、资源准入、流式保存、加密恢复日志 | 256 MiB 与接近 2 GiB 真实 GUI 均只有一条滚动条、无回弹、晋升前后位置保持；头/中/尾编辑保存、崩溃恢复和资源不足回退通过 |
+| P7 S1 编辑与 Hex 优化 | S1 Scintilla 装载、正式 HexEditorProvider、B1/B2/B3、Text/Byte SearchTarget | S1 Text/Hex 的 Find/Find All 接入同一 SearchSession；B1 编辑稳定；B2/B3 只读；GUI 稳定 |
+| P8 S2/S3 大文件只读分析 | 单滚动 WindowedReadOnlyProvider、mmap 首屏、只读 capability、零完整编辑装载、统一搜索 | 256 MiB 与接近 2 GiB 真实 GUI 均只有一条滚动条、无回弹；头/中/尾浏览搜索通过；任何修改无效且源 hash 不变 |
 | P9 S3/B3 分析与统一搜索 | 单滚动 Windowed View、SparseLineIndex、PCRE2、Text/Byte target、可选 scope、有界 SearchScheduler、per-target 增量刷新、分页结果 Dock、typed position、精确异步跳转、可见区高亮和全部打开文档 ReplacePlan | 4.59 GiB/10+ GiB 与混合文件搜索稳定、搜索不等待完整行索引、跨块/跨 Provider 不漏报；全部打开文件查找/替换一致；线程/背压/generation 及 14.5 GUI 专项全部通过 |
 | P10 清理与发布治理 | 删除可见 Vault Dock、生产 `.nsk` 写路径和旧 S2 Patch 写穿，保留必要迁移读取/facade；补齐 SBOM、恢复工具和升级自动化 | 无生产用户路径引用废止架构；内部兼容类型不形成第二套 UX；旧版本迁移测试持续保留 |
 
 2026-08-17 的真实用户复审已经推翻“P1–P10 全部收敛、可以发布”的结论。旧门禁只能
 证明其明确断言覆盖的局部行为，不能证明真实编辑器成熟。当前必须保持旧数据读取和已验证的
-加密路径，但 B1 Hex 双滚动、统一搜索动态行为和接近 2 GiB 的 S2 编辑重新列为发布 P0；
+加密路径，但 B1 Hex 双滚动、统一搜索动态行为和接近 2 GiB 的 S2 只读浏览/搜索重新列为发布 P0；
 0.3.1 历史包不得作为发布候选。详细当前真值见第 18 章和 `ITERATION_ROADMAP.md` 6.1。
 
 执行以**纵向功能批次**为单位：一个批次同时完成领域接口、命令状态、菜单/工具栏/状态栏、错误与进度、单元测试、GUI smoke、真实进程交互和截图。除阻断构建/数据安全的 P0 问题外，不接受“只修一个按钮、以后再补相邻状态”的零散提交；同一表格行/同一页面的相关缺陷应合并处理，以减少重复构建和 GUI 验证成本。
@@ -1950,8 +1901,7 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 | 路由 | 当前可见 Provider | 本轮状态 | 后续动作 |
 |---|---|---|---|
 | S1 Text `<32 MiB` | 原生 QScintilla | 保持完整编辑基线 | 与 Secure Text 共用搜索/命令动态复审 |
-| S2 Text `32 MiB–<2 GiB` 预览/回退 | WindowedReadOnlyProvider | 单滚动、gutter、wrap 和物理 EOF 本轮修复 | 继续编码、长行、增长日志、搜索跳转组合验收 |
-| S2 Text 晋升后 | 完整 Scintilla ILoader document | 资源允许时可编辑；不能保证每台机器接近 2 GiB | ResourceAdmission 不通过时留在上述只读 Provider |
+| S2 Text `32 MiB–<2 GiB` | WindowedReadOnlyProvider | 与 S3 等价只读；后台编辑装载已移除 | 继续编码、长行、增长日志、搜索跳转和零修改组合验收 |
 | S3 Text `>=2 GiB` | WindowedReadOnlyProvider | 只读分析；本轮正式 2 GiB+ wrap/EOF 通过 | 全量 PCRE2、结果 Dock 与日志增长继续复审 |
 | B2/B3 Hex | WindowedReadOnlyProvider Hex + ASCII pane | 已统一为地址 margin、纯 Hex、独立 ASCII、单滚动；真实大文件与契约用例通过 | 跨窗口鼠标选区、全部搜索分支、右键与 DPI 继续复审 |
 | B1 Hex `<32 MiB` | VirtualFileView + Scintilla/ASCII overlay | 可见三栏与单滚动契约已和 B2/B3 对齐；编辑、保存、Undo 基线通过 | 保留行为门禁后抽取统一 HexEditorProvider，清除内部 overlay 技术债务 |
@@ -2009,9 +1959,7 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 2. **统一 SearchSession 动态复审批次**：Text/Hex × S1/S2/S3/Secure × 当前/全部打开文件，
    真实打开 Dock、观察增量分组和高亮、双击正文精确 selection、快速切 tab/关闭/编辑导致
    revision 失效、取消与重跑；Replace All 只覆盖 eligible editable targets 且每文档一次 Undo。
-3. **S2 编辑资源批次**：256 MiB 日常样本与接近 2 GiB 基准样本均执行首/中/尾编辑、
-   Undo/Redo、保存/重开、任务阶段、取消和内存不足回退；峰值资源或超时不合格时产品行为
-   是无损留在 S3 风格只读分析，不是回到 mmap patch 编辑。
+3. **S2/S3 只读成熟度批次**：256 MiB 日常样本、接近 2 GiB 基准样本和 2 GiB+ 日志均执行首/中/尾浏览、滚轮/拖柄/换行、查找/查找全部、取消和内存压力验证；同时断言零编辑装载任务、全部修改入口禁用且源文件 hash 不变。
 
 以上三批未完成前，不得把成熟度标记为 50% 以上，不得生成新发布候选。每批只运行受影响
 测试和少量邻接回归；阶段门才运行全矩阵，以控制剩余资源。

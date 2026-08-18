@@ -81,7 +81,7 @@
 | SR-R05 | Replace All 当前 | 0/1/N、相邻、长度变化、case/whole/regex | 精确计数；一次合理 Undo；不自动保存 |
 | SR-R06 | Replace All 全部 | 多可编辑、Secure、只读、Binary、锁定混合 | 预检清单+确认；明确 skip；每文件一个 Undo |
 | SR-R07 | 全部文件事务 | 确认后 revision 变化、标签关闭、第 N 个失败 | 未修改即退出，或回滚此前文件；不产生半批状态 |
-| SR-R08 | 只读边界 | S3、S2 fallback、B2/B3、权限只读、锁定安全文档 | 所有替换入口禁用；搜索/复制/跳转仍可用 |
+| SR-R08 | 只读边界 | S2/S3、B2/B3、权限只读、锁定安全文档 | 所有替换入口禁用；搜索/复制/跳转仍可用 |
 | SR-R09 | 空查询/空替换 | 空 find、空 replacement | 空 find 禁止；空 replacement 是合法删除 |
 | SR-R10 | 零长度/超量 | 零长度 Regex、超过安全上限、Patch 压力 | 修改前拒绝或明确分批策略；错误不改变文档 |
 | SR-R11 | 历史与保存 | Replace/All 后 Undo/Redo、Save/Save As、外部冲突 | 正文、dirty、结果失效、磁盘 hash 一致 |
@@ -94,8 +94,7 @@
 | Provider | Find Next/Prev | Find All | Replace | Replace All |
 |---|---|---|---|---|
 | S1 普通/未命名/安全文本 | 必须 | 必须 | 必须 | 必须 |
-| S2 已晋升编辑 | 必须 | 必须异步 | 必须 | 必须，需响应性门禁 |
-| S2 预览/fallback | 必须 | 必须异步 | 禁止 | 禁止 |
+| S2 只读分析 | 必须 | 必须异步/可取消 | 禁止 | 禁止 |
 | S3 只读日志 | 必须 | 必须异步/可取消 | 禁止 | 禁止 |
 | B1 Hex | bytes 必须 | bytes 必须 | 当前禁用 | 当前禁用 |
 | B2/B3 Hex | bytes 必须 | bytes 必须异步 | 禁止 | 禁止 |

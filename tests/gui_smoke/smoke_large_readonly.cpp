@@ -3,9 +3,11 @@
 
 #include <QApplication>
 #include <QAbstractTextDocumentLayout>
+#include <QBuffer>
 #include <QClipboard>
 #include <QCheckBox>
 #include <QCryptographicHash>
+#include <QDataStream>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -28,13 +30,13 @@
 #include "EditorTab.h"
 #include "ByteClipboard.h"
 #include "FindReplaceDialog.h"
-#include "LargeFileVerticalSlice.h"
+#include "WindowedReadOnlyProvider.h"
 #include "VirtualFileView.h"
-#include "DraftStore.h"
-#include "SessionManager.h"
 #include "AsyncTaskManager.h"
 
-class S2PromotionSmokeTest final : public QObject {
+// Historical source filename; this suite now verifies that S2 and S3 stay on
+// the same read-only mmap path and never start a background editor load.
+class LargeReadOnlySmokeTest final : public QObject {
     Q_OBJECT
 
     static QString marginText(QsciScintilla *editor, int line)
@@ -239,7 +241,7 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&window));
 
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error, false,
+        QVERIFY2(tab->openLargeFileL2(path, &error,
                                       L2Presentation::Hex,
                                       L2ContentKind::Binary), qPrintable(error));
         QVERIFY(tab->isL2Mode());
@@ -390,7 +392,7 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&window));
 
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error, false,
+        QVERIFY2(tab->openLargeFileL2(path, &error,
                                       L2Presentation::Hex,
                                       L2ContentKind::Binary), qPrintable(error));
         QTRY_VERIFY_WITH_TIMEOUT(tab->l2View() && tab->l2View()->isOpen(), 5000);
@@ -862,7 +864,7 @@ private slots:
         window.close();
     }
 
-    void mmapPreviewPromotesToEditableScintilla()
+    void mmapS2RemainsReadOnlyAndStartsNoBackgroundLoad()
     {
         QTemporaryDir temporary;
         QVERIFY(temporary.isValid());
@@ -882,7 +884,7 @@ private slots:
         QCOMPARE(sourceBytes, 40LL * 1024 * 1024);
 
         QWidget window;
-        window.setWindowTitle(QStringLiteral("Notepad Safe S2 Promotion Acceptance"));
+        window.setWindowTitle(QStringLiteral("Notepad Safe S2 Read-only Acceptance"));
         window.resize(1280, 820);
         auto *layout = new QVBoxLayout(&window);
         layout->setContentsMargins(0, 0, 0, 0);
@@ -894,7 +896,7 @@ private slots:
         QElapsedTimer opening;
         opening.start();
         QString error;
-        QVERIFY2(tab->openLargeFileL2(sourcePath, &error, false),
+        QVERIFY2(tab->openLargeFileL2(sourcePath, &error),
                  qPrintable(error));
         QVERIFY2(opening.elapsed() < 1000,
                  "S2 open must return with mmap preview instead of waiting for Scintilla");
@@ -977,42 +979,35 @@ private slots:
             .filePath(QStringLiteral("gui-production-s2-preview-dynamic.png"));
         QVERIFY(window.grab().save(previewScreenshot));
 
-        // Reopen the same S2 file with promotion enabled. The first open above
-        // isolates actual preview dynamics from a fast ILoader completion.
+        // Reopening the same S2 file must remain on the same read-only route and
+        // must not submit a task or attach a full Scintilla document.
+        QSignalSpy tasksAdded(&AsyncTaskManager::instance(), &AsyncTaskManager::taskAdded);
         tab->shutdownL2BeforeClose();
-        QVERIFY2(tab->openLargeFileL2(sourcePath, &error, true), qPrintable(error));
+        QVERIFY2(tab->openLargeFileL2(sourcePath, &error), qPrintable(error));
         QVERIFY(tab->isL2Mode());
         tab->gotoByteOffset(dragged);
-
-        QTRY_VERIFY_WITH_TIMEOUT(!tab->isL2Mode(), 30000);
-        QVERIFY(tab->isLargeDocument());
-        QVERIFY(!tab->isReadOnlyByPolicy());
-        QCOMPARE(tab->editor()->length(), sourceBytes);
-        QCOMPARE(tab->editor()->SendScintilla(QsciScintillaBase::SCI_GETREADONLY), 0L);
-        const qint64 promotedPosition = tab->editor()->SendScintilla(
-            QsciScintillaBase::SCI_GETCURRENTPOS);
-        QVERIFY2(qAbs(promotedPosition - dragged) <= 1,
-                 qPrintable(QStringLiteral("promotion changed position: expected %1, actual %2")
-                                .arg(dragged).arg(promotedPosition)));
-
-        tab->editor()->setCursorPosition(0, 0);
-        tab->editor()->setFocus();
-        QTest::keyClicks(tab->editor(), QStringLiteral("EDIT_"));
-        QTRY_VERIFY_WITH_TIMEOUT(tab->editor()->text(0).startsWith(QStringLiteral("EDIT_")),
-                                 3000);
-        QVERIFY(tab->isModified());
-
-        const QString savedPath = temporary.filePath(QStringLiteral("saved.log"));
-        QVERIFY2(tab->saveAsFile(savedPath, &error), qPrintable(error));
-        QFile saved(savedPath);
-        QVERIFY(saved.open(QIODevice::ReadOnly));
-        QCOMPARE(saved.read(5), QByteArrayLiteral("EDIT_"));
-        QCOMPARE(saved.size(), sourceBytes + 5);
+        QTest::qWait(500);
+        QCOMPARE(tasksAdded.count(), 0);
+        QVERIFY(tab->isReadOnlyByPolicy());
+        QCOMPARE(tab->largeDocumentRuntimeState(),
+                 EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis);
+        auto *readOnly = tab->windowedReadOnlyProvider();
+        QVERIFY(readOnly);
+        const QByteArray before = readOnly->sourceBytes(dragged, 32);
+        readOnly->editor()->setFocus();
+        QTest::keyClicks(readOnly->editor(), QStringLiteral("EDIT_"));
+        QCOMPARE(readOnly->sourceBytes(dragged, 32), before);
         QVERIFY(!tab->isModified());
 
-        const QString screenshot = QDir(QCoreApplication::applicationDirPath())
-                                       .filePath(QStringLiteral("gui-s2-promotion.png"));
-        QVERIFY(window.grab().save(screenshot));
+        // The policy guard must also reject direct calls into the legacy save
+        // entry point, so future callers cannot accidentally revive S2 patch
+        // editing by bypassing the disabled UI actions.
+        const QString forbiddenSave = temporary.filePath(
+            QStringLiteral("s2-forbidden-save.log"));
+        QString saveError;
+        QVERIFY(!tab->saveL2As(forbiddenSave, &saveError));
+        QVERIFY(saveError.contains(QStringLiteral("只读")));
+        QVERIFY(!QFileInfo::exists(forbiddenSave));
         window.close();
     }
 
@@ -1043,7 +1038,7 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&window));
 
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error, false), qPrintable(error));
+        QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
         auto *provider = tab->windowedReadOnlyProvider();
         QVERIFY(provider);
         auto *horizontal = provider->editor()->horizontalScrollBar();
@@ -1207,7 +1202,7 @@ private slots:
         window.show();
         QVERIFY(QTest::qWaitForWindowExposed(&window));
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error, false), qPrintable(error));
+        QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
         QVERIFY(tab->isL2Mode());
         QVERIFY(tab->windowedReadOnlyProvider());
         QVERIFY(tab->l2View());
@@ -1230,7 +1225,7 @@ private slots:
         window.close();
     }
 
-    void s2ExpandedEncodingFallsBackBeforeAllocation()
+    void s2ExpandedEncodingRemainsReadOnlyWithoutAllocation()
     {
         QTemporaryDir temporary;
         QVERIFY(temporary.isValid());
@@ -1254,25 +1249,22 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&window));
         QSignalSpy stateChanged(tab, &EditorTab::largeDocumentRuntimeStateChanged);
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error, true), qPrintable(error));
-        QTRY_COMPARE_WITH_TIMEOUT(
-            tab->largeDocumentRuntimeState(),
-            EditorTab::LargeDocumentRuntimeState::ReadOnlyFallback, 5000);
-        QVERIFY(!tab->isLargeFilePreparationRunning());
+        QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
+        QCOMPARE(tab->largeDocumentRuntimeState(),
+                 EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis);
         QVERIFY(tab->isL2Mode());
         QVERIFY(tab->isReadOnlyByPolicy());
         QVERIFY(tab->windowedReadOnlyProvider());
         QVERIFY(!tab->l2View()->isOpen());
-        QVERIFY(tab->largeDocumentFallbackReason().contains(QStringLiteral("2 GiB")));
-        QVERIFY(stateChanged.count() >= 2);
+        QVERIFY(stateChanged.count() >= 1);
         window.close();
     }
 
-    void cancelingQueuedOrRunningPromotionKeepsPreviewUsable()
+    void s2DoesNotQueueBackgroundEditLoad()
     {
         QTemporaryDir temporary;
         QVERIFY(temporary.isValid());
-        const QString path = temporary.filePath(QStringLiteral("cancel-promotion.log"));
+        const QString path = temporary.filePath(QStringLiteral("no-background-edit-load.log"));
         QFile source(path);
         QVERIFY(source.open(QIODevice::WriteOnly));
         QCOMPARE(source.write(QByteArrayLiteral("CANCEL_TEST_HEAD\n")), qint64(17));
@@ -1288,34 +1280,20 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&window));
         QSignalSpy added(&AsyncTaskManager::instance(), &AsyncTaskManager::taskAdded);
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error, true), qPrintable(error));
-        QTRY_VERIFY_WITH_TIMEOUT(!added.isEmpty(), 5000);
-
-        qint64 promotionTask = 0;
-        for (const QList<QVariant> &arguments : added) {
-            const qint64 id = arguments.at(0).toLongLong();
-            if (AsyncTaskManager::instance().taskById(id).type
-                == AsyncTaskType::LargeFileLoad) {
-                promotionTask = id;
-                break;
-            }
-        }
-        QVERIFY(promotionTask > 0);
-        AsyncTaskManager::instance().cancel(promotionTask);
-        QTRY_COMPARE_WITH_TIMEOUT(
-            tab->largeDocumentRuntimeState(),
-            EditorTab::LargeDocumentRuntimeState::ReadOnlyFallback, 5000);
-        QVERIFY(!tab->isLargeFilePreparationRunning());
+        QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
+        QTest::qWait(500);
+        QCOMPARE(added.count(), 0);
+        QCOMPARE(tab->largeDocumentRuntimeState(),
+                 EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis);
         QVERIFY(tab->isL2Mode());
         QVERIFY(tab->isReadOnlyByPolicy());
-        QVERIFY(tab->largeDocumentFallbackReason().contains(QStringLiteral("取消")));
         tab->gotoByteOffset(0);
         QVERIFY(tab->windowedReadOnlyProvider()->editor()->text().startsWith(
             QStringLiteral("CANCEL_TEST_HEAD")));
         window.close();
     }
 
-    void invalidEncodingDuringPromotionFallsBackWithoutLosingPreview()
+    void invalidEncodingDoesNotStartBackgroundLoader()
     {
         QTemporaryDir temporary;
         QVERIFY(temporary.isValid());
@@ -1342,12 +1320,9 @@ private slots:
         window.show();
         QVERIFY(QTest::qWaitForWindowExposed(&window));
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error, true), qPrintable(error));
-        QTRY_COMPARE_WITH_TIMEOUT(
-            tab->largeDocumentRuntimeState(),
-            EditorTab::LargeDocumentRuntimeState::ReadOnlyFallback, 10000);
-        QVERIFY(!tab->isLargeFilePreparationRunning());
-        QVERIFY(tab->largeDocumentFallbackReason().contains(QStringLiteral("UTF-8")));
+        QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
+        QCOMPARE(tab->largeDocumentRuntimeState(),
+                 EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis);
         QVERIFY(tab->isL2Mode());
         QVERIFY(tab->isReadOnlyByPolicy());
         tab->gotoByteOffset(0);
@@ -1356,7 +1331,7 @@ private slots:
         window.close();
     }
 
-    void nearTwoGiBPreviewReachesHeadMiddleAndTailWithoutPromotion()
+    void nearTwoGiBReadOnlyReachesHeadMiddleAndTailWithoutEditLoad()
     {
         QTemporaryDir temporary;
         QVERIFY(temporary.isValid());
@@ -1384,7 +1359,7 @@ private slots:
         QElapsedTimer opening;
         opening.start();
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error, false), qPrintable(error));
+        QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
         QVERIFY2(opening.elapsed() < 1500,
                  "near-2-GiB preview must not load the full document");
         auto *provider = tab->windowedReadOnlyProvider();
@@ -1421,7 +1396,7 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&window));
 
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error, false,
+        QVERIFY2(tab->openLargeFileL2(path, &error,
                                       L2Presentation::Hex,
                                       L2ContentKind::Binary), qPrintable(error));
         QVERIFY(tab->isL2Mode());
@@ -1502,7 +1477,7 @@ private slots:
         window.close();
     }
 
-    void b2BinaryUsesStableSingleScrollFallback()
+    void realB2BinaryRemainsReadOnlyAndStartsNoBackgroundLoad()
     {
         const QString path = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
             .absoluteFilePath(QStringLiteral("../smalltestfile"));
@@ -1512,7 +1487,7 @@ private slots:
         QVERIFY(size < 2LL * 1024 * 1024 * 1024);
 
         QWidget window;
-        window.setWindowTitle(QStringLiteral("Notepad Safe production B2 fallback"));
+        window.setWindowTitle(QStringLiteral("Notepad Safe production B2 read-only"));
         window.resize(1280, 820);
         auto *layout = new QVBoxLayout(&window);
         layout->setContentsMargins(0, 0, 0, 0);
@@ -1521,8 +1496,9 @@ private slots:
         window.show();
         QVERIFY(QTest::qWaitForWindowExposed(&window));
 
+        QSignalSpy tasksAdded(&AsyncTaskManager::instance(), &AsyncTaskManager::taskAdded);
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error, false,
+        QVERIFY2(tab->openLargeFileL2(path, &error,
                                       L2Presentation::Hex,
                                       L2ContentKind::Binary), qPrintable(error));
         QVERIFY(tab->isL2Mode());
@@ -1552,6 +1528,7 @@ private slots:
         QVERIFY(provider->editor()->geometry().right()
                 <= ascii->geometry().left());
         QTest::qWait(1000);
+        QCOMPARE(tasksAdded.count(), 0);
         QCOMPARE(provider->globalOffset(), dragged);
         QCOMPARE(provider->editor()->text(0), firstLine);
 
@@ -1581,7 +1558,7 @@ private slots:
         window.close();
     }
 
-    void utf16PromotesAndSavesInOriginalEncoding()
+    void utf16S2RemainsReadOnlyAndUnchanged()
     {
         QTemporaryDir temporary;
         QVERIFY(temporary.isValid());
@@ -1612,173 +1589,78 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&window));
 
         QString error;
-        QVERIFY2(tab->openLargeFileL2(sourcePath, &error, true), qPrintable(error));
+        QSignalSpy tasksAdded(&AsyncTaskManager::instance(), &AsyncTaskManager::taskAdded);
+        QVERIFY2(tab->openLargeFileL2(sourcePath, &error), qPrintable(error));
         QVERIFY(tab->isL2Mode());
-        QTRY_VERIFY_WITH_TIMEOUT(!tab->isL2Mode(), 30000);
-        QCOMPARE(tab->encoding(), TextEncoding::Utf16LE);
-        QVERIFY(tab->editor()->text(0).contains(QStringLiteral("UTF16_PROMOTION_OK")));
-        QVERIFY(tab->editor()->text(0).contains(QStringLiteral("中文日志")));
-
-        tab->editor()->setCursorPosition(0, 0);
-        tab->editor()->setFocus();
-        QTest::keyClicks(tab->editor(), QStringLiteral("EDIT_"));
-        QTRY_VERIFY_WITH_TIMEOUT(tab->editor()->text(0).startsWith(QStringLiteral("EDIT_")),
-                                 3000);
-
-        const QString savedPath = temporary.filePath(QStringLiteral("utf16-saved.log"));
-        QVERIFY2(tab->saveAsFile(savedPath, &error), qPrintable(error));
-        QFile saved(savedPath);
-        QVERIFY(saved.open(QIODevice::ReadOnly));
-        const QByteArray prefix = saved.read(12);
-        QCOMPARE(prefix.left(2), QByteArray("\xff\xfe", 2));
-        QCOMPARE(prefix.mid(2, 10), QByteArray("E\0D\0I\0T\0_\0", 10));
-        QCOMPARE(saved.size(), sourceBytes + 10);
+        QVERIFY(tab->isReadOnlyByPolicy());
+        QCOMPARE(tab->largeDocumentRuntimeState(),
+                 EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis);
+        QTest::qWait(500);
+        QCOMPARE(tasksAdded.count(), 0);
+        auto *provider = tab->windowedReadOnlyProvider();
+        QVERIFY(provider);
+        const QByteArray before = provider->sourceBytes(0, 32);
+        provider->editor()->setFocus();
+        QTest::keyClicks(provider->editor(), QStringLiteral("EDIT_"));
+        QCOMPARE(provider->sourceBytes(0, 32), before);
+        QCOMPARE(QFileInfo(sourcePath).size(), sourceBytes);
+        QVERIFY(!tab->isModified());
         window.close();
     }
 
-    void encryptedEditJournalRestoresWithoutPlaintextSnapshot()
+    void s2DoesNotExportEditRecoveryData()
     {
         QTemporaryDir temporary;
         QVERIFY(temporary.isValid());
-        const QString sourcePath = temporary.filePath(QStringLiteral("journal-base.log"));
+        const QString sourcePath = temporary.filePath(QStringLiteral("readonly-base.log"));
         QSaveFile source(sourcePath);
         QVERIFY(source.open(QIODevice::WriteOnly));
-        const QByteArray line = QByteArrayLiteral(
-            "2026-08-15T12:34:56Z INFO service=api request=42 payload=bbbbbbbbbbbbbbbb\n");
-        QByteArray block;
-        while (block.size() + line.size() <= 1024 * 1024)
-            block += line;
-        block += QByteArray(1024 * 1024 - block.size(), '\n');
+        const QByteArray block(1024 * 1024, 'R');
         for (int i = 0; i < 33; ++i)
             QCOMPARE(source.write(block), qint64(block.size()));
         QVERIFY(source.commit());
 
-        QWidget sourceWindow;
-        sourceWindow.resize(1100, 700);
-        auto *sourceLayout = new QVBoxLayout(&sourceWindow);
-        auto *sourceTab = new EditorTab(&sourceWindow);
-        sourceLayout->addWidget(sourceTab);
-        sourceWindow.show();
-        QVERIFY(QTest::qWaitForWindowExposed(&sourceWindow));
+        EditorTab tab;
         QString error;
-        QVERIFY2(sourceTab->openLargeFileL2(sourcePath, &error, true), qPrintable(error));
-        QTRY_VERIFY_WITH_TIMEOUT(!sourceTab->isL2Mode(), 30000);
+        QVERIFY2(tab.openLargeFileL2(sourcePath, &error), qPrintable(error));
+        QVERIFY(tab.isL2Mode());
+        QVERIFY(tab.isReadOnlyByPolicy());
 
-        const QString marker = QStringLiteral("RECOVERED_S2_EDIT_");
-        sourceTab->editor()->setCursorPosition(0, 0);
-        sourceTab->editor()->setFocus();
-        QTest::keyClicks(sourceTab->editor(), marker);
-        QTRY_VERIFY_WITH_TIMEOUT(sourceTab->editor()->text(0).startsWith(marker), 3000);
-        sourceTab->editor()->setSelection(0, marker.size(), 0, marker.size() + 5);
-        QTest::keyClick(sourceTab->editor(), Qt::Key_Delete);
-        const QString expectedPrefix = marker + QStringLiteral("08-15");
-        QTRY_VERIFY_WITH_TIMEOUT(sourceTab->editor()->text(0).startsWith(expectedPrefix),
-                                 3000);
+        QByteArray payload;
+        QVERIFY(!tab.exportRecoveryPayload(&payload, &error));
+        QVERIFY(payload.isEmpty());
+        QVERIFY(error.contains(QStringLiteral("只读分析")));
 
-        SessionManager session(temporary.filePath(QStringLiteral("session-data")));
-        QVector<EditorTab *> tabs{sourceTab};
-        QVERIFY(session.saveSession(tabs, 0, true));
-        const SessionData state = session.loadSession();
-        QCOMPARE(state.tabs.size(), 1);
-        const QString draftPath = state.tabs.first().autosavePath;
-        QVERIFY(DraftStore::isEncryptedDraft(draftPath));
-        QFile encrypted(draftPath);
-        QVERIFY(encrypted.open(QIODevice::ReadOnly));
-        const QByteArray diskBytes = encrypted.readAll();
-        QVERIFY(!diskBytes.contains(marker.toUtf8()));
-        QVERIFY2(diskBytes.size() < 1024 * 1024,
-                 "small edit journal must not copy the 33 MiB base file");
-
-        QWidget restoredWindow;
-        restoredWindow.setWindowTitle(QStringLiteral("Notepad Safe S2 Recovery Acceptance"));
-        restoredWindow.resize(1100, 700);
-        auto *restoredLayout = new QVBoxLayout(&restoredWindow);
-        auto *restoredTab = new EditorTab(&restoredWindow);
-        restoredLayout->addWidget(restoredTab);
-        restoredWindow.show();
-        QVERIFY(QTest::qWaitForWindowExposed(&restoredWindow));
-        QVERIFY(session.restoreAutosave(restoredTab, draftPath, sourcePath));
-        QVERIFY(restoredTab->isL2Mode());
-        QTRY_VERIFY_WITH_TIMEOUT(!restoredTab->isL2Mode(), 30000);
-        QTRY_VERIFY_WITH_TIMEOUT(restoredTab->editor()->text(0).startsWith(expectedPrefix),
-                                 3000);
-        QVERIFY(restoredTab->isModified());
-
-        const QString screenshot = QDir(QCoreApplication::applicationDirPath())
-                                       .filePath(QStringLiteral("gui-s2-encrypted-recovery.png"));
-        QVERIFY(restoredWindow.grab().save(screenshot));
-        restoredWindow.close();
-        sourceWindow.close();
+        QBuffer checkpoint;
+        QVERIFY(checkpoint.open(QIODevice::WriteOnly));
+        error.clear();
+        QVERIFY(!tab.exportRecoveryCheckpoint(&checkpoint, &error));
+        QCOMPARE(checkpoint.size(), qint64(0));
+        QVERIFY(error.contains(QStringLiteral("只读分析")));
     }
 
-    void chunkedEncryptedCheckpointRestoresDirectlyToScintilla()
+    void legacyS2RecoveryIsRejected()
     {
-        QTemporaryDir temporary;
-        QVERIFY(temporary.isValid());
-        const QString sourcePath = temporary.filePath(QStringLiteral("checkpoint-base.log"));
-        QSaveFile source(sourcePath);
-        QVERIFY(source.open(QIODevice::WriteOnly));
-        const QByteArray line = QByteArrayLiteral(
-            "2026-08-15 WARN component=storage payload=cccccccccccccccccccccccccccc\n");
-        QByteArray block;
-        while (block.size() + line.size() <= 1024 * 1024)
-            block += line;
-        block += QByteArray(1024 * 1024 - block.size(), '\n');
-        for (int i = 0; i < 33; ++i)
-            QCOMPARE(source.write(block), qint64(block.size()));
-        QVERIFY(source.commit());
-
-        QWidget sourceWindow;
-        sourceWindow.resize(1100, 700);
-        auto *layout = new QVBoxLayout(&sourceWindow);
-        auto *tab = new EditorTab(&sourceWindow);
-        layout->addWidget(tab);
-        sourceWindow.show();
-        QVERIFY(QTest::qWaitForWindowExposed(&sourceWindow));
+        EditorTab tab;
         QString error;
-        QVERIFY2(tab->openLargeFileL2(sourcePath, &error, true), qPrintable(error));
-        QTRY_VERIFY_WITH_TIMEOUT(!tab->isL2Mode(), 30000);
-        const QString marker = QStringLiteral("CHECKPOINT_RECOVERED_");
-        tab->editor()->setCursorPosition(0, 0);
-        tab->editor()->setFocus();
-        QTest::keyClicks(tab->editor(), marker);
-        QTRY_VERIFY_WITH_TIMEOUT(tab->editor()->text(0).startsWith(marker), 3000);
+        QByteArray legacyPayload;
+        {
+            QDataStream stream(&legacyPayload, QIODevice::WriteOnly);
+            stream.setByteOrder(QDataStream::LittleEndian);
+            stream << QByteArray("NotepadSafe.LargeEditJournal.v1",
+                                 int(sizeof("NotepadSafe.LargeEditJournal.v1")))
+                   << quint32(1);
+        }
+        QVERIFY(!tab.restoreRecoveryPayload(legacyPayload, QString(), &error));
+        QVERIFY(!error.isEmpty());
 
-        const QString checkpoint = temporary.filePath(QStringLiteral("full.ndraft"));
-        QVERIFY2(DraftStore::writeCheckpoint(
-                     checkpoint, int(tab->encoding()),
-                     [tab](QIODevice *output, QString *writerError) {
-                         return tab->exportRecoveryCheckpoint(output, writerError);
-                     }, &error), qPrintable(error));
-        DraftStore::SnapshotInfo info;
-        QVERIFY2(DraftStore::inspect(checkpoint, &info, &error), qPrintable(error));
-        QCOMPARE(info.kind, DraftStore::PayloadKind::FullCheckpoint);
-        QCOMPARE(info.plaintextBytes, QFileInfo(sourcePath).size() + marker.toUtf8().size());
-        QFile encrypted(checkpoint);
-        QVERIFY(encrypted.open(QIODevice::ReadOnly));
-        QVERIFY(!encrypted.readAll().contains(marker.toUtf8()));
-
-        QWidget restoredWindow;
-        restoredWindow.resize(1100, 700);
-        auto *restoredLayout = new QVBoxLayout(&restoredWindow);
-        auto *restored = new EditorTab(&restoredWindow);
-        restoredLayout->addWidget(restored);
-        restoredWindow.show();
-        QVERIFY(QTest::qWaitForWindowExposed(&restoredWindow));
-        SessionManager session(temporary.filePath(QStringLiteral("checkpoint-session")));
-        QVERIFY2(session.restoreAutosave(restored, checkpoint, sourcePath), qPrintable(error));
-        QVERIFY(restored->isL2Mode());
-        QTRY_VERIFY_WITH_TIMEOUT(!restored->isL2Mode(), 30000);
-        QTRY_VERIFY_WITH_TIMEOUT(restored->editor()->text(0).startsWith(marker), 3000);
-        QVERIFY(restored->isModified());
-
-        const QString screenshot = QDir(QCoreApplication::applicationDirPath())
-                                       .filePath(QStringLiteral("gui-s2-checkpoint-recovery.png"));
-        QVERIFY(restoredWindow.grab().save(screenshot));
-        restoredWindow.close();
-        sourceWindow.close();
+        error.clear();
+        QVERIFY(!tab.restoreRecoveryCheckpoint(QStringLiteral("disabled.ndraft"),
+                                               QStringLiteral("disabled.log"),
+                                               TextEncoding::Utf8, 0, &error));
+        QVERIFY(error.contains(QStringLiteral("已禁用")));
     }
 };
 
-QTEST_MAIN(S2PromotionSmokeTest)
-#include "smoke_s2_promotion.moc"
+QTEST_MAIN(LargeReadOnlySmokeTest)
+#include "smoke_large_readonly.moc"
