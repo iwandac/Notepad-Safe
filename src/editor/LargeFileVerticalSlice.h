@@ -112,6 +112,7 @@ private:
     QScrollBar *m_globalScrollBar = nullptr;
     bool m_updatingScrollBar = false;
     bool m_wordWrap = false;
+    bool m_scrollToEndAfterPaint = false;
     int m_hexBytesPerRow = 16;
     int m_wheelAngleRemainder = 0;
     int m_wheelPixelRemainder = 0;

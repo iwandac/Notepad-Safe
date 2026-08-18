@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QByteArray>
 #include <QVector>
 #include <QStringList>
 #include <QTimer>
@@ -12,6 +13,7 @@ class QTabWidget;
 class QShowEvent;
 class QStackedWidget;
 class QLabel;
+class QToolButton;
 class QMenu;
 class QAction;
 class QUuid;
@@ -133,6 +135,7 @@ private:
     QLabel *m_statusSize = nullptr;
     QLabel *m_statusSyntax = nullptr;
     QLabel *m_statusModified = nullptr;
+    QToolButton *m_hexEditModeButton = nullptr;
     StatusBarTaskWidget *m_taskWidget = nullptr;
 
     // 最近文件菜单
@@ -170,6 +173,7 @@ private:
     QAction *m_copyAction = nullptr;
     QAction *m_pasteAction = nullptr;
     QAction *m_selectAllAction = nullptr;
+    QAction *m_hexInsertModeAction = nullptr;
     QAction *m_findAction = nullptr;
     QAction *m_replaceAction = nullptr;
     QAction *m_accountsAction = nullptr;
@@ -253,6 +257,8 @@ private:
     bool saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool showErrors = true);
     static QString secureTitleFrom(EditorTab *tab);
     void purgeSensitiveSearchState();
+    void rememberSensitiveDocumentClipboard(EditorTab *sourceTab);
+    void clearSensitiveDocumentClipboard();
     void protectForSystemLock();
     void restoreAfterSystemUnlock();
 
@@ -281,6 +287,7 @@ private:
     bool m_sessionNotificationsRegistered = false;
     bool m_restoreAccountsAfterSystemUnlock = false;
     bool m_destroying = false;
+    QByteArray m_sensitiveDocumentClipboardFingerprint;
 
     static constexpr int MAX_RECENT = 10;
 };

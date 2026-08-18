@@ -100,7 +100,7 @@ public:
 
     const SecurityIdentityParameters &parameters() const { return parameters_; }
 
-    bool matches(const SecurityIdentityParameters &parameters) const noexcept;
+    bool matches(const SecurityIdentityParameters &parameters);
     QString descriptorPath() const;
     QString capsulePath() const;
 

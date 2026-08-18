@@ -422,6 +422,19 @@ void FindReplaceDialog::updateQueryUi()
     if (!m_hexBytesCheck)
         return;
     const bool busy = m_l2SearchInProgress;
+    int searchableTargetCount = 0;
+    for (EditorTab *tab : openTabs()) {
+        if (isSearchableDocument(tab))
+            ++searchableTargetCount;
+    }
+    if (m_scopeCombo) {
+        const int allOpenIndex = m_scopeCombo->findData(1);
+        if (allOpenIndex >= 0) {
+            m_scopeCombo->setItemText(
+                allOpenIndex,
+                QStringLiteral("全部打开文件 (%1)").arg(searchableTargetCount));
+        }
+    }
     bool hasBinaryTarget = isSearchableDocument(m_tab)
         && m_tab->isBinaryDocument();
     bool hasSearchableTarget = isSearchableDocument(m_tab);

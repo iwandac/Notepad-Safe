@@ -24,6 +24,7 @@
 #include <QStyle>
 #include <QStatusBar>
 #include <QLabel>
+#include <QToolButton>
 #include <QToolBar>
 #include <QFileDialog>
 #include <QMessageBox>
@@ -37,6 +38,7 @@
 #include <QPushButton>
 #include <QVBoxLayout>
 #include <QCloseEvent>
+#include <QContextMenuEvent>
 #include <QShowEvent>
 #include <QDragEnterEvent>
 #include <QDropEvent>
@@ -55,6 +57,7 @@
 #include <QComboBox>
 #include <QShortcut>
 #include <QKeySequence>
+#include <QKeyEvent>
 #include <QDateTime>
 #include <QElapsedTimer>
 #include <QDir>
@@ -1332,7 +1335,12 @@ void MainWindow::createMenus()
     m_documentOnlyActions.append(cutAct);
     cutAct->setShortcut(QKeySequence::Cut);
     connect(cutAct, &QAction::triggered, this, [this]() {
-        if (auto *t = currentTab()) t->cut();
+        if (auto *t = currentTab()) {
+            const bool hadSelection = t->hasSelectionCommand();
+            t->cut();
+            if (hadSelection)
+                rememberSensitiveDocumentClipboard(t);
+        }
     });
 
     auto *copyAct = editMenu->addAction(QStringLiteral("复制(&C)"));
@@ -1341,7 +1349,12 @@ void MainWindow::createMenus()
     m_documentOnlyActions.append(copyAct);
     copyAct->setShortcut(QKeySequence::Copy);
     connect(copyAct, &QAction::triggered, this, [this]() {
-        if (auto *t = currentTab()) t->copy();
+        if (auto *t = currentTab()) {
+            if (t->hasSelectionCommand()) {
+                t->copy();
+                rememberSensitiveDocumentClipboard(t);
+            }
+        }
     });
 
     auto *pasteAct = editMenu->addAction(QStringLiteral("粘贴(&P)"));
@@ -1360,6 +1373,18 @@ void MainWindow::createMenus()
     selectAllAct->setShortcut(QKeySequence::SelectAll);
     connect(selectAllAct, &QAction::triggered, this, [this]() {
         if (auto *t = currentTab()) t->selectAll();
+    });
+
+    m_hexInsertModeAction = editMenu->addAction(
+        QStringLiteral("十六进制插入模式(&I)"));
+    m_hexInsertModeAction->setObjectName(QStringLiteral("edit.hexInsertMode"));
+    m_hexInsertModeAction->setCheckable(true);
+    m_hexInsertModeAction->setStatusTip(
+        QStringLiteral("在十六进制视图中插入字节；也可按 Insert 或单击状态栏 INS/OVR 切换"));
+    m_documentOnlyActions.append(m_hexInsertModeAction);
+    connect(m_hexInsertModeAction, &QAction::triggered, this, [this]() {
+        if (auto *tab = currentTab())
+            tab->toggleHexOverwriteMode();
     });
 
     editMenu->addSeparator();
@@ -1832,6 +1857,18 @@ void MainWindow::createStatusBar()
     m_statusSize->setAccessibleName(QStringLiteral("文档大小"));
     m_statusSize->setMinimumWidth(80);
     statusBar()->addPermanentWidget(m_statusSize);
+
+    m_hexEditModeButton = new QToolButton;
+    m_hexEditModeButton->setObjectName(QStringLiteral("status.hexEditMode"));
+    m_hexEditModeButton->setAccessibleName(QStringLiteral("十六进制编辑模式"));
+    m_hexEditModeButton->setAutoRaise(true);
+    m_hexEditModeButton->setMinimumWidth(44);
+    m_hexEditModeButton->hide();
+    statusBar()->addPermanentWidget(m_hexEditModeButton);
+    connect(m_hexEditModeButton, &QToolButton::clicked, this, [this]() {
+        if (auto *tab = currentTab())
+            tab->toggleHexOverwriteMode();
+    });
 
     m_statusModified = new QLabel(QStringLiteral(""));
     m_statusModified->setObjectName(QStringLiteral("status.modified"));
@@ -2368,6 +2405,7 @@ void MainWindow::lockSecureDocuments()
 
 void MainWindow::purgeSensitiveSearchState()
 {
+    clearSensitiveDocumentClipboard();
     m_lastFindPattern.fill(QChar(0));
     m_lastFindPattern.clear();
     m_lastFindRegex = false;
@@ -2377,6 +2415,44 @@ void MainWindow::purgeSensitiveSearchState()
         m_findDialog->clearSensitiveState();
     if (m_searchDock)
         m_searchDock->clearResults();
+}
+
+void MainWindow::rememberSensitiveDocumentClipboard(EditorTab *sourceTab)
+{
+    scrubByteArray(m_sensitiveDocumentClipboardFingerprint);
+    if (!sourceTab || !sourceTab->isSecureDocument()
+        || sourceTab->isSecureDocumentMasked()) {
+        return;
+    }
+
+    QString clipboardText = QGuiApplication::clipboard()->text();
+    QByteArray clipboardUtf8 = clipboardText.toUtf8();
+    if (!clipboardUtf8.isEmpty()) {
+        m_sensitiveDocumentClipboardFingerprint = QCryptographicHash::hash(
+            clipboardUtf8, QCryptographicHash::Sha256);
+    }
+    scrubByteArray(clipboardUtf8);
+    if (!clipboardText.isEmpty())
+        clipboardText.fill(QChar(0));
+}
+
+void MainWindow::clearSensitiveDocumentClipboard()
+{
+    if (m_sensitiveDocumentClipboardFingerprint.isEmpty())
+        return;
+
+    QString clipboardText = QGuiApplication::clipboard()->text();
+    QByteArray clipboardUtf8 = clipboardText.toUtf8();
+    QByteArray currentFingerprint = QCryptographicHash::hash(
+        clipboardUtf8, QCryptographicHash::Sha256);
+    if (currentFingerprint == m_sensitiveDocumentClipboardFingerprint)
+        QGuiApplication::clipboard()->clear();
+
+    scrubByteArray(clipboardUtf8);
+    if (!clipboardText.isEmpty())
+        clipboardText.fill(QChar(0));
+    scrubByteArray(currentFingerprint);
+    scrubByteArray(m_sensitiveDocumentClipboardFingerprint);
 }
 
 void MainWindow::protectForSystemLock()
@@ -3859,6 +3935,13 @@ void MainWindow::syncCommandStates(EditorTab *tab)
     }
     if (m_selectAllAction)
         m_selectAllAction->setEnabled(hasDocument && !tab->isSecureDocumentMasked());
+    const bool editableHex = hasDocument && canModify && tab->isL2Active()
+        && tab->viewModeL2() == ViewMode::Hex;
+    if (m_hexInsertModeAction) {
+        m_hexInsertModeAction->setEnabled(editableHex);
+        m_hexInsertModeAction->setChecked(
+            editableHex && !tab->hexOverwriteMode());
+    }
     for (QAction *action : m_textMutationActions) {
         if (action)
             action->setEnabled(canModify && !tab->isL2Active());
@@ -4294,6 +4377,7 @@ void MainWindow::updateStatusBar()
         if (m_statusEncoding) m_statusEncoding->hide();
         if (m_statusSyntax) m_statusSyntax->hide();
         if (m_statusSize) m_statusSize->hide();
+        if (m_hexEditModeButton) m_hexEditModeButton->hide();
         if (m_statusModified) m_statusModified->hide();
         return;
     }
@@ -4306,6 +4390,22 @@ void MainWindow::updateStatusBar()
     int line, index;
     tab->getCursorPosition(&line, &index);
     const bool hexMode = tab->isL2Active() && tab->viewModeL2() == ViewMode::Hex;
+    if (m_hexEditModeButton) {
+        m_hexEditModeButton->setVisible(hexMode);
+        if (hexMode) {
+            const bool overwrite = tab->hexOverwriteMode();
+            m_hexEditModeButton->setText(overwrite ? QStringLiteral("OVR")
+                                                    : QStringLiteral("INS"));
+            m_hexEditModeButton->setEnabled(tab->canModifyCommand());
+            m_hexEditModeButton->setToolTip(overwrite
+                ? QStringLiteral("覆盖模式：输入替换现有字节。单击或按 Insert 切换为插入模式")
+                : QStringLiteral("插入模式：输入新增字节。单击或按 Insert 切换为覆盖模式"));
+        }
+    }
+    if (m_hexInsertModeAction) {
+        m_hexInsertModeAction->setEnabled(hexMode && tab->canModifyCommand());
+        m_hexInsertModeAction->setChecked(hexMode && !tab->hexOverwriteMode());
+    }
     if (hexMode) {
         const qint64 offset = qMax<qint64>(0, tab->currentByteOffset());
         m_statusPos->setText(QStringLiteral("偏移: 0x%1")
@@ -4381,10 +4481,6 @@ void MainWindow::updateStatusBar()
             capability += QStringLiteral(" · 只读");
         break;
     }
-    if (tab->largeDocumentRuntimeState()
-            == EditorTab::LargeDocumentRuntimeState::None && hexMode)
-        capability += tab->hexOverwriteMode() ? QStringLiteral(" · OVR")
-                                              : QStringLiteral(" · INS");
     m_statusSize->setText(capability.isEmpty()
                               ? sizeStr
                               : QStringLiteral("%1 · %2").arg(sizeStr, capability));
@@ -4399,6 +4495,7 @@ void MainWindow::showWorkspaceStatus(const QString &workspaceName)
     if (m_statusPos) m_statusPos->hide();
     if (m_statusEncoding) m_statusEncoding->hide();
     if (m_statusSize) m_statusSize->hide();
+    if (m_hexEditModeButton) m_hexEditModeButton->hide();
     if (m_statusModified) m_statusModified->hide();
     if (m_statusSyntax) {
         m_statusSyntax->setText(workspaceName);
@@ -4480,6 +4577,55 @@ static QStringList filePathsFromMime(const QMimeData *mime)
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
+    // QScintilla consumes editing shortcuts and its native context menu before
+    // the window-level QActions can run. Route every editor copy/cut entry path
+    // through the same commands so secure-document clipboard fingerprints are
+    // always registered and can be conditionally cleared at lock time.
+    EditorTab *sourceTab = nullptr;
+    for (int index = 0; m_tabs && index < m_tabs->count(); ++index) {
+        auto *candidate = qobject_cast<EditorTab *>(m_tabs->widget(index));
+        if (candidate && candidate->editor()
+            && (watched == candidate->editor()
+                || watched == candidate->editor()->viewport())) {
+            sourceTab = candidate;
+            break;
+        }
+    }
+    if (sourceTab && event->type() == QEvent::KeyPress) {
+        auto *keyEvent = static_cast<QKeyEvent *>(event);
+        if (keyEvent->matches(QKeySequence::Copy)) {
+            if (sourceTab->hasSelectionCommand()) {
+                sourceTab->copy();
+                rememberSensitiveDocumentClipboard(sourceTab);
+            }
+            keyEvent->accept();
+            return true;
+        }
+        if (keyEvent->matches(QKeySequence::Cut)) {
+            if (sourceTab->hasSelectionCommand()) {
+                sourceTab->cut();
+                rememberSensitiveDocumentClipboard(sourceTab);
+            }
+            keyEvent->accept();
+            return true;
+        }
+    }
+    if (sourceTab && event->type() == QEvent::ContextMenu) {
+        auto *contextEvent = static_cast<QContextMenuEvent *>(event);
+        QMenu menu(this);
+        menu.addAction(m_undoAction);
+        menu.addAction(m_redoAction);
+        menu.addSeparator();
+        menu.addAction(m_cutAction);
+        menu.addAction(m_copyAction);
+        menu.addAction(m_pasteAction);
+        menu.addSeparator();
+        menu.addAction(m_selectAllAction);
+        menu.exec(contextEvent->globalPos());
+        contextEvent->accept();
+        return true;
+    }
+
     // 统一转发 DragEnter/DragMove/Drop：
     // 经过 registerDropProxy 注册过的控件（m_tabs/每个EditorTab/每个QsciScintilla/其viewport）
     // 都会安装本事件过滤器并关闭 acceptDrops。这里把它们的 drag 事件都转给 MainWindow 处理。
@@ -4966,6 +5112,7 @@ void MainWindow::closeEvent(QCloseEvent *event)
         m_secureDocuments->closeAll();
     if (m_securitySession)
         m_securitySession->endSession(false);
+    clearSensitiveDocumentClipboard();
 
     event->accept();
 }

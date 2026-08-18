@@ -119,6 +119,19 @@ WindowedReadOnlyProvider::WindowedReadOnlyProvider(QWidget *parent)
         syncAsciiSelectionFromHex();
         syncAsciiScrollFromHex();
     });
+    connect(m_editor, &QsciScintillaBase::SCN_PAINTED, this, [this]() {
+        if (!m_scrollToEndAfterPaint)
+            return;
+        // Wrap counts are lazy in Scintilla. The first setText-time count can
+        // describe only logical lines, leaving most of the final wrapped line
+        // below the viewport. Recompute exactly after the first real paint.
+        m_scrollToEndAfterPaint = false;
+        scrollProjectionToEnd();
+        m_globalOffset = std::max<qint64>(0, m_fileSize - 1);
+        m_updatingScrollBar = true;
+        m_globalScrollBar->setValue(m_globalScrollBar->maximum());
+        m_updatingScrollBar = false;
+    });
     connect(m_editor, &QsciScintilla::selectionChanged,
             this, &WindowedReadOnlyProvider::syncAsciiSelectionFromHex);
     connect(m_editor, &QsciScintilla::cursorPositionChanged,
@@ -400,6 +413,26 @@ qint64 WindowedReadOnlyProvider::visibleBottomOffset() const
 {
     if (m_path.isEmpty() || !m_editor || !m_editor->viewport())
         return 0;
+    if (m_presentation == Presentation::Text) {
+        const int firstVisible = static_cast<int>(directScintilla(
+            m_editor, QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
+        const int linesOnScreen = std::max(1, static_cast<int>(directScintilla(
+            m_editor, QsciScintillaBase::SCI_LINESONSCREEN)));
+        if (firstVisible + linesOnScreen >= projectedDisplayLineCount())
+            return m_windowEnd;
+        // Bottom visibility means the furthest source character painted in the
+        // viewport, not the start of its last display row. With wrapping, the
+        // old left-edge probe under-reported by up to one complete wrapped row
+        // even when the physical EOF marker was already on screen.
+        const qint64 position = directScintilla(
+            m_editor, QsciScintillaBase::SCI_POSITIONFROMPOINTCLOSE,
+            static_cast<ScintillaUnsigned>(
+                std::max(2, m_editor->viewport()->width() - 2)),
+            static_cast<ScintillaSigned>(
+                std::max(1, m_editor->viewport()->height() - 2)));
+        if (position >= 0)
+            return sourceOffsetForProjectedPosition(position, true);
+    }
     const qint64 offset = sourceOffsetAtViewportY(
         std::max(1, m_editor->viewport()->height() - 2));
     return offset >= 0 ? offset : visibleTopOffset();
@@ -886,8 +919,15 @@ void WindowedReadOnlyProvider::reloadWindow(qint64 anchorOffset, qint64 selectio
                             static_cast<ScintillaSigned>(caretY / lineHeight));
         }
     }
-    if (anchorOffset >= m_fileSize - 1)
+    if (anchorOffset >= m_fileSize - 1) {
+        m_scrollToEndAfterPaint = m_presentation == Presentation::Text
+            && m_wordWrap;
         scrollProjectionToEnd();
+        if (m_scrollToEndAfterPaint)
+            m_editor->viewport()->update();
+    } else {
+        m_scrollToEndAfterPaint = false;
+    }
     if (preserveHorizontal) {
         directScintilla(m_editor, QsciScintillaBase::SCI_SETXOFFSET,
                         static_cast<ScintillaUnsigned>(

@@ -1049,6 +1049,91 @@ private slots:
         window.reset();
         qunsetenv("NOTEPADSAFE_DATADIR");
     }
+
+    void secureClipboardIsConditionalAndClearedOnLock()
+    {
+        QTemporaryDir dataDirectory;
+        QVERIFY(dataDirectory.isValid());
+        qputenv("NOTEPADSAFE_DATADIR", dataDirectory.path().toUtf8());
+
+        auto window = std::make_unique<MainWindow>();
+        window->resize(1180, 760);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window.get()));
+
+        QTimer::singleShot(80, window.get(), []() {
+            auto *identity = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            QVERIFY(identity);
+            auto *password = identity->findChild<QLineEdit *>(
+                QStringLiteral("securitySessionPassword"));
+            auto *confirmation = identity->findChild<QLineEdit *>(
+                QStringLiteral("securitySessionConfirmation"));
+            auto *buttons = identity->findChild<QDialogButtonBox *>();
+            QVERIFY(password && confirmation && buttons);
+            QTest::keyClicks(password, QStringLiteral("correct horse battery staple"));
+            QTest::keyClicks(confirmation, QStringLiteral("correct horse battery staple"));
+            QTimer::singleShot(120, identity, []() {
+                confirmRecoverySeedFromIdentitySetup();
+            });
+            QTest::mouseClick(buttons->button(QDialogButtonBox::Ok), Qt::LeftButton);
+        });
+        QVERIFY(QMetaObject::invokeMethod(window.get(), "newFile", Qt::DirectConnection));
+
+        EditorTab *tab = currentEditor(window.get());
+        QVERIFY(tab && tab->isSecureDocument() && !tab->isSecureDocumentMasked());
+        const QString secret = QStringLiteral("CLIPBOARD_SECRET_74f6d18c");
+        tab->editor()->setText(secret);
+        tab->editor()->selectAll();
+        tab->editor()->setFocus();
+        QTest::keyClick(tab->editor(), Qt::Key_C, Qt::ControlModifier);
+        QTRY_COMPARE(QApplication::clipboard()->text(), secret);
+        QTest::keyClick(tab->editor(), Qt::Key_Right);
+        QVERIFY(!tab->hasSelectionCommand());
+        QTest::keyClick(tab->editor(), Qt::Key_C, Qt::ControlModifier);
+        QCOMPARE(QApplication::clipboard()->text(), secret);
+
+#ifdef Q_OS_WIN
+        // Exercise the native Windows workstation-lock route: copied secure
+        // note text must disappear together with the editor plaintext.
+        ::SendMessageW(reinterpret_cast<HWND>(window->winId()), WM_WTSSESSION_CHANGE,
+                       WTS_SESSION_LOCK, 0);
+        QTRY_VERIFY_WITH_TIMEOUT(tab->isSecureDocumentMasked(), 3000);
+        auto *tabs = window->findChild<QTabWidget *>();
+        QVERIFY(tabs);
+        QCOMPARE(tabs->tabText(tabs->indexOf(tab)), QStringLiteral("已锁定文档"));
+        QVERIFY(!tabs->tabText(tabs->indexOf(tab)).contains(secret));
+        const bool clipboardWasCleared = QApplication::clipboard()->text().isEmpty();
+        QApplication::clipboard()->clear();
+        QVERIFY2(clipboardWasCleared,
+                 "secure document plaintext remained in the clipboard after system lock");
+        QVERIFY(window->grab().save(QDir::current().filePath(
+            QStringLiteral("gui-secure-clipboard-locked.png"))));
+
+        ::SendMessageW(reinterpret_cast<HWND>(window->winId()), WM_WTSSESSION_CHANGE,
+                       WTS_SESSION_UNLOCK, 0);
+        QTRY_VERIFY_WITH_TIMEOUT(!tab->isSecureDocumentMasked(), 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->editor()->text(), secret, 5000);
+
+        // Clipboard cleanup is fingerprint-conditional. Never erase content
+        // another application/user copied after NotepadSafe's secure copy.
+        tab->editor()->selectAll();
+        tab->editor()->setFocus();
+        QTest::keyClick(tab->editor(), Qt::Key_C, Qt::ControlModifier);
+        QTRY_COMPARE(QApplication::clipboard()->text(), secret);
+        const QString externalReplacement = QStringLiteral("external clipboard value");
+        QApplication::clipboard()->setText(externalReplacement);
+        QAction *lockAction = actionWithText(window.get(), QStringLiteral("立即锁定"));
+        QVERIFY(lockAction);
+        lockAction->trigger();
+        QVERIFY(tab->isSecureDocumentMasked());
+        QCOMPARE(QApplication::clipboard()->text(), externalReplacement);
+#endif
+
+        QApplication::clipboard()->clear();
+        window->close();
+        window.reset();
+        qunsetenv("NOTEPADSAFE_DATADIR");
+    }
 };
 
 QTEST_MAIN(SecureDocumentsSmokeTest)

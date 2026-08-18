@@ -11,6 +11,7 @@
 #include <QVariantMap>
 #include <QDebug>
 
+#include <cstdio>
 #include <type_traits>
 
 namespace {
@@ -21,6 +22,7 @@ void check(bool condition, const char *message)
 {
     if (!condition) {
         qCritical().noquote() << "FAIL:" << message;
+        std::fprintf(stderr, "FAIL: %s\n", message);
         ++failures;
     }
 }
@@ -364,6 +366,25 @@ int main(int argc, char **argv)
               && restoredLease.isValid(),
           "restored session can lease keys again");
     restoredLease.clear();
+
+    // The sealed capsule is the authority for an active device session. If it
+    // disappears (cleanup, profile damage, or external tampering), a stale
+    // in-memory active_ flag must not continue to match document identities.
+    const SecurityIdentityParameters activeParameters = session.parameters();
+    check(session.matches(activeParameters),
+          "live device session matches its current identity");
+    check(QFile::remove(session.capsulePath()),
+          "session capsule can be removed to simulate external loss");
+    check(!session.matches(activeParameters) && !session.hasActiveSession(),
+          "missing capsule immediately invalidates identity matching and active state");
+    SecurityOperationLease missingCapsuleLease;
+    check(session.acquireOperationLease(&missingCapsuleLease).code
+              == VaultErrorCode::Locked
+              && !missingCapsuleLease.isValid(),
+          "missing capsule cannot yield an operation lease");
+
+    check(!session.unlockIdentity(sessionPassphrase).isError(),
+          "master password can establish a fresh session after capsule loss");
     session.endSession(true);
     check(!QFile::exists(session.capsulePath()),
           "explicit lock removes the seven-day device capsule");

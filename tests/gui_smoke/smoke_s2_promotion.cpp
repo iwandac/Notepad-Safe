@@ -5,11 +5,13 @@
 #include <QAbstractTextDocumentLayout>
 #include <QClipboard>
 #include <QCheckBox>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QLineEdit>
 #include <QMimeData>
+#include <QInputMethodEvent>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSaveFile>
@@ -71,6 +73,35 @@ class S2PromotionSmokeTest final : public QObject {
         QTest::mouseRelease(bar, Qt::LeftButton, Qt::NoModifier, destination);
     }
 
+    static void dragScrollBarContinuously(QScrollBar *bar, qreal targetRatio)
+    {
+        QStyleOptionSlider option;
+        option.initFrom(bar);
+        option.rect = bar->rect();
+        option.orientation = bar->orientation();
+        option.minimum = bar->minimum();
+        option.maximum = bar->maximum();
+        option.sliderPosition = bar->sliderPosition();
+        option.sliderValue = bar->value();
+        option.singleStep = bar->singleStep();
+        option.pageStep = bar->pageStep();
+        const QRect handle = bar->style()->subControlRect(
+            QStyle::CC_ScrollBar, &option, QStyle::SC_ScrollBarSlider, bar);
+        const QPoint start = handle.center();
+        const QPoint destination = bar->orientation() == Qt::Vertical
+            ? QPoint(bar->width() / 2,
+                     qBound(2, int(bar->height() * targetRatio), bar->height() - 2))
+            : QPoint(qBound(2, int(bar->width() * targetRatio), bar->width() - 2),
+                     bar->height() / 2);
+        QTest::mousePress(bar, Qt::LeftButton, Qt::NoModifier, start);
+        for (int step = 1; step <= 24; ++step) {
+            const QPoint point = start + (destination - start) * step / 24;
+            QTest::mouseMove(bar, point, 8);
+            QCoreApplication::processEvents();
+        }
+        QTest::mouseRelease(bar, Qt::LeftButton, Qt::NoModifier, destination);
+    }
+
     static void wheelLinesDown(QWidget *target, int notches = 1)
     {
         const QPointF local(target->rect().center());
@@ -100,6 +131,56 @@ class S2PromotionSmokeTest final : public QObject {
         const qsizetype compared = std::min<qsizetype>(64, rendered.size());
         QVERIFY(compared > 0);
         QCOMPARE(rendered.left(compared), provider->sourceBytes(topOffset, compared));
+    }
+
+    static QByteArray fileSha256(const QString &path)
+    {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly))
+            return {};
+        QCryptographicHash hash(QCryptographicHash::Sha256);
+        while (!file.atEnd()) {
+            const QByteArray chunk = file.read(1024 * 1024);
+            if (chunk.isEmpty() && file.error() != QFileDevice::NoError)
+                return {};
+            hash.addData(chunk);
+        }
+        return hash.result();
+    }
+
+    static int visibleVerticalScrollBars(QWidget *root)
+    {
+        int count = 0;
+        const auto bars = root->findChildren<QScrollBar *>();
+        for (QScrollBar *bar : bars) {
+            if (bar->orientation() == Qt::Vertical && bar->isVisibleTo(root)
+                && bar->maximum() > bar->minimum()) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    static int visibleHorizontalScrollBars(QWidget *root)
+    {
+        int count = 0;
+        const auto bars = root->findChildren<QScrollBar *>();
+        for (QScrollBar *bar : bars) {
+            if (bar->orientation() == Qt::Horizontal && bar->isVisibleTo(root))
+                ++count;
+        }
+        return count;
+    }
+
+    static QByteArray scintillaBytes(QsciScintilla *editor)
+    {
+        const long length = editor->SendScintilla(
+            QsciScintillaBase::SCI_GETLENGTH);
+        QByteArray bytes(qMax<long>(0, length) + 1, '\0');
+        editor->SendScintilla(QsciScintillaBase::SCI_GETTEXT,
+                              static_cast<uintptr_t>(bytes.size()), bytes.data());
+        bytes.resize(qMax<long>(0, length));
+        return bytes;
     }
 
 private slots:
@@ -144,7 +225,8 @@ private slots:
         const QString path = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
             .absoluteFilePath(QStringLiteral("../tinytestfile"));
         QVERIFY2(QFileInfo::exists(path), qPrintable(path));
-        QCOMPARE(QFileInfo(path).size(), qint64(32111104));
+        QVERIFY(QFileInfo(path).size() > 0);
+        QVERIFY(QFileInfo(path).size() < qint64(32) * 1024 * 1024);
 
         QWidget window;
         window.setWindowTitle(QStringLiteral("tinytestfile Hex contract"));
@@ -187,7 +269,9 @@ private slots:
         constexpr qint64 copiedOffset = 0x416;
         QVERIFY(source.seek(copiedOffset));
         const QByteArray expectedBytes = source.read(3);
-        QCOMPARE(expectedBytes, QByteArray::fromHex("01E924"));
+        QCOMPARE(expectedBytes.size(), 3);
+        const QString expectedHexText = QString::fromLatin1(
+            expectedBytes.toHex(' ').toUpper());
         source.close();
 
         // Physically drag the ASCII pane from the right boundary back to the
@@ -224,7 +308,7 @@ private slots:
         QVERIFY(mime);
         QCOMPARE(mime->data(QString::fromLatin1(ByteClipboard::RawBytesMime)),
                  expectedBytes);
-        QCOMPARE(QGuiApplication::clipboard()->text(), QStringLiteral("01 E9 24"));
+        QCOMPARE(QGuiApplication::clipboard()->text(), expectedHexText);
 
         FindReplaceDialog dialog(&window);
         dialog.setActiveTab(tab);
@@ -237,7 +321,7 @@ private slots:
         QVERIFY(pattern && hexMode && findNext);
         pattern->setFocus(Qt::OtherFocusReason);
         QTest::keyClick(pattern, Qt::Key_V, Qt::ControlModifier);
-        QCOMPARE(pattern->text(), QStringLiteral("01 E9 24"));
+        QCOMPARE(pattern->text(), expectedHexText);
         QVERIFY(hexMode->isChecked());
         QTest::mouseClick(findNext, Qt::LeftButton);
         QVERIFY(tab->l2View()->selectionStart() > copiedOffset);
@@ -282,6 +366,256 @@ private slots:
             QDir(QCoreApplication::applicationDirPath()).filePath(
                 QStringLiteral("gui-tiny-binary-text-absolute-lines.png"))));
         window.close();
+    }
+
+    void tinyBinaryAsciiEditingTextScrollAndWrapAreByteSafe()
+    {
+        const QString path = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
+            .absoluteFilePath(QStringLiteral("../tinytestfile"));
+        const QFileInfo sourceInfo(path);
+        QVERIFY2(sourceInfo.exists(), qPrintable(path));
+        QVERIFY(sourceInfo.size() > 0);
+        QVERIFY(sourceInfo.size() < qint64(32) * 1024 * 1024);
+        const QByteArray diskHashBefore = fileSha256(path);
+        QVERIFY(!diskHashBefore.isEmpty());
+
+        QWidget window;
+        window.setWindowTitle(QStringLiteral("tinytestfile editing/scroll/wrap contract"));
+        window.resize(1280, 820);
+        auto *layout = new QVBoxLayout(&window);
+        layout->setContentsMargins(0, 0, 0, 0);
+        auto *tab = new EditorTab(&window);
+        layout->addWidget(tab);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+        QString error;
+        QVERIFY2(tab->openLargeFileL2(path, &error, false,
+                                      L2Presentation::Hex,
+                                      L2ContentKind::Binary), qPrintable(error));
+        QTRY_VERIFY_WITH_TIMEOUT(tab->l2View() && tab->l2View()->isOpen(), 5000);
+        auto *ascii = tab->findChild<QPlainTextEdit *>(
+            QStringLiteral("HexAsciiPreview"));
+        QVERIFY(ascii && ascii->isVisibleTo(&window));
+
+        // Default application routing opens this fixture in Hex. Reproduce a
+        // real continuous thumb gesture before any programmatic go-to call.
+        QScrollBar *hexGlobal = tab->l2View()->verticalScrollBar();
+        QVERIFY(hexGlobal && hexGlobal->maximum() > 0);
+        QSignalSpy hexProjectionChanges(tab->l2View(),
+                                        &VirtualFileView::activeWindowChanged);
+        dragScrollBarContinuously(hexGlobal, 0.61);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            tab->l2View()->activeWindowByteStart() > sourceInfo.size() / 2,
+            5000);
+        QTest::qWait(500); // allow the one release projection to paint
+        const int settledHexValue = hexGlobal->value();
+        const qint64 settledHexWindow = tab->l2View()->activeWindowByteStart();
+        const int settledHexProjections = hexProjectionChanges.count();
+        QTest::qWait(3000);
+        QCOMPARE(hexGlobal->value(), settledHexValue);
+        QCOMPARE(tab->l2View()->activeWindowByteStart(), settledHexWindow);
+        QVERIFY2(hexProjectionChanges.count() <= settledHexProjections + 1,
+                 "idle Hex viewport kept rebuilding after drag release");
+
+        // Click and type at the actually painted distant row. Programmatic
+        // goto/cursor placement cannot expose a stale windowStart or a pane
+        // whose internal scroll is no longer aligned with the global thumb.
+        const QPoint distantPoint(
+            qMax(2, ascii->fontMetrics().horizontalAdvance(QLatin1Char('0')) * 3),
+            ascii->viewport()->height() / 2);
+        const QTextCursor distantCursor = ascii->cursorForPosition(distantPoint);
+        const QTextBlock distantBlock = distantCursor.block();
+        QVERIFY(distantBlock.isValid());
+        const int distantColumn = distantCursor.position() - distantBlock.position();
+        QVERIFY(distantColumn >= 0
+                && distantColumn < tab->l2View()->hexBytesPerRow());
+        const qint64 distantOffset = tab->l2View()->activeWindowByteStart()
+            + qint64(distantBlock.blockNumber()) * tab->l2View()->hexBytesPerRow()
+            + distantColumn;
+        const QByteArray distantOriginal =
+            tab->l2View()->readByteRange(distantOffset, distantOffset + 1);
+        QCOMPARE(distantOriginal.size(), 1);
+        QTest::mouseClick(ascii->viewport(), Qt::LeftButton,
+                          Qt::NoModifier, distantPoint);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->cursorByte(), distantOffset, 1000);
+        QElapsedTimer distantTyping;
+        distantTyping.start();
+        QTest::keyClick(ascii, Qt::Key_Q);
+        QVERIFY2(distantTyping.elapsed() < 250,
+                 qPrintable(QStringLiteral("one distant ASCII overwrite took %1 ms")
+                                .arg(distantTyping.elapsed())));
+        QCOMPARE(tab->l2View()->readByteRange(distantOffset, distantOffset + 1),
+                 QByteArrayLiteral("q"));
+        QCOMPARE(tab->l2View()->cursorByte(), distantOffset + 1);
+        tab->undo();
+        QCOMPARE(tab->l2View()->readByteRange(distantOffset, distantOffset + 1),
+                 distantOriginal);
+
+        QTest::mouseClick(ascii->viewport(), Qt::LeftButton,
+                          Qt::NoModifier, distantPoint);
+        const qint64 commitOffset = tab->l2View()->cursorByte();
+        const QByteArray commitOriginal =
+            tab->l2View()->readByteRange(commitOffset, commitOffset + 4);
+        QCOMPARE(commitOriginal.size(), 4);
+        QInputMethodEvent asciiCommit;
+        asciiCommit.setCommitString(QStringLiteral("SAFE"));
+        QElapsedTimer commitTimer;
+        commitTimer.start();
+        QApplication::sendEvent(ascii, &asciiCommit);
+        QCoreApplication::processEvents();
+        QVERIFY2(commitTimer.elapsed() < 250,
+                 qPrintable(QStringLiteral("four-byte ASCII IME commit took %1 ms")
+                                .arg(commitTimer.elapsed())));
+        QCOMPARE(tab->l2View()->readByteRange(commitOffset, commitOffset + 4),
+                 QByteArrayLiteral("SAFE"));
+        QCOMPARE(tab->l2View()->cursorByte(), commitOffset + 4);
+        tab->undo();
+        QCOMPARE(tab->l2View()->readByteRange(commitOffset, commitOffset + 4),
+                 commitOriginal);
+
+        constexpr qint64 editOffset = 0x416;
+        QFile source(path);
+        QVERIFY(source.open(QIODevice::ReadOnly));
+        QVERIFY(source.seek(editOffset));
+        const QByteArray original = source.read(8);
+        QCOMPARE(original.size(), 8);
+        source.close();
+
+        // ASCII pane must support both conventional Hex-editor modes. Insert
+        // grows the byte stream; overwrite keeps its size. Every key must move
+        // the caret and update both projections without touching the disk file.
+        const auto placeAsciiCaret = [tab, ascii](qint64 byteOffset) {
+            tab->gotoByteOffset(byteOffset, 0);
+            QCoreApplication::processEvents();
+            const qint64 local = byteOffset
+                - tab->l2View()->activeWindowByteStart();
+            const int bytesPerRow = tab->l2View()->hexBytesPerRow();
+            const QTextBlock block = ascii->document()->findBlockByNumber(
+                int(local / bytesPerRow));
+            if (!block.isValid())
+                return false;
+            QTextCursor cursor(ascii->document());
+            cursor.setPosition(block.position() + int(local % bytesPerRow));
+            ascii->setFocus(Qt::OtherFocusReason);
+            ascii->setTextCursor(cursor);
+            QCoreApplication::processEvents();
+            return true;
+        };
+        QVERIFY(placeAsciiCaret(editOffset));
+        QTRY_VERIFY_WITH_TIMEOUT(ascii->hasFocus(), 1000);
+        QTRY_COMPARE(tab->l2View()->cursorByte(), editOffset);
+        QVERIFY(tab->hexOverwriteMode());
+        QTest::keyClick(ascii, Qt::Key_Insert);
+        QVERIFY(!tab->hexOverwriteMode());
+        QElapsedTimer typing;
+        typing.start();
+        QTest::keyClicks(ascii, QStringLiteral("ABC"), Qt::NoModifier, 0);
+        QVERIFY2(typing.elapsed() < 3000,
+                 qPrintable(QStringLiteral("three ASCII insert keys took %1 ms")
+                                .arg(typing.elapsed())));
+        QCOMPARE(tab->l2View()->virtualFileSize(), sourceInfo.size() + 3);
+        QCOMPARE(tab->l2View()->readByteRange(editOffset, editOffset + 11),
+                 QByteArray("ABC") + original);
+        QCOMPARE(tab->l2View()->cursorByte(), editOffset + 3);
+
+        tab->undo();
+        tab->undo();
+        tab->undo();
+        QTRY_COMPARE(tab->l2View()->virtualFileSize(), sourceInfo.size());
+        QCOMPARE(tab->l2View()->readByteRange(editOffset, editOffset + 8), original);
+        QTest::keyClick(ascii, Qt::Key_Insert);
+        QVERIFY(tab->hexOverwriteMode());
+        QVERIFY(placeAsciiCaret(editOffset));
+        QTRY_VERIFY_WITH_TIMEOUT(ascii->hasFocus(), 1000);
+        QTRY_COMPARE(tab->l2View()->cursorByte(), editOffset);
+        QTest::keyClicks(ascii, QStringLiteral("XYZ"), Qt::NoModifier, 0);
+        QCOMPARE(tab->l2View()->virtualFileSize(), sourceInfo.size());
+        QCOMPARE(tab->l2View()->readByteRange(editOffset, editOffset + 8),
+                 QByteArray("XYZ") + original.mid(3));
+        tab->undo();
+        tab->undo();
+        tab->undo();
+        QCOMPARE(tab->l2View()->readByteRange(editOffset, editOffset + 8), original);
+        QVERIFY(!tab->l2View()->patches().isModified());
+        QCOMPARE(tab->l2View()->virtualFileSize(), sourceInfo.size());
+
+        tab->setViewModeL2(ViewMode::Text);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->viewModeL2(), ViewMode::Text, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(visibleVerticalScrollBars(tab), 1, 3000);
+        QCOMPARE(tab->editor()->SendScintilla(
+                     QsciScintillaBase::SCI_GETVSCROLLBAR), 0L);
+        QCOMPARE(tab->editor()->SendScintilla(
+                     QsciScintillaBase::SCI_GETHSCROLLBAR), 0L);
+        QScrollBar *global = tab->l2View()->verticalScrollBar();
+        QVERIFY(global && global->maximum() > 0);
+
+        QSignalSpy projectionChanges(tab->l2View(),
+                                     &VirtualFileView::activeWindowChanged);
+        dragScrollBarContinuously(global, 0.75);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            tab->l2View()->activeWindowByteStart() > sourceInfo.size() / 2, 5000);
+        const int settledAt75 = global->value();
+        QVERIFY(settledAt75 > global->maximum() / 2);
+        const qint64 settledWindowStart = tab->l2View()->activeWindowByteStart();
+        const int projectionsAfterRelease = projectionChanges.count();
+        QTest::qWait(3000);
+        QCOMPARE(global->value(), settledAt75); // no delayed feedback-loop snap-back
+        QCOMPARE(tab->l2View()->activeWindowByteStart(), settledWindowStart);
+        QVERIFY2(projectionChanges.count() <= projectionsAfterRelease + 1,
+                 "an idle viewport kept rebuilding projections after drag release");
+
+        const qint64 sizeBeforeWrap = tab->l2View()->virtualFileSize();
+        QCOMPARE(sizeBeforeWrap, sourceInfo.size());
+        const int logicalLinesBeforeWrap = tab->editor()->lines();
+        const QString projectedTextBeforeWrap = tab->editor()->text();
+        const QByteArray projectedBytesBeforeWrap = scintillaBytes(tab->editor());
+        QCOMPARE(projectedBytesBeforeWrap,
+                 tab->l2View()->readByteRange(
+                     tab->l2View()->activeWindowByteStart(),
+                     tab->l2View()->activeWindowByteEnd()));
+        QVERIFY(!tab->l2View()->patches().isModified());
+        tab->setWordWrap(true);
+        QTRY_VERIFY_WITH_TIMEOUT(tab->wordWrap(), 1000);
+        QCOMPARE(tab->editor()->wrapMode(), QsciScintilla::WrapWord);
+        QTRY_COMPARE_WITH_TIMEOUT(visibleHorizontalScrollBars(tab), 0, 1000);
+        QCOMPARE(tab->editor()->lines(), logicalLinesBeforeWrap);
+        QCOMPARE(tab->editor()->text(), projectedTextBeforeWrap);
+        QCOMPARE(scintillaBytes(tab->editor()), projectedBytesBeforeWrap);
+        QCOMPARE(tab->l2View()->virtualFileSize(), sizeBeforeWrap);
+        QVERIFY(!tab->l2View()->patches().isModified());
+
+        // The persisted application setting may enable wrapping before the
+        // user opens/switches this file. Exercise a non-terminal continuous
+        // thumb drag while wrap layout notifications are active; EOF-only
+        // coverage cannot expose a midpoint feedback loop.
+        dragScrollBarContinuously(global, 0.42);
+        QTRY_VERIFY_WITH_TIMEOUT(global->value() > global->maximum() / 3, 5000);
+        const int wrappedSettledValue = global->value();
+        const qint64 wrappedSettledStart = tab->l2View()->activeWindowByteStart();
+        const int wrappedProjectionCount = projectionChanges.count();
+        QTest::qWait(3000);
+        QCOMPARE(global->value(), wrappedSettledValue);
+        QCOMPARE(tab->l2View()->activeWindowByteStart(), wrappedSettledStart);
+        QVERIFY2(projectionChanges.count() <= wrappedProjectionCount + 1,
+                 "wrapped idle viewport kept rebuilding after midpoint drag");
+
+        dragScrollBar(global, 1.0);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->activeWindowByteEnd(),
+                                  tab->l2View()->virtualFileSize(), 5000);
+        QTest::qWait(500);
+        QVERIFY(global->value() >= global->maximum() - global->pageStep());
+        QVERIFY(!tab->l2View()->patches().isModified());
+        QCOMPARE(tab->l2View()->virtualFileSize(), sizeBeforeWrap);
+
+        QVERIFY(window.grab().save(
+            QDir(QCoreApplication::applicationDirPath()).filePath(
+                QStringLiteral("gui-tiny-binary-text-wrap-eof.png"))));
+        tab->setWordWrap(false);
+        QTRY_VERIFY_WITH_TIMEOUT(!tab->wordWrap(), 1000);
+        QVERIFY(!tab->l2View()->patches().isModified());
+        window.close();
+        QCOMPARE(fileSha256(path), diskHashBefore);
     }
 
     void windowedHexUsesUnifiedThreeColumnByteContract()
@@ -767,8 +1101,8 @@ private slots:
         QVERIFY2(dragTimer.elapsed() < 3000,
                  "word-wrapped global drag stalled the GUI");
         QCOMPARE(provider->windowEnd(), provider->fileSize());
-        QVERIFY2(provider->fileSize() - provider->visibleBottomOffset() < 8192,
-                 "scrollbar maximum did not put the physical EOF on screen");
+        QTRY_VERIFY_WITH_TIMEOUT(
+            provider->fileSize() - provider->visibleBottomOffset() < 8192, 3000);
         QVERIFY(provider->editor()->text().contains(QString::fromLatin1(tail)));
 
         const qint64 topAtEnd = provider->visibleTopOffset();

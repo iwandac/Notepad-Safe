@@ -16,6 +16,7 @@
 #include <QtCore/QObject>
 #include <QtTest/QTest>
 #include <QtTest/QAbstractItemModelTester>
+#include <QtTest/QSignalSpy>
 // ---------- 全局单个 test slot 的硬超时：30 秒。
 //   一旦某个 slot 超过 30s 还没返回（例如主线程被同步 readAll 大文件卡死），Qt Test 会
 //   直接 abort 当前 case，不再让整个桌面 UI 僵死 5 分钟（默认 300 秒 fatality）。
@@ -55,6 +56,9 @@
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QMessageBox>
 #include <QtWidgets/QPushButton>
+#include <QtWidgets/QLineEdit>
+#include <QtWidgets/QComboBox>
+#include <QtWidgets/QTreeView>
 #include <QtWidgets/QToolButton>
 #include <QtWidgets/QListView>
 #include <QtWidgets/QPlainTextEdit>
@@ -74,6 +78,8 @@
 #include "EditorTab.h"
 #include "VirtualFileView.h"
 #include "FindReplaceDialog.h"
+#include "SearchResultsDock.h"
+#include "SearchResultsModel.h"
 #include "AsyncTaskManager.h"
 #include "AsyncTaskPanelDialog.h"
 #include "SessionManager.h"
@@ -910,8 +916,12 @@ private slots:
 
         bool restoredSizeStatus = false;
         for (QLabel *label : mw_->findChildren<QLabel *>())
-            restoredSizeStatus |= label->text() == QStringLiteral("512 B · B1 · OVR");
+            restoredSizeStatus |= label->text() == QStringLiteral("512 B · B1");
         QVERIFY(restoredSizeStatus);
+        auto *hexModeStatus = mw_->findChild<QToolButton *>(
+            QStringLiteral("status.hexEditMode"));
+        QVERIFY(hexModeStatus && hexModeStatus->isVisible());
+        QCOMPARE(hexModeStatus->text(), QStringLiteral("OVR"));
 
         // Insert toggles a single document-level mode shared by both byte
         // columns. In ASCII it inserts one byte; Undo restores the exact source.
@@ -934,9 +944,6 @@ private slots:
         QTest::keyClicks(tab->editor(), QStringLiteral("AB"));
         QTRY_VERIFY_WITH_TIMEOUT(tab->editor()->text().startsWith(
                                      QStringLiteral("FF 41 5A AB 03")), 1000);
-        tab->undo();
-        QTRY_VERIFY_WITH_TIMEOUT(tab->editor()->text().startsWith(
-                                     QStringLiteral("FF 41 5A A0 03")), 1000);
         tab->undo();
         QTRY_VERIFY_WITH_TIMEOUT(tab->editor()->text().startsWith(
                                      QStringLiteral("FF 41 5A 03")), 1000);
@@ -1222,14 +1229,16 @@ private slots:
         QCOMPARE(pagedColumn % 3, 0);
         QTest::keyClick(tab->editor(), Qt::Key_End, Qt::ControlModifier);
         tab->editor()->getCursorPosition(&line, &column);
-        QCOMPARE(line, (bytes.size() - 1) / bytesPerRow);
-        QCOMPARE(column, ((bytes.size() - 1) % bytesPerRow) * 3 + 1);
+        QCOMPARE(tab->currentByteOffset(), qint64(bytes.size()));
+        QCOMPARE(tab->editor()->SendScintilla(
+                     QsciScintillaBase::SCI_GETCURRENTPOS),
+                 tab->editor()->length());
         const QTextBlock lastAsciiRow = ascii->document()->findBlockByNumber(
             (bytes.size() - 1) / bytesPerRow);
         QVERIFY(lastAsciiRow.isValid());
         QTRY_COMPARE_WITH_TIMEOUT(ascii->textCursor().position(),
                                   lastAsciiRow.position()
-                                      + ((bytes.size() - 1) % bytesPerRow),
+                                      + lastAsciiRow.text().size(),
                                   1000);
         QTest::keyClick(tab->editor(), Qt::Key_Home, Qt::ControlModifier);
         tab->editor()->getCursorPosition(&line, &column);
@@ -1341,6 +1350,139 @@ private slots:
         closeAllEditorTabs(mw_);
     }
 
+    void tc_hex_insert_mode_discoverable_and_eof_append() {
+        closeAllEditorTabs(mw_);
+        const QByteArray original = QByteArray::fromHex("00112233");
+        const QString path = tmpDir_.filePath(QStringLiteral("hex-insert-discoverable.bin"));
+        {
+            QFile source(path);
+            QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(source.write(original), qint64(original.size()));
+        }
+        mw_->openFilesFromExternal({path});
+        QVERIFY(waitForTabCountAndL2(mw_, 1, true, 5000));
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && tab->viewModeL2() == ViewMode::Hex);
+
+        auto *modeButton = mw_->findChild<QToolButton *>(
+            QStringLiteral("status.hexEditMode"));
+        QVERIFY2(modeButton,
+                 "Hex OVR/INS must be a persistent clickable status control");
+        QCOMPARE(modeButton->text(), QStringLiteral("OVR"));
+        QVERIFY(modeButton->isVisibleTo(mw_));
+        QVERIFY(modeButton->toolTip().contains(QStringLiteral("Insert")));
+
+        QTest::mouseClick(modeButton, Qt::LeftButton);
+        QVERIFY(!tab->hexOverwriteMode());
+        QCOMPARE(modeButton->text(), QStringLiteral("INS"));
+        auto *modeAction = mw_->findChild<QAction *>(
+            QStringLiteral("edit.hexInsertMode"));
+        QVERIFY(modeAction && modeAction->isEnabled() && modeAction->isChecked());
+        modeAction->trigger();
+        QVERIFY(tab->hexOverwriteMode());
+        QTRY_COMPARE_WITH_TIMEOUT(modeButton->text(), QStringLiteral("OVR"), 1000);
+        modeAction->trigger();
+        QVERIFY(!tab->hexOverwriteMode());
+        QTRY_COMPARE_WITH_TIMEOUT(modeButton->text(), QStringLiteral("INS"), 1000);
+
+        // This must use normal user navigation. The historical implementation
+        // mapped Ctrl+End back onto the final low nibble, making an EOF insert
+        // caret unreachable even though tests could set a synthetic position.
+        tab->editor()->setFocus(Qt::OtherFocusReason);
+        QTest::keyClick(tab->editor(), Qt::Key_End, Qt::ControlModifier);
+        QCOMPARE(tab->currentByteOffset(), qint64(original.size()));
+        QCOMPARE(tab->editor()->SendScintilla(
+                     QsciScintillaBase::SCI_GETCURRENTPOS),
+                 tab->editor()->length());
+        QTest::keyClicks(tab->editor(), QStringLiteral("A"));
+        QCOMPARE(tab->l2View()->virtualFileSize(), qint64(original.size() + 1));
+        QCOMPARE(tab->l2View()->readByteRange(original.size(), original.size() + 1),
+                 QByteArray::fromHex("A0"));
+        QCOMPARE(tab->editor()->SendScintilla(
+                     QsciScintillaBase::SCI_GETCURRENTPOS),
+                 tab->editor()->positionFromLineIndex(0, original.size() * 3 + 1));
+        QTest::keyClicks(tab->editor(), QStringLiteral("B"));
+
+        QByteArray expected = original;
+        expected.append(char(0xab));
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->virtualFileSize(),
+                                  qint64(expected.size()), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(0, expected.size()),
+                                  expected, 1000);
+        QVERIFY(tab->isModified());
+
+        QString saveError;
+        QVERIFY2(tab->saveFile(&saveError), qPrintable(saveError));
+        QFile saved(path);
+        QVERIFY(saved.open(QIODevice::ReadOnly));
+        QCOMPARE(saved.readAll(), expected);
+        auto *sizeStatus = mw_->findChild<QLabel *>(QStringLiteral("status.size"));
+        QVERIFY(sizeStatus);
+        QTRY_VERIFY_WITH_TIMEOUT(sizeStatus->text().startsWith(
+                                     QStringLiteral("5 B · B1")), 1000);
+        QVERIFY(mw_->grab().save(QCoreApplication::applicationDirPath()
+                                 + QStringLiteral("/gui-hex-insert-mode.png")));
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_hex_selected_direct_typing_replaces_complete_range() {
+        const QByteArray original = QByteArray::fromHex("0001020304050607");
+        for (const bool overwrite : {true, false}) {
+            closeAllEditorTabs(mw_);
+            const QString path = tmpDir_.filePath(QStringLiteral(
+                "hex-selection-type-%1.bin").arg(overwrite ? "ovr" : "ins"));
+            {
+                QFile source(path);
+                QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
+                QCOMPARE(source.write(original), qint64(original.size()));
+            }
+            mw_->openFilesFromExternal({path});
+            QVERIFY(waitForTabCountAndL2(mw_, 1, true, 5000));
+            EditorTab *tab = currentEditorTab(mw_);
+            QVERIFY(tab && tab->l2View() && tab->viewModeL2() == ViewMode::Hex);
+            if (!overwrite) {
+                tab->editor()->setFocus(Qt::OtherFocusReason);
+                QTest::keyClick(tab->editor(), Qt::Key_Insert);
+            }
+            QCOMPARE(tab->hexOverwriteMode(), overwrite);
+
+            // Direct typing over a byte selection has the same replace-range
+            // semantics in OVR and INS: [2,6) becomes exactly one byte AB.
+            tab->editor()->setSelection(0, 2 * 3, 0, 6 * 3 - 1);
+            QVERIFY(tab->hasSelectionCommand());
+            QTest::keyClicks(tab->editor(), QStringLiteral("A"));
+            QCOMPARE(tab->l2View()->readByteRange(0, original.size()),
+                     QByteArray::fromHex("0001A00607"));
+            QCOMPARE(tab->editor()->SendScintilla(
+                         QsciScintillaBase::SCI_GETCURRENTPOS),
+                     tab->editor()->positionFromLineIndex(0, 2 * 3 + 1));
+            QTest::keyClicks(tab->editor(), QStringLiteral("B"));
+            QByteArray expected = original;
+            expected.replace(2, 4, QByteArray(1, char(0xab)));
+            QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->virtualFileSize(),
+                                      qint64(expected.size()), 1000);
+            QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(0, expected.size()),
+                                      expected, 1000);
+
+            // A high+low nibble pair is one byte-entry undo unit. Undo/redo
+            // must never expose an overlapping A0 patch or split projection
+            // state from the byte model.
+            tab->undo();
+            QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(0, original.size()),
+                                      original, 1000);
+            tab->redo();
+            QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(0, expected.size()),
+                                      expected, 1000);
+
+            QString saveError;
+            QVERIFY2(tab->saveFile(&saveError), qPrintable(saveError));
+            QFile saved(path);
+            QVERIFY(saved.open(QIODevice::ReadOnly));
+            QCOMPARE(saved.readAll(), expected);
+        }
+        closeAllEditorTabs(mw_);
+    }
+
     void tc_hex_nibble_input_pairwise_contract() {
         using namespace GuiContractMatrix;
         closeAllEditorTabs(mw_);
@@ -1405,10 +1547,11 @@ private slots:
 
             if (contract.value(QStringLiteral("mode")) == QStringLiteral("INS"))
                 QTest::keyClick(tab->editor(), Qt::Key_Insert);
-            auto *sizeStatus = mw_->findChild<QLabel *>(QStringLiteral("status.size"));
-            QVERIFY(sizeStatus);
-            QTRY_VERIFY_WITH_TIMEOUT(sizeStatus->text().contains(
-                contract.value(QStringLiteral("mode"))), 1000);
+            auto *modeStatus = mw_->findChild<QToolButton *>(
+                QStringLiteral("status.hexEditMode"));
+            QVERIFY(modeStatus);
+            QTRY_COMPARE_WITH_TIMEOUT(modeStatus->text(),
+                                      contract.value(QStringLiteral("mode")), 1000);
             const int target = contract.value(QStringLiteral("boundary"))
                     == QStringLiteral("start") ? 0
                 : contract.value(QStringLiteral("boundary"))
@@ -1436,6 +1579,8 @@ private slots:
                                       formattedHex(expected, row), 1000);
             QTRY_COMPARE_WITH_TIMEOUT(ascii->toPlainText(),
                                       formattedAscii(expected, row), 1000);
+            QCOMPARE(tab->l2View()->readByteRange(
+                         0, tab->l2View()->virtualFileSize()), expected);
             QVERIFY2(tab->isModified(), caseLabel.constData());
 
             // Undo/redo must update both projections regardless of whether the
@@ -2034,6 +2179,14 @@ private slots:
         QAction *cutAction = findMenuActionByExactDisplay(mw_, QStringLiteral("剪切"));
         QAction *pasteAction = findMenuActionByExactDisplay(mw_, QStringLiteral("粘贴"));
         QVERIFY(copyAction && cutAction && pasteAction);
+
+        // Earlier pairwise cases intentionally trigger invalid-input beeps;
+        // on Windows that can leave the test top-level inactive. Reactivate
+        // the real window before asserting focus-routed QAction behavior.
+        mw_->show();
+        mw_->raise();
+        mw_->activateWindow();
+        QTRY_VERIFY(mw_->isActiveWindow());
 
         QTextCursor asciiSelection(ascii->document());
         asciiSelection.setPosition(1);
@@ -3221,6 +3374,191 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 0, 3000);
         QVERIFY(!closeTab->isEnabled());
         QVERIFY(!closeAll->isEnabled());
+    }
+
+    void tc_mainwindow_find_shortcuts_preserve_query_scope_and_tab_order() {
+        closeAllEditorTabs(mw_);
+        const QString firstPath = tmpDir_.filePath(QStringLiteral("search-shortcut-a.txt"));
+        const QString secondPath = tmpDir_.filePath(QStringLiteral("search-shortcut-b.txt"));
+        {
+            QFile first(firstPath);
+            QVERIFY(first.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            const QByteArray firstBytes("head\nTARGET first\nmiddle\nTARGET second\ntail\n");
+            QCOMPARE(first.write(firstBytes), qint64(firstBytes.size()));
+            QFile second(secondPath);
+            QVERIFY(second.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            const QByteArray secondBytes("prefix\nTARGET third\nsuffix\n");
+            QCOMPARE(second.write(secondBytes), qint64(secondBytes.size()));
+        }
+        mw_->openFilesFromExternal({firstPath, secondPath});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 2, 3000);
+        auto *tabs = mw_->findChild<QTabWidget *>();
+        QVERIFY(tabs != nullptr);
+        switchToTab(mw_, 0);
+        auto *first = currentEditorTab(mw_);
+        QVERIFY(first && !first->isL2Active());
+
+        auto *findAction = mw_->findChild<QAction *>(QStringLiteral("search.find"));
+        auto *nextAction = mw_->findChild<QAction *>(QStringLiteral("search.next"));
+        auto *previousAction = mw_->findChild<QAction *>(QStringLiteral("search.previous"));
+        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+        QVERIFY(findAction && nextAction && previousAction && dialog);
+        QCOMPARE(nextAction->shortcut(), QKeySequence(QStringLiteral("F3")));
+        QCOMPARE(previousAction->shortcut(), QKeySequence(QStringLiteral("Shift+F3")));
+
+        findAction->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
+        auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        auto *scope = dialog->findChild<QComboBox *>(QStringLiteral("searchScopeCombo"));
+        QVERIFY(pattern && scope);
+        pattern->setText(QStringLiteral("TARGET"));
+        const int currentScope = scope->findData(0);
+        const int allOpenScope = scope->findData(1);
+        QVERIFY(currentScope >= 0 && allOpenScope >= 0);
+        QCOMPARE(scope->itemText(allOpenScope), QStringLiteral("全部打开文件 (2)"));
+        scope->setCurrentIndex(currentScope);
+        dialog->close();
+
+        first->resetSearchPosition(true);
+        first->editor()->setFocus();
+        QTest::keyClick(first->editor(), Qt::Key_F3);
+        QTRY_COMPARE_WITH_TIMEOUT(first->editor()->selectedText(),
+                                  QStringLiteral("TARGET"), 1000);
+        const long firstHit = first->editor()->SendScintilla(
+            QsciScintillaBase::SCI_GETSELECTIONSTART);
+        QTest::keyClick(first->editor(), Qt::Key_F3);
+        QTRY_VERIFY_WITH_TIMEOUT(first->editor()->SendScintilla(
+                                     QsciScintillaBase::SCI_GETSELECTIONSTART) > firstHit,
+                                 1000);
+        QTest::keyClick(first->editor(), Qt::Key_F3, Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(first->editor()->SendScintilla(
+                                      QsciScintillaBase::SCI_GETSELECTIONSTART),
+                                  firstHit, 1000);
+
+        findAction->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
+        QCOMPARE(pattern->text(), QStringLiteral("TARGET"));
+        scope->setCurrentIndex(allOpenScope);
+        dialog->close();
+
+        // First F3 selects the second match in A; the next one must cross to B.
+        QTest::keyClick(first->editor(), Qt::Key_F3);
+        QCOMPARE(tabs->currentIndex(), 0);
+        QTest::keyClick(first->editor(), Qt::Key_F3);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->currentIndex(), 1, 1000);
+        auto *second = currentEditorTab(mw_);
+        QVERIFY(second != nullptr);
+        QCOMPARE(second->editor()->selectedText(), QStringLiteral("TARGET"));
+
+        QTest::keyClick(second->editor(), Qt::Key_F3, Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->currentIndex(), 0, 1000);
+        QCOMPARE(first->editor()->selectedText(), QStringLiteral("TARGET"));
+        const QString screenshot = QCoreApplication::applicationDirPath()
+                                   + QStringLiteral("/gui-mainwindow-search-shortcuts-scope.png");
+        QVERIFY2(mw_->grab().save(screenshot), qPrintable(screenshot));
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_mainwindow_all_open_find_all_utf8_utf16_dock_jump() {
+        closeAllEditorTabs(mw_);
+        const QString firstPath = tmpDir_.filePath(QStringLiteral("search-dock-a.txt"));
+        const QString secondPath = tmpDir_.filePath(QStringLiteral("search-dock-b.txt"));
+        const QString firstText = QStringLiteral("前缀😀 TOKEN first\r\n尾行\r\n");
+        const QString secondText = QStringLiteral("表头\r\n中文😀 TOKEN second\r\n结尾\r\n");
+        {
+            QFile first(firstPath);
+            QVERIFY(first.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            const QByteArray bytes = firstText.toUtf8();
+            QCOMPARE(first.write(bytes), qint64(bytes.size()));
+
+            QByteArray utf16le("\xff\xfe", 2);
+            utf16le.reserve(2 + secondText.size() * 2);
+            for (QChar ch : secondText) {
+                const ushort value = ch.unicode();
+                utf16le.append(char(value & 0xff));
+                utf16le.append(char(value >> 8));
+            }
+            QFile second(secondPath);
+            QVERIFY(second.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(second.write(utf16le), qint64(utf16le.size()));
+        }
+
+        mw_->openFilesFromExternal({firstPath, secondPath});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 2, 3000);
+        auto *tabs = mw_->findChild<QTabWidget *>();
+        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+        auto *findAction = mw_->findChild<QAction *>(QStringLiteral("search.find"));
+        auto *dock = mw_->findChild<SearchResultsDock *>(QStringLiteral("SearchResultsDock"));
+        QVERIFY(tabs && dialog && findAction && dock);
+        switchToTab(mw_, 1);
+        auto *second = currentEditorTab(mw_);
+        QVERIFY(second && !second->isL2Active());
+        QCOMPARE(second->encoding(), TextEncoding::Utf16LE);
+
+        findAction->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
+        auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        auto *scope = dialog->findChild<QComboBox *>(QStringLiteral("searchScopeCombo"));
+        auto *findAll = dialog->findChild<QPushButton *>(QStringLiteral("findAllButton"));
+        auto *tree = dock->findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+        QVERIFY(pattern && scope && findAll && tree);
+        pattern->setText(QStringLiteral("TOKEN"));
+        scope->setCurrentIndex(scope->findData(1));
+        QTest::mouseClick(findAll, Qt::LeftButton);
+
+        QTRY_VERIFY_WITH_TIMEOUT(dock->isVisible(), 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(tree->model() != nullptr, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(tree->model()->rowCount(), 2, 3000);
+        QCOMPARE(scope->currentData().toInt(), 1);
+        QCOMPARE(scope->itemText(scope->currentIndex()),
+                 QStringLiteral("全部打开文件 (2)"));
+
+        int secondGroupRow = -1;
+        for (int row = 0; row < tree->model()->rowCount(); ++row) {
+            const QModelIndex group = tree->model()->index(row, 0);
+            if (group.data().toString().contains(QStringLiteral("search-dock-b.txt"))) {
+                secondGroupRow = row;
+                break;
+            }
+        }
+        QVERIFY(secondGroupRow >= 0);
+        const QModelIndex secondGroup = tree->model()->index(secondGroupRow, 0);
+        QCOMPARE(tree->model()->rowCount(secondGroup), 1);
+        tree->expand(secondGroup);
+        const QModelIndex context = tree->model()->index(
+            0, SearchResultsModel::COL_CONTEXT, secondGroup);
+        QVERIFY(context.isValid());
+        QCOMPARE(context.data(SearchResultsModel::ContextRole).toString(),
+                 QStringLiteral("中文😀 TOKEN second"));
+        const QVariantList ranges =
+            context.data(SearchResultsModel::MatchByteRangesRole).toList();
+        QCOMPARE(ranges.size(), 1);
+
+        QSignalSpy jumpSpy(dock, &SearchResultsDock::jumpToTabByteOffset);
+        switchToTab(mw_, 0);
+        tree->resizeColumnToContents(SearchResultsModel::COL_CONTEXT);
+        tree->scrollTo(context);
+        QApplication::processEvents(QEventLoop::AllEvents, 100);
+        const QRect rect = tree->visualRect(context);
+        QVERIFY(rect.isValid());
+        QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                          Qt::NoModifier, rect.center());
+        QTest::mouseDClick(tree->viewport(), Qt::LeftButton,
+                           Qt::NoModifier, rect.center());
+        QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->currentIndex(), 1, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(second->editor()->selectedText(),
+                                  QStringLiteral("TOKEN"), 2000);
+        QCOMPARE(second->editor()->SendScintilla(
+                     QsciScintillaBase::SCI_INDICATORVALUEAT, 8,
+                     second->editor()->SendScintilla(
+                         QsciScintillaBase::SCI_GETSELECTIONSTART)), 1L);
+
+        dialog->close();
+        const QString screenshot = QCoreApplication::applicationDirPath()
+                                   + QStringLiteral("/gui-mainwindow-search-utf16-dock-jump.png");
+        QVERIFY2(mw_->grab().save(screenshot), qPrintable(screenshot));
+        closeAllEditorTabs(mw_);
     }
 
     void tc_background_task_center_lifecycle() {

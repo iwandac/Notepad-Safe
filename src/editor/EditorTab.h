@@ -117,6 +117,7 @@ public:
     }
     bool isBinaryDocument() const { return m_binaryDocument; }
     bool hexOverwriteMode() const { return m_hexOverwriteMode; }
+    void toggleHexOverwriteMode();
     bool isSecureDocumentMasked() const { return m_secureDocumentMasked; }
     bool isSecureDocumentTransitioning() const { return m_secureDocumentTransitioning; }
     QUuid secureDocumentId() const { return m_secureDocumentId; }
@@ -525,6 +526,8 @@ private:
         qint64    windowLen   = 0;  // 窗口长度（= W_active）
         QTimer    syncVfvDebounce;  // 桥 3 Scintilla→VFV 防抖（250ms single-shot）
         bool      applying = false; // 桥 1/3 灌 Scintilla 时抑制 SCN_UPDATEUI 递归
+        bool      viewportNavigationPending = false; // 仅真实编辑器导航可反向更新全局视口
+        quint64   projectionGeneration = 0; // 丢弃上一轮 setText 遗留的延迟 UI 通知
     };
     L2ScintillaBridge m_bridge;
     bool m_l2BridgeConnectionsInstalled = false;
@@ -546,7 +549,12 @@ private:
     bool bridgeFlushOverlayToPatches(QString* errMsg = nullptr);
     int preferredHexBytesPerRow() const;
     void adaptHexBytesPerRow(bool repopulate);
+    void alignTextOverlayToGlobalScroll();
     void applyL2SearchHighlightsToOverlay();
+    bool updateFixedHexProjection(qint64 globalStart, qint32 oldLength,
+                                  const QByteArray &replacement);
+    bool replaceHexAsciiBytes(qint64 from, qint64 to, QByteArray bytes,
+                              QString *error = nullptr);
     // 桥 3：syncVfvDebounce 超时回调 → 取 Scintilla 中心 → 换算全局字节 → syncActiveWindowToCursor
     void bridgeOnSyncDebounce();
     // 切回 L1 / closeEvent 时，把 overlay Scintilla 从 VFV viewport 上拆回 m_stack

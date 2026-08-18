@@ -200,7 +200,14 @@ bool SecuritySessionService::validateActiveSession()
         endSession(true);
         return false;
     }
-    return QFileInfo::exists(capsulePath());
+    if (!QFileInfo::exists(capsulePath())) {
+        // The DPAPI capsule is the durable authority for a remembered device
+        // session. Never leave a stale in-process flag capable of matching a
+        // document identity after the capsule has disappeared.
+        clearMemory();
+        return false;
+    }
+    return true;
 }
 
 QString SecuritySessionService::descriptorPath() const
@@ -1096,9 +1103,10 @@ VaultError SecuritySessionService::unsealDocumentCredential(
 }
 
 bool SecuritySessionService::matches(
-    const SecurityIdentityParameters &parameters) const noexcept
+    const SecurityIdentityParameters &parameters)
 {
-    return active_ && parameters.identityId == parameters_.identityId
+    return validateActiveSession()
+           && parameters.identityId == parameters_.identityId
            && parameters.keyVersion == parameters_.keyVersion
            && parameters.kdfSalt == parameters_.kdfSalt
            && parameters.memoryKiB == parameters_.memoryKiB

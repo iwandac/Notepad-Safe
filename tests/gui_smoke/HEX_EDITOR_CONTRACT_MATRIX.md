@@ -33,10 +33,10 @@ caret/selection、状态栏、dirty/Undo 和磁盘结果中适用的部分。
 | HX-S01 | Hex 选择 | high/low 起点、正反向、跨行/窗口、Shift+导航 | 选择按完整 source byte 定义；ASCII 镜像相同 half-open range |
 | HX-S02 | ASCII 选择 | 正反向、跨行/窗口、末字节 | Hex 镜像精确；方向不改变 payload range |
 | HX-S03 | Select All/清除 | Hex/ASCII、空/单/多窗口 | 全文件或产品明确的有界范围；状态栏 64 位长度准确 |
-| HX-E01 | Hex nibble 输入 | 0–9/A–F/a–f、high/low、OVR/INS、BOF/middle/EOF | OVR 长度不变；INS 插入；两 nibble 合成一 byte；caret 跳转正确 |
+| HX-E01 | Hex nibble 输入 | 0–9/A–F/a–f、high/low、OVR/INS、BOF/middle/EOF、完整 byte selection | OVR 长度不变；INS 仅在 high nibble 新增 X0、low nibble 完成同一字节；选区先整体替换为 X0；两 nibble 是一个 byte-entry Undo 单元；caret 跳转正确 |
 | HX-E02 | 非法 Hex 输入 | G/空格/换行/Unicode、组合键、IME preedit/commit | payload 不变；候选整段原子拒绝；预编辑不进入固定网格；导航/快捷键不被误拦截 |
 | HX-E03 | ASCII 输入 | 0x20–0x7E、0x00/0xFF via paste、Unicode、OVR/INS | Latin-1 规则明确；Hex 即时同步；非法输入无修改 |
-| HX-E04 | Insert 模式切换 | 两表面、切标签、重开、只读 | 单文档共享 OVR/INS；不泄漏；状态栏/能力一致 |
+| HX-E04 | Insert 模式切换 | Insert 键、编辑菜单、状态栏按钮、两表面、切标签、重开、只读 | 默认 OVR；单文档共享 OVR/INS；不泄漏；持续可见、可点击且 QAction checked/enabled 与实际能力一致 |
 | HX-D01 | Delete/Backspace | 两表面×模式×选择方向×BOF/middle/EOF | 删除准确；BOF Backspace/EOF Delete no-op；不被字符校验吞掉 |
 | HX-C01 | Copy | 两表面×选择/none×跨行、可打印/控制/NUL bytes | Hex 输出规范 bytes；ASCII 可打印内容输出文本；不可打印内容同时携带私有 raw-byte MIME 与可见 Hex 文本，不能被剪贴板 NUL 截断；payload 不变 |
 | HX-C02 | Cut | 两表面×选择方向×边界×只读 | 剪贴板与删除范围一致；无选择 no-op；只读禁用 |
@@ -86,6 +86,8 @@ caret/selection、状态栏、dirty/Undo 和磁盘结果中适用的部分。
 | HX-N01/N02/N03 | `tc_hex_keyboard_navigation_contract` | 通过；真实点击分隔符及 Left/Right/Up/Down/Home/End/Page/Ctrl+Home/End；已修复 separator caret、短尾行和垂直 source-byte 导航 |
 | HX-S01/S02 | `tc_hex_byte_selection_contract` | 通过；正反向 Shift、跨行、Ctrl+Shift+End、真实鼠标拖选；已修复半 nibble/分隔符选区和拖选事件递归 |
 | HX-E01/E04/HX-U01/P02/HX-A01 | `tc_hex_nibble_input_pairwise_contract` | 9 个 pairwise 案例通过；已修复 Undo/Redo 后 ASCII 残留和 OVR/INS 状态栏失配 |
+| HX-E01/E04/HX-U01/P02/HX-A01 | `tc_hex_insert_mode_discoverable_and_eof_append` | 通过；真实点击常驻 OVR/INS、编辑菜单双向切换、Ctrl+End 到真实 EOF、`A` 中间态 `A0`、`B` 完成 `AB`、字节模型/投影/状态栏/保存重开逐字节一致；视觉证据 `build/gui-hex-insert-mode.png` |
+| HX-E01/HX-S01/HX-U01/P02 | `tc_hex_selected_direct_typing_replaces_complete_range` | OVR/INS 均通过；正向多字节选区 `[2,6)` 直接输入 `AB` 后严格缩为单字节，修复 Scintilla 投影已改而 PatchList 仍保留旧长度及重叠 `AB A0` 的数据损坏路径 |
 | HX-C01/C02/HX-U01 | `tc_hex_copy_cut_pairwise_contract` | 9 个 pairwise 案例通过 |
 | HX-C03/HX-U01 | `tc_hex_paste_pairwise_contract` | 9 个 pairwise 案例通过；已修复 OVR 在 EOF/剩余空间不足时增长文件 |
 | HX-E02/E03 | `tc_hex_invalid_direct_input_contract` | 8 个约束 pairwise 案例通过；控制字符/Unicode 原子拒绝，已修复 ASCII Enter 写入 0x0D |
@@ -98,13 +100,16 @@ caret/selection、状态栏、dirty/Undo 和磁盘结果中适用的部分。
 | HX-L01/L02/HX-N02/HX-S01/S02/S03/HX-C01/HX-Q01 | `windowedHexUsesUnifiedThreeColumnByteContract` | 通过；B2/B3 已改为与 B1 相同的“地址 margin + 纯 Hex + 独立 ASCII + 单一全局滚动条”契约，并证明双向选区、逐 nibble 导航、焦点敏感 Copy、Ctrl+A 全源边界、窄宽重排与源文件不变 |
 | HX-N04/HX-N05 | `windowedHexBothPanesWheelInLockstep`、`tc_nine_mib_unknown_binary_unchanged_save_is_noop` | 通过；Hex/ASCII 两个表面的 angle/pixel wheel 均驱动同一全局位置，屏幕首行逐行一致；B1/B2/B3 跨 256KiB 投影边界即时换窗，无停顿后跳跃、回跳或两栏漂移 |
 | HX-O02 | `windowedBinaryTextPresentationUsesTextLineNumberGutter`、`tc_binary_text_presentation_survives_session_restore` | 通过；Binary 切到 Text 后 margin 改为十进制文本行号，ASCII pane 隐藏；B1 与 Windowed Provider 及会话恢复均不残留 Hex 地址 gutter |
-| HX-L01/HX-S02/HX-C01/HX-O02/HX-F02 | `tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers` | 通过；直接只读打开保留的 32,111,104-byte `tinytestfile`，逐行核对 0–1000 行 Hex/ASCII 实际像素行高；在 ASCII 表面真实从右向左拖选 Hex 地址 `0x416–0x418`、source `[0x416,0x419)`=`01 E9 24`，复制后保留 raw bytes 并自动进入 Hex bytes 查找；Find Next 跳过当前选区命中下一处同 bytes，重置到 BOF 后精确回到 `0x416`；切换 Text 后 75% 窗口首行显示由源文件前缀换行数计算的绝对十进制行号 64591；视觉证据 `build/gui-tiny-hex-aligned-reverse-selection.png`、`build/gui-tiny-hex-raw-byte-search.png`、`build/gui-tiny-binary-text-absolute-lines.png` |
+| HX-L01/HX-S02/HX-C01/HX-O02/HX-F02 | `tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers` | 通过；直接打开保留的 32 MiB 以下 `tinytestfile`，逐行核对 0–1000 行 Hex/ASCII 实际像素行高；在 ASCII 表面真实从右向左拖选 source `[0x416,0x419)`，复制后保留样本当前 raw bytes 并自动进入 Hex bytes 查找；Find Next 跳过当前选区命中下一处同 bytes，重置到 BOF 后精确回到 `0x416`；切换 Text 后非零窗口首行显示由源文件前缀换行数计算的绝对十进制行号。fixture 内容允许作为人工大文件测试样本演进，测试不再硬编码旧大小或旧 3-byte 内容；视觉证据 `build/gui-tiny-hex-aligned-reverse-selection.png`、`build/gui-tiny-hex-raw-byte-search.png`、`build/gui-tiny-binary-text-absolute-lines.png` |
+| HX-E03/HX-E04/HX-U01/HX-O02/HX-N05 | `tinyBinaryAsciiEditingTextScrollAndWrapAreByteSafe` | 复验通过；保留的真实 `tinytestfile` 默认 Hex 下连续 24 段拖柄移动到 61%，松手/paint 后静置 3 秒不得继续换窗或改 thumb；直接点击远处可见 ASCII 行后立即输入及提交 `SAFE` IME transaction，逐项比较点击 offset、写入 bytes、caret、Undo。随后 `ABC`/`XYZ` 分别证明 INS 增长与 OVR 原位更新；Binary→Text 补建真实 LineIndex，连续 75% 拖动、Wrap ON 中段/EOF 拖动稳定且只显示一个全局滚动条。Wrap ON/OFF 前后 raw projection、逻辑行数、virtual size、PatchList 和磁盘 SHA-256 全部不变；视觉证据 `build/gui-tiny-binary-text-wrap-eof.png`。旧版只做单个 mouseMove/500ms/programmatic goto，曾产生假阳性，禁止恢复该弱验收。 |
 | HX-R01 | `tc_hex_binary_crash_recovery_restores_bytes_and_position` | 基线通过，编辑原语待展开 |
 | HX-O02 | `tc_binary_text_presentation_survives_session_restore` | 基线通过 |
 | HX-F02 | `tc_fr_011_hex_byte_find_all_highlight_and_double_click` | 当前文件基线通过 |
 | HX-F02 | `tc_fr_012_hex_byte_all_open_filters_text_targets` | 全部打开文件基线通过 |
 
 ## 5. 当前明确未收敛项
+
+- **2026-08-18 已关闭“只能覆盖、不能插入”主故障**：OVR 保持安全默认；INS 通过状态栏常驻按钮、编辑菜单和 Insert 键可发现。直接 Hex 键入不再修改 Scintilla 字符投影，而是先修改 authoritative byte model 再重绘两栏。EOF 是可达插入边界；输入首个 high nibble 生成 X0，第二个 nibble 原位完成该字节；完整 byte selection 在 OVR/INS 中都按一次字节替换。PatchList 会合并对既有 patch payload 的同长覆盖，禁止产生重叠 payload 或每个低 nibble 意外增长文件。该交互采用 [010 Editor Hex Editing](https://www.sweetscape.com/010editor/manual/UsingHexEditor.htm)、[010 Editor Edit Menu](https://www.sweetscape.com/010editor/manual/MenuEdit.htm) 的 INS/OVR 与选区替换边界，并保留 ImHex 明确区分 size-changing 操作的思路。
 
 - **2026-08-17 已关闭可见界面分裂**：B2/B3 不再把地址、Hex、ASCII 拼成一行；B1/B2/B3 均为地址 margin、纯 Hex 网格、独立 ASCII pane 和唯一全局纵向滚动条。`windowedHexUsesUnifiedThreeColumnByteContract` 与真实 228MB/4.9GB 样本共同作为禁止回退到旧拼接投影/双滚动的永久哨兵。
 - B1 的鼠标拖到 viewport 边缘自动滚动、跨活动窗口选区尚未自动证明。

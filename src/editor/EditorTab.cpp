@@ -1007,6 +1007,8 @@ void EditorTab::setFilePath(const QString &path)
 QString EditorTab::fileName() const
 {
     if (isSecureDocument()) {
+        if (m_secureDocumentMasked)
+            return QStringLiteral("已锁定文档");
         if (!m_filePath.isEmpty())
             return QFileInfo(m_filePath).fileName();
         return m_secureDocumentTitle.isEmpty() ? QStringLiteral("未命名")
@@ -1174,6 +1176,13 @@ void EditorTab::maskSecureDocument()
         return;
     m_secureDocumentTransitioning = true;
     m_secureDocumentMasked = true;
+    // A note title is commonly derived from its first plaintext line. Do not
+    // leave that content resident or visible in the tab strip while locked;
+    // the encrypted backing store restores it on the next unlock.
+    if (!m_secureDocumentTitle.isEmpty()) {
+        m_secureDocumentTitle.fill(QChar(0));
+        m_secureDocumentTitle.clear();
+    }
     if (m_secureBinaryDocument) {
         bridgeReparentEditorToStack();
         if (m_l2View && m_l2View->isOpen())
@@ -1799,6 +1808,16 @@ void EditorTab::setWordWrap(bool on)
                 m_editor->setWrapVisualFlags(QsciScintilla::WrapFlagByText);
                 m_editor->setWrapIndentMode(QsciScintilla::WrapIndentSame);
             }
+            layoutL2Overlay();
+            alignTextOverlayToGlobalScroll();
+            const quint64 generation = m_bridge.projectionGeneration;
+            // Scintilla lays out wrapped display lines lazily. Re-apply the
+            // same source anchor after the first repaint; this changes only
+            // viewport state and never inserts document line endings.
+            QTimer::singleShot(0, this, [this, generation]() {
+                if (m_l2Mode && m_bridge.projectionGeneration == generation)
+                    alignTextOverlayToGlobalScroll();
+            });
         }
         return;
     }
@@ -2014,8 +2033,10 @@ VirtualFileView *EditorTab::ensureL2View()
                 this, &EditorTab::l2LineBuildFinished);
         connect(m_l2View, &VirtualFileView::lineBuildFinished,
                 this, [this](bool ok) {
-                    if (ok)
+                    if (ok) {
                         refreshTextProjectionMargin();
+                        alignTextOverlayToGlobalScroll();
+                    }
                 });
     }
     return m_l2View;
@@ -2236,12 +2257,19 @@ void EditorTab::layoutL2Overlay()
     const bool hex = m_l2View->viewMode() == ViewMode::Hex;
     if (!hex) {
         m_editor->setAttribute(Qt::WA_InputMethodEnabled, true);
-        m_l2View->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-        m_editor->SendScintilla(QsciScintillaBase::SCI_SETVSCROLLBAR, 1UL);
-        m_editor->SendScintilla(QsciScintillaBase::SCI_SETHSCROLLBAR, 1UL);
+        m_l2View->setHorizontalScrollBarPolicy(
+            m_l2View->wordWrap() ? Qt::ScrollBarAlwaysOff
+                                 : Qt::ScrollBarAsNeeded);
+        // Text and Hex share the provider's one global scroll contract. Native
+        // Scintilla scrollbars describe only the bounded projection and must
+        // never compete visually or semantically with the whole-file bars.
+        m_editor->SendScintilla(QsciScintillaBase::SCI_SETVSCROLLBAR, 0UL);
+        m_editor->SendScintilla(QsciScintillaBase::SCI_SETHSCROLLBAR, 0UL);
         if (m_hexAsciiPreview)
             m_hexAsciiPreview->hide();
         m_editor->setGeometry(0, 0, viewport->width(), viewport->height());
+        m_editor->SendScintilla(QsciScintillaBase::SCI_SETXOFFSET,
+                                m_l2View->horizontalScrollBar()->value());
         return;
     }
 
@@ -2270,6 +2298,61 @@ void EditorTab::layoutL2Overlay()
     m_hexAsciiPreview->show();
     m_hexAsciiPreview->raise();
     m_editor->raise();
+}
+
+void EditorTab::alignTextOverlayToGlobalScroll()
+{
+    if (!m_l2Mode || !m_l2View || !m_editor
+        || m_l2View->viewMode() != ViewMode::Text
+        || m_bridge.windowStart < 0 || m_bridge.baseline.isEmpty()) {
+        return;
+    }
+
+    QScrollBar *global = m_l2View->verticalScrollBar();
+    const LineIndex &index = m_l2View->lineIndex();
+    const qint64 virtualSize = m_l2View->virtualFileSize();
+    qint64 targetByte = 0;
+    if (index.isIncomplete() && index.realCoverageBytes() < virtualSize) {
+        const qint64 minimum = global->minimum();
+        const qint64 span = qMax<qint64>(
+            1, qint64(global->maximum()) - minimum);
+        const qint64 value = qBound<qint64>(
+            minimum, qint64(global->value()),
+            qint64(global->maximum())) - minimum;
+        targetByte = (virtualSize * value) / span;
+    } else {
+        targetByte = index.lineToByteOffset(global->value());
+        if (m_l2View->patches().isModified())
+            targetByte = m_l2View->patches().origToVirtForLineStart(targetByte);
+    }
+    targetByte = qBound<qint64>(m_bridge.windowStart, targetByte,
+                                m_bridge.windowStart + m_bridge.windowLen);
+    const qint64 localByte = targetByte - m_bridge.windowStart;
+    const int localDocumentLine = m_bridge.baseline.left(
+        int(qMin<qint64>(localByte, INT_MAX))).count('\n');
+    long displayLine = m_editor->SendScintilla(
+        QsciScintillaBase::SCI_VISIBLEFROMDOCLINE,
+        static_cast<unsigned long>(qMax(0, localDocumentLine)));
+    if (global->value() == global->maximum()
+        && m_bridge.windowStart + m_bridge.windowLen >= virtualSize) {
+        const int lastDocumentLine = qMax(0, m_editor->lines() - 1);
+        const long lastVisibleStart = m_editor->SendScintilla(
+            QsciScintillaBase::SCI_VISIBLEFROMDOCLINE,
+            static_cast<unsigned long>(lastDocumentLine));
+        const long lastWrapCount = m_editor->SendScintilla(
+            QsciScintillaBase::SCI_WRAPCOUNT,
+            static_cast<unsigned long>(lastDocumentLine));
+        displayLine = qMax<long>(0, lastVisibleStart)
+            + qMax<long>(1, lastWrapCount);
+    }
+    const bool wasApplying = m_bridge.applying;
+    m_bridge.applying = true;
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETFIRSTVISIBLELINE,
+                            static_cast<unsigned long>(qMax<long>(0, displayLine)));
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETXOFFSET,
+                            m_l2View->wordWrap()
+                                ? 0 : m_l2View->horizontalScrollBar()->value());
+    m_bridge.applying = wasApplying;
 }
 
 void EditorTab::alignHexOverlayToGlobalScroll()
@@ -2385,12 +2468,38 @@ void EditorTab::activateL2Overlay(VirtualFileView *view)
                     QsciScintillaBase::SCI_GETFIRSTVISIBLELINE);
                 m_hexAsciiPreview->verticalScrollBar()->setValue(int(first));
             }
-            m_bridge.syncVfvDebounce.start();
+            // Paint, wrap-layout and projection replacement also emit
+            // SCN_UPDATEUI. Treating every notification as user navigation
+            // creates a closed feedback loop with the outer global scrollbar.
+            // Only an input event recorded by eventFilter may drive the
+            // Scintilla -> provider direction.
+            if (m_bridge.viewportNavigationPending)
+                m_bridge.syncVfvDebounce.start();
         });
         QObject::connect(view, &VirtualFileView::activeWindowChanged,
                          this, [this](qint64 byteStart, qint64 byteEnd) {
             if (m_l2Mode)
                 bridgePopulateScintilla(byteStart, byteEnd);
+        });
+        QObject::connect(view->horizontalScrollBar(), &QScrollBar::valueChanged,
+                         this, [this](int value) {
+            if (!m_l2Mode || !m_l2View || !m_editor
+                || m_l2View->viewMode() != ViewMode::Text) {
+                return;
+            }
+            m_editor->SendScintilla(QsciScintillaBase::SCI_SETXOFFSET,
+                                    m_l2View->wordWrap() ? 0 : value);
+        });
+        QObject::connect(view->verticalScrollBar(), &QScrollBar::valueChanged,
+                         this, [this](int) {
+            if (!m_l2Mode || !m_l2View || !m_editor)
+                return;
+            // A value change may be programmatic (goto/range restoration) or
+            // part of a user action. It may align an already-loaded Hex row,
+            // but it must never start mmap IO or choose another active window;
+            // VirtualFileView's slider/action signals exclusively own that.
+            if (m_l2View->viewMode() == ViewMode::Hex)
+                alignHexOverlayToGlobalScroll();
         });
         m_l2BridgeConnectionsInstalled = true;
     }
@@ -2471,6 +2580,11 @@ void EditorTab::bridgePopulateScintilla(qint64 s, qint64 e)
         }
     }
 
+    // A debounce started by the previous projection must never be allowed to
+    // reinterpret the caret after this window has replaced it.
+    m_bridge.syncVfvDebounce.stop();
+    m_bridge.viewportNavigationPending = false;
+    const quint64 projectionGeneration = ++m_bridge.projectionGeneration;
     adaptHexBytesPerRow(false);
     m_bridge.applying = true;
     QByteArray bytes = m_l2View->readByteRange(s, e);
@@ -2526,11 +2640,35 @@ void EditorTab::bridgePopulateScintilla(qint64 s, qint64 e)
         m_editor->setAttribute(Qt::WA_InputMethodEnabled, true);
         if (m_hexAsciiPreview)
             m_hexAsciiPreview->hide();
-        m_editor->setText(QString::fromUtf8(bytes));
+        if (m_binaryDocument) {
+            // Binary->Text is a byte-preserving view. UTF-8 decoding would
+            // replace invalid sequences with U+FFFD and a later flush could
+            // silently rewrite untouched source bytes. Scintilla's 8-bit
+            // document accepts embedded NUL through length-based SCI_ADDTEXT,
+            // so every projected position remains one source byte.
+            m_editor->setUtf8(false);
+            m_editor->SendScintilla(QsciScintillaBase::SCI_CLEARALL);
+            if (!bytes.isEmpty()) {
+                m_editor->SendScintilla(
+                    QsciScintillaBase::SCI_ADDTEXT,
+                    static_cast<uintptr_t>(bytes.size()), bytes.constData());
+            }
+        } else {
+            m_editor->setUtf8(true);
+            m_editor->setText(QString::fromUtf8(bytes));
+        }
         m_editor->setWrapMode(m_l2View->wordWrap() ? QsciScintilla::WrapWord
                                                    : QsciScintilla::WrapNone);
     }
     m_editor->setModified(false);
+    // The L2 overlay is a projection of VirtualFileView, not a second document.
+    // setText/SCI_ADDTEXT can leave native Scintilla undo records behind on
+    // some builds.  If those records win over PatchList, Ctrl+Z rewinds the
+    // formatted Hex grid and sends the mirrored ASCII caret to the window end.
+    // A completed projection rebuild is therefore always an undo boundary;
+    // user-visible L2 history lives exclusively in PatchList.
+    m_editor->SendScintilla(QsciScintillaBase::SCI_EMPTYUNDOBUFFER);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETSAVEPOINT);
     m_editor->setReadOnly(isReadOnlyByPolicy());
     // Both Scintilla and QPlainTextEdit may recalculate input-method support
     // when editability changes. This final assignment is authoritative for
@@ -2543,10 +2681,19 @@ void EditorTab::bridgePopulateScintilla(qint64 s, qint64 e)
     m_bridge.baseline    = std::move(bytes);
     m_bridge.windowStart = s;
     m_bridge.windowLen   = e - s;
-    m_bridge.applying    = false;
     if (m_l2View->viewMode() == ViewMode::Text)
         refreshTextProjectionMargin();
+    if (m_l2View->viewMode() == ViewMode::Text)
+        alignTextOverlayToGlobalScroll();
     applyL2SearchHighlightsToOverlay();
+    // Scintilla/Qt may deliver caret and paint notifications after setText has
+    // returned. Keep them inside the projection transaction for one event-loop
+    // turn. The generation check prevents an older queued release from opening
+    // the gate while a newer projection is still being built.
+    QTimer::singleShot(0, this, [this, projectionGeneration]() {
+        if (m_bridge.projectionGeneration == projectionGeneration)
+            m_bridge.applying = false;
+    });
 }
 
 bool EditorTab::bridgeFlushOverlayToPatches(QString* errMsg)
@@ -2561,7 +2708,17 @@ bool EditorTab::bridgeFlushOverlayToPatches(QString* errMsg)
         if (!parseHexBytes(m_editor->text(), &now, errMsg))
             return false;
     } else {
-        now = m_editor->text().toUtf8();
+        if (m_binaryDocument) {
+            const long length = m_editor->SendScintilla(
+                QsciScintillaBase::SCI_GETLENGTH);
+            now.resize(qMax<long>(0, length) + 1);
+            m_editor->SendScintilla(
+                QsciScintillaBase::SCI_GETTEXT,
+                static_cast<uintptr_t>(now.size()), now.data());
+            now.resize(qMax<long>(0, length));
+        } else {
+            now = m_editor->text().toUtf8();
+        }
     }
     if (now == m_bridge.baseline) {
         m_editor->setModified(false);
@@ -2695,8 +2852,24 @@ void EditorTab::applyL2SearchHighlightsToOverlay()
 
 void EditorTab::bridgeOnSyncDebounce()
 {
-    if (!m_l2View || !m_l2View->isOpen() || m_bridge.applying) return;
+    const bool navigationRequested = m_bridge.viewportNavigationPending;
+    m_bridge.viewportNavigationPending = false;
+    if (!navigationRequested || !m_l2View || !m_l2View->isOpen()
+        || m_bridge.applying) return;
     if (m_bridge.windowStart < 0 || m_bridge.windowLen <= 0) return;
+
+    // At the global bottom, lazy wrap/layout notifications can temporarily
+    // report a centre position from the previous projection. Feeding that
+    // value back into the window allocator pulls the file away from EOF and
+    // makes the thumb jump upward. The user's explicit maximum position is the
+    // stronger anchor until the final projection has settled.
+    if (m_l2View->viewMode() == ViewMode::Text
+        && m_l2View->verticalScrollBar()->value()
+               == m_l2View->verticalScrollBar()->maximum()) {
+        m_l2View->syncActiveWindowToCursor(m_l2View->virtualFileSize());
+        alignTextOverlayToGlobalScroll();
+        return;
+    }
 
     // 取 Scintilla 中心位置：
     //   - 有选区：选区中心字节
@@ -2706,7 +2879,10 @@ void EditorTab::bridgeOnSyncDebounce()
     int firstLine = m_editor->SendScintilla(QsciScintilla::SCI_GETFIRSTVISIBLELINE);
     int linesOnScreen = m_editor->SendScintilla(QsciScintilla::SCI_LINESONSCREEN);
     if (linesOnScreen <= 0) linesOnScreen = 1;
-    const int mid = qBound(0, firstLine + linesOnScreen / 2, lineCount - 1);
+    const int mid = qBound(0, firstLine + linesOnScreen / 2,
+                           qMax(0, int(m_editor->SendScintilla(
+                               QsciScintillaBase::SCI_VISIBLEFROMDOCLINE,
+                               static_cast<unsigned long>(lineCount))) - 1));
     // SCI_GETLINESELSTARTPOSITION / CURRENTPOS 太粗糙，直接用 mid 行首 + 当前光标列近似：
     qint64 localByte = 0;
     if (m_l2View->viewMode() == ViewMode::Hex) {
@@ -2720,10 +2896,56 @@ void EditorTab::bridgeOnSyncDebounce()
             qint64(m_l2View->verticalScrollBar()->minimum()), globalFirst,
             qint64(m_l2View->verticalScrollBar()->maximum()))));
     } else {
-        const long lineStart = m_editor->positionFromLineIndex(mid, 0);
-        localByte = qMax<qint64>(0, lineStart);
+        const int x = qMax(1, m_editor->marginWidth(0) + 2);
+        const int y = qMax(1, m_editor->viewport()->height() / 2);
+        const long position = m_editor->SendScintilla(
+            QsciScintillaBase::SCI_POSITIONFROMPOINTCLOSE,
+            static_cast<unsigned long>(x), static_cast<long>(y));
+        localByte = qBound<qint64>(0, qint64(qMax<long>(0, position)),
+                                   m_bridge.windowLen);
     }
     const qint64 globCenter = m_bridge.windowStart + localByte;
+
+    if (m_l2View->viewMode() == ViewMode::Text) {
+        QScrollBar *global = m_l2View->verticalScrollBar();
+        int globalValue = 0;
+        const LineIndex &index = m_l2View->lineIndex();
+        const int topX = qMax(1, m_editor->marginWidth(0) + 2);
+        const long topPosition = m_editor->SendScintilla(
+            QsciScintillaBase::SCI_POSITIONFROMPOINTCLOSE,
+            static_cast<unsigned long>(topX), 1L);
+        const qint64 globTop = m_bridge.windowStart
+            + qBound<qint64>(0, qint64(qMax<long>(0, topPosition)),
+                              m_bridge.windowLen);
+        const long displayedLines = m_editor->SendScintilla(
+            QsciScintillaBase::SCI_VISIBLEFROMDOCLINE,
+            static_cast<unsigned long>(lineCount));
+        const bool lastScreen = m_bridge.windowStart + m_bridge.windowLen
+                                    >= m_l2View->virtualFileSize()
+            && qint64(firstLine) + qint64(linesOnScreen)
+                   >= qint64(qMax<long>(0, displayedLines));
+        if (lastScreen) {
+            globalValue = global->maximum();
+        } else if (index.isIncomplete()
+            && index.realCoverageBytes() < m_l2View->virtualFileSize()) {
+            const qint64 size = qMax<qint64>(1, m_l2View->virtualFileSize());
+            const qint64 span = qMax<qint64>(
+                1, qint64(global->maximum()) - global->minimum());
+            globalValue = int(qBound<qint64>(
+                qint64(global->minimum()),
+                qint64(global->minimum()) + (globTop * span) / size,
+                qint64(global->maximum())));
+        } else {
+            int line = 0;
+            qint64 column = 0;
+            const qint64 original = m_l2View->patches().isModified()
+                ? m_l2View->patches().virtToOrig(globTop) : globTop;
+            index.byteToLineCol(original, &line, &column);
+            globalValue = qBound(global->minimum(), line, global->maximum());
+        }
+        QSignalBlocker blocker(global);
+        global->setValue(globalValue);
+    }
 
     m_l2View->syncActiveWindowToCursor(globCenter);
 }
@@ -2735,6 +2957,28 @@ bool EditorTab::eventFilter(QObject* obj, QEvent* ev)
         && (obj == m_editor || obj == m_editor->viewport()
             || obj == m_hexAsciiPreview
             || (m_hexAsciiPreview && obj == m_hexAsciiPreview->viewport()));
+    const bool textOverlayObject = m_l2Mode && m_l2View
+        && m_l2View->viewMode() == ViewMode::Text
+        && (obj == m_editor || obj == m_editor->viewport());
+    if (textOverlayObject && ev->type() == QEvent::Wheel) {
+        m_bridge.viewportNavigationPending = true;
+    } else if (textOverlayObject && ev->type() == QEvent::KeyPress) {
+        const auto *key = static_cast<QKeyEvent *>(ev);
+        switch (key->key()) {
+        case Qt::Key_Up:
+        case Qt::Key_Down:
+        case Qt::Key_Left:
+        case Qt::Key_Right:
+        case Qt::Key_PageUp:
+        case Qt::Key_PageDown:
+        case Qt::Key_Home:
+        case Qt::Key_End:
+            m_bridge.viewportNavigationPending = true;
+            break;
+        default:
+            break;
+        }
+    }
     if (hexOverlayObject && ev->type() == QEvent::MouseButtonPress
         && static_cast<QMouseEvent *>(ev)->button() == Qt::LeftButton) {
         m_hexMouseSelecting = true;
@@ -2809,6 +3053,17 @@ bool EditorTab::eventFilter(QObject* obj, QEvent* ev)
         const bool asciiSurface = m_hexAsciiPreview
             && (obj == m_hexAsciiPreview
                 || obj == m_hexAsciiPreview->viewport());
+        if (asciiSurface) {
+            // QPlainTextEdit has already updated its cursor during press/move.
+            // Publish that byte position before the release returns so an IME
+            // commit or key event queued immediately behind the click cannot
+            // observe the previous model/status position. This path only
+            // changes the opposite Hex pane, so it does not interfere with the
+            // ASCII widget's native release/selection state machine.
+            m_hexMouseSelecting = false;
+            syncHexSelectionFromAscii();
+            return QWidget::eventFilter(obj, ev);
+        }
         QTimer::singleShot(0, this, [this, asciiSurface]() {
             m_hexMouseSelecting = false;
             if (asciiSurface)
@@ -2862,6 +3117,16 @@ bool EditorTab::handleHexInsertModeKey(QKeyEvent *event)
         || event->modifiers() != Qt::NoModifier || isReadOnlyByPolicy()) {
         return false;
     }
+    toggleHexOverwriteMode();
+    return true;
+}
+
+void EditorTab::toggleHexOverwriteMode()
+{
+    if (!m_l2View || m_l2View->viewMode() != ViewMode::Hex
+        || isReadOnlyByPolicy()) {
+        return;
+    }
     m_hexOverwriteMode = !m_hexOverwriteMode;
     emit cursorPositionChanged(m_lastL2Line, m_lastL2Col);
     if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
@@ -2870,7 +3135,6 @@ bool EditorTab::handleHexInsertModeKey(QKeyEvent *event)
                                : QObject::tr("Hex 插入模式 (INS)"),
             1800);
     }
-    return true;
 }
 
 void EditorTab::setAsciiCaret(qint64 globalByte)
@@ -2973,6 +3237,19 @@ void EditorTab::syncAsciiSelectionFromHex()
     // byte selection is still mirrored below; otherwise scrolling owns the
     // viewport and both panes remain locked to the same first row.
     if (end == start && !m_hexAsciiPreview->textCursor().hasSelection()) {
+        // Mirror the logical caret as well as the selection. Preserve both
+        // scroll offsets because QPlainTextEdit::setTextCursor() calls
+        // ensureCursorVisible(); without restoration, a Hex-wheel gesture can
+        // drag the synchronized ASCII pane back to an off-screen caret.
+        const int verticalValue = m_hexAsciiPreview->verticalScrollBar()->value();
+        const int horizontalValue = m_hexAsciiPreview->horizontalScrollBar()->value();
+        QTextCursor mirrored(m_hexAsciiPreview->document());
+        mirrored.setPosition(documentPosition(start));
+        m_adjustingAsciiCaret = true;
+        m_hexAsciiPreview->setTextCursor(mirrored);
+        m_adjustingAsciiCaret = false;
+        m_hexAsciiPreview->verticalScrollBar()->setValue(verticalValue);
+        m_hexAsciiPreview->horizontalScrollBar()->setValue(horizontalValue);
         m_hexAsciiPreview->setExtraSelections({});
         const int first = int(m_editor->SendScintilla(
             QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
@@ -3066,6 +3343,108 @@ void EditorTab::refreshHexAsciiProjectionFromEditor()
     syncAsciiSelectionFromHex();
 }
 
+bool EditorTab::updateFixedHexProjection(qint64 globalStart, qint32 oldLength,
+                                         const QByteArray &replacement)
+{
+    if (!m_l2View || !m_editor || !m_hexAsciiPreview
+        || m_l2View->viewMode() != ViewMode::Hex || oldLength <= 0
+        || oldLength != replacement.size() || replacement.size() > 4096
+        || globalStart < m_bridge.windowStart
+        || globalStart + oldLength
+               > m_bridge.windowStart + m_bridge.baseline.size()) {
+        return false;
+    }
+
+    const qint64 localStart = globalStart - m_bridge.windowStart;
+    const bool previousApplying = m_bridge.applying;
+    const int asciiVertical = m_hexAsciiPreview->verticalScrollBar()->value();
+    const int asciiHorizontal = m_hexAsciiPreview->horizontalScrollBar()->value();
+    m_bridge.applying = true;
+    m_adjustingAsciiCaret = true;
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETUNDOCOLLECTION, 0UL);
+    static constexpr char digits[] = "0123456789ABCDEF";
+    for (qsizetype index = 0; index < replacement.size(); ++index) {
+        const qint64 localByte = localStart + index;
+        const int line = int(localByte / m_hexBytesPerRow);
+        const int byteColumn = int(localByte % m_hexBytesPerRow);
+        const long hexPosition = m_editor->positionFromLineIndex(
+            line, byteColumn * 3);
+        if (hexPosition < 0) {
+            m_editor->SendScintilla(QsciScintillaBase::SCI_SETUNDOCOLLECTION, 1UL);
+            m_adjustingAsciiCaret = false;
+            m_bridge.applying = previousApplying;
+            return false;
+        }
+        const uchar value = uchar(replacement.at(index));
+        const char hex[2] = {digits[value >> 4], digits[value & 0x0f]};
+        m_editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETRANGE,
+                                hexPosition, hexPosition + 2);
+        m_editor->SendScintilla(QsciScintillaBase::SCI_REPLACETARGET,
+                                static_cast<uintptr_t>(2),
+                                static_cast<const char *>(hex));
+
+        const QTextBlock block =
+            m_hexAsciiPreview->document()->findBlockByNumber(line);
+        if (block.isValid() && byteColumn < block.text().size()) {
+            QTextCursor cursor(m_hexAsciiPreview->document());
+            cursor.setPosition(block.position() + byteColumn);
+            cursor.movePosition(QTextCursor::NextCharacter,
+                                QTextCursor::KeepAnchor);
+            cursor.insertText(QString(value >= 0x20 && value <= 0x7e
+                                          ? QChar::fromLatin1(char(value))
+                                          : QLatin1Char('.')));
+        }
+    }
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETUNDOCOLLECTION, 1UL);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_EMPTYUNDOBUFFER);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETSAVEPOINT);
+    m_editor->setModified(false);
+    m_hexAsciiPreview->verticalScrollBar()->setValue(asciiVertical);
+    m_hexAsciiPreview->horizontalScrollBar()->setValue(asciiHorizontal);
+    m_adjustingAsciiCaret = false;
+    m_bridge.baseline.replace(int(localStart), replacement.size(), replacement);
+    m_bridge.applying = previousApplying;
+    applyL2SearchHighlightsToOverlay();
+    return true;
+}
+
+bool EditorTab::replaceHexAsciiBytes(qint64 from, qint64 to, QByteArray bytes,
+                                     QString *error)
+{
+    QString flushError;
+    if (!bridgeFlushOverlayToPatches(&flushError)) {
+        if (error) *error = flushError;
+        if (m_secureBinaryDocument && !bytes.isEmpty())
+            bytes.fill(0);
+        return false;
+    }
+    const qint32 oldLength = qint32(qMin<qint64>(qMax<qint64>(0, to - from),
+                                                 INT_MAX));
+    QString replaceError;
+    if (!m_l2View->replaceBytes(from, oldLength, bytes, &replaceError)) {
+        if (error) *error = replaceError;
+        if (m_secureBinaryDocument && !bytes.isEmpty())
+            bytes.fill(0);
+        return false;
+    }
+
+    const qint64 caret = from + bytes.size();
+    const bool updatedInPlace = updateFixedHexProjection(from, oldLength, bytes);
+    const qint64 previousWindowStart = m_l2View->activeWindowByteStart();
+    const qint64 previousWindowEnd = m_l2View->activeWindowByteEnd();
+    m_l2View->syncActiveWindowToCursor(caret);
+    if (!updatedInPlace
+        && previousWindowStart == m_l2View->activeWindowByteStart()
+        && previousWindowEnd == m_l2View->activeWindowByteEnd()) {
+        bridgePopulateScintilla(previousWindowStart, previousWindowEnd);
+    }
+    setAsciiCaret(caret);
+    m_hexAsciiPreview->setFocus(Qt::OtherFocusReason);
+    if (m_secureBinaryDocument && !bytes.isEmpty())
+        bytes.fill(0);
+    return true;
+}
+
 bool EditorTab::handleHexAsciiKeyPress(QKeyEvent *event)
 {
     if (!event || !m_l2View || isReadOnlyByPolicy())
@@ -3084,26 +3463,10 @@ bool EditorTab::handleHexAsciiKeyPress(QKeyEvent *event)
     };
     const auto replace = [this, &showError](qint64 from, qint64 to,
                                             QByteArray bytes) {
-        QString flushError;
-        if (!bridgeFlushOverlayToPatches(&flushError)) {
-            showError(flushError);
-            return;
-        }
         QString error;
-        const bool ok = m_l2View->replaceBytes(
-            from, qint32(qMin<qint64>(to - from, INT_MAX)), bytes, &error);
-        const qint64 caret = from + bytes.size();
-        if (m_secureBinaryDocument && !bytes.isEmpty())
-            bytes.fill(0);
-        if (!ok) {
+        if (!replaceHexAsciiBytes(from, to, std::move(bytes), &error)) {
             showError(error);
-            return;
         }
-        m_l2View->syncActiveWindowToCursor(caret);
-        bridgePopulateScintilla(m_l2View->activeWindowByteStart(),
-                                m_l2View->activeWindowByteEnd());
-        setAsciiCaret(caret);
-        m_hexAsciiPreview->setFocus(Qt::OtherFocusReason);
     };
 
     if (event->matches(QKeySequence::Copy) || event->matches(QKeySequence::Cut)) {
@@ -3218,6 +3581,33 @@ bool EditorTab::handleHexInputMethodEvent(QInputMethodEvent *event,
         }
     }
 
+    if (asciiSurface) {
+        qint64 start = 0;
+        qint64 end = 0;
+        if (!asciiSelectionByteRange(&start, &end)) {
+            showError(QObject::tr("无法把输入法提交定位到源字节。"));
+            return true;
+        }
+        QByteArray replacement = committed.toLatin1();
+        if (start == end && m_hexOverwriteMode) {
+            const qint64 available = m_l2View->virtualFileSize() - start;
+            if (available <= 0) {
+                if (m_secureBinaryDocument && !replacement.isEmpty())
+                    replacement.fill(0);
+                return true;
+            }
+            if (replacement.size() > available)
+                replacement.truncate(int(available));
+            end = start + replacement.size();
+        }
+        QString replaceError;
+        if (!replaceHexAsciiBytes(start, end, std::move(replacement),
+                                  &replaceError)) {
+            showError(replaceError);
+        }
+        return true;
+    }
+
     if (!asciiSurface) {
         // An IME commit is one user transaction. Replaying its characters as
         // independent nibble key presses is incorrect in INS mode because a
@@ -3326,11 +3716,9 @@ bool EditorTab::handleHexInputMethodEvent(QInputMethodEvent *event,
     }
 
     for (const QChar ch : committed) {
-        const int key = asciiSurface ? int(ch.unicode())
-                                     : int(ch.toUpper().unicode());
+        const int key = int(ch.toUpper().unicode());
         QKeyEvent typed(QEvent::KeyPress, key, Qt::NoModifier, QString(ch));
-        const bool handled = asciiSurface
-            ? handleHexAsciiKeyPress(&typed) : handleHexKeyPress(&typed);
+        const bool handled = handleHexKeyPress(&typed);
         if (!handled) {
             showError(QObject::tr("输入法提交未能转换为原始字节，文件保持不变。"));
             break;
@@ -3404,10 +3792,19 @@ void EditorTab::setHexCaret(qint64 globalByte, int nibble)
 
     qint64 local = globalByte - m_bridge.windowStart;
     const qint64 size = m_l2View->virtualFileSize();
-    if (globalByte == size && size > 0) {
-        --globalByte;
-        --local;
-        nibble = 1;
+    if (globalByte == size) {
+        // EOF is a real insertion boundary, not an alias for the low nibble of
+        // the last byte.  Keeping it reachable makes Ctrl+End followed by Hex
+        // input behave like mature binary editors in INS mode.
+        m_adjustingHexCaret = true;
+        m_editor->SendScintilla(QsciScintillaBase::SCI_GOTOPOS,
+                                m_editor->length());
+        m_adjustingHexCaret = false;
+        m_lastL2Line = int(qMin<qint64>(globalByte / m_hexBytesPerRow, INT_MAX));
+        m_lastL2Col = int(globalByte % m_hexBytesPerRow);
+        m_lastL2Byte = globalByte;
+        emit cursorPositionChanged(m_lastL2Line, m_lastL2Col);
+        return;
     }
     const int line = int(qMin<qint64>(local / m_hexBytesPerRow, INT_MAX));
     const int column = int((local % m_hexBytesPerRow) * 3
@@ -3596,10 +3993,10 @@ bool EditorTab::handleHexKeyPress(QKeyEvent *event)
     if (!hasSelection
         && (event->modifiers() == Qt::ControlModifier)
         && (event->key() == Qt::Key_Home || event->key() == Qt::Key_End)) {
-        if (event->key() == Qt::Key_Home || m_l2View->virtualFileSize() <= 0)
+        if (event->key() == Qt::Key_Home)
             setHexCaret(0, 0);
         else
-            setHexCaret(m_l2View->virtualFileSize() - 1, 1);
+            setHexCaret(m_l2View->virtualFileSize(), 0);
         syncAsciiSelectionFromHex();
         return true;
     }
@@ -3713,54 +4110,58 @@ bool EditorTab::handleHexKeyPress(QKeyEvent *event)
     if (typed.size() == 1 && hexNibble(typed.at(0)) >= 0
         && !(event->modifiers() & (Qt::ControlModifier | Qt::AltModifier
                                   | Qt::MetaModifier))) {
-        if (!m_hexOverwriteMode && !hasSelection && nibble == 0) {
-            QString flushError;
-            if (!bridgeFlushOverlayToPatches(&flushError)) {
-                showError(flushError);
-                return true;
-            }
-            QByteArray inserted(1, char(hexNibble(typed.at(0)) << 4));
-            QString insertError;
-            if (!m_l2View->replaceBytes(start, 0, inserted, &insertError)) {
-                showError(insertError);
-                return true;
-            }
-            if (m_secureBinaryDocument)
-                inserted.fill(0);
-            refresh(start, 1);
+        QString flushError;
+        if (!bridgeFlushOverlayToPatches(&flushError)) {
+            showError(flushError);
             return true;
         }
-        // Edit exactly one nibble in the fixed projection.  Both nibbles of a
-        // byte are flushed as one byte-level patch on save/window change,
-        // avoiding transient half-byte states and overlapping patches.
-        const qint64 local = start - m_bridge.windowStart;
-        const int line = int(qMin<qint64>(local / m_hexBytesPerRow, INT_MAX));
-        const int column = int((local % m_hexBytesPerRow) * 3 + nibble);
-        const long position = m_editor->positionFromLineIndex(line, column);
-        if (position < 0)
+        (void)hexSelectionByteRange(&start, &end, &nibble);
+
+        const int value = hexNibble(typed.at(0));
+        const qint64 size = m_l2View->virtualFileSize();
+        QByteArray replacement;
+        qint32 replacedLength = 0;
+
+        if (end > start) {
+            // Direct typing replaces the complete byte selection in both OVR
+            // and INS.  The first digit creates X0; the second edits its low
+            // nibble.  Partial projection text is never allowed to survive.
+            replacement = QByteArray(1, char(value << 4));
+            replacedLength = qint32(qMin<qint64>(end - start, INT_MAX));
+            nibble = 0;
+        } else if (!m_hexOverwriteMode && nibble == 0) {
+            // INS inserts only when entering the high nibble.  Low-nibble
+            // entry completes the byte just inserted, matching established
+            // Hex-editor behavior.
+            replacement = QByteArray(1, char(value << 4));
+        } else {
+            if (start >= size)
+                return true; // OVR cannot extend the document at EOF.
+            replacement = m_l2View->readByteRange(start, start + 1);
+            if (replacement.size() != 1) {
+                showError(QObject::tr("无法读取待编辑字节，文件保持不变。"));
+                return true;
+            }
+            const uchar oldByte = uchar(replacement.at(0));
+            replacement[0] = char(nibble == 0
+                ? ((value << 4) | (oldByte & 0x0f))
+                : ((oldByte & 0xf0) | value));
+            replacedLength = 1;
+        }
+
+        QString editError;
+        if (!m_l2View->replaceBytes(start, replacedLength, replacement,
+                                    &editError)) {
+            showError(editError);
+            if (m_secureBinaryDocument && !replacement.isEmpty())
+                replacement.fill(0);
             return true;
-        m_editor->SendScintilla(QsciScintillaBase::SCI_SETSEL,
-                                position, position + 1);
-        const QByteArray digit = typed.toUpper().toLatin1();
-        m_editor->SendScintilla(QsciScintillaBase::SCI_REPLACESEL,
-                                digit.constData());
+        }
+        if (m_secureBinaryDocument && !replacement.isEmpty())
+            replacement.fill(0);
 
         const bool completedByte = nibble == 1;
-        const qint64 nextByte = start + (completedByte ? 1 : 0);
-        const int nextNibble = completedByte ? 0 : 1;
-        const qint64 nextLocal = nextByte - m_bridge.windowStart;
-        const int nextLine = int(qMin<qint64>(nextLocal / m_hexBytesPerRow, INT_MAX));
-        const int nextColumn = int((nextLocal % m_hexBytesPerRow) * 3 + nextNibble);
-        const long nextPosition = m_editor->positionFromLineIndex(nextLine, nextColumn);
-        if (nextPosition >= 0)
-            m_editor->SendScintilla(QsciScintillaBase::SCI_GOTOPOS, nextPosition);
-
-        refreshHexAsciiProjectionFromEditor();
-        m_lastL2Line = int(qMin<qint64>(nextByte / m_hexBytesPerRow, INT_MAX));
-        m_lastL2Col = int(nextByte % m_hexBytesPerRow);
-        m_lastL2Byte = nextByte;
-        emit cursorPositionChanged(m_lastL2Line, m_lastL2Col);
-        syncAsciiSelectionFromHex();
+        refresh(start + (completedByte ? 1 : 0), completedByte ? 0 : 1);
         return true;
     }
 
@@ -4392,6 +4793,10 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
     m_autosavePath.clear();
     refreshDiskVersionBaseline();
     emit titleChanged(tabTitle());
+    // Saving a mapped document closes and reopens its provider. During the
+    // short closed interval the projection length is not the payload length;
+    // refresh permanent UI only after the authoritative provider is open.
+    emit cursorPositionChanged(m_lastL2Line, m_lastL2Col);
     return true;
 }
 
@@ -5026,10 +5431,16 @@ void EditorTab::undo()
 {
     if (isReadOnlyByPolicy()) return;
     if (isL2Mode() && m_l2View) {
-        if (m_editor->isUndoAvailable()) {
+        if (m_l2View->viewMode() == ViewMode::Hex) {
+            if (m_l2View->undo(nullptr)) {
+                const qint64 caret = qBound<qint64>(
+                    0, m_l2View->cursorByte(), m_l2View->virtualFileSize());
+                bridgePopulateScintilla(m_l2View->activeWindowByteStart(),
+                                        m_l2View->activeWindowByteEnd());
+                setAsciiCaret(caret);
+            }
+        } else if (m_editor->isUndoAvailable()) {
             m_editor->undo();
-            if (m_l2View->viewMode() == ViewMode::Hex)
-                refreshHexAsciiProjectionFromEditor();
         } else if (m_l2View->undo(nullptr)) {
             bridgePopulateScintilla(m_l2View->activeWindowByteStart(),
                                     m_l2View->activeWindowByteEnd());
@@ -5043,10 +5454,16 @@ void EditorTab::redo()
 {
     if (isReadOnlyByPolicy()) return;
     if (isL2Mode() && m_l2View) {
-        if (m_editor->isRedoAvailable()) {
+        if (m_l2View->viewMode() == ViewMode::Hex) {
+            if (m_l2View->redo(nullptr)) {
+                const qint64 caret = qBound<qint64>(
+                    0, m_l2View->cursorByte(), m_l2View->virtualFileSize());
+                bridgePopulateScintilla(m_l2View->activeWindowByteStart(),
+                                        m_l2View->activeWindowByteEnd());
+                setAsciiCaret(caret);
+            }
+        } else if (m_editor->isRedoAvailable()) {
             m_editor->redo();
-            if (m_l2View->viewMode() == ViewMode::Hex)
-                refreshHexAsciiProjectionFromEditor();
         } else if (m_l2View->redo(nullptr)) {
             bridgePopulateScintilla(m_l2View->activeWindowByteStart(),
                                     m_l2View->activeWindowByteEnd());

@@ -498,47 +498,43 @@ public:
         int maxWidth = textRect.width();
         QString elidedText = fm.elidedText(text, Qt::ElideRight, maxWidth);
 
-        // 逐字符绘制，匹配区域用高亮色
-        int x = textRect.left();
-        // 构建「是否高亮」的字符位图
-        // matchPositions 已由模型从 UTF-8 字节范围精确转换为 UTF-16 字符范围。
-        QVector<bool> highlightMask(text.size(), false);
+        // Draw the shaped string as a whole.  Painting one QChar at a time
+        // splits emoji surrogate pairs and combining sequences, disables font
+        // fallback/kerning and makes the result text visibly corrupt.  Match
+        // ranges are UTF-16 positions, so their pixel rectangles can be
+        // derived from shaped prefixes; clipping a second full-string paint
+        // then changes only the matched foreground without breaking glyphs.
+        painter->setFont(opt.font);
+        QVector<QRect> highlightRects;
         for (const QVariant &encoded : encodedRanges) {
             const QVariantMap range = encoded.toMap();
-            int col = range.value(QStringLiteral("start")).toInt();
-            int len = range.value(QStringLiteral("length")).toInt();
-            if (col < 0) col = 0;
-            if (col >= text.size()) continue;
-            int end = qMin(col + len, text.size());
-            for (int i = col; i < end; ++i)
-                highlightMask[i] = true;
-        }
-
-        // 逐字符绘制
-        painter->setFont(opt.font);
-        int drawnWidth = 0;
-        for (int i = 0; i < elidedText.size() && i < text.size(); ++i) {
-            QChar ch = elidedText[i];
-            int w = fm.horizontalAdvance(ch);
-            if (x + w > textRect.right()) break;
-
-            if (highlightMask[i]) {
-                // 画高亮背景
-                painter->fillRect(QRect(x, opt.rect.y(), w, opt.rect.height()), hlBg);
-                painter->setPen(hlFg);
-            } else {
-                painter->setPen(normalFg);
+            const int start = qBound(
+                0, range.value(QStringLiteral("start")).toInt(), elidedText.size());
+            const int end = qBound(
+                start,
+                start + qMax(0, range.value(QStringLiteral("length")).toInt()),
+                elidedText.size());
+            if (end <= start)
+                continue;
+            const int startX = fm.horizontalAdvance(elidedText.left(start));
+            const int endX = fm.horizontalAdvance(elidedText.left(end));
+            QRect highlightRect(textRect.left() + startX, opt.rect.y(),
+                                qMax(1, endX - startX), opt.rect.height());
+            highlightRect = highlightRect.intersected(textRect);
+            if (!highlightRect.isEmpty()) {
+                painter->fillRect(highlightRect, hlBg);
+                highlightRects.append(highlightRect);
             }
-            painter->drawText(x, y, ch);
-            x += w;
-            drawnWidth += w;
         }
 
-        // 如果有省略号，绘制它
-        if (elidedText.size() < text.size() && drawnWidth < maxWidth) {
-            painter->setPen(normalFg);
-            QString ellipsis = QStringLiteral("…");
-            painter->drawText(x, y, ellipsis);
+        painter->setPen(normalFg);
+        painter->drawText(textRect.left(), y, elidedText);
+        painter->setPen(hlFg);
+        for (const QRect &highlightRect : std::as_const(highlightRects)) {
+            painter->save();
+            painter->setClipRect(highlightRect);
+            painter->drawText(textRect.left(), y, elidedText);
+            painter->restore();
         }
 
         painter->restore();

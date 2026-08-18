@@ -306,11 +306,19 @@ private:
     void       lruClear();
 
     // 提交 AsyncTask：预取 chunkIds（一般 3 个：prev/cur/next）；结果写进 LRU，完成后 onPrefetchFinished
-    void submitPrefetchForChunks(const QVector<qint64>& chunkIds, bool cancelOngoing = true);
+    void submitPrefetchForChunks(const QVector<qint64>& chunkIds,
+                                 bool cancelOngoing = true,
+                                 bool refreshProjection = true);
 
     // 把 centerByte 对齐到 W_active 窗口边界（尽量让 centerByte 落在窗口中心 ± 25% 范围内，prev/next 覆盖）
     // 返回 true 如果 m_activeWindowStart/m_activeWindowLen 变了（需要触发 activeWindowChanged）
     bool alignActiveWindowTo(qint64 centerByte, qint64 wBytes);
+
+    // In incomplete Text-index mode the global thumb is a byte-progress
+    // control, so its target is the first byte to show rather than a viewport
+    // centre. Keeping that distinction prevents a long logical line from
+    // pulling the projection backwards after every Scintilla layout update.
+    bool alignActiveWindowToTop(qint64 topByte, qint64 wBytes);
 
     // 把当前 vertical/horizontal scrollbar 的值 → 当前可视中心字节（Text/Hex 模式都能用）
     qint64 computeViewportCenterByteFromScrollbars() const;

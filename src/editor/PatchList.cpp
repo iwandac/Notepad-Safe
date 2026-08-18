@@ -196,12 +196,34 @@ bool PatchList_replaceWithSnapshots(PatchList& self, qint64 byteOffset, qint32 o
     if (!self.validateRange(byteOffset, oldLength, errMsg)) return false;
     if (oldLength == 0 && newData.isEmpty()) return true;
 
-    // A later same-size overwrite of the exact virtual range supersedes the
-    // previous overwrite. Keeping both patches would render both payloads and
-    // consume the original range twice (for example F0 -> FF became FF F0).
-    // Preserve the first patch's original snapshot so Undo still returns to
-    // the disk byte, and update its visible payload in place.
+    // A same-size overwrite inside bytes produced by an earlier patch edits
+    // that patch's payload in place.  Stacking an overlapping patch would
+    // render both payloads (an inserted A0 followed by low-nibble input B used
+    // to become "AB A0") and could grow the file on every second digit.
+    // Treat the two nibbles as one byte-entry undo unit: the original patch
+    // keeps its disk snapshot, so Undo returns to the state before that byte
+    // was entered.
     if (oldLength == newData.size()) {
+        const qint64 replaceEnd = byteOffset + oldLength;
+        for (int i = self.l1Hot_.size() - 1; i >= 0; --i) {
+            Patch &existing = self.l1Hot_[i];
+            const qint64 payloadEnd = existing.byteOffset
+                                      + existing.newText.size();
+            if (byteOffset < existing.byteOffset || replaceEnd > payloadEnd)
+                continue;
+            const int payloadOffset = int(byteOffset - existing.byteOffset);
+            if (self.sensitive_) {
+                for (int j = 0; j < oldLength; ++j)
+                    existing.newText[payloadOffset + j] = 0;
+            }
+            existing.newText.replace(payloadOffset, oldLength, newData);
+            self.redoStack_.clear();
+            return true;
+        }
+
+        // A later same-size overwrite of the exact original virtual range
+        // supersedes the previous overwrite. Preserve the first patch's
+        // original snapshot so Undo still returns to the disk byte.
         for (int i = 0; i < self.l1Hot_.size(); ++i) {
             Patch &existing = self.l1Hot_[i];
             if (existing.byteOffset != byteOffset

@@ -118,7 +118,7 @@
 完成不是“现有测试全绿”，而是本矩阵 P0 数据正确性全部有可执行证据、真实 S2/S3/Hex
 代表组合通过、主程序构建并完成 GUI 操作验收。
 
-## 8. 当前自动化证据（2026-08-17）
+## 8. 当前自动化证据（2026-08-18）
 
 | 用例 | 已证明的契约 |
 |---|---|
@@ -137,6 +137,8 @@
 | `tc_fr_031` | 保留的 4.9 GB Binary S3 中模拟从 ASCII 面板复制文本；默认仅勾选循环查找时按原始字节 Literal 搜索，不进入 PCRE2/UTF-8 错误路径，正文精确选中 64 位 byte range |
 | `tc_fr_032` | 含 `FF FE 80/C0` 的小型 Binary；默认 Literal 以不同字母大小写命中 ASCII token；勾选整词后只命中独立 `cat`/`cat!`，跳过 `catalog`/`_cat`，且无效 UTF-8 不产生正则错误 |
 | `tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers` | 从保留的 `tinytestfile` ASCII 区真实反向拖选 Hex 地址 `0x416–0x418`、source `[0x416,0x419)`=`01 E9 24`；剪贴板显示安全 Hex 文本并保留 raw bytes；粘贴到查找框自动启用 Hex bytes；Find Next 跳过当前匹配并命中下一处同 bytes，重置到 BOF 后精确选中原三字节 |
+| `tc_mainwindow_find_shortcuts_preserve_query_scope_and_tab_order` | 正式 MainWindow 中关闭查找框后以真实 F3/Shift+F3 保留查询；当前文件正反向、全部打开文件按标签跨越/返回；范围项显示可搜索目标数 |
+| `tc_mainwindow_all_open_find_all_utf8_utf16_dock_jump` | 正式 MainWindow 的 UTF-8/UTF-16LE + 中文/emoji/CRLF；全部打开 Find All 两组结果、Dock Unicode 高亮、真实双击、标签激活、正文精确选区与 indicator |
 
 本轮 30 个功能用例全部通过：`tc_fr_001`–`tc_fr_029` 为 **31 passed / 0 failed**（含
 init/cleanup），`tc_fr_030` 为 **3 passed / 0 failed**。两轮完整运行中真实 S3 Find All
@@ -150,5 +152,9 @@ init/cleanup），`tc_fr_030` 为 **3 passed / 0 failed**。两轮完整运行�
 通过真实 fixture 补充。视觉证据为
 `build/gui-s3-default-literal-copied-text.png`；同时复跑 `tc_fr_017/019/021/022`，确认
 Literal/Regex 状态、合法组合、文本语义和 Hex 语义没有退化。
-百万级压力、编码 PositionMapper、正式 MainWindow 菜单/F3 和跨全部锁定入口清理仍按
+百万级压力、原编码 PositionMapper、正式 MainWindow 的 Regex/Hex/S2/S3 路径和跨全部锁定入口清理仍按
 第 2–6 节及 `DESIGN.md` 14.5 作为后续发布门禁，不能因该数字被标记为完成。
+
+2026-08-18 已补正式 MainWindow 的菜单/F3 S1 Literal 代表和 UTF-8/UTF-16LE Find All/Dock
+代表；后者同时修复了结果 delegate 按 `QChar` 拆坏 emoji/组合字形的问题。这里证明的是
+S1 解码后编辑空间的导航，原编码 source-byte PositionMapper、S2/S3 和动态成员竞态仍是门禁。

@@ -877,6 +877,15 @@ void VirtualFileView::setViewMode(ViewMode mode) {
     updateScrollBarsFromContent();
     viewport()->update();
     emit viewModeChanged(m_viewMode);
+    // Hex does not need a line index, so initial binary routing deliberately
+    // skips it. Once the user asks for Text, start the index in the background;
+    // otherwise the byte-progress fallback becomes permanent and cannot offer
+    // stable Notepad-style line scrolling or absolute line numbers.
+    if (m_viewMode == ViewMode::Text && m_fullLineIndexBuildEnabled
+        && mmapBase_ && mmapSize_ > 0 && lineIndex_.isIncomplete()
+        && m_lineBuildTaskId <= 0) {
+        startAsyncLineBuild();
+    }
 }
 
 void VirtualFileView::setHexBytesPerRow(int bytesPerRow) {
@@ -1393,10 +1402,13 @@ bool VirtualFileView::removeSelection(QString* errMsg) {
 //  小 chunk + ±1 预读 + Scintilla 小窗口：公开 API / 工具函数
 // ============================================================================
 qint64 VirtualFileView::computeDisplayWindowBytes() const {
-    // Hex expands every source byte to roughly three display characters.
-    // Bound the editable overlay to about 768 KiB of Scintilla text.
+    // Hex expands every source byte to roughly three display characters and
+    // duplicates it in the ASCII document. A 256 KiB source projection forced
+    // close to 1 MiB of formatted UI to be rebuilt for a one-byte INS/DEL.
+    // 64 KiB still covers more than a thousand rows while keeping structural
+    // edits responsive; OVR edits use the in-place projection fast path.
     if (m_viewMode == ViewMode::Hex)
-        return Q_INT64_C(256) * 1024;
+        return Q_INT64_C(64) * 1024;
     // W_display = 11 screens × 每屏字节数（真实 viewport 尺寸 + 当前字体度量，不猜）
     const int rows = qMax(1, visibleLineCount());
     const int vpW  = qMax(1, viewport()->width() - gutterWidth());
@@ -1459,6 +1471,24 @@ bool VirtualFileView::alignActiveWindowTo(qint64 centerByte, qint64 wBytes) {
     if (newStart == m_activeWindowStart && newLen == m_activeWindowLen) return false;
     m_activeWindowStart = newStart;
     m_activeWindowLen   = newLen;
+    return true;
+}
+
+bool VirtualFileView::alignActiveWindowToTop(qint64 topByte, qint64 wBytes)
+{
+    const qint64 virtualSize = virtualFileSize();
+    const qint64 windowBytes = qBound<qint64>(
+        Q_INT64_C(64) * 1024, wBytes,
+        qMax<qint64>(Q_INT64_C(64) * 1024, virtualSize));
+    topByte = qBound<qint64>(0, topByte, virtualSize);
+    const qint64 newStart = qMin(topByte,
+                                 qMax<qint64>(0, virtualSize - windowBytes));
+    const qint64 newLength = qMax<qint64>(
+        0, qMin(windowBytes, virtualSize - newStart));
+    if (newStart == m_activeWindowStart && newLength == m_activeWindowLen)
+        return false;
+    m_activeWindowStart = newStart;
+    m_activeWindowLen = newLength;
     return true;
 }
 
@@ -1532,6 +1562,19 @@ qint64 VirtualFileView::computeViewportCenterByteFromScrollbars() const {
     // Text 模式：用 LineIndex → 中间一行的起始字节 + 最长行的一半，估算"中心字节"
     const qint64 total = lineIndex_.totalLines();
     const int mid = int(qBound<qint64>(0, qint64(verticalScrollBar()->value()) + qint64(visibleLineCount())/2, total-1));
+    // A document first opened as Hex intentionally skips the full text line
+    // index. After switching to Text, a distant thumb drag must still address
+    // the whole file instead of clamping to the quick index's first 256 KiB.
+    // Until the index is complete, the global thumb is a byte-progress scale.
+    if (lineIndex_.isIncomplete() && lineIndex_.realCoverageBytes() < vSize) {
+        const qint64 minimum = verticalScrollBar()->minimum();
+        const qint64 span = qMax<qint64>(
+            1, qint64(verticalScrollBar()->maximum()) - minimum);
+        const qint64 value = qBound<qint64>(
+            minimum, qint64(verticalScrollBar()->value()),
+            qint64(verticalScrollBar()->maximum())) - minimum;
+        return qBound<qint64>(0, (vSize * value) / span, vSize);
+    }
     const qint64 lineStart = lineIndex_.lineToByteOffset(mid);
     qint64 lineLen;
     if (mid + 1 < total) lineLen = lineIndex_.lineToByteOffset(mid + 1) - lineStart;
@@ -1552,12 +1595,20 @@ void VirtualFileView::connectScrollBarThrottling() {
     // L3：滑块松开 → 精确落点
     connect(vsb, &QScrollBar::sliderReleased, this, &VirtualFileView::onScrollSliderReleasedL3);
     connect(hsb, &QScrollBar::sliderReleased, this, &VirtualFileView::onScrollSliderReleasedL3);
-    // Wheel, keyboard and scrollbar arrow/page operations change value without
-    // emitting sliderMoved. Feed them into the same bounded settle pipeline so
-    // the global thumb and projected bytes can never diverge.
-    connect(vsb, &QScrollBar::valueChanged, this, [this, vsb](int value) {
-        if (!vsb->isSliderDown())
-            onScrollSliderMovedPreviewL1(value);
+    // Arrow/page/wheel/keyboard operations emit actionTriggered, while plain
+    // valueChanged is also emitted by programmatic range, caret and projection
+    // alignment. Feeding every valueChanged back into the loader made those
+    // internal corrections look like fresh user requests and could oscillate
+    // by a screen forever. Read the final value on the next event turn only
+    // for an actual scrollbar action; drag gestures remain owned by
+    // sliderMoved/sliderReleased above.
+    connect(vsb, &QScrollBar::actionTriggered, this, [this, vsb](int) {
+        if (vsb->isSliderDown())
+            return;
+        QTimer::singleShot(0, this, [this, vsb]() {
+            if (isOpen() && !vsb->isSliderDown())
+                onScrollSliderMovedPreviewL1(vsb->value());
+        });
     });
 }
 
@@ -1586,7 +1637,12 @@ void VirtualFileView::onScrollDebouncedL2() {
         m_lastComputedW = w;
         lruClear();
     }
-    (void)alignActiveWindowTo(center, w);
+    const bool byteProgressText = m_viewMode == ViewMode::Text
+        && lineIndex_.isIncomplete()
+        && lineIndex_.realCoverageBytes() < virtualFileSize();
+    const bool windowChanged = byteProgressText
+        ? alignActiveWindowToTop(center, w)
+        : alignActiveWindowTo(center, w);
 
     // 2) 计算 prev/cur/next 3 个 chunk
     const qint64 cBytes = currentChunkBytes();
@@ -1606,13 +1662,16 @@ void VirtualFileView::onScrollDebouncedL2() {
         if (!lruFindChunk(id)) { allHit = false; break; }
     }
     if (allHit) {
-        if (!m_inDestruction) {
+        if (windowChanged && !m_inDestruction) {
             emit activeWindowChanged(m_activeWindowStart,
                                      m_activeWindowStart + m_activeWindowLen);
         }
         return;
     }
-    submitPrefetchForChunks(ids, /*cancelOngoing=*/true);
+    // Cache fill alone is not a document change. Rebuilding an identical
+    // Scintilla projection after a background prefetch resets the native caret
+    // to its end and corrupts the foreground ASCII/Hex editing position.
+    submitPrefetchForChunks(ids, /*cancelOngoing=*/true, windowChanged);
 }
 
 void VirtualFileView::onScrollSliderReleasedL3() {
@@ -1621,14 +1680,31 @@ void VirtualFileView::onScrollSliderReleasedL3() {
     if (m_scrollDebounceTimer) m_scrollDebounceTimer->stop();
     m_previewJumpByteHint = -1;
     const qint64 center = computeViewportCenterByteFromScrollbars();
-    syncActiveWindowToCursor(center);
+    const bool byteProgressText = m_viewMode == ViewMode::Text
+        && lineIndex_.isIncomplete()
+        && lineIndex_.realCoverageBytes() < virtualFileSize();
+    if (byteProgressText) {
+        const qint64 w = computeActiveWindowBytes();
+        if (w != m_lastComputedW) {
+            m_lastComputedW = w;
+            lruClear();
+        }
+        if (alignActiveWindowToTop(center, w) && !m_inDestruction) {
+            emit activeWindowChanged(m_activeWindowStart,
+                                     m_activeWindowStart + m_activeWindowLen);
+        }
+    } else {
+        syncActiveWindowToCursor(center);
+    }
     viewport()->update();
 }
 
 // ============================================================================
 //  Prefetch（prev/cur/next 3 chunk）：AsyncTaskManager 跑 worker，支持甩滚 cancel
 // ============================================================================
-void VirtualFileView::submitPrefetchForChunks(const QVector<qint64>& chunkIds, bool cancelOngoing) {
+void VirtualFileView::submitPrefetchForChunks(const QVector<qint64>& chunkIds,
+                                               bool cancelOngoing,
+                                               bool refreshProjection) {
     if (!isOpen()) return;
     if (chunkIds.isEmpty()) return;
 
@@ -1680,7 +1756,7 @@ void VirtualFileView::submitPrefetchForChunks(const QVector<qint64>& chunkIds, b
         QObject::tr("准备相邻文件块以无缝滚动..."),
         // WorkerFn = void(taskId, cancel, reportProgress, reportError)
         [that, base, fSize, cBytes, validIds, outerCancel, activeStart, activeLen,
-         mappingGeneration, sensitive, workerDone]
+         mappingGeneration, sensitive, workerDone, refreshProjection]
         (qint64, AsyncCancelPtr innerCancel,
          std::function<void(qint64,qint64)> reportProgress,
          std::function<void(const AsyncErrorInfo&)>)
@@ -1728,7 +1804,7 @@ void VirtualFileView::submitPrefetchForChunks(const QVector<qint64>& chunkIds, b
                 QVector<QPair<qint64, QByteArray>>>(std::move(result));
             const bool queued = QMetaObject::invokeMethod(that,
                 [that, queuedResult, activeStart, activeLen,
-                 mappingGeneration, sensitive]() mutable {
+                 mappingGeneration, sensitive, refreshProjection]() mutable {
                     auto &result = *queuedResult;
                     const auto scrubQueued = [&result, sensitive]() {
                         if (!sensitive)
@@ -1753,7 +1829,8 @@ void VirtualFileView::submitPrefetchForChunks(const QVector<qint64>& chunkIds, b
                         if (p.first >= 0)
                             that->lruPutChunk(p.first, std::move(p.second));
                     }
-                    if (windowStillMatched && that->m_activeWindowLen > 0) {
+                    if (refreshProjection && windowStillMatched
+                        && that->m_activeWindowLen > 0) {
                         emit that->activeWindowChanged(
                             that->m_activeWindowStart,
                             that->m_activeWindowStart + that->m_activeWindowLen);
@@ -1972,6 +2049,10 @@ void VirtualFileView::onAsyncLineBuildSwapped(LineIndex result, bool buildOk)
 {
     if (m_closingFile || !mmapBase_)
         return;
+    // Preserve the byte represented by the old incomplete progress thumb.
+    // Reusing its raw integer value after installing the real line range makes
+    // the visible content jump to an unrelated line.
+    const qint64 viewportAnchor = computeViewportCenterByteFromScrollbars();
     bool ok = buildOk;
     try {
         if (ok) {
@@ -1981,6 +2062,17 @@ void VirtualFileView::onAsyncLineBuildSwapped(LineIndex result, bool buildOk)
                 lineIndex_.setCompletedAndSwapIn(std::move(result));
                 updateMetrics();
                 updateScrollBarsFromContent();
+                int anchorLine = 0;
+                qint64 anchorColumn = 0;
+                lineIndex_.byteToLineCol(
+                    qBound<qint64>(0, viewportAnchor, mmapSize_),
+                    &anchorLine, &anchorColumn);
+                {
+                    QSignalBlocker blocker(verticalScrollBar());
+                    verticalScrollBar()->setValue(qBound(
+                        verticalScrollBar()->minimum(), anchorLine,
+                        verticalScrollBar()->maximum()));
+                }
                 m_buildProgressBytes = mmapSize_;  // 构建完成
                 viewport()->update();
                 if (search_) search_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
@@ -1994,6 +2086,7 @@ void VirtualFileView::onAsyncLineBuildSwapped(LineIndex result, bool buildOk)
     } catch (...) {
         ok = false;
     }
+    m_lineBuildTaskId = -1;
     onAsyncLineBuildFinished();
     emit lineBuildFinished(ok);
 }
