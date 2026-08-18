@@ -10,6 +10,7 @@
 class QLabel;
 class QFileSystemWatcher;
 class QProgressBar;
+class QPlainTextEdit;
 class QScrollBar;
 class QStackedWidget;
 class QTimer;
@@ -29,6 +30,8 @@ public:
     bool openFile(const QString &path, Presentation presentation, QString *error = nullptr);
     void closeFile();
     void setPresentation(Presentation presentation);
+    void setWordWrap(bool enabled);
+    bool wordWrap() const { return m_wordWrap; }
     Presentation presentation() const { return m_presentation; }
 
     qint64 fileSize() const { return m_fileSize; }
@@ -36,6 +39,7 @@ public:
     qint64 windowStart() const { return m_windowStart; }
     qint64 windowEnd() const { return m_windowEnd; }
     qint64 visibleTopOffset() const;
+    qint64 visibleBottomOffset() const;
     int hexBytesPerRow() const { return m_hexBytesPerRow; }
     QByteArray sourceBytes(qint64 offset, qsizetype length) const;
     qint64 selectionStartOffset() const;
@@ -44,10 +48,12 @@ public:
     bool refreshFileMapping(QString *error = nullptr);
 
     QsciScintilla *editor() const { return m_editor; }
+    QPlainTextEdit *asciiPreview() const { return m_asciiPreview; }
     QScrollBar *globalScrollBar() const { return m_globalScrollBar; }
     int visibleVerticalScrollBarCount() const;
 
     void goToOffset(qint64 offset, qint64 selectionBytes = 0);
+    void selectAllSource();
     void findBytesAsync(const QByteArray &needle, qint64 fromOffset = 0);
     bool searchRunning() const;
     qint64 lastSearchResult() const { return m_lastSearchResult; }
@@ -71,11 +77,23 @@ private:
     void clearVirtualSelection();
     void applyVirtualSelection();
     qint64 sourceOffsetForProjectedLine(int line) const;
+    qint64 sourceOffsetAtViewportY(int y) const;
+    int projectedDisplayLineCount() const;
+    void scrollProjectionToEnd();
+    void configureProjectionMargin();
+    void populateAsciiProjection(const QByteArray &source);
+    void syncAsciiSelectionFromHex();
+    void syncHexSelectionFromAscii();
+    void syncAsciiScrollFromHex();
+    qint64 sourceOffsetForAsciiPosition(int position, bool endBoundary) const;
+    int asciiPositionForSourceOffset(qint64 offset) const;
+    qint64 sourceBoundaryForHexPosition(qint64 position) const;
+    void setHexCaretAtSource(qint64 offset, int nibble = 0);
+    void setHexSourceSelection(qint64 anchor, qint64 caret);
     qint64 sourceOffsetForProjectedPosition(qint64 position, bool endBoundary) const;
     int projectedLineForSourceOffset(qint64 offset) const;
     qint64 projectedPositionForSourceOffset(qint64 offset) const;
     int calculateHexBytesPerRow() const;
-    int hexProjectedRowStride() const;
     qint64 offsetForSlider(int value) const;
     int sliderForOffset(qint64 offset) const;
     QByteArray formatHexWindow(const uchar *data, qsizetype length, qint64 absoluteStart) const;
@@ -90,12 +108,16 @@ private:
     qint64 m_windowSpan = 2LL * 1024 * 1024;
     Presentation m_presentation = Presentation::Text;
     QsciScintilla *m_editor = nullptr;
+    QPlainTextEdit *m_asciiPreview = nullptr;
     QScrollBar *m_globalScrollBar = nullptr;
     bool m_updatingScrollBar = false;
+    bool m_wordWrap = false;
     int m_hexBytesPerRow = 16;
     int m_wheelAngleRemainder = 0;
     int m_wheelPixelRemainder = 0;
     bool m_hexRelayoutPending = false;
+    bool m_syncingHexSelection = false;
+    bool m_syncingAsciiSelection = false;
     qint64 m_selectionAnchor = -1;
     qint64 m_selectionCaret = -1;
     QFileSystemWatcher *m_fileWatcher = nullptr;

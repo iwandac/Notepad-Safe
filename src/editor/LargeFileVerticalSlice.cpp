@@ -1,4 +1,5 @@
 #include "LargeFileVerticalSlice.h"
+#include "EditorSurfaceStyle.h"
 
 #include <algorithm>
 #include <cstring>
@@ -12,10 +13,15 @@
 #include <QFontMetrics>
 #include <QHBoxLayout>
 #include <QKeyEvent>
+#include <QKeySequence>
 #include <QLabel>
+#include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QScrollBar>
+#include <QSignalBlocker>
 #include <QStackedWidget>
+#include <QTextBlock>
+#include <QTextCursor>
 #include <QThread>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -67,12 +73,14 @@ WindowedReadOnlyProvider::WindowedReadOnlyProvider(QWidget *parent)
     : QWidget(parent)
 {
     setObjectName(QStringLiteral("windowedReadOnlySlice"));
+    installEventFilter(this);
     auto *layout = new QHBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
 
     m_editor = new QsciScintilla(this);
     m_editor->setObjectName(QStringLiteral("windowProjectionEditor"));
+    applySharedEditorSurfaceStyle(m_editor);
     m_editor->setUtf8(true);
     m_editor->setReadOnly(true);
     m_editor->setWrapMode(QsciScintilla::WrapNone);
@@ -82,6 +90,37 @@ WindowedReadOnlyProvider::WindowedReadOnlyProvider(QWidget *parent)
     m_editor->installEventFilter(this);
     if (m_editor->viewport())
         m_editor->viewport()->installEventFilter(this);
+
+    m_asciiPreview = new QPlainTextEdit(this);
+    m_asciiPreview->setObjectName(QStringLiteral("HexAsciiPreview"));
+    m_asciiPreview->setAccessibleName(tr("ASCII 字节预览"));
+    m_asciiPreview->setToolTip(tr("字符栏（不可打印字节显示为 .；只读）"));
+    m_asciiPreview->setFont(m_editor->font());
+    m_asciiPreview->setReadOnly(true);
+    m_asciiPreview->setLineWrapMode(QPlainTextEdit::NoWrap);
+    m_asciiPreview->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_asciiPreview->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_asciiPreview->document()->setDocumentMargin(0);
+    m_asciiPreview->setStyleSheet(QStringLiteral(
+        "QPlainTextEdit { border: 0; border-left: 1px solid #c8c8c8;"
+        " background: #fafafa; padding-left: 8px; }"));
+    m_asciiPreview->installEventFilter(this);
+    if (m_asciiPreview->viewport())
+        m_asciiPreview->viewport()->installEventFilter(this);
+    connect(m_asciiPreview, &QPlainTextEdit::cursorPositionChanged,
+            this, &WindowedReadOnlyProvider::syncHexSelectionFromAscii);
+    connect(m_asciiPreview, &QPlainTextEdit::selectionChanged,
+            this, &WindowedReadOnlyProvider::syncHexSelectionFromAscii);
+    m_asciiPreview->hide();
+    connect(m_editor, &QsciScintilla::SCN_UPDATEUI,
+            this, [this]() {
+        syncAsciiScrollFromHex();
+        syncAsciiSelectionFromHex();
+    });
+    connect(m_editor, &QsciScintilla::selectionChanged,
+            this, &WindowedReadOnlyProvider::syncAsciiSelectionFromHex);
+    connect(m_editor, &QsciScintilla::cursorPositionChanged,
+            this, [this](int, int) { syncAsciiSelectionFromHex(); });
 
     m_globalScrollBar = new QScrollBar(Qt::Vertical, this);
     m_globalScrollBar->setObjectName(QStringLiteral("globalLargeFileScrollBar"));
@@ -93,7 +132,8 @@ WindowedReadOnlyProvider::WindowedReadOnlyProvider(QWidget *parent)
             reloadWindow(offsetForSlider(value), 0);
     });
 
-    layout->addWidget(m_editor, 1);
+    layout->addWidget(m_editor, 3);
+    layout->addWidget(m_asciiPreview, 1);
     layout->addWidget(m_globalScrollBar);
 
     m_fileWatcher = new QFileSystemWatcher(this);
@@ -164,6 +204,12 @@ bool WindowedReadOnlyProvider::openFile(const QString &path, Presentation presen
     m_file.close();
     m_presentation = presentation;
     m_windowSpan = presentation == Presentation::Hex ? kHexWindowBytes : kTextWindowBytes;
+    m_asciiPreview->setVisible(presentation == Presentation::Hex);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETHSCROLLBAR,
+                            presentation == Presentation::Hex ? 0UL : 1UL);
+    m_editor->setWrapMode(presentation == Presentation::Text && m_wordWrap
+                              ? QsciScintilla::WrapWord
+                              : QsciScintilla::WrapNone);
     if (presentation == Presentation::Hex)
         m_hexBytesPerRow = calculateHexBytesPerRow();
     m_globalScrollBar->setPageStep(std::max(
@@ -197,6 +243,8 @@ void WindowedReadOnlyProvider::closeFile()
     m_windowEnd = 0;
     clearVirtualSelection();
     m_path.clear();
+    if (m_asciiPreview)
+        m_asciiPreview->clear();
     m_observedSize = -1;
     m_observedModified = {};
 }
@@ -256,7 +304,9 @@ bool WindowedReadOnlyProvider::refreshFileMapping(QString *error)
         reloadWindow(clampOffset(preservedAnchor, m_fileSize), 0,
                      std::clamp(preservedTop, 0LL, m_fileSize - 1), false);
         directScintilla(m_editor, QsciScintillaBase::SCI_SETXOFFSET,
-                        static_cast<ScintillaUnsigned>(std::max(0, preservedHorizontal)));
+                        static_cast<ScintillaUnsigned>(
+                            m_presentation == Presentation::Hex
+                                ? 0 : std::max(0, preservedHorizontal)));
     } else {
         m_windowStart = 0;
         m_windowEnd = 0;
@@ -278,9 +328,32 @@ void WindowedReadOnlyProvider::setPresentation(Presentation presentation)
         return;
     m_presentation = presentation;
     m_windowSpan = presentation == Presentation::Hex ? kHexWindowBytes : kTextWindowBytes;
+    m_asciiPreview->setVisible(presentation == Presentation::Hex);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETHSCROLLBAR,
+                            presentation == Presentation::Hex ? 0UL : 1UL);
+    m_editor->setWrapMode(presentation == Presentation::Text && m_wordWrap
+                              ? QsciScintilla::WrapWord
+                              : QsciScintilla::WrapNone);
+    if (presentation == Presentation::Hex)
+        m_hexBytesPerRow = calculateHexBytesPerRow();
     m_globalScrollBar->setPageStep(std::max(
         1, int((static_cast<long double>(m_windowSpan) * kSliderMaximum) / m_fileSize)));
     reloadWindow(m_globalOffset, 0);
+}
+
+void WindowedReadOnlyProvider::setWordWrap(bool enabled)
+{
+    if (m_wordWrap == enabled)
+        return;
+    const qint64 preservedTop = visibleTopOffset();
+    m_wordWrap = enabled;
+    m_editor->setWrapMode(m_presentation == Presentation::Text && enabled
+                              ? QsciScintilla::WrapWord
+                              : QsciScintilla::WrapNone);
+    m_editor->setWrapVisualFlags(QsciScintilla::WrapFlagByText);
+    m_editor->setWrapIndentMode(QsciScintilla::WrapIndentSame);
+    if (!m_path.isEmpty())
+        reloadWindow(m_globalOffset, 0, preservedTop, true);
 }
 
 QByteArray WindowedReadOnlyProvider::sourceBytes(qint64 offset, qsizetype length) const
@@ -309,15 +382,35 @@ qint64 WindowedReadOnlyProvider::visibleTopOffset() const
 {
     if (m_path.isEmpty() || !m_editor)
         return 0;
+    const qint64 precise = sourceOffsetAtViewportY(1);
+    if (precise >= 0)
+        return precise;
     const int firstVisible = static_cast<int>(directScintilla(
         m_editor, QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
     return sourceOffsetForProjectedLine(firstVisible);
+}
+
+qint64 WindowedReadOnlyProvider::visibleBottomOffset() const
+{
+    if (m_path.isEmpty() || !m_editor || !m_editor->viewport())
+        return 0;
+    const qint64 offset = sourceOffsetAtViewportY(
+        std::max(1, m_editor->viewport()->height() - 2));
+    return offset >= 0 ? offset : visibleTopOffset();
 }
 
 qint64 WindowedReadOnlyProvider::selectionStartOffset() const
 {
     if (m_selectionAnchor >= 0 && m_selectionCaret >= 0)
         return std::min(m_selectionAnchor, m_selectionCaret);
+    if (m_presentation == Presentation::Hex && m_asciiPreview
+        && (m_asciiPreview->hasFocus()
+            || (m_asciiPreview->viewport()
+                && m_asciiPreview->viewport()->hasFocus()))) {
+        const QTextCursor cursor = m_asciiPreview->textCursor();
+        return std::min(sourceOffsetForAsciiPosition(cursor.anchor(), false),
+                        sourceOffsetForAsciiPosition(cursor.position(), false));
+    }
     const qint64 start = directScintilla(
         m_editor, QsciScintillaBase::SCI_GETSELECTIONSTART);
     return sourceOffsetForProjectedPosition(start, false);
@@ -327,8 +420,20 @@ qint64 WindowedReadOnlyProvider::selectionEndOffset() const
 {
     if (m_selectionAnchor >= 0 && m_selectionCaret >= 0)
         return std::max(m_selectionAnchor, m_selectionCaret);
+    if (m_presentation == Presentation::Hex && m_asciiPreview
+        && (m_asciiPreview->hasFocus()
+            || (m_asciiPreview->viewport()
+                && m_asciiPreview->viewport()->hasFocus()))) {
+        const QTextCursor cursor = m_asciiPreview->textCursor();
+        return std::max(sourceOffsetForAsciiPosition(cursor.anchor(), true),
+                        sourceOffsetForAsciiPosition(cursor.position(), true));
+    }
+    const qint64 start = directScintilla(
+        m_editor, QsciScintillaBase::SCI_GETSELECTIONSTART);
     const qint64 end = directScintilla(
         m_editor, QsciScintillaBase::SCI_GETSELECTIONEND);
+    if (start == end)
+        return sourceOffsetForProjectedPosition(end, false);
     return sourceOffsetForProjectedPosition(end, true);
 }
 
@@ -346,10 +451,19 @@ bool WindowedReadOnlyProvider::copySelection(QString *error) const
         return false;
     }
     QByteArray selected = sourceBytes(start, static_cast<qsizetype>(length));
-    if (m_presentation == Presentation::Hex)
-        QGuiApplication::clipboard()->setText(QString::fromLatin1(selected.toHex(' ').toUpper()));
-    else
+    const bool asciiFocused = m_presentation == Presentation::Hex
+        && m_asciiPreview
+        && (m_asciiPreview->hasFocus()
+            || (m_asciiPreview->viewport()
+                && m_asciiPreview->viewport()->hasFocus()));
+    if (m_presentation == Presentation::Hex && !asciiFocused) {
+        QGuiApplication::clipboard()->setText(
+            QString::fromLatin1(selected.toHex(' ').toUpper()));
+    } else if (m_presentation == Presentation::Hex) {
+        QGuiApplication::clipboard()->setText(QString::fromLatin1(selected));
+    } else {
         QGuiApplication::clipboard()->setText(QString::fromUtf8(selected));
+    }
     return true;
 }
 
@@ -364,6 +478,15 @@ void WindowedReadOnlyProvider::goToOffset(qint64 offset, qint64 selectionBytes)
         clearVirtualSelection();
     }
     reloadWindow(clampOffset(offset, m_fileSize), selectionBytes);
+}
+
+void WindowedReadOnlyProvider::selectAllSource()
+{
+    if (m_path.isEmpty() || m_fileSize <= 0)
+        return;
+    m_selectionAnchor = 0;
+    m_selectionCaret = m_fileSize;
+    applyVirtualSelection();
 }
 
 void WindowedReadOnlyProvider::findBytesAsync(const QByteArray &needle, qint64 fromOffset)
@@ -433,21 +556,27 @@ bool WindowedReadOnlyProvider::searchRunning() const
 
 bool WindowedReadOnlyProvider::eventFilter(QObject *watched, QEvent *event)
 {
-    if ((watched == m_editor || watched == m_editor->viewport()) && m_fileSize > 0) {
-        if (event->type() == QEvent::Resize && m_presentation == Presentation::Hex
+    const bool providerSurface = watched == this;
+    const bool editorSurface = m_editor
+        && (watched == m_editor || watched == m_editor->viewport());
+    const bool asciiSurface = m_asciiPreview
+        && (watched == m_asciiPreview || watched == m_asciiPreview->viewport());
+    if ((providerSurface || editorSurface || asciiSurface) && m_fileSize > 0) {
+        if ((providerSurface || editorSurface) && event->type() == QEvent::Resize
+            && m_presentation == Presentation::Hex
             && !m_hexRelayoutPending) {
-            const int desired = calculateHexBytesPerRow();
-            if (desired != m_hexBytesPerRow) {
-                const qint64 topOffset = visibleTopOffset();
-                m_hexRelayoutPending = true;
-                QTimer::singleShot(0, this, [this, desired, topOffset]() {
-                    m_hexRelayoutPending = false;
-                    if (m_path.isEmpty() || m_presentation != Presentation::Hex)
-                        return;
+            const qint64 topOffset = visibleTopOffset();
+            m_hexRelayoutPending = true;
+            QTimer::singleShot(0, this, [this, topOffset]() {
+                m_hexRelayoutPending = false;
+                if (m_path.isEmpty() || m_presentation != Presentation::Hex)
+                    return;
+                const int desired = calculateHexBytesPerRow();
+                if (desired != m_hexBytesPerRow) {
                     m_hexBytesPerRow = desired;
                     reloadWindow(m_globalOffset, 0, topOffset, true);
-                });
-            }
+                }
+            });
         }
         if (event->type() == QEvent::Wheel) {
             const auto *wheel = static_cast<QWheelEvent *>(event);
@@ -476,6 +605,128 @@ bool WindowedReadOnlyProvider::eventFilter(QObject *watched, QEvent *event)
         if (event->type() == QEvent::KeyPress) {
             const auto *key = static_cast<QKeyEvent *>(event);
             const bool extend = key->modifiers().testFlag(Qt::ShiftModifier);
+            if (key->matches(QKeySequence::Copy)) {
+                (void)copySelection();
+                event->accept();
+                return true;
+            }
+            if (key->matches(QKeySequence::SelectAll)) {
+                selectAllSource();
+                event->accept();
+                return true;
+            }
+
+            if (m_presentation == Presentation::Hex && editorSurface) {
+                const qint64 anchorPosition = directScintilla(
+                    m_editor, QsciScintillaBase::SCI_GETANCHOR);
+                const qint64 caretPosition = directScintilla(
+                    m_editor, QsciScintillaBase::SCI_GETCURRENTPOS);
+                const bool hasSelection = anchorPosition != caretPosition;
+                int line = 0;
+                int column = 0;
+                m_editor->lineIndexFromPosition(caretPosition, &line, &column);
+                int nibble = std::clamp(column % 3, 0, 1);
+                qint64 caretByte = hasSelection
+                    ? sourceBoundaryForHexPosition(caretPosition)
+                    : sourceOffsetForProjectedPosition(caretPosition, false);
+                qint64 anchorByte = hasSelection
+                    ? sourceBoundaryForHexPosition(anchorPosition) : caretByte;
+                const int pageRows = std::max(1, static_cast<int>(directScintilla(
+                    m_editor, QsciScintillaBase::SCI_LINESONSCREEN)));
+                const bool navigation = key->key() == Qt::Key_Left
+                    || key->key() == Qt::Key_Right
+                    || key->key() == Qt::Key_Up
+                    || key->key() == Qt::Key_Down
+                    || key->key() == Qt::Key_Home
+                    || key->key() == Qt::Key_End
+                    || key->key() == Qt::Key_PageUp
+                    || key->key() == Qt::Key_PageDown;
+                if (navigation) {
+                    if (extend) {
+                        if (key->modifiers().testFlag(Qt::ControlModifier)
+                            && key->key() == Qt::Key_Home) {
+                            caretByte = 0;
+                        } else if (key->modifiers().testFlag(Qt::ControlModifier)
+                                   && key->key() == Qt::Key_End) {
+                            caretByte = m_fileSize;
+                        } else if (key->key() == Qt::Key_Left) {
+                            caretByte = std::max(0LL, caretByte - 1);
+                        } else if (key->key() == Qt::Key_Right) {
+                            caretByte = std::min(m_fileSize, caretByte + 1);
+                        } else if (key->key() == Qt::Key_Up) {
+                            caretByte = std::max(0LL, caretByte - m_hexBytesPerRow);
+                        } else if (key->key() == Qt::Key_Down) {
+                            caretByte = std::min(m_fileSize,
+                                                 caretByte + m_hexBytesPerRow);
+                        } else if (key->key() == Qt::Key_PageUp) {
+                            caretByte = std::max(
+                                0LL, caretByte - qint64(pageRows) * m_hexBytesPerRow);
+                        } else if (key->key() == Qt::Key_PageDown) {
+                            caretByte = std::min(
+                                m_fileSize,
+                                caretByte + qint64(pageRows) * m_hexBytesPerRow);
+                        } else {
+                            const qint64 rowStart = (caretByte / m_hexBytesPerRow)
+                                                    * m_hexBytesPerRow;
+                            caretByte = key->key() == Qt::Key_Home
+                                ? rowStart
+                                : std::min(m_fileSize,
+                                           rowStart + m_hexBytesPerRow);
+                        }
+                        setHexSourceSelection(anchorByte, caretByte);
+                    } else if (key->modifiers().testFlag(Qt::ControlModifier)
+                               && (key->key() == Qt::Key_Home
+                                   || key->key() == Qt::Key_End)) {
+                        setHexCaretAtSource(key->key() == Qt::Key_Home
+                                               ? 0 : m_fileSize - 1,
+                                           key->key() == Qt::Key_End ? 1 : 0);
+                    } else if (key->key() == Qt::Key_Left
+                               || key->key() == Qt::Key_Right) {
+                        if (hasSelection) {
+                            const qint64 target = key->key() == Qt::Key_Left
+                                ? std::min(anchorByte, caretByte)
+                                : std::max(anchorByte, caretByte);
+                            setHexCaretAtSource(
+                                std::min(target, m_fileSize - 1),
+                                key->key() == Qt::Key_Left ? 0 : 1);
+                        } else if (key->key() == Qt::Key_Right) {
+                            if (nibble == 0)
+                                setHexCaretAtSource(caretByte, 1);
+                            else
+                                setHexCaretAtSource(
+                                    std::min(m_fileSize - 1, caretByte + 1), 0);
+                        } else if (nibble == 1) {
+                            setHexCaretAtSource(caretByte, 0);
+                        } else {
+                            setHexCaretAtSource(std::max(0LL, caretByte - 1), 1);
+                        }
+                    } else {
+                        qint64 target = caretByte;
+                        if (key->key() == Qt::Key_Up)
+                            target -= m_hexBytesPerRow;
+                        else if (key->key() == Qt::Key_Down)
+                            target += m_hexBytesPerRow;
+                        else if (key->key() == Qt::Key_PageUp)
+                            target -= qint64(pageRows) * m_hexBytesPerRow;
+                        else if (key->key() == Qt::Key_PageDown)
+                            target += qint64(pageRows) * m_hexBytesPerRow;
+                        else {
+                            const qint64 rowStart = (caretByte / m_hexBytesPerRow)
+                                                    * m_hexBytesPerRow;
+                            target = key->key() == Qt::Key_Home
+                                ? rowStart
+                                : std::min(m_fileSize - 1,
+                                           rowStart + m_hexBytesPerRow - 1);
+                            nibble = key->key() == Qt::Key_End ? 1 : 0;
+                        }
+                        setHexCaretAtSource(
+                            std::clamp(target, 0LL, m_fileSize - 1), nibble);
+                    }
+                    event->accept();
+                    return true;
+                }
+            }
+
             if (key->key() == Qt::Key_PageDown || key->key() == Qt::Key_PageUp) {
                 if (extend)
                     beginVirtualSelection();
@@ -486,6 +737,19 @@ bool WindowedReadOnlyProvider::eventFilter(QObject *watched, QEvent *event)
                 scrollByLines(key->key() == Qt::Key_PageDown ? pageLines : -pageLines);
                 if (extend)
                     updateVirtualSelection(visibleTopOffset());
+                event->accept();
+                return true;
+            }
+
+            if (key->matches(QKeySequence::Cut)
+                || key->matches(QKeySequence::Paste)
+                || key->key() == Qt::Key_Delete
+                || key->key() == Qt::Key_Backspace
+                || key->key() == Qt::Key_Insert
+                || (!key->text().isEmpty()
+                    && !(key->modifiers()
+                         & (Qt::ControlModifier | Qt::AltModifier
+                            | Qt::MetaModifier)))) {
                 event->accept();
                 return true;
             }
@@ -563,30 +827,58 @@ void WindowedReadOnlyProvider::reloadWindow(qint64 anchorOffset, qint64 selectio
     else
         projection = source;
 
+    m_windowStart = start;
+    m_windowEnd = end;
     m_editor->setReadOnly(false);
-    m_editor->setText(QString::fromUtf8(projection));
+    m_editor->setText(m_presentation == Presentation::Hex
+                          ? QString::fromLatin1(projection)
+                          : QString::fromUtf8(projection));
     m_editor->setReadOnly(true);
     m_editor->SendScintilla(QsciScintillaBase::SCI_SETVSCROLLBAR, 0UL);
     m_editor->SendScintilla(QsciScintillaBase::SCI_SETSCROLLWIDTH, 1UL);
     m_editor->SendScintilla(QsciScintillaBase::SCI_SETSCROLLWIDTHTRACKING, 1UL);
-    m_windowStart = start;
-    m_windowEnd = end;
+    if (m_presentation == Presentation::Hex) {
+        populateAsciiProjection(source);
+        m_asciiPreview->show();
+    } else {
+        m_asciiPreview->hide();
+    }
+    configureProjectionMargin();
     m_globalOffset = anchorOffset;
     m_updatingScrollBar = true;
     m_globalScrollBar->setValue(sliderForOffset(anchorOffset));
     m_updatingScrollBar = false;
     selectProjectedBytes(anchorOffset, selectionBytes);
     if (requestedTopOffset >= 0) {
-        const int topLine = projectedLineForSourceOffset(requestedTopOffset);
-        directScintilla(m_editor, QsciScintillaBase::SCI_SETFIRSTVISIBLELINE,
-                        static_cast<ScintillaUnsigned>(std::max(0, topLine)));
+        const qint64 topPosition = projectedPositionForSourceOffset(requestedTopOffset);
+        directScintilla(m_editor, QsciScintillaBase::SCI_GOTOPOS,
+                        static_cast<ScintillaUnsigned>(std::max<qint64>(0, topPosition)));
+        directScintilla(m_editor, QsciScintillaBase::SCI_SCROLLCARET);
+        const int caretY = static_cast<int>(directScintilla(
+            m_editor, QsciScintillaBase::SCI_POINTYFROMPOSITION, 0,
+            static_cast<ScintillaSigned>(std::max<qint64>(0, topPosition))));
+        const int docLine = static_cast<int>(directScintilla(
+            m_editor, QsciScintillaBase::SCI_LINEFROMPOSITION,
+            static_cast<ScintillaUnsigned>(std::max<qint64>(0, topPosition))));
+        const int lineHeight = std::max(1, static_cast<int>(directScintilla(
+            m_editor, QsciScintillaBase::SCI_TEXTHEIGHT,
+            static_cast<ScintillaUnsigned>(std::max(0, docLine)))));
+        if (caretY > 0) {
+            directScintilla(m_editor, QsciScintillaBase::SCI_LINESCROLL, 0,
+                            static_cast<ScintillaSigned>(caretY / lineHeight));
+        }
     }
+    if (anchorOffset >= m_fileSize - 1)
+        scrollProjectionToEnd();
     if (preserveHorizontal) {
         directScintilla(m_editor, QsciScintillaBase::SCI_SETXOFFSET,
-                        static_cast<ScintillaUnsigned>(std::max(0, horizontalOffset)));
+                        static_cast<ScintillaUnsigned>(
+                            m_presentation == Presentation::Hex
+                                ? 0 : std::max(0, horizontalOffset)));
     }
     if (m_selectionAnchor >= 0 && m_selectionCaret >= 0)
         applyVirtualSelection();
+    syncAsciiScrollFromHex();
     emit windowReady(start, end, anchorOffset);
 }
 
@@ -597,11 +889,9 @@ void WindowedReadOnlyProvider::scrollByLines(int lineDelta)
 
     auto firstVisible = static_cast<int>(directScintilla(
         m_editor, QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
-    auto lineCount = static_cast<int>(directScintilla(
-        m_editor, QsciScintillaBase::SCI_GETLINECOUNT));
     const int linesOnScreen = std::max(1, static_cast<int>(directScintilla(
         m_editor, QsciScintillaBase::SCI_LINESONSCREEN)));
-    int lastFirst = std::max(0, lineCount - linesOnScreen);
+    int lastFirst = std::max(0, projectedDisplayLineCount() - linesOnScreen);
 
     const bool needsForwardWindow = lineDelta > 0
         && firstVisible + lineDelta > lastFirst && m_windowEnd < m_fileSize;
@@ -612,18 +902,20 @@ void WindowedReadOnlyProvider::scrollByLines(int lineDelta)
         reloadWindow(preservedTop, 0, preservedTop, true);
         firstVisible = static_cast<int>(directScintilla(
             m_editor, QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
-        lineCount = static_cast<int>(directScintilla(
-            m_editor, QsciScintillaBase::SCI_GETLINECOUNT));
-        lastFirst = std::max(0, lineCount - linesOnScreen);
+        lastFirst = std::max(0, projectedDisplayLineCount() - linesOnScreen);
     }
 
     const int targetFirst = std::clamp(firstVisible + lineDelta, 0, lastFirst);
     directScintilla(m_editor, QsciScintillaBase::SCI_LINESCROLL, 0,
                     static_cast<ScintillaSigned>(targetFirst - firstVisible));
-    m_globalOffset = sourceOffsetForProjectedLine(targetFirst);
+    m_globalOffset = visibleTopOffset();
     m_updatingScrollBar = true;
-    m_globalScrollBar->setValue(sliderForOffset(m_globalOffset));
+    if (m_windowEnd == m_fileSize && targetFirst >= lastFirst)
+        m_globalScrollBar->setValue(m_globalScrollBar->maximum());
+    else
+        m_globalScrollBar->setValue(sliderForOffset(m_globalOffset));
     m_updatingScrollBar = false;
+    syncAsciiScrollFromHex();
 }
 
 void WindowedReadOnlyProvider::beginVirtualSelection()
@@ -634,8 +926,13 @@ void WindowedReadOnlyProvider::beginVirtualSelection()
         m_editor, QsciScintillaBase::SCI_GETANCHOR);
     const qint64 caretPosition = directScintilla(
         m_editor, QsciScintillaBase::SCI_GETCURRENTPOS);
-    m_selectionAnchor = sourceOffsetForProjectedPosition(anchorPosition, false);
-    m_selectionCaret = sourceOffsetForProjectedPosition(caretPosition, true);
+    if (anchorPosition == caretPosition) {
+        m_selectionAnchor = sourceOffsetForProjectedPosition(anchorPosition, false);
+        m_selectionCaret = m_selectionAnchor;
+    } else {
+        m_selectionAnchor = sourceOffsetForProjectedPosition(anchorPosition, true);
+        m_selectionCaret = sourceOffsetForProjectedPosition(caretPosition, true);
+    }
 }
 
 void WindowedReadOnlyProvider::updateVirtualSelection(qint64 caretOffset)
@@ -666,6 +963,107 @@ void WindowedReadOnlyProvider::applyVirtualSelection()
     directScintilla(m_editor, QsciScintillaBase::SCI_SETSEL,
                     static_cast<ScintillaUnsigned>(forward ? startPosition : endPosition),
                     static_cast<ScintillaSigned>(forward ? endPosition : startPosition));
+    if (m_presentation == Presentation::Hex && m_asciiPreview) {
+        QTextCursor cursor(m_asciiPreview->document());
+        cursor.setPosition(asciiPositionForSourceOffset(
+            forward ? visibleLow : visibleHigh));
+        cursor.setPosition(asciiPositionForSourceOffset(
+            forward ? visibleHigh : visibleLow), QTextCursor::KeepAnchor);
+        m_syncingAsciiSelection = true;
+        m_asciiPreview->setTextCursor(cursor);
+        m_syncingAsciiSelection = false;
+    }
+}
+
+qint64 WindowedReadOnlyProvider::sourceOffsetAtViewportY(int y) const
+{
+    if (m_path.isEmpty() || !m_editor || !m_editor->viewport())
+        return -1;
+    const qint64 position = directScintilla(
+        m_editor, QsciScintillaBase::SCI_POSITIONFROMPOINTCLOSE,
+        static_cast<ScintillaUnsigned>(
+            m_presentation == Presentation::Hex
+                ? std::max(2, m_editor->marginWidth(0) + 2) : 2),
+        static_cast<ScintillaSigned>(std::max(0, y)));
+    if (position < 0)
+        return -1;
+    return sourceOffsetForProjectedPosition(position, false);
+}
+
+int WindowedReadOnlyProvider::projectedDisplayLineCount() const
+{
+    if (!m_editor)
+        return 0;
+    const int documentLines = std::max(1, static_cast<int>(directScintilla(
+        m_editor, QsciScintillaBase::SCI_GETLINECOUNT)));
+    const int lastDocumentLine = documentLines - 1;
+    const int firstVisibleForLast = static_cast<int>(directScintilla(
+        m_editor, QsciScintillaBase::SCI_VISIBLEFROMDOCLINE,
+        static_cast<ScintillaUnsigned>(lastDocumentLine)));
+    const int wrappedCount = std::max(1, static_cast<int>(directScintilla(
+        m_editor, QsciScintillaBase::SCI_WRAPCOUNT,
+        static_cast<ScintillaUnsigned>(lastDocumentLine))));
+    return std::max(documentLines, firstVisibleForLast + wrappedCount);
+}
+
+void WindowedReadOnlyProvider::scrollProjectionToEnd()
+{
+    if (!m_editor)
+        return;
+    const int linesOnScreen = std::max(1, static_cast<int>(directScintilla(
+        m_editor, QsciScintillaBase::SCI_LINESONSCREEN)));
+    const int lastFirst = std::max(0, projectedDisplayLineCount() - linesOnScreen);
+    directScintilla(m_editor, QsciScintillaBase::SCI_SETFIRSTVISIBLELINE,
+                    static_cast<ScintillaUnsigned>(lastFirst));
+    syncAsciiScrollFromHex();
+}
+
+void WindowedReadOnlyProvider::configureProjectionMargin()
+{
+    if (!m_editor)
+        return;
+    if (m_presentation == Presentation::Hex) {
+        m_editor->setMarginLineNumbers(0, false);
+        m_editor->setMarginType(0, QsciScintilla::TextMargin);
+        const int addressDigits = std::max(
+            8, static_cast<int>(QString::number(
+                std::max<qint64>(0, m_fileSize - 1), 16).size()));
+        m_editor->setMarginWidth(0, QString(addressDigits + 2, QLatin1Char('0')));
+        const int lines = std::max(0, static_cast<int>(directScintilla(
+            m_editor, QsciScintillaBase::SCI_GETLINECOUNT)));
+        for (int line = 0; line < lines; ++line) {
+            const QString address = QString::number(
+                std::clamp(m_windowStart + qint64(line) * m_hexBytesPerRow,
+                           0LL, m_fileSize), 16)
+                                        .rightJustified(addressDigits, QLatin1Char('0'))
+                                        .toUpper();
+            m_editor->setMarginText(line, address, 0);
+        }
+        return;
+    }
+
+    // A windowed preview cannot claim local Scintilla line numbers are global
+    // file line numbers. Until a full LineIndex is available, show exact source
+    // byte offsets in the gutter instead of hiding the navigation landmark or
+    // restarting misleading line numbers at 1 after every remap.
+    const int addressDigits = std::max(
+        8, static_cast<int>(QString::number(
+                                std::max<qint64>(0, m_fileSize - 1), 16).size()));
+    m_editor->setMarginLineNumbers(0, false);
+    m_editor->setMarginType(0, QsciScintilla::TextMargin);
+    m_editor->setMarginWidth(0, QString(addressDigits + 2, QLatin1Char('0')));
+    const int lines = std::max(0, static_cast<int>(directScintilla(
+        m_editor, QsciScintillaBase::SCI_GETLINECOUNT)));
+    for (int line = 0; line < lines; ++line) {
+        const qint64 local = directScintilla(
+            m_editor, QsciScintillaBase::SCI_POSITIONFROMLINE,
+            static_cast<ScintillaUnsigned>(line));
+        const QString address = QString::number(
+            std::clamp(m_windowStart + std::max<qint64>(0, local), 0LL, m_fileSize), 16)
+                                    .rightJustified(addressDigits, QLatin1Char('0'))
+                                    .toUpper();
+        m_editor->setMarginText(line, address, 0);
+    }
 }
 
 qint64 WindowedReadOnlyProvider::sourceOffsetForProjectedLine(int line) const
@@ -675,9 +1073,15 @@ qint64 WindowedReadOnlyProvider::sourceOffsetForProjectedLine(int line) const
     line = std::max(0, line);
     if (m_presentation == Presentation::Hex)
         return clampOffset(m_windowStart + qint64(line) * m_hexBytesPerRow, m_fileSize);
+    int documentLine = line;
+    if (m_wordWrap) {
+        documentLine = static_cast<int>(directScintilla(
+            m_editor, QsciScintillaBase::SCI_DOCLINEFROMVISIBLE,
+            static_cast<ScintillaUnsigned>(line)));
+    }
     const qint64 localPosition = directScintilla(
         m_editor, QsciScintillaBase::SCI_POSITIONFROMLINE,
-        static_cast<ScintillaUnsigned>(line));
+        static_cast<ScintillaUnsigned>(std::max(0, documentLine)));
     return clampOffset(m_windowStart + std::max(0LL, localPosition), m_fileSize);
 }
 
@@ -697,25 +1101,13 @@ qint64 WindowedReadOnlyProvider::sourceOffsetForProjectedPosition(
         m_editor, QsciScintillaBase::SCI_POSITIONFROMLINE,
         static_cast<ScintillaUnsigned>(std::max(0, line)));
     const qint64 column = std::max(0LL, position - lineStart);
-    const int groupSpaces = (m_hexBytesPerRow - 1) / 4;
-    const qint64 asciiStart = 20 + 3 * m_hexBytesPerRow + groupSpaces;
-    qint64 byteInRow = 0;
-    if (column >= asciiStart) {
-        byteInRow = std::min<qint64>(m_hexBytesPerRow,
-                                     column - asciiStart + (endBoundary ? 1 : 0));
-    } else if (column > 18) {
-        for (int candidate = 0; candidate < m_hexBytesPerRow; ++candidate) {
-            const qint64 byteColumn = 18 + candidate * 3 + candidate / 4;
-            if (column <= byteColumn + (endBoundary ? 2 : 1)) {
-                byteInRow = candidate + (endBoundary ? 1 : 0);
-                break;
-            }
-            byteInRow = candidate + 1;
-        }
-    }
+    qint64 byteInRow = endBoundary ? (column + 2) / 3 : column / 3;
+    if (!endBoundary && column % 3 == 2)
+        ++byteInRow;
+    byteInRow = std::clamp(byteInRow, 0LL, qint64(m_hexBytesPerRow));
     return std::clamp(m_windowStart + qint64(std::max(0, line)) * m_hexBytesPerRow
                           + byteInRow,
-                      0LL, m_fileSize);
+                      m_windowStart, std::min(m_fileSize, m_windowEnd));
 }
 
 int WindowedReadOnlyProvider::projectedLineForSourceOffset(qint64 offset) const
@@ -735,32 +1127,35 @@ qint64 WindowedReadOnlyProvider::projectedPositionForSourceOffset(qint64 offset)
                                           std::max(0LL, m_windowEnd - m_windowStart));
     if (m_presentation == Presentation::Text)
         return localOffset;
+    if (localOffset >= m_windowEnd - m_windowStart)
+        return directScintilla(m_editor, QsciScintillaBase::SCI_GETLENGTH);
     const qint64 row = localOffset / m_hexBytesPerRow;
     const qint64 column = localOffset % m_hexBytesPerRow;
-    return row * hexProjectedRowStride() + 18 + column * 3 + column / 4;
+    const qint64 lineStart = directScintilla(
+        m_editor, QsciScintillaBase::SCI_POSITIONFROMLINE,
+        static_cast<ScintillaUnsigned>(row));
+    return std::max<qint64>(0, lineStart) + column * 3;
 }
 
 int WindowedReadOnlyProvider::calculateHexBytesPerRow() const
 {
     if (!m_editor || !m_editor->viewport())
         return 16;
-    const int glyphWidth = std::max(1, QFontMetrics(m_editor->font()).horizontalAdvance(QLatin1Char('0')));
-    const int availableColumns = std::max(1, (m_editor->viewport()->width() - 12) / glyphWidth);
-    int best = 8;
-    for (int candidate = 8; candidate <= 64; candidate += 4) {
-        const int groupSpaces = (candidate - 1) / 4;
-        const int requiredColumns = 21 + 4 * candidate + groupSpaces;
-        if (requiredColumns > availableColumns)
-            break;
-        best = candidate;
+    const int width = std::max(1, this->width()
+        - (m_globalScrollBar ? m_globalScrollBar->sizeHint().width() : 0));
+    const int glyphWidth = std::max(
+        7, QFontMetrics(m_editor->font()).horizontalAdvance(QLatin1Char('0')));
+    const int addressDigits = std::max(
+        8, static_cast<int>(QString::number(
+            std::max<qint64>(0, m_fileSize - 1), 16).size()));
+    const int addressWidth = glyphWidth * (addressDigits + 2) + 16;
+    for (int candidate = 64; candidate >= 8; candidate -= 4) {
+        const int required = addressWidth
+            + glyphWidth * (candidate * 3 + candidate + 12) + 52;
+        if (required <= width)
+            return candidate;
     }
-    return best;
-}
-
-int WindowedReadOnlyProvider::hexProjectedRowStride() const
-{
-    const int groupSpaces = (m_hexBytesPerRow - 1) / 4;
-    return 22 + 4 * m_hexBytesPerRow + groupSpaces;
+    return 8;
 }
 
 qint64 WindowedReadOnlyProvider::offsetForSlider(int value) const
@@ -782,31 +1177,21 @@ int WindowedReadOnlyProvider::sliderForOffset(qint64 offset) const
 QByteArray WindowedReadOnlyProvider::formatHexWindow(const uchar *data, qsizetype length,
                                                    qint64 absoluteStart) const
 {
+    Q_UNUSED(absoluteStart);
     static constexpr char digits[] = "0123456789ABCDEF";
     QByteArray result;
-    result.reserve((length / m_hexBytesPerRow + 1) * hexProjectedRowStride());
+    result.reserve(length * 3 + length / m_hexBytesPerRow + 1);
     for (qsizetype row = 0; row < length; row += m_hexBytesPerRow) {
-        result += QByteArray::number(absoluteStart + row, 16).rightJustified(16, '0').toUpper();
-        result += "  ";
         const qsizetype count = std::min<qsizetype>(m_hexBytesPerRow, length - row);
-        for (qsizetype column = 0; column < m_hexBytesPerRow; ++column) {
-            if (column < count) {
-                const uchar byte = data[row + column];
-                result += digits[byte >> 4];
-                result += digits[byte & 0x0f];
-                result += ' ';
-            } else {
-                result += "   ";
-            }
-            if ((column + 1) % 4 == 0 && column + 1 < m_hexBytesPerRow)
-                result += ' ';
-        }
-        result += " |";
         for (qsizetype column = 0; column < count; ++column) {
+            if (column > 0)
+                result += ' ';
             const uchar byte = data[row + column];
-            result += byte >= 32 && byte < 127 ? char(byte) : '.';
+            result += digits[byte >> 4];
+            result += digits[byte & 0x0f];
         }
-        result += "|\n";
+        if (row + count < length)
+            result += '\n';
     }
     return result;
 }
@@ -818,15 +1203,181 @@ void WindowedReadOnlyProvider::selectProjectedBytes(qint64 absoluteOffset, qint6
     qint64 localStart = absoluteOffset - m_windowStart;
     qint64 localEnd = localStart + std::max(0LL, selectionBytes);
     if (m_presentation == Presentation::Hex) {
-        const qint64 row = localStart / m_hexBytesPerRow;
-        const qint64 column = localStart % m_hexBytesPerRow;
-        localStart = row * hexProjectedRowStride() + 18 + column * 3 + column / 4;
-        localEnd = localStart + (selectionBytes > 0 ? 2 : 0);
+        localStart = projectedPositionForSourceOffset(absoluteOffset);
+        localEnd = projectedPositionForSourceOffset(
+            std::min(m_fileSize, absoluteOffset + std::max(0LL, selectionBytes)));
     }
     directScintilla(m_editor, QsciScintillaBase::SCI_SETSEL,
                     static_cast<ScintillaUnsigned>(localStart),
                     static_cast<ScintillaSigned>(localEnd));
     directScintilla(m_editor, QsciScintillaBase::SCI_SCROLLCARET);
+    if (m_presentation == Presentation::Hex && m_asciiPreview) {
+        QTextCursor cursor(m_asciiPreview->document());
+        cursor.setPosition(asciiPositionForSourceOffset(absoluteOffset));
+        if (selectionBytes > 0) {
+            cursor.setPosition(asciiPositionForSourceOffset(
+                std::min(m_fileSize, absoluteOffset + selectionBytes)),
+                QTextCursor::KeepAnchor);
+        }
+        m_syncingAsciiSelection = true;
+        m_asciiPreview->setTextCursor(cursor);
+        m_syncingAsciiSelection = false;
+    }
+}
+
+void WindowedReadOnlyProvider::populateAsciiProjection(const QByteArray &source)
+{
+    if (!m_asciiPreview)
+        return;
+    QString ascii;
+    ascii.reserve(source.size() + source.size() / std::max(1, m_hexBytesPerRow));
+    for (qsizetype row = 0; row < source.size(); row += m_hexBytesPerRow) {
+        if (row > 0)
+            ascii.append(QLatin1Char('\n'));
+        const qsizetype count = std::min<qsizetype>(m_hexBytesPerRow,
+                                                     source.size() - row);
+        for (qsizetype column = 0; column < count; ++column) {
+            const uchar byte = uchar(source.at(row + column));
+            ascii.append(byte >= 0x20 && byte <= 0x7e
+                             ? QChar(byte) : QLatin1Char('.'));
+        }
+    }
+    m_syncingAsciiSelection = true;
+    m_asciiPreview->setPlainText(ascii);
+    m_syncingAsciiSelection = false;
+}
+
+qint64 WindowedReadOnlyProvider::sourceOffsetForAsciiPosition(
+    int position, bool endBoundary) const
+{
+    Q_UNUSED(endBoundary);
+    if (!m_asciiPreview)
+        return m_windowStart;
+    const QTextBlock block = m_asciiPreview->document()->findBlock(
+        std::max(0, position));
+    if (!block.isValid())
+        return m_windowEnd;
+    const qint64 column = std::clamp<qint64>(
+        qint64(position - block.position()), 0, block.text().size());
+    return std::clamp(
+        m_windowStart + qint64(block.blockNumber()) * m_hexBytesPerRow + column,
+        m_windowStart, m_windowEnd);
+}
+
+int WindowedReadOnlyProvider::asciiPositionForSourceOffset(qint64 offset) const
+{
+    if (!m_asciiPreview)
+        return 0;
+    const qint64 local = std::clamp(offset - m_windowStart, 0LL,
+                                    std::max(0LL, m_windowEnd - m_windowStart));
+    if (local >= m_windowEnd - m_windowStart)
+        return std::max(0, m_asciiPreview->document()->characterCount() - 1);
+    const QTextBlock block = m_asciiPreview->document()->findBlockByNumber(
+        int(local / m_hexBytesPerRow));
+    if (!block.isValid())
+        return std::max(0, m_asciiPreview->document()->characterCount() - 1);
+    return std::min(block.position() + int(local % m_hexBytesPerRow),
+                    block.position() + int(block.text().size()));
+}
+
+qint64 WindowedReadOnlyProvider::sourceBoundaryForHexPosition(qint64 position) const
+{
+    return sourceOffsetForProjectedPosition(position, true);
+}
+
+void WindowedReadOnlyProvider::syncAsciiScrollFromHex()
+{
+    if (m_presentation != Presentation::Hex || !m_asciiPreview)
+        return;
+    const int first = static_cast<int>(directScintilla(
+        m_editor, QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
+    QSignalBlocker blocker(m_asciiPreview->verticalScrollBar());
+    m_asciiPreview->verticalScrollBar()->setValue(first);
+}
+
+void WindowedReadOnlyProvider::syncAsciiSelectionFromHex()
+{
+    if (m_presentation != Presentation::Hex || !m_asciiPreview
+        || m_syncingHexSelection || m_syncingAsciiSelection) {
+        return;
+    }
+    const qint64 anchorPosition = directScintilla(
+        m_editor, QsciScintillaBase::SCI_GETANCHOR);
+    const qint64 caretPosition = directScintilla(
+        m_editor, QsciScintillaBase::SCI_GETCURRENTPOS);
+    const bool selected = anchorPosition != caretPosition;
+    const qint64 anchor = selected
+        ? sourceBoundaryForHexPosition(anchorPosition)
+        : sourceOffsetForProjectedPosition(anchorPosition, false);
+    const qint64 caret = selected
+        ? sourceBoundaryForHexPosition(caretPosition) : anchor;
+    clearVirtualSelection();
+    QTextCursor cursor(m_asciiPreview->document());
+    cursor.setPosition(asciiPositionForSourceOffset(anchor));
+    cursor.setPosition(asciiPositionForSourceOffset(caret), QTextCursor::KeepAnchor);
+    m_syncingAsciiSelection = true;
+    m_asciiPreview->setTextCursor(cursor);
+    m_syncingAsciiSelection = false;
+}
+
+void WindowedReadOnlyProvider::syncHexSelectionFromAscii()
+{
+    if (m_presentation != Presentation::Hex || !m_asciiPreview
+        || m_syncingAsciiSelection || m_syncingHexSelection) {
+        return;
+    }
+    const QTextCursor cursor = m_asciiPreview->textCursor();
+    const qint64 anchor = sourceOffsetForAsciiPosition(cursor.anchor(), false);
+    const qint64 caret = sourceOffsetForAsciiPosition(cursor.position(), true);
+    clearVirtualSelection();
+    const qint64 anchorPosition = projectedPositionForSourceOffset(anchor);
+    const qint64 caretPosition = projectedPositionForSourceOffset(caret);
+    m_syncingHexSelection = true;
+    directScintilla(m_editor, QsciScintillaBase::SCI_SETSEL,
+                    static_cast<ScintillaUnsigned>(anchorPosition),
+                    static_cast<ScintillaSigned>(caretPosition));
+    m_syncingHexSelection = false;
+}
+
+void WindowedReadOnlyProvider::setHexCaretAtSource(qint64 offset, int nibble)
+{
+    if (m_fileSize <= 0)
+        return;
+    offset = std::clamp(offset, 0LL, m_fileSize - 1);
+    if (offset < m_windowStart || offset >= m_windowEnd)
+        reloadWindow(offset, 0);
+    qint64 position = projectedPositionForSourceOffset(offset);
+    position += std::clamp(nibble, 0, 1);
+    clearVirtualSelection();
+    m_syncingHexSelection = true;
+    directScintilla(m_editor, QsciScintillaBase::SCI_GOTOPOS,
+                    static_cast<ScintillaUnsigned>(position));
+    m_syncingHexSelection = false;
+    syncAsciiSelectionFromHex();
+}
+
+void WindowedReadOnlyProvider::setHexSourceSelection(qint64 anchor, qint64 caret)
+{
+    anchor = std::clamp(anchor, 0LL, m_fileSize);
+    caret = std::clamp(caret, 0LL, m_fileSize);
+    if (anchor < m_windowStart || anchor > m_windowEnd
+        || caret < m_windowStart || caret > m_windowEnd) {
+        m_selectionAnchor = anchor;
+        m_selectionCaret = caret;
+        const qint64 display = caret >= m_fileSize ? m_fileSize - 1 : caret;
+        reloadWindow(std::max<qint64>(0, display), 0);
+        applyVirtualSelection();
+        return;
+    }
+    clearVirtualSelection();
+    m_syncingHexSelection = true;
+    directScintilla(m_editor, QsciScintillaBase::SCI_SETSEL,
+                    static_cast<ScintillaUnsigned>(
+                        projectedPositionForSourceOffset(anchor)),
+                    static_cast<ScintillaSigned>(
+                        projectedPositionForSourceOffset(caret)));
+    m_syncingHexSelection = false;
+    syncAsciiSelectionFromHex();
 }
 
 LargeFileVerticalSlice::LargeFileVerticalSlice(QWidget *parent)

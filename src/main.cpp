@@ -68,14 +68,16 @@ int main(int argc, char *argv[])
     //    此时用户已看到标题栏和空客户区（不会以为启动失败），状态栏随后显示
     //    "正在恢复会话 0/N" 提供明确进度反馈。
     // ====================================================================
-    QTimer::singleShot(30, &w, &MainWindow::deferredRestoreSession);
-
-    // 显示后再处理外部文件：确保窗口可见且默认标签已初始化
+    // Explicit files are the user's current intent. Open them before session
+    // restoration so an empty saved session cannot create an encrypted draft
+    // (and prompt for a security identity) ahead of an ordinary plain file.
     if (!files.isEmpty()) {
-        QTimer::singleShot(50, [&w, files]() {
+        QTimer::singleShot(30, [&w, files]() {
             w.openFilesFromExternal(files);
         });
     }
+    QTimer::singleShot(files.isEmpty() ? 30 : 60,
+                       &w, &MainWindow::deferredRestoreSession);
 
     return app.exec();
 }

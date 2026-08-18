@@ -28,6 +28,9 @@
 2. **安全 Note 不使用第二套编辑器。** 解锁后的 Text/Binary payload 进入与普通文件相同的 Document、EditorProvider、搜索、撤销、主题、菜单和状态栏路径；差异只存在于打开前的解锁与保存后的密文持久化。
 3. **账户不是拼接的保险箱。** 账户管理是与文档并列的中央工作区，共享身份、会话、恢复和视觉系统，但使用适合账号条目的列表/详情交互，不伪装成文本文件。
 4. **日常操作不要求理解加密。** 新建默认安全；打开只有一个入口；保存保持当前类型；只有“另存为”承担安全文档与普通文件之间的显式转换。
+5. **文件大小不产生第二套编辑器。** S1/S2/S3 Text 共用同一 EditorSurface，B1/B2/B3
+   Binary 共用同一 HexView；Tier 只改变数据源、任务状态和写入 capability。字体、gutter、
+   正文、滚动条位置、选择、搜索高亮、菜单和主题必须一致，S2 晋升/回退不得发生可见换页。
 
 不追求的范围：IDE 调试器、终端、语言服务器、工程构建、Git 工作流、远程开发、插件市场、云同步和浏览器自动填充。参考 VS Code 是为了学习编辑、恢复、搜索和状态反馈，不是把产品扩展成 IDE。
 
@@ -172,6 +175,7 @@ Windowed Provider 是一个无限文档的有限投影，必须模拟普通编�
 | `LF-UX-002` | **Round 9 已关闭。** wheel/pixelDelta 在窗口内逐行移动，只在重叠边界换页 | 小幅滚轮显示相邻行；跨窗口无重复、gap、闪回和大跳 | 五个窗口双向滚轮/触控板、末尾稳定等待与 4.59 GiB 搜索跳转通过；`gui-largefile-200dpi-round9.txt` |
 | `HEX-UX-001` | **Round 3 已关闭核心阻断。** offset/Hex/ASCII 共用 byte selection，B1 编辑/Undo/保存与搜索跳转已动态验收；字节通配符和 Inspector 留作后续增强 | offset、Hex、ASCII、caret、selection、编辑、搜索和保存形成一致模型 | `gui-hex-round3-slice.txt`、`gui-hex-search-final.txt` 与逐字节 round-trip 均通过 |
 | `HEX-UX-002` | **Round 9 已关闭。** B1/B2/B3 均按 viewport 选择完整 4-byte 分组；宽窄重排不裁切首末 nibble，也不继承旧横向偏移 | 依据窗口宽度采用合适 bytes-per-row；窄/宽窗口紧凑可读 | 默认/窄宽截图及实际 200% DPI 编辑—保存—重开、崩溃恢复 4/4 通过；`gui-hex-200dpi-round9.txt` |
+| `TIER-UX-003` | **部分关闭。** Binary 可见契约已统一：B1/B2/B3 均为地址 margin、纯 Hex 网格、独立 ASCII pane 和唯一全局纵向滚动条；内部 Provider 仍不同。Text S1/S2/S3 的几何与模式迁移一致性尚未关闭 | Text 各 Tier 共用 EditorSurface；Binary 各 Tier 共用 HexView 可见契约；只允许 capability/状态文案不同 | `windowedHexUsesUnifiedThreeColumnByteContract`、真实 228MB/4.9GB 样本与 B1 邻接回归通过；Binary 截图 differential 已建立。Text 同内容切片及 S2 Preview→Editable/Fallback 逐帧无几何变化仍待证明 |
 
 除上述已复现项外，下面是必须主动探索的风险。它们不表示已经观察到缺陷，但在关闭对应旅程前必须用动态测试证明不存在：
 

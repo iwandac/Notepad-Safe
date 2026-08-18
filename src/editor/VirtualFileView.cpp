@@ -1432,6 +1432,17 @@ bool VirtualFileView::alignActiveWindowTo(qint64 centerByte, qint64 wBytes) {
         newLen   = vSize - newStart;   // 尾部短一点也没问题
         if (newLen <= 0) { newStart = qMax<qint64>(0, vSize - 1); newLen = (vSize > 0) ? 1 : 0; }
     }
+    // Hex scrolling is expressed in global rows.  The projected window must
+    // therefore start on the same row grid; otherwise margin address 0 is an
+    // arbitrary byte while the outer scrollbar still denotes row N, and the
+    // two visible positions drift after every distant jump.  At EOF keep the
+    // aligned prefix as well (the window may grow by less than one row).
+    const bool windowTouchesEof = (newStart + newLen >= vSize);
+    if (m_viewMode == ViewMode::Hex && m_hexBytesPerRow > 0 && newStart > 0) {
+        newStart = (newStart / m_hexBytesPerRow) * m_hexBytesPerRow;
+        newLen = windowTouchesEof ? (vSize - newStart)
+                                  : qMin(w, vSize - newStart);
+    }
     if (newStart == m_activeWindowStart && newLen == m_activeWindowLen) return false;
     m_activeWindowStart = newStart;
     m_activeWindowLen   = newLen;
@@ -1528,6 +1539,13 @@ void VirtualFileView::connectScrollBarThrottling() {
     // L3：滑块松开 → 精确落点
     connect(vsb, &QScrollBar::sliderReleased, this, &VirtualFileView::onScrollSliderReleasedL3);
     connect(hsb, &QScrollBar::sliderReleased, this, &VirtualFileView::onScrollSliderReleasedL3);
+    // Wheel, keyboard and scrollbar arrow/page operations change value without
+    // emitting sliderMoved. Feed them into the same bounded settle pipeline so
+    // the global thumb and projected bytes can never diverge.
+    connect(vsb, &QScrollBar::valueChanged, this, [this, vsb](int value) {
+        if (!vsb->isSliderDown())
+            onScrollSliderMovedPreviewL1(value);
+    });
 }
 
 void VirtualFileView::onScrollSliderMovedPreviewL1(int /*value*/) {

@@ -6,11 +6,13 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QPlainTextEdit>
 #include <QSaveFile>
 #include <QScrollBar>
 #include <QStyle>
 #include <QStyleOptionSlider>
 #include <QTemporaryDir>
+#include <QTextCursor>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QWidget>
@@ -24,6 +26,18 @@
 
 class S2PromotionSmokeTest final : public QObject {
     Q_OBJECT
+
+    static QString marginText(QsciScintilla *editor, int line)
+    {
+        const long length = editor->SendScintilla(
+            QsciScintillaBase::SCI_MARGINGETTEXT,
+            static_cast<unsigned long>(line), static_cast<void *>(nullptr));
+        QByteArray buffer(qMax<long>(0, length) + 1, '\0');
+        editor->SendScintilla(QsciScintillaBase::SCI_MARGINGETTEXT,
+                              static_cast<unsigned long>(line),
+                              static_cast<void *>(buffer.data()));
+        return QString::fromUtf8(buffer.constData(), qMax<long>(0, length));
+    }
 
     static void dragScrollBar(QScrollBar *bar, qreal targetRatio)
     {
@@ -81,6 +95,143 @@ class S2PromotionSmokeTest final : public QObject {
     }
 
 private slots:
+    void editorSurfaceBaselineMatchesFullAndWindowedProviders()
+    {
+        EditorTab full;
+        WindowedReadOnlyProvider windowed;
+        QsciScintilla *s1 = full.editor();
+        QsciScintilla *s2 = windowed.editor();
+        QVERIFY(s1 && s2);
+
+        QCOMPARE(s2->font().family(), s1->font().family());
+        QCOMPARE(s2->font().pointSizeF(), s1->font().pointSizeF());
+        QCOMPARE(s2->font().fixedPitch(), s1->font().fixedPitch());
+        QCOMPARE(s2->marginWidth(1), s1->marginWidth(1));
+
+        const auto sci = [](QsciScintilla *editor, unsigned int message) {
+            return editor->SendScintilla(message);
+        };
+        QCOMPARE(sci(s2, QsciScintillaBase::SCI_GETCARETWIDTH),
+                 sci(s1, QsciScintillaBase::SCI_GETCARETWIDTH));
+        QCOMPARE(sci(s2, QsciScintillaBase::SCI_GETCARETLINEVISIBLE),
+                 sci(s1, QsciScintillaBase::SCI_GETCARETLINEVISIBLE));
+        QCOMPARE(sci(s2, QsciScintillaBase::SCI_GETCARETLINEBACK),
+                 sci(s1, QsciScintillaBase::SCI_GETCARETLINEBACK));
+        QCOMPARE(sci(s2, QsciScintillaBase::SCI_GETTABWIDTH),
+                 sci(s1, QsciScintillaBase::SCI_GETTABWIDTH));
+        QCOMPARE(sci(s2, QsciScintillaBase::SCI_GETUSETABS),
+                 sci(s1, QsciScintillaBase::SCI_GETUSETABS));
+        QCOMPARE(sci(s2, QsciScintillaBase::SCI_GETINDENTATIONGUIDES),
+                 sci(s1, QsciScintillaBase::SCI_GETINDENTATIONGUIDES));
+        QCOMPARE(sci(s2, QsciScintillaBase::SCI_GETSCROLLWIDTHTRACKING),
+                 sci(s1, QsciScintillaBase::SCI_GETSCROLLWIDTHTRACKING));
+        QCOMPARE(sci(s2, QsciScintillaBase::SCI_GETWRAPVISUALFLAGS),
+                 sci(s1, QsciScintillaBase::SCI_GETWRAPVISUALFLAGS));
+        QCOMPARE(sci(s2, QsciScintillaBase::SCI_GETWRAPINDENTMODE),
+                 sci(s1, QsciScintillaBase::SCI_GETWRAPINDENTMODE));
+    }
+
+    void windowedHexUsesUnifiedThreeColumnByteContract()
+    {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        const QString path = temporary.filePath(QStringLiteral("unified-hex.bin"));
+        QByteArray sourceBytes(4096, '\0');
+        for (int i = 0; i < sourceBytes.size(); ++i)
+            sourceBytes[i] = char(i & 0xff);
+        {
+            QFile source(path);
+            QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(source.write(sourceBytes), qint64(sourceBytes.size()));
+        }
+
+        QWidget window;
+        window.resize(1200, 760);
+        auto *layout = new QVBoxLayout(&window);
+        layout->setContentsMargins(0, 0, 0, 0);
+        auto *provider = new WindowedReadOnlyProvider(&window);
+        layout->addWidget(provider);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        QString error;
+        QVERIFY2(provider->openFile(path,
+                                    WindowedReadOnlyProvider::Presentation::Hex,
+                                    &error), qPrintable(error));
+        auto *hex = provider->editor();
+        auto *ascii = provider->asciiPreview();
+        QVERIFY(hex && ascii && ascii->isVisibleTo(provider));
+        QCOMPARE(provider->visibleVerticalScrollBarCount(), 1);
+        QVERIFY(hex->marginWidth(0) > 0);
+        QCOMPARE(marginText(hex, 0), QStringLiteral("00000000"));
+        QVERIFY(hex->text(0).startsWith(QStringLiteral("00 01 02 03")));
+        QVERIFY(!hex->text(0).contains(QLatin1Char('|')));
+        QVERIFY(!hex->text(0).startsWith(QStringLiteral("00000000")));
+        QCOMPARE(ascii->toPlainText().left(4), QStringLiteral("...."));
+        QVERIFY(hex->geometry().right() <= ascii->geometry().left());
+        QVERIFY(!hex->verticalScrollBar()->isVisibleTo(provider));
+        QVERIFY(!ascii->verticalScrollBar()->isVisibleTo(provider));
+
+        // Hex selection [5, 7) mirrors the same two source bytes in ASCII.
+        hex->setFocus(Qt::OtherFocusReason);
+        hex->setSelection(0, 5 * 3, 0, 7 * 3);
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(), qint64(5), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(), qint64(7), 1000);
+        QCOMPARE(ascii->textCursor().selectionStart(), 5);
+        QCOMPARE(ascii->textCursor().selectionEnd(), 7);
+
+        // ASCII reverse selection [1, 3) mirrors to full Hex byte boundaries.
+        QTextCursor asciiSelection(ascii->document());
+        asciiSelection.setPosition(3);
+        asciiSelection.setPosition(1, QTextCursor::KeepAnchor);
+        ascii->setFocus(Qt::OtherFocusReason);
+        ascii->setTextCursor(asciiSelection);
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(), qint64(1), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(), qint64(3), 1000);
+        QCOMPARE(hex->SendScintilla(QsciScintillaBase::SCI_GETSELECTIONSTART),
+                 hex->positionFromLineIndex(0, 3));
+        QCOMPARE(hex->SendScintilla(QsciScintillaBase::SCI_GETSELECTIONEND),
+                 hex->positionFromLineIndex(0, 9));
+
+        // Copy format follows the focused surface, matching editable B1.
+        provider->goToOffset(65, 1); // ASCII 'A'
+        ascii->setFocus(Qt::OtherFocusReason);
+        QVERIFY(provider->copySelection(&error));
+        QCOMPARE(QGuiApplication::clipboard()->text(), QStringLiteral("A"));
+        hex->setFocus(Qt::OtherFocusReason);
+        QVERIFY(provider->copySelection(&error));
+        QCOMPARE(QGuiApplication::clipboard()->text(), QStringLiteral("41"));
+
+        // Byte-aware horizontal movement never stops on the separator.
+        provider->goToOffset(5);
+        hex->setFocus(Qt::OtherFocusReason);
+        QTest::keyClick(hex, Qt::Key_Right);
+        int line = -1, column = -1;
+        hex->getCursorPosition(&line, &column);
+        QCOMPARE(column, 5 * 3 + 1);
+        QCOMPARE(provider->selectionStartOffset(), qint64(5));
+        QCOMPARE(provider->selectionEndOffset(), qint64(5));
+        QTest::keyClick(hex, Qt::Key_Right);
+        hex->getCursorPosition(&line, &column);
+        QCOMPARE(column, 6 * 3);
+        QTest::keyClick(hex, Qt::Key_Right, Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(), qint64(6), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(), qint64(7), 1000);
+
+        QTest::keyClick(hex, Qt::Key_A, Qt::ControlModifier);
+        QCOMPARE(provider->selectionStartOffset(), qint64(0));
+        QCOMPARE(provider->selectionEndOffset(), qint64(sourceBytes.size()));
+
+        const int wideBytesPerRow = provider->hexBytesPerRow();
+        window.resize(700, 760);
+        QTRY_VERIFY_WITH_TIMEOUT(provider->hexBytesPerRow() < wideBytesPerRow, 2000);
+        QVERIFY(provider->hexBytesPerRow() >= 8);
+        QCOMPARE(provider->sourceBytes(0, sourceBytes.size()), sourceBytes);
+        const QString screenshot = QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-windowed-hex-unified.png"));
+        QVERIFY(window.grab().save(screenshot));
+        window.close();
+    }
+
     void mmapPreviewPromotesToEditableScintilla()
     {
         QTemporaryDir temporary;
@@ -274,6 +425,67 @@ private slots:
 
         const QString screenshot = QDir(QCoreApplication::applicationDirPath())
             .filePath(QStringLiteral("gui-s2-long-line-horizontal.png"));
+        QVERIFY(window.grab().save(screenshot));
+        window.close();
+    }
+
+    void windowedTextWrapReachesPhysicalEofAndKeepsGutter()
+    {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        const QString path = temporary.filePath(QStringLiteral("wrapped-eof.log"));
+        QSaveFile source(path);
+        QVERIFY(source.open(QIODevice::WriteOnly));
+        QByteArray line(4096, 'w');
+        line += '\n';
+        qint64 written = 0;
+        while (written + line.size() < 6LL * 1024 * 1024) {
+            QCOMPARE(source.write(line), qint64(line.size()));
+            written += line.size();
+        }
+        const QByteArray tail("FINAL_PHYSICAL_EOF_MARKER");
+        QCOMPARE(source.write(tail), qint64(tail.size()));
+        QVERIFY(source.commit());
+
+        QWidget window;
+        window.resize(900, 620);
+        auto *layout = new QVBoxLayout(&window);
+        auto *provider = new WindowedReadOnlyProvider(&window);
+        layout->addWidget(provider);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        QString error;
+        QVERIFY2(provider->openFile(path,
+                                    WindowedReadOnlyProvider::Presentation::Text,
+                                    &error), qPrintable(error));
+        provider->setWordWrap(true);
+        QVERIFY(provider->wordWrap());
+        QVERIFY2(provider->editor()->marginWidth(0) > 0,
+                 "windowed text preview lost its navigation gutter");
+
+        QElapsedTimer dragTimer;
+        dragTimer.start();
+        dragScrollBar(provider->globalScrollBar(), 1.0);
+        QTRY_COMPARE_WITH_TIMEOUT(provider->globalScrollBar()->value(),
+                                  provider->globalScrollBar()->maximum(), 3000);
+        QVERIFY2(dragTimer.elapsed() < 3000,
+                 "word-wrapped global drag stalled the GUI");
+        QCOMPARE(provider->windowEnd(), provider->fileSize());
+        QVERIFY2(provider->fileSize() - provider->visibleBottomOffset() < 8192,
+                 "scrollbar maximum did not put the physical EOF on screen");
+        QVERIFY(provider->editor()->text().contains(QString::fromLatin1(tail)));
+
+        const qint64 topAtEnd = provider->visibleTopOffset();
+        provider->editor()->setFocus();
+        for (int i = 0; i < 64; ++i)
+            QTest::keyClick(provider->editor(), Qt::Key_Down);
+        QApplication::processEvents(QEventLoop::AllEvents, 100);
+        QCOMPARE(provider->visibleTopOffset(), topAtEnd);
+        wheelLinesDown(provider->editor()->viewport(), 8);
+        QCOMPARE(provider->visibleTopOffset(), topAtEnd);
+
+        const QString screenshot = QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-windowed-wrap-physical-eof.png"));
         QVERIFY(window.grab().save(screenshot));
         window.close();
     }
@@ -599,13 +811,22 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(provider->globalOffset() > size * 65 / 100, 3000);
         const qint64 dragged = provider->globalOffset();
         const QString firstLine = provider->editor()->text(0);
-        QVERIFY(firstLine.size() >= 20);
-        bool offsetOk = false;
-        const qint64 renderedStart = firstLine.left(16).toLongLong(&offsetOk, 16);
-        QVERIFY(offsetOk);
-        QCOMPARE(renderedStart, provider->windowStart());
+        QVERIFY(firstLine.size() >= 2);
+        auto *ascii = provider->asciiPreview();
+        QVERIFY(ascii && ascii->isVisibleTo(provider));
+        const int addressDigits = qMax(
+            8, QString::number(size - 1, 16).size());
+        QCOMPARE(marginText(provider->editor(), 0),
+                 QString::number(provider->windowStart(), 16)
+                     .rightJustified(addressDigits, QLatin1Char('0')).toUpper());
         const QByteArray firstByte = provider->sourceBytes(provider->windowStart(), 1).toHex().toUpper();
-        QCOMPARE(firstLine.mid(18, 2).toLatin1(), firstByte);
+        QCOMPARE(firstLine.left(2).toLatin1(), firstByte);
+        const uchar firstValue = uchar(provider->sourceBytes(provider->windowStart(), 1).at(0));
+        QCOMPARE(ascii->toPlainText().left(1),
+                 QString(firstValue >= 0x20 && firstValue <= 0x7e
+                             ? QChar(firstValue) : QLatin1Char('.')));
+        QVERIFY(provider->editor()->geometry().right()
+                <= ascii->geometry().left());
         QTest::qWait(1000);
         QCOMPARE(provider->globalOffset(), dragged);
         QCOMPARE(provider->editor()->text(0), firstLine);
@@ -614,15 +835,40 @@ private slots:
         tab->gotoByteOffset(exactTarget, 1);
         QCOMPARE(provider->globalOffset(), exactTarget);
         const QString exactFirstLine = provider->editor()->text(0);
-        const qint64 exactRenderedStart = exactFirstLine.left(16).toLongLong(&offsetOk, 16);
-        QVERIFY(offsetOk);
-        QCOMPARE(exactRenderedStart, provider->windowStart());
+        QCOMPARE(marginText(provider->editor(), 0),
+                 QString::number(provider->windowStart(), 16)
+                     .rightJustified(addressDigits, QLatin1Char('0')).toUpper());
+        QCOMPARE(exactFirstLine.left(2).toLatin1(),
+                 provider->sourceBytes(provider->windowStart(), 1).toHex().toUpper());
         QVERIFY(provider->windowStart() <= exactTarget);
         QVERIFY(provider->windowEnd() > exactTarget);
 
         const QString screenshot = QDir(QCoreApplication::applicationDirPath())
             .filePath(QStringLiteral("gui-production-s3-dynamic.png"));
         QVERIFY(window.grab().save(screenshot));
+
+        // S3 Hex is read-only but must retain the useful half of an editor:
+        // precise byte selection/copy and full-file navigation. Every keyboard
+        // and command mutation path remains a source-file no-op.
+        const qint64 probe = exactTarget;
+        const QByteArray before = provider->sourceBytes(probe, 32);
+        tab->gotoByteOffset(probe, 4);
+        tab->copy();
+        QCOMPARE(QGuiApplication::clipboard()->text(),
+                 QString::fromLatin1(before.left(4).toHex(' ').toUpper()));
+        QGuiApplication::clipboard()->setText(QStringLiteral("AA BB"));
+        provider->editor()->setFocus(Qt::OtherFocusReason);
+        QTest::keyClicks(provider->editor(), QStringLiteral("FF"));
+        QTest::keyClick(provider->editor(), Qt::Key_Delete);
+        QTest::keyClick(provider->editor(), Qt::Key_Backspace);
+        tab->cut();
+        tab->paste();
+        QCOMPARE(QFileInfo(path).size(), size);
+        QCOMPARE(provider->sourceBytes(probe, 32), before);
+        QTest::keyClick(provider->editor(), Qt::Key_Home, Qt::ControlModifier);
+        QCOMPARE(provider->globalOffset(), qint64(0));
+        QTest::keyClick(provider->editor(), Qt::Key_End, Qt::ControlModifier);
+        QCOMPARE(provider->globalOffset(), size - 1);
         window.close();
     }
 
@@ -660,11 +906,21 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(provider->globalOffset() > size / 2, 3000);
         const qint64 dragged = provider->globalOffset();
         const QString firstLine = provider->editor()->text(0);
-        bool offsetOk = false;
-        QCOMPARE(firstLine.left(16).toLongLong(&offsetOk, 16), provider->windowStart());
-        QVERIFY(offsetOk);
-        QCOMPARE(firstLine.mid(18, 2).toLatin1(),
+        auto *ascii = provider->asciiPreview();
+        QVERIFY(ascii && ascii->isVisibleTo(provider));
+        const int addressDigits = qMax(
+            8, QString::number(size - 1, 16).size());
+        QCOMPARE(marginText(provider->editor(), 0),
+                 QString::number(provider->windowStart(), 16)
+                     .rightJustified(addressDigits, QLatin1Char('0')).toUpper());
+        QCOMPARE(firstLine.left(2).toLatin1(),
                  provider->sourceBytes(provider->windowStart(), 1).toHex().toUpper());
+        const uchar firstValue = uchar(provider->sourceBytes(provider->windowStart(), 1).at(0));
+        QCOMPARE(ascii->toPlainText().left(1),
+                 QString(firstValue >= 0x20 && firstValue <= 0x7e
+                             ? QChar(firstValue) : QLatin1Char('.')));
+        QVERIFY(provider->editor()->geometry().right()
+                <= ascii->geometry().left());
         QTest::qWait(1000);
         QCOMPARE(provider->globalOffset(), dragged);
         QCOMPARE(provider->editor()->text(0), firstLine);
@@ -672,6 +928,26 @@ private slots:
         const QString screenshot = QDir(QCoreApplication::applicationDirPath())
             .filePath(QStringLiteral("gui-production-b2-dynamic.png"));
         QVERIFY(window.grab().save(screenshot));
+
+        const qint64 probe = size * 3 / 5;
+        const QByteArray before = provider->sourceBytes(probe, 32);
+        tab->gotoByteOffset(probe, 4);
+        tab->copy();
+        QCOMPARE(QGuiApplication::clipboard()->text(),
+                 QString::fromLatin1(before.left(4).toHex(' ').toUpper()));
+        QGuiApplication::clipboard()->setText(QStringLiteral("AA BB"));
+        provider->editor()->setFocus(Qt::OtherFocusReason);
+        QTest::keyClicks(provider->editor(), QStringLiteral("FF"));
+        QTest::keyClick(provider->editor(), Qt::Key_Delete);
+        QTest::keyClick(provider->editor(), Qt::Key_Backspace);
+        tab->cut();
+        tab->paste();
+        QCOMPARE(QFileInfo(path).size(), size);
+        QCOMPARE(provider->sourceBytes(probe, 32), before);
+        QTest::keyClick(provider->editor(), Qt::Key_Home, Qt::ControlModifier);
+        QCOMPARE(provider->globalOffset(), qint64(0));
+        QTest::keyClick(provider->editor(), Qt::Key_End, Qt::ControlModifier);
+        QCOMPARE(provider->globalOffset(), size - 1);
         window.close();
     }
 

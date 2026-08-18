@@ -1813,25 +1813,25 @@ void MainWindow::createStatusBar()
     m_statusPos->setObjectName(QStringLiteral("status.position"));
     m_statusPos->setAccessibleName(QStringLiteral("光标位置"));
     m_statusPos->setMinimumWidth(120);
-    statusBar()->addWidget(m_statusPos);
+    statusBar()->addPermanentWidget(m_statusPos);
 
     m_statusEncoding = new QLabel(QStringLiteral("UTF-8"));
     m_statusEncoding->setObjectName(QStringLiteral("status.encoding"));
     m_statusEncoding->setAccessibleName(QStringLiteral("编码与换行符"));
     m_statusEncoding->setMinimumWidth(80);
-    statusBar()->addWidget(m_statusEncoding);
+    statusBar()->addPermanentWidget(m_statusEncoding);
 
     m_statusSyntax = new QLabel(QStringLiteral("纯文本"));
     m_statusSyntax->setObjectName(QStringLiteral("status.context"));
     m_statusSyntax->setAccessibleName(QStringLiteral("文档类型或当前工作区"));
     m_statusSyntax->setMinimumWidth(80);
-    statusBar()->addWidget(m_statusSyntax);
+    statusBar()->addPermanentWidget(m_statusSyntax);
 
     m_statusSize = new QLabel(QStringLiteral("0 B"));
     m_statusSize->setObjectName(QStringLiteral("status.size"));
     m_statusSize->setAccessibleName(QStringLiteral("文档大小"));
     m_statusSize->setMinimumWidth(80);
-    statusBar()->addWidget(m_statusSize);
+    statusBar()->addPermanentWidget(m_statusSize);
 
     m_statusModified = new QLabel(QStringLiteral(""));
     m_statusModified->setObjectName(QStringLiteral("status.modified"));
@@ -3870,7 +3870,7 @@ void MainWindow::syncCommandStates(EditorTab *tab)
     const bool accountsWorkspace = m_workspaceStack && m_accountsPage
                                    && m_workspaceStack->currentWidget() == m_accountsPage;
     if (m_saveAction) {
-        m_saveAction->setEnabled(hasDocument
+        m_saveAction->setEnabled((hasDocument && (tab->isModified() || tab->isUntitled()))
                                  || (accountsWorkspace && m_vaultDock
                                      && m_vaultDock->canSaveActiveEntry()));
     }
@@ -4204,9 +4204,10 @@ void MainWindow::onTabCursorPositionChanged(int line, int index)
 {
     EditorTab *tab = currentTab();
     if (tab && tab->isL2Active() && tab->viewModeL2() == ViewMode::Hex) {
-        const qint64 offset = qMax<qint64>(0, tab->currentByteOffset());
-        m_statusPos->setText(QStringLiteral("偏移: 0x%1")
-            .arg(QString::number(offset, 16).rightJustified(8, QLatin1Char('0')).toUpper()));
+        // Hex uses cursorPositionChanged for both byte movement and OVR/INS
+        // mode changes.  Refresh the complete permanent status contract so
+        // the size/tier/mode segment cannot retain a stale INS/OVR value.
+        updateStatusBar();
         return;
     }
     m_statusPos->setText(QStringLiteral("行: %1, 列: %2").arg(line + 1).arg(index + 1));
@@ -4597,6 +4598,7 @@ struct MainWindow::PendingSessionRestore {
     int currentIndex = 0;   // 已处理到第几个 tab
     bool hasUnsaved = false;
     QString sessionJsonPathToRemove;
+    QPointer<EditorTab> preferredActiveTab;
 };
 
 // ============================================================================
@@ -4612,6 +4614,7 @@ void MainWindow::deferredRestoreSession()
     // 主动 AllEvents 派发一次，确保窗口立刻可见（用户不会"双击后以为没启动"）。
     QApplication::processEvents(QEventLoop::AllEvents);
 
+    QPointer<EditorTab> preferredActiveTab = currentTab();
     SessionData data = m_session->loadSession();
     if (data.tabs.isEmpty()) {
         // 没有会话记录：补一个空 tab（对应原构造函数中的空 tab 兜底）
@@ -4627,6 +4630,7 @@ void MainWindow::deferredRestoreSession()
     m_pendingRestore->currentIndex         = 0;
     m_pendingRestore->hasUnsaved           = false;
     m_pendingRestore->sessionJsonPathToRemove = m_session->sessionFilePath();
+    m_pendingRestore->preferredActiveTab      = preferredActiveTab;
 
     // 立刻给用户看到 "正在恢复会话… 0/M"（StatusBar 永久可见，同时窗口已绘制）
     statusBar()->showMessage(
@@ -4645,8 +4649,13 @@ void MainWindow::restoreNextSessionTab()
 
     // --- 收尾：全部 tab 已处理完 ---
     if (m_pendingRestore->currentIndex >= total) {
-        if (m_pendingRestore->activeTab >= 0 && m_pendingRestore->activeTab < m_tabs->count())
+        if (m_pendingRestore->preferredActiveTab
+            && m_tabs->indexOf(m_pendingRestore->preferredActiveTab) >= 0) {
+            m_tabs->setCurrentWidget(m_pendingRestore->preferredActiveTab);
+        } else if (m_pendingRestore->activeTab >= 0
+                   && m_pendingRestore->activeTab < m_tabs->count()) {
             m_tabs->setCurrentIndex(m_pendingRestore->activeTab);
+        }
 
         if (!m_pendingRestore->sessionJsonPathToRemove.isEmpty())
             QFile::remove(m_pendingRestore->sessionJsonPathToRemove);
@@ -4749,6 +4758,14 @@ void MainWindow::restoreNextSessionTab()
     } else {
         restoreSessionPosition(tab, st);
         m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
+    }
+
+    // Session items are background restoration when the process was launched
+    // for an explicit file. Do not let each restored tab steal the visible
+    // document while the user is already reading or editing it.
+    if (m_pendingRestore->preferredActiveTab
+        && m_tabs->indexOf(m_pendingRestore->preferredActiveTab) >= 0) {
+        m_tabs->setCurrentWidget(m_pendingRestore->preferredActiveTab);
     }
 
     m_pendingRestore->currentIndex++;

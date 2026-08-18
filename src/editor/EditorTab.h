@@ -384,6 +384,7 @@ private:
     void clearL2BridgeBaseline();
     void ensureHexAsciiPreview(QWidget *parent);
     void layoutL2Overlay();
+    void alignHexOverlayToGlobalScroll();
     bool handleHexKeyPress(QKeyEvent *event);
     bool handleHexAsciiKeyPress(QKeyEvent *event);
     bool handleHexInsertModeKey(QKeyEvent *event);
@@ -394,6 +395,7 @@ private:
     void setAsciiCaret(qint64 globalByte);
     void syncAsciiSelectionFromHex();
     void syncHexSelectionFromAscii();
+    void refreshHexAsciiProjectionFromEditor();
 
     // 大文件分块加载：通过 SCI_APPENDTEXT 分块追加 UTF-8 字节，
     // 避免 setText() 一次性重建整个文档导致 UI 卡死
@@ -520,6 +522,9 @@ private:
     bool m_hexOverwriteMode = true;
     bool m_adjustingHexCaret = false;
     bool m_adjustingAsciiCaret = false;
+    bool m_hexMouseSelecting = false;
+    int m_hexWheelAngleRemainder = 0;
+    int m_hexWheelPixelRemainder = 0;
     QVector<QPair<qint64, qint32>> m_l2SearchHighlights;
 
 

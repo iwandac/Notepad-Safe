@@ -100,10 +100,13 @@ void FindReplaceDialog::buildUi()
     // 选项
     auto *optionsLayout = new QHBoxLayout;
     m_regexCheck = new QCheckBox(QStringLiteral("正则表达式"));
+    m_regexCheck->setObjectName(QStringLiteral("regexSearchCheck"));
     m_hexBytesCheck = new QCheckBox(QStringLiteral("十六进制字节"));
     m_hexBytesCheck->setObjectName(QStringLiteral("hexBytesCheck"));
     m_caseCheck = new QCheckBox(QStringLiteral("区分大小写"));
+    m_caseCheck->setObjectName(QStringLiteral("caseSensitiveSearchCheck"));
     m_wordCheck = new QCheckBox(QStringLiteral("整词匹配"));
+    m_wordCheck->setObjectName(QStringLiteral("wholeWordSearchCheck"));
     m_wrapCheck = new QCheckBox(QStringLiteral("循环查找"));
     m_wrapCheck->setObjectName(QStringLiteral("wrapSearchCheck"));
     m_wrapCheck->setChecked(true);

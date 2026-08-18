@@ -98,6 +98,14 @@ private slots:
     // S2/S3 文本搜索不得等待全量 LineIndex；第一个进度必须是扫描进度，
     // 结果位置以 64 位 byte offset 为权威。
     void tc_fr_016_large_search_starts_before_line_index_completes();
+
+    // 正则复选框是查询语义开关：关闭时元字符必须按字面量查找，
+    // 开启时同一输入才按正则表达式解释。
+    void tc_fr_017_regex_toggle_distinguishes_literal_and_regex();
+
+    // 模型驱动试点：一份正则参数契约自动贯穿 Find All 与 Find Next，
+    // 并检查 literal/escaped-regex 等价关系和非法表达式分流。
+    void tc_fr_018_regex_contract_model_runs_gui_variants();
 };
 
 // -------- 构造测试文件：N 行，其中 K 处包含 "__TEST_OLD__" 标记 --------
@@ -1366,6 +1374,180 @@ void SmokeFindReplace::tc_fr_016_large_search_starts_before_line_index_completes
     QVERIFY(dock.grab().save(
         QDir(QCoreApplication::applicationDirPath())
             .filePath(QStringLiteral("gui-search-line-decoration.png"))));
+}
+
+void SmokeFindReplace::tc_fr_017_regex_toggle_distinguishes_literal_and_regex()
+{
+    // "a.b" 是判别语料：literal 只能命中带点文本；regex 还应命中
+    // axb/acb。若 UI 开关未传入领域层或两个分支都直接按 regex 执行，
+    // 第一个断言会立即失败。
+    const QString path = createSmallTestFile(
+        QByteArray("literal a.b\nregex axb\nregex acb\n"),
+        QStringLiteral("fr-017-regex-toggle.log"));
+    EditorTab l1;
+    l1.resize(900, 520);
+    QVERIFY(l1.loadFile(path));
+    QVERIFY(!l1.isL2Mode());
+    l1.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&l1));
+
+    SearchResultsDock dock;
+    dock.resize(1000, 300);
+    dock.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&dock));
+
+    FindReplaceDialog dialog;
+    dialog.setActiveTab(&l1);
+    dialog.setSearchResultsDock(&dock);
+    dialog.showFindMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+    auto *findAll = dialog.findChild<QPushButton *>(QStringLiteral("findAllButton"));
+    auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+    QVERIFY(pattern && regex && findAll && tree);
+
+    const auto resultRows = [tree]() -> int {
+        // The L1 Dock deliberately uses FlatL1SearchResultsModel while L2 uses
+        // SearchResultsModel.  This corpus puts one match on each line, so row
+        // count is a provider-neutral visible-result assertion.
+        return tree->model() ? tree->model()->rowCount() : -1;
+    };
+
+    pattern->setText(QStringLiteral("a.b"));
+    regex->setChecked(false);
+    QTest::mouseClick(findAll, Qt::LeftButton);
+    QTRY_COMPARE_WITH_TIMEOUT(resultRows(), 1, 3000);
+
+    regex->setChecked(true);
+    QTest::mouseClick(findAll, Qt::LeftButton);
+    QTRY_COMPARE_WITH_TIMEOUT(resultRows(), 3, 3000);
+
+    QVERIFY(dialog.grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-search-regex-toggle.png"))));
+}
+
+void SmokeFindReplace::tc_fr_018_regex_contract_model_runs_gui_variants()
+{
+    struct ContractVariant {
+        const char *id;
+        QString query;
+        bool regex = false;
+        QVector<QPair<qint64, int>> expected;
+        bool invalidRegex = false;
+    };
+
+    // The oracle is deliberately specified as byte ranges, independently of
+    // EditorTab/Pcre2Regex/SearchResultsDock.  Each match occupies its own line
+    // so visible Dock rows and authoritative byte ranges are both observable.
+    const QByteArray corpus("a.b\naxb\nacb\n[ bracket\n");
+    const QVector<ContractVariant> variants = {
+        {"literal-dot", QStringLiteral("a.b"), false, {{0, 3}}},
+        {"regex-dot", QStringLiteral("a.b"), true,
+         {{0, 3}, {4, 3}, {8, 3}}},
+        {"escaped-regex-dot", QStringLiteral("a\\.b"), true, {{0, 3}}},
+        {"literal-open-bracket", QStringLiteral("["), false, {{12, 1}}},
+        {"invalid-regex-open-bracket", QStringLiteral("["), true, {}, true},
+    };
+
+    QVector<QPair<qint64, int>> literalDotResults;
+    QVector<QPair<qint64, int>> escapedRegexDotResults;
+
+    for (const ContractVariant &variant : variants) {
+        const QString path = createSmallTestFile(
+            corpus, QStringLiteral("fr-018-%1.log").arg(variant.id));
+        EditorTab l1;
+        l1.resize(900, 520);
+        QVERIFY2(l1.loadFile(path), variant.id);
+        QVERIFY2(!l1.isL2Mode(), variant.id);
+        l1.show();
+        QVERIFY2(QTest::qWaitForWindowExposed(&l1), variant.id);
+
+        SearchResultsDock dock;
+        dock.resize(1000, 300);
+        dock.show();
+        QVERIFY2(QTest::qWaitForWindowExposed(&dock), variant.id);
+
+        FindReplaceDialog dialog;
+        dialog.setActiveTab(&l1);
+        dialog.setSearchResultsDock(&dock);
+        dialog.showFindMode();
+        QVERIFY2(QTest::qWaitForWindowExposed(&dialog), variant.id);
+
+        auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+        auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
+        auto *findNext = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+        auto *findAll = dialog.findChild<QPushButton *>(QStringLiteral("findAllButton"));
+        auto *status = dialog.findChild<QLabel *>(QStringLiteral("findStatusLabel"));
+        auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+        QVERIFY2(pattern && regex && wrap && findNext && findAll && status && tree,
+                 variant.id);
+
+        pattern->setText(variant.query);
+        regex->setChecked(variant.regex);
+        wrap->setChecked(false);
+        QTest::mouseClick(findAll, Qt::LeftButton);
+
+        if (variant.invalidRegex) {
+            QTRY_VERIFY_WITH_TIMEOUT(
+                status->text().contains(QStringLiteral("正则无效")), 2000);
+            QVERIFY2(!tree->model() || tree->model()->rowCount() == 0, variant.id);
+            QTest::mouseClick(findNext, Qt::LeftButton);
+            QTRY_VERIFY_WITH_TIMEOUT(
+                status->text().contains(QStringLiteral("正则无效")), 2000);
+            continue;
+        }
+
+        QTRY_VERIFY_WITH_TIMEOUT(tree->model() != nullptr, 2000);
+        QVector<QPair<qint64, int>> dockRanges;
+        for (int row = 0; row < tree->model()->rowCount(); ++row) {
+            const QModelIndex index = tree->model()->index(
+                row, SearchResultsModel::COL_CONTEXT);
+            const QVariantList ranges =
+                index.data(SearchResultsModel::MatchByteRangesRole).toList();
+            for (const QVariant &entry : ranges) {
+                const QVariantMap range = entry.toMap();
+                dockRanges.append(qMakePair(
+                    range.value(QStringLiteral("byteOffset")).toLongLong(),
+                    range.value(QStringLiteral("length")).toInt()));
+            }
+        }
+        QCOMPARE(dockRanges.size(), variant.expected.size());
+        for (int i = 0; i < variant.expected.size(); ++i)
+            QCOMPARE(dockRanges.at(i), variant.expected.at(i));
+
+        // Drive the second execution path through the actual button.  Find All
+        // and repeated Find Next must expose the same ordered byte ranges.
+        l1.editor()->SendScintilla(QsciScintillaBase::SCI_SETSEL,
+                                   static_cast<unsigned long>(0),
+                                   static_cast<long>(0));
+        l1.resetSearchPosition(true);
+        for (const auto &expected : variant.expected) {
+            QTest::mouseClick(findNext, Qt::LeftButton);
+            const qint64 start = l1.editor()->SendScintilla(
+                QsciScintillaBase::SCI_GETSELECTIONSTART);
+            const qint64 end = l1.editor()->SendScintilla(
+                QsciScintillaBase::SCI_GETSELECTIONEND);
+            QCOMPARE(start, expected.first);
+            QCOMPARE(end - start, qint64(expected.second));
+        }
+        QTest::mouseClick(findNext, Qt::LeftButton);
+        QVERIFY2(status->text().contains(QStringLiteral("未找到更多匹配")),
+                 variant.id);
+
+        if (QString::fromLatin1(variant.id) == QStringLiteral("literal-dot"))
+            literalDotResults = dockRanges;
+        if (QString::fromLatin1(variant.id) == QStringLiteral("escaped-regex-dot"))
+            escapedRegexDotResults = dockRanges;
+    }
+
+    // Metamorphic oracle: literal(q) == regex(escape(q)).  This catches a
+    // shared wrong implementation even if individual result counts happen to
+    // look plausible.
+    QCOMPARE(literalDotResults, escapedRegexDotResults);
 }
 
 QTEST_MAIN(SmokeFindReplace)

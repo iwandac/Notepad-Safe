@@ -36,6 +36,8 @@
 #include <QtGui/QClipboard>
 #include <QtGui/QContextMenuEvent>
 #include <QtGui/QTextCursor>
+#include <QtGui/QTextBlock>
+#include <QtGui/QWheelEvent>
 #include <QtCore/QTemporaryDir>
 #include <QtCore/QDir>
 #include <QtCore/QElapsedTimer>
@@ -55,6 +57,9 @@
 #include <QtWidgets/QToolButton>
 #include <QtWidgets/QListView>
 #include <QtWidgets/QPlainTextEdit>
+#include <QtWidgets/QScrollBar>
+#include <QtWidgets/QStyle>
+#include <QtWidgets/QStyleOptionSlider>
 #include <stdexcept>
 
 #ifdef Q_OS_WIN
@@ -72,6 +77,7 @@
 #include "AsyncTaskPanelDialog.h"
 #include "SessionManager.h"
 #include "DraftStore.h"
+#include "GuiContractMatrix.h"
 
 // Mnemonic / 省略号去除：「替换(&R)...」→「替换」
 //   关键：不能只 remove '&'，否则留下 "替换(R)"；必须**整个匹配 `(&[A-Za-z0-9])` 模式全删**。
@@ -227,6 +233,26 @@ static void switchToTab(MainWindow* mw, int idx) {
     QApplication::processEvents(QEventLoop::AllEvents, 100);
 }
 
+static void dragScrollBar(QScrollBar *bar, qreal targetRatio) {
+    QStyleOptionSlider option;
+    option.initFrom(bar);
+    option.rect = bar->rect();
+    option.orientation = bar->orientation();
+    option.minimum = bar->minimum();
+    option.maximum = bar->maximum();
+    option.sliderPosition = bar->sliderPosition();
+    option.sliderValue = bar->value();
+    option.singleStep = bar->singleStep();
+    option.pageStep = bar->pageStep();
+    const QRect handle = bar->style()->subControlRect(
+        QStyle::CC_ScrollBar, &option, QStyle::SC_ScrollBarSlider, bar);
+    const QPoint destination(bar->width() / 2,
+        qBound(2, int(bar->height() * targetRatio), bar->height() - 2));
+    QTest::mousePress(bar, Qt::LeftButton, Qt::NoModifier, handle.center());
+    QTest::mouseMove(bar, destination, 80);
+    QTest::mouseRelease(bar, Qt::LeftButton, Qt::NoModifier, destination);
+}
+
 // 一次性关闭 MainWindow 所有 tab（D007 的阶段 0 逻辑抽取），保证 case 间不互相残留状态。
 // 对每个 L2 tab 先 shutdownL2BeforeClose()，然后 removeTab 直到 count=0。
 static void closeAllEditorTabs(MainWindow* mw) {
@@ -337,6 +363,9 @@ class Group1SmallfixesMenuUI : public QObject {
 private:
     QTemporaryDir tmpDir_;
     MainWindow* mw_ = nullptr;
+    QString primaryTestDataDir_;
+    QByteArray originalDataDir_;
+    bool originalDataDirWasSet_ = false;
     // 大 fixture 按用例懒创建；指定运行聚焦用例时不再无意义写入 120 MiB。
     QString l2FixtureD001_;
     QString l2FixtureD003_;
@@ -346,6 +375,15 @@ private:
 private slots:
     void initTestCase() {
         QVERIFY(tmpDir_.isValid());
+        // Never read or overwrite the developer's real window/session state.
+        // This also makes screenshots deterministic: a Search Results dock
+        // left open by a prior manual run must not leak into an unrelated
+        // clean-profile journey.
+        originalDataDirWasSet_ = qEnvironmentVariableIsSet("NOTEPADSAFE_DATADIR");
+        originalDataDir_ = qgetenv("NOTEPADSAFE_DATADIR");
+        primaryTestDataDir_ = tmpDir_.filePath(QStringLiteral("primary-app-data"));
+        QVERIFY(QDir().mkpath(primaryTestDataDir_));
+        qputenv("NOTEPADSAFE_DATADIR", primaryTestDataDir_.toUtf8());
         // Qt 全局只有一个 QApplication（由 QTEST_MAIN 创建），这里 new MainWindow
         // 作为顶层窗口即可。不 show() 也行（enabled 状态不依赖 visible），但
         // SR02-COMFORT-C 需要 dialog 能被 expose，所以 show() + waitExposed。
@@ -362,6 +400,10 @@ private slots:
     }
 
     void cleanupTestCase() {
+        // A failed isolated-settings case may return before restoring the
+        // environment.  Point teardown back at the suite-owned directory so
+        // MainWindow::saveSettings can never touch the user's profile.
+        qputenv("NOTEPADSAFE_DATADIR", primaryTestDataDir_.toUtf8());
         // 依次 close 所有 tab 防止 autosave 弹窗阻塞
         if (mw_) {
             auto* tabs = mw_->findChild<QTabWidget*>();
@@ -378,6 +420,10 @@ private slots:
             mw_ = nullptr;
         }
         QApplication::processEvents(QEventLoop::AllEvents, 100);
+        if (originalDataDirWasSet_)
+            qputenv("NOTEPADSAFE_DATADIR", originalDataDir_);
+        else
+            qunsetenv("NOTEPADSAFE_DATADIR");
     }
 
     // ========== SR02-COMFORT（替换快捷键一致性 3 子断言）==========
@@ -727,6 +773,26 @@ private slots:
         QVERIFY(rawByteStatus);
         QVERIFY(hexStatus);
 
+        // An unchanged binary document is already durable. Save must be a
+        // literal no-op: no rewrite, no replacement file identity change and
+        // no legacy visible backup beside the source. This is the same route
+        // used by a 9 MiB PDF/unknown binary document.
+        QAction *saveAction = findMenuActionByExactDisplay(mw_, QStringLiteral("保存"));
+        QVERIFY(saveAction != nullptr);
+        QVERIFY(!saveAction->isEnabled());
+        DiskFileVersion unchangedBefore;
+        QCOMPARE(captureDiskFileVersion(sourcePath, &unchangedBefore),
+                 DiskFileState::Unchanged);
+        QString unchangedSaveError;
+        QVERIFY2(tab->saveFile(&unchangedSaveError), qPrintable(unchangedSaveError));
+        DiskFileVersion unchangedAfter;
+        QCOMPARE(captureDiskFileVersion(sourcePath, &unchangedAfter),
+                 DiskFileState::Unchanged);
+        QCOMPARE(unchangedAfter.fileIdentity, unchangedBefore.fileIdentity);
+        QCOMPARE(unchangedAfter.modifiedMs, unchangedBefore.modifiedMs);
+        QVERIFY(!QFileInfo::exists(sourcePath
+                                  + QStringLiteral(".notepad-safe-save-tmp")));
+
         // Real GUI input: byte overwrite does not mutate the formatted text
         // projection. Two nibbles typed at the byte caret become one raw byte.
         tab->editor()->setFocus(Qt::OtherFocusReason);
@@ -779,8 +845,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(asciiPreview->toPlainText().startsWith(
                                      QStringLiteral(".AZ")), 1000);
 
-        QAction *saveAction = findMenuActionByExactDisplay(mw_, QStringLiteral("保存"));
-        QVERIFY(saveAction != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(saveAction->isEnabled(), 1000);
         saveAction->trigger();
         QTRY_VERIFY_WITH_TIMEOUT(!tab->isModified(), 5000);
         QTRY_VERIFY_WITH_TIMEOUT(tab->l2View()->isOpen(), 5000);
@@ -789,6 +854,8 @@ private slots:
             QVERIFY(saved.open(QIODevice::ReadOnly));
             QCOMPARE(saved.readAll(), expected);
         }
+        QVERIFY(!QFileInfo::exists(sourcePath
+                                  + QStringLiteral(".notepad-safe-save-tmp")));
 
         // Exercise Save As backing-store handoff, then reopen through the same
         // MainWindow dispatcher used by Open/recent/drag-drop/session paths.
@@ -899,6 +966,1092 @@ private slots:
         closeAllEditorTabs(mw_);
     }
 
+    void tc_hex_delete_backspace_pairwise_contract() {
+        using namespace GuiContractMatrix;
+        closeAllEditorTabs(mw_);
+
+        const QVector<Dimension> dimensions = {
+            {QStringLiteral("surface"), {QStringLiteral("hex"), QStringLiteral("ascii")}},
+            {QStringLiteral("mode"), {QStringLiteral("OVR"), QStringLiteral("INS")}},
+            {QStringLiteral("key"), {QStringLiteral("Delete"), QStringLiteral("Backspace")}},
+            {QStringLiteral("selection"), {QStringLiteral("none"),
+                                             QStringLiteral("forward"),
+                                             QStringLiteral("reverse")}},
+            {QStringLiteral("boundary"), {QStringLiteral("start"),
+                                            QStringLiteral("middle"),
+                                            QStringLiteral("end")}},
+        };
+        const QVector<Assignment> cases = pairwise(dimensions);
+        QVERIFY(!cases.isEmpty());
+        QVERIFY(coversEveryValidPair(cases, dimensions));
+        QVERIFY2(cases.size() < 72,
+                 "Pairwise runner should be materially smaller than full Cartesian product");
+
+        // Include a NUL so the real unified-open classifier routes this small
+        // fixture to Binary/Hex while leaving the remaining bytes readable in
+        // the ASCII projection.
+        const QByteArray original("\0bcdefghijklmnop", 16);
+        for (int caseIndex = 0; caseIndex < cases.size(); ++caseIndex) {
+            const Assignment &contract = cases.at(caseIndex);
+            const QByteArray caseLabel = caseId(contract).toUtf8();
+            qInfo().noquote() << "[HEX-CONTRACT]" << caseLabel;
+            const QString path = tmpDir_.filePath(
+                QStringLiteral("hex-delete-contract-%1.bin").arg(caseIndex));
+            {
+                QFile source(path);
+                QVERIFY2(source.open(QIODevice::WriteOnly | QIODevice::Truncate),
+                         caseLabel.constData());
+                QCOMPARE(source.write(original), qint64(original.size()));
+            }
+
+            mw_->openFilesFromExternal(QStringList{path});
+            QVERIFY2(waitForTabCountAndL2(mw_, 1, true, 5000), caseLabel.constData());
+            EditorTab *tab = currentEditorTab(mw_);
+            QVERIFY2(tab && tab->l2View() && tab->l2View()->isOpen(),
+                     caseLabel.constData());
+            QCOMPARE(tab->viewModeL2(), ViewMode::Hex);
+            auto *ascii = tab->findChild<QPlainTextEdit *>(
+                QStringLiteral("HexAsciiPreview"));
+            QVERIFY2(ascii && ascii->isVisibleTo(tab), caseLabel.constData());
+
+            QWidget *surface = contract.value(QStringLiteral("surface"))
+                    == QStringLiteral("hex")
+                ? static_cast<QWidget *>(tab->editor())
+                : static_cast<QWidget *>(ascii);
+            surface->setFocus(Qt::OtherFocusReason);
+            if (contract.value(QStringLiteral("mode")) == QStringLiteral("INS"))
+                QTest::keyClick(surface, Qt::Key_Insert);
+            QCOMPARE(tab->hexOverwriteMode(),
+                     contract.value(QStringLiteral("mode")) == QStringLiteral("OVR"));
+
+            const QString boundary = contract.value(QStringLiteral("boundary"));
+            const QString selection = contract.value(QStringLiteral("selection"));
+            const int caret = boundary == QStringLiteral("start") ? 0
+                : boundary == QStringLiteral("middle") ? 8 : original.size();
+            const int rangeStart = boundary == QStringLiteral("start") ? 0
+                : boundary == QStringLiteral("middle") ? 7 : original.size() - 2;
+            const int rangeEnd = rangeStart + 2;
+
+            if (surface == tab->editor()) {
+                const auto hexColumn = [](int byte, bool rangeEndColumn) {
+                    return rangeEndColumn && byte > 0 ? byte * 3 - 1 : byte * 3;
+                };
+                if (selection == QStringLiteral("none")) {
+                    tab->editor()->setCursorPosition(0, hexColumn(caret, caret > 0));
+                } else {
+                    const int startColumn = hexColumn(rangeStart, false);
+                    const int endColumn = hexColumn(rangeEnd, true);
+                    if (selection == QStringLiteral("forward"))
+                        tab->editor()->setSelection(0, startColumn, 0, endColumn);
+                    else
+                        tab->editor()->setSelection(0, endColumn, 0, startColumn);
+                }
+            } else {
+                QTextCursor cursor(ascii->document());
+                if (selection == QStringLiteral("none")) {
+                    cursor.setPosition(caret);
+                } else if (selection == QStringLiteral("forward")) {
+                    cursor.setPosition(rangeStart);
+                    cursor.setPosition(rangeEnd, QTextCursor::KeepAnchor);
+                } else {
+                    cursor.setPosition(rangeEnd);
+                    cursor.setPosition(rangeStart, QTextCursor::KeepAnchor);
+                }
+                ascii->setTextCursor(cursor);
+            }
+
+            QByteArray expected = original;
+            if (selection != QStringLiteral("none")) {
+                expected.remove(rangeStart, rangeEnd - rangeStart);
+            } else if (contract.value(QStringLiteral("key")) == QStringLiteral("Delete")) {
+                if (caret < expected.size())
+                    expected.remove(caret, 1);
+            } else if (caret > 0) {
+                expected.remove(caret - 1, 1);
+            }
+
+            const Qt::Key key = contract.value(QStringLiteral("key"))
+                    == QStringLiteral("Delete")
+                ? Qt::Key_Delete : Qt::Key_Backspace;
+            QTest::keyClick(surface, key);
+            QApplication::processEvents(QEventLoop::AllEvents, 50);
+
+            const QByteArray actual = tab->l2View()->readByteRange(
+                0, tab->l2View()->virtualFileSize());
+            QCOMPARE(actual, expected);
+            QCOMPARE(tab->l2View()->virtualFileSize(), qint64(expected.size()));
+
+            QString expectedHex;
+            for (int i = 0; i < expected.size(); ++i) {
+                if (i > 0) expectedHex.append(QLatin1Char(' '));
+                expectedHex.append(QStringLiteral("%1").arg(
+                    quint8(expected.at(i)), 2, 16, QLatin1Char('0')).toUpper());
+            }
+            QTRY_COMPARE_WITH_TIMEOUT(tab->editor()->text(), expectedHex, 1000);
+            QString expectedAscii;
+            expectedAscii.reserve(expected.size());
+            for (const char byte : expected) {
+                const uchar value = uchar(byte);
+                expectedAscii.append(value >= 0x20 && value <= 0x7e
+                                         ? QChar(value) : QLatin1Char('.'));
+            }
+            QTRY_COMPARE_WITH_TIMEOUT(ascii->toPlainText(), expectedAscii, 1000);
+
+            // Both projections are views of one source.  Neither may regain an
+            // independent scrollbar while exercising a different input path.
+            QVERIFY2(!tab->editor()->verticalScrollBar()->isVisibleTo(tab),
+                     caseLabel.constData());
+            QVERIFY2(!ascii->verticalScrollBar()->isVisibleTo(tab),
+                     caseLabel.constData());
+            QCOMPARE(tab->isModified(), actual != original);
+
+            if (actual != original) {
+                tab->undo();
+                QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(
+                                              0, tab->l2View()->virtualFileSize()),
+                                          original, 1000);
+                tab->redo();
+                QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(
+                                              0, tab->l2View()->virtualFileSize()),
+                                          expected, 1000);
+            }
+            closeAllEditorTabs(mw_);
+        }
+    }
+
+    void tc_hex_keyboard_navigation_contract() {
+        closeAllEditorTabs(mw_);
+        QByteArray bytes(128, '\0');
+        for (int i = 0; i < bytes.size(); ++i)
+            bytes[i] = char(i);
+        const QString path = tmpDir_.filePath(QStringLiteral("hex-navigation.bin"));
+        {
+            QFile source(path);
+            QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(source.write(bytes), qint64(bytes.size()));
+        }
+        mw_->openFilesFromExternal(QStringList{path});
+        QVERIFY(waitForTabCountAndL2(mw_, 1, true, 5000));
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && tab->l2View() && tab->viewModeL2() == ViewMode::Hex);
+        auto *ascii = tab->findChild<QPlainTextEdit *>(QStringLiteral("HexAsciiPreview"));
+        QVERIFY(ascii && ascii->isVisibleTo(tab));
+        tab->editor()->setFocus(Qt::OtherFocusReason);
+
+        const int byte = 5;
+        tab->editor()->setCursorPosition(0, byte * 3); // high nibble
+        QTest::keyClick(tab->editor(), Qt::Key_Right);
+        int line = -1, column = -1;
+        tab->editor()->getCursorPosition(&line, &column);
+        QCOMPARE(line, 0);
+        QCOMPARE(column, byte * 3 + 1); // low nibble
+        QTRY_COMPARE_WITH_TIMEOUT(ascii->textCursor().position(), byte, 1000);
+
+        QTest::keyClick(tab->editor(), Qt::Key_Right);
+        tab->editor()->getCursorPosition(&line, &column);
+        QCOMPARE(line, 0);
+        QCOMPARE(column, (byte + 1) * 3); // skip separator space
+        QTRY_COMPARE_WITH_TIMEOUT(ascii->textCursor().position(), byte + 1, 1000);
+
+        QTest::keyClick(tab->editor(), Qt::Key_Left);
+        tab->editor()->getCursorPosition(&line, &column);
+        QCOMPARE(column, byte * 3 + 1);
+        QTest::keyClick(tab->editor(), Qt::Key_Left);
+        tab->editor()->getCursorPosition(&line, &column);
+        QCOMPARE(column, byte * 3);
+
+        const int bytesPerRow = tab->l2View()->hexBytesPerRow();
+        QVERIFY(bytesPerRow > 8 && bytes.size() > bytesPerRow * 2);
+        tab->editor()->setCursorPosition(1, 3 * 3); // row 1, byte 3 high
+        QTest::keyClick(tab->editor(), Qt::Key_End);
+        tab->editor()->getCursorPosition(&line, &column);
+        QCOMPARE(line, 1);
+        QCOMPARE(column, (bytesPerRow - 1) * 3 + 1); // final low nibble, not after text
+        QTest::keyClick(tab->editor(), Qt::Key_Home);
+        tab->editor()->getCursorPosition(&line, &column);
+        QCOMPARE(line, 1);
+        QCOMPARE(column, 0);
+
+        // Vertical movement is byte-row movement, not movement through the
+        // three-character projection. Preserve the nibble column and mirror
+        // the resulting source byte into the ASCII pane.
+        tab->editor()->setCursorPosition(1, 3 * 3 + 1);
+        QTest::keyClick(tab->editor(), Qt::Key_Up);
+        tab->editor()->getCursorPosition(&line, &column);
+        QCOMPARE(line, 0);
+        QCOMPARE(column, 3 * 3 + 1);
+        QTRY_COMPARE_WITH_TIMEOUT(ascii->textCursor().position(), 3, 1000);
+        QTest::keyClick(tab->editor(), Qt::Key_Down);
+        tab->editor()->getCursorPosition(&line, &column);
+        QCOMPARE(line, 1);
+        QCOMPARE(column, 3 * 3 + 1);
+        const QTextBlock secondAsciiRow =
+            ascii->document()->findBlockByNumber(1);
+        QVERIFY(secondAsciiRow.isValid());
+        QTRY_COMPARE_WITH_TIMEOUT(ascii->textCursor().position(),
+                                  secondAsciiRow.position() + 3, 1000);
+
+        // A real pointer hit on the separator after byte 5 must snap to the
+        // following source byte. It may never leave a visible caret on a
+        // character that cannot be edited as a nibble.
+        const long separator = tab->editor()->positionFromLineIndex(0, 5 * 3 + 2);
+        const int separatorX = int(tab->editor()->SendScintilla(
+            QsciScintillaBase::SCI_POINTXFROMPOSITION, 0UL, separator));
+        const int separatorY = int(tab->editor()->SendScintilla(
+            QsciScintillaBase::SCI_POINTYFROMPOSITION, 0UL, separator));
+        const int glyphWidth = qMax(1, tab->editor()->fontMetrics().horizontalAdvance(
+                                          QLatin1Char('0')));
+        QTest::mouseClick(tab->editor()->viewport(), Qt::LeftButton,
+                          Qt::NoModifier,
+                          QPoint(separatorX + glyphWidth / 2,
+                                 separatorY + tab->editor()->fontMetrics().height() / 2));
+        QTRY_COMPARE_WITH_TIMEOUT(
+            tab->editor()->SendScintilla(QsciScintillaBase::SCI_GETCURRENTPOS),
+            tab->editor()->positionFromLineIndex(0, 6 * 3), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(ascii->textCursor().position(), 6, 1000);
+
+        // File and page boundaries are explicit byte boundaries. The short
+        // final row is clamped to a real byte, never to projection whitespace.
+        tab->editor()->setCursorPosition(0, 0);
+        QTest::keyClick(tab->editor(), Qt::Key_PageDown);
+        int pagedLine = -1, pagedColumn = -1;
+        tab->editor()->getCursorPosition(&pagedLine, &pagedColumn);
+        QVERIFY(pagedLine >= 0);
+        QVERIFY(pagedColumn >= 0);
+        QCOMPARE(pagedColumn % 3, 0);
+        QTest::keyClick(tab->editor(), Qt::Key_End, Qt::ControlModifier);
+        tab->editor()->getCursorPosition(&line, &column);
+        QCOMPARE(line, (bytes.size() - 1) / bytesPerRow);
+        QCOMPARE(column, ((bytes.size() - 1) % bytesPerRow) * 3 + 1);
+        const QTextBlock lastAsciiRow = ascii->document()->findBlockByNumber(
+            (bytes.size() - 1) / bytesPerRow);
+        QVERIFY(lastAsciiRow.isValid());
+        QTRY_COMPARE_WITH_TIMEOUT(ascii->textCursor().position(),
+                                  lastAsciiRow.position()
+                                      + ((bytes.size() - 1) % bytesPerRow),
+                                  1000);
+        QTest::keyClick(tab->editor(), Qt::Key_Home, Qt::ControlModifier);
+        tab->editor()->getCursorPosition(&line, &column);
+        QCOMPARE(line, 0);
+        QCOMPARE(column, 0);
+        QTRY_COMPARE_WITH_TIMEOUT(ascii->textCursor().position(), 0, 1000);
+
+        // Navigation is a pure view operation.
+        QCOMPARE(tab->l2View()->readByteRange(0, bytes.size()), bytes);
+        QVERIFY(!tab->isModified());
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_hex_byte_selection_contract() {
+        closeAllEditorTabs(mw_);
+        QByteArray bytes(128, '\0');
+        for (int i = 0; i < bytes.size(); ++i)
+            bytes[i] = char(i);
+        const QString path = tmpDir_.filePath(QStringLiteral("hex-selection.bin"));
+        {
+            QFile source(path);
+            QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(source.write(bytes), qint64(bytes.size()));
+        }
+        mw_->openFilesFromExternal(QStringList{path});
+        QVERIFY(waitForTabCountAndL2(mw_, 1, true, 5000));
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && tab->l2View() && tab->viewModeL2() == ViewMode::Hex);
+        auto *ascii = tab->findChild<QPlainTextEdit *>(
+            QStringLiteral("HexAsciiPreview"));
+        QVERIFY(ascii && ascii->isVisibleTo(tab));
+        const int bytesPerRow = tab->l2View()->hexBytesPerRow();
+        QVERIFY(bytesPerRow > 8);
+        tab->editor()->setFocus(Qt::OtherFocusReason);
+
+        // Shift+Right grows in whole source bytes and both projections expose
+        // the same half-open range.
+        tab->editor()->setCursorPosition(0, 5 * 3);
+        QTest::keyClick(tab->editor(), Qt::Key_Right, Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionStart(), qint64(5), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionEnd(), qint64(6), 1000);
+        QCOMPARE(ascii->textCursor().selectionStart(), 5);
+        QCOMPARE(ascii->textCursor().selectionEnd(), 6);
+        QCOMPARE(tab->editor()->SendScintilla(
+                     QsciScintillaBase::SCI_GETSELECTIONSTART),
+                 tab->editor()->positionFromLineIndex(0, 5 * 3));
+        QCOMPARE(tab->editor()->SendScintilla(
+                     QsciScintillaBase::SCI_GETSELECTIONEND),
+                 tab->editor()->positionFromLineIndex(0, 6 * 3));
+
+        QTest::keyClick(tab->editor(), Qt::Key_Right, Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionEnd(), qint64(7), 1000);
+        QTest::keyClick(tab->editor(), Qt::Key_Left, Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionEnd(), qint64(6), 1000);
+
+        // Reverse selection retains direction in Scintilla but publishes the
+        // same sorted source range to editing commands and the ASCII mirror.
+        tab->editor()->setCursorPosition(0, 5 * 3);
+        QTest::keyClick(tab->editor(), Qt::Key_Left, Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionStart(), qint64(4), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionEnd(), qint64(5), 1000);
+        QVERIFY(tab->editor()->SendScintilla(QsciScintillaBase::SCI_GETANCHOR)
+                > tab->editor()->SendScintilla(QsciScintillaBase::SCI_GETCURRENTPOS));
+        QCOMPARE(ascii->textCursor().selectionStart(), 4);
+        QCOMPARE(ascii->textCursor().selectionEnd(), 5);
+
+        // Cross-row and file-boundary extension must not stop at projection
+        // separators or the final short-row padding.
+        tab->editor()->setCursorPosition(0, (bytesPerRow - 1) * 3);
+        QTest::keyClick(tab->editor(), Qt::Key_Down, Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionStart(),
+                                  qint64(bytesPerRow - 1), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionEnd(),
+                                  qint64(bytesPerRow * 2 - 1), 1000);
+        tab->editor()->setCursorPosition(0, 2 * 3);
+        QTest::keyClick(tab->editor(), Qt::Key_End,
+                        Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionStart(), qint64(2), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionEnd(),
+                                  qint64(bytes.size()), 1000);
+
+        // Real pointer drag from byte 2 to the start of byte 6 is normalized
+        // to [2, 6), then Copy returns exactly those four source bytes.
+        QTest::keyClick(tab->editor(), Qt::Key_Home, Qt::ControlModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            tab->editor()->SendScintilla(QsciScintillaBase::SCI_GETCURRENTPOS),
+            tab->editor()->positionFromLineIndex(0, 0), 1000);
+        const long dragStartPos = tab->editor()->positionFromLineIndex(0, 2 * 3);
+        const long dragEndPos = tab->editor()->positionFromLineIndex(0, 6 * 3);
+        const auto pointForPosition = [tab](long position) {
+            const int x = int(tab->editor()->SendScintilla(
+                QsciScintillaBase::SCI_POINTXFROMPOSITION, 0UL, position));
+            const int y = int(tab->editor()->SendScintilla(
+                QsciScintillaBase::SCI_POINTYFROMPOSITION, 0UL, position));
+            return QPoint(x + 1, y + tab->editor()->fontMetrics().height() / 2);
+        };
+        QTest::mousePress(tab->editor()->viewport(), Qt::LeftButton,
+                          Qt::NoModifier, pointForPosition(dragStartPos));
+        QTest::mouseMove(tab->editor()->viewport(), pointForPosition(dragEndPos), 80);
+        QTest::mouseRelease(tab->editor()->viewport(), Qt::LeftButton,
+                            Qt::NoModifier, pointForPosition(dragEndPos));
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionStart(), qint64(2), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionEnd(), qint64(6), 1000);
+        tab->copy();
+        QCOMPARE(QGuiApplication::clipboard()->text(), QStringLiteral("02 03 04 05"));
+
+        QCOMPARE(tab->l2View()->readByteRange(0, bytes.size()), bytes);
+        QVERIFY(!tab->isModified());
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_hex_nibble_input_pairwise_contract() {
+        using namespace GuiContractMatrix;
+        closeAllEditorTabs(mw_);
+        const QVector<Dimension> dimensions = {
+            {QStringLiteral("mode"), {QStringLiteral("OVR"), QStringLiteral("INS")}},
+            {QStringLiteral("nibble"), {QStringLiteral("high"), QStringLiteral("low")}},
+            {QStringLiteral("boundary"), {QStringLiteral("start"),
+                                            QStringLiteral("middle"),
+                                            QStringLiteral("last")}},
+            {QStringLiteral("digit"), {QStringLiteral("0"),
+                                         QStringLiteral("A"),
+                                         QStringLiteral("f")}},
+        };
+        const QVector<Assignment> cases = pairwise(dimensions);
+        QVERIFY(!cases.isEmpty());
+        QVERIFY(coversEveryValidPair(cases, dimensions));
+
+        const QByteArray original("\0bcdefghijklmnop", 16);
+        const auto formattedHex = [](const QByteArray &bytes, int row) {
+            QString text;
+            for (int i = 0; i < bytes.size(); ++i) {
+                if (i > 0)
+                    text.append(i % row == 0 ? QLatin1Char('\n') : QLatin1Char(' '));
+                text.append(QStringLiteral("%1").arg(
+                    quint8(bytes.at(i)), 2, 16, QLatin1Char('0')).toUpper());
+            }
+            return text;
+        };
+        const auto formattedAscii = [](const QByteArray &bytes, int row) {
+            QString text;
+            for (int i = 0; i < bytes.size(); ++i) {
+                if (i > 0 && i % row == 0)
+                    text.append(QLatin1Char('\n'));
+                const uchar value = uchar(bytes.at(i));
+                text.append(value >= 0x20 && value <= 0x7e
+                                ? QChar(value) : QLatin1Char('.'));
+            }
+            return text;
+        };
+
+        for (int caseIndex = 0; caseIndex < cases.size(); ++caseIndex) {
+            const Assignment &contract = cases.at(caseIndex);
+            const QByteArray caseLabel = caseId(contract).toUtf8();
+            qInfo().noquote() << "[HEX-NIBBLE]" << caseLabel;
+            const QString path = tmpDir_.filePath(
+                QStringLiteral("hex-nibble-contract-%1.bin").arg(caseIndex));
+            {
+                QFile source(path);
+                QVERIFY2(source.open(QIODevice::WriteOnly | QIODevice::Truncate),
+                         caseLabel.constData());
+                QCOMPARE(source.write(original), qint64(original.size()));
+            }
+            mw_->openFilesFromExternal(QStringList{path});
+            QVERIFY2(waitForTabCountAndL2(mw_, 1, true, 5000), caseLabel.constData());
+            EditorTab *tab = currentEditorTab(mw_);
+            QVERIFY2(tab && tab->l2View() && tab->viewModeL2() == ViewMode::Hex,
+                     caseLabel.constData());
+            auto *ascii = tab->findChild<QPlainTextEdit *>(
+                QStringLiteral("HexAsciiPreview"));
+            QVERIFY2(ascii && ascii->isVisibleTo(tab), caseLabel.constData());
+            tab->editor()->setFocus(Qt::OtherFocusReason);
+
+            if (contract.value(QStringLiteral("mode")) == QStringLiteral("INS"))
+                QTest::keyClick(tab->editor(), Qt::Key_Insert);
+            auto *sizeStatus = mw_->findChild<QLabel *>(QStringLiteral("status.size"));
+            QVERIFY(sizeStatus);
+            QTRY_VERIFY_WITH_TIMEOUT(sizeStatus->text().contains(
+                contract.value(QStringLiteral("mode"))), 1000);
+            const int target = contract.value(QStringLiteral("boundary"))
+                    == QStringLiteral("start") ? 0
+                : contract.value(QStringLiteral("boundary"))
+                    == QStringLiteral("middle") ? 8 : original.size() - 1;
+            const bool high = contract.value(QStringLiteral("nibble"))
+                              == QStringLiteral("high");
+            tab->editor()->setCursorPosition(0, target * 3 + (high ? 0 : 1));
+
+            const QChar digit = contract.value(QStringLiteral("digit")).at(0);
+            const int nibbleValue = digit.isDigit()
+                ? digit.digitValue() : 10 + digit.toUpper().unicode() - QChar('A').unicode();
+            QByteArray expected = original;
+            if (!tab->hexOverwriteMode() && high) {
+                expected.insert(target, char(nibbleValue << 4));
+            } else {
+                const uchar old = uchar(expected.at(target));
+                expected[target] = high
+                    ? char((nibbleValue << 4) | (old & 0x0f))
+                    : char((old & 0xf0) | nibbleValue);
+            }
+
+            QTest::keyClicks(tab->editor(), QString(digit));
+            const int row = tab->l2View()->hexBytesPerRow();
+            QTRY_COMPARE_WITH_TIMEOUT(tab->editor()->text(),
+                                      formattedHex(expected, row), 1000);
+            QTRY_COMPARE_WITH_TIMEOUT(ascii->toPlainText(),
+                                      formattedAscii(expected, row), 1000);
+            QVERIFY2(tab->isModified(), caseLabel.constData());
+
+            // Undo/redo must update both projections regardless of whether the
+            // edit was an overlay nibble replacement or a VFV insertion.
+            tab->undo();
+            QTRY_COMPARE_WITH_TIMEOUT(tab->editor()->text(),
+                                      formattedHex(original, row), 1000);
+            QTRY_COMPARE_WITH_TIMEOUT(ascii->toPlainText(),
+                                      formattedAscii(original, row), 1000);
+            tab->redo();
+            QTRY_COMPARE_WITH_TIMEOUT(tab->editor()->text(),
+                                      formattedHex(expected, row), 1000);
+            QTRY_COMPARE_WITH_TIMEOUT(ascii->toPlainText(),
+                                      formattedAscii(expected, row), 1000);
+
+            QString saveError;
+            QVERIFY2(tab->saveFile(&saveError), qPrintable(saveError));
+            QFile saved(path);
+            QVERIFY(saved.open(QIODevice::ReadOnly));
+            QCOMPARE(saved.readAll(), expected);
+            closeAllEditorTabs(mw_);
+        }
+    }
+
+    void tc_hex_copy_cut_pairwise_contract() {
+        using namespace GuiContractMatrix;
+        closeAllEditorTabs(mw_);
+        const QVector<Dimension> dimensions = {
+            {QStringLiteral("surface"), {QStringLiteral("hex"), QStringLiteral("ascii")}},
+            {QStringLiteral("mode"), {QStringLiteral("OVR"), QStringLiteral("INS")}},
+            {QStringLiteral("operation"), {QStringLiteral("copy"), QStringLiteral("cut")}},
+            {QStringLiteral("selection"), {QStringLiteral("none"),
+                                             QStringLiteral("forward"),
+                                             QStringLiteral("reverse")}},
+            {QStringLiteral("boundary"), {QStringLiteral("start"),
+                                            QStringLiteral("middle"),
+                                            QStringLiteral("end")}},
+        };
+        const QVector<Assignment> cases = pairwise(dimensions);
+        QVERIFY(!cases.isEmpty());
+        QVERIFY(coversEveryValidPair(cases, dimensions));
+
+        QByteArray original("abcdefghijklmnopqrstuvwxyzABCDE", 31);
+        original.append('\0'); // unified-open binary classifier, outside selected ranges
+        const auto hexText = [](const QByteArray &bytes) {
+            QString text;
+            for (int i = 0; i < bytes.size(); ++i) {
+                if (i) text.append(QLatin1Char(' '));
+                text.append(QStringLiteral("%1").arg(
+                    quint8(bytes.at(i)), 2, 16, QLatin1Char('0')).toUpper());
+            }
+            return text;
+        };
+
+        for (int caseIndex = 0; caseIndex < cases.size(); ++caseIndex) {
+            const Assignment &contract = cases.at(caseIndex);
+            const QByteArray caseLabel = caseId(contract).toUtf8();
+            qInfo().noquote() << "[HEX-CLIPBOARD]" << caseLabel;
+            const QString path = tmpDir_.filePath(
+                QStringLiteral("hex-clipboard-contract-%1.bin").arg(caseIndex));
+            {
+                QFile source(path);
+                QVERIFY2(source.open(QIODevice::WriteOnly | QIODevice::Truncate),
+                         caseLabel.constData());
+                QCOMPARE(source.write(original), qint64(original.size()));
+            }
+            mw_->openFilesFromExternal(QStringList{path});
+            QVERIFY2(waitForTabCountAndL2(mw_, 1, true, 5000), caseLabel.constData());
+            EditorTab *tab = currentEditorTab(mw_);
+            QVERIFY2(tab && tab->l2View() && tab->viewModeL2() == ViewMode::Hex,
+                     caseLabel.constData());
+            auto *ascii = tab->findChild<QPlainTextEdit *>(
+                QStringLiteral("HexAsciiPreview"));
+            QVERIFY2(ascii && ascii->isVisibleTo(tab), caseLabel.constData());
+            QWidget *surface = contract.value(QStringLiteral("surface"))
+                    == QStringLiteral("hex")
+                ? static_cast<QWidget *>(tab->editor())
+                : static_cast<QWidget *>(ascii);
+            surface->setFocus(Qt::OtherFocusReason);
+            if (contract.value(QStringLiteral("mode")) == QStringLiteral("INS"))
+                QTest::keyClick(surface, Qt::Key_Insert);
+
+            const QString boundary = contract.value(QStringLiteral("boundary"));
+            const int rangeStart = boundary == QStringLiteral("start") ? 0
+                : boundary == QStringLiteral("middle") ? 15 : original.size() - 3;
+            const int rangeEnd = rangeStart + 2;
+            const QString selection = contract.value(QStringLiteral("selection"));
+            if (surface == tab->editor()) {
+                if (selection == QStringLiteral("none")) {
+                    const int caret = boundary == QStringLiteral("start") ? 0
+                        : boundary == QStringLiteral("middle") ? 16 : original.size();
+                    tab->editor()->setCursorPosition(0, caret * 3 - (caret ? 1 : 0));
+                } else {
+                    const int first = rangeStart * 3;
+                    const int last = rangeEnd * 3 - 1;
+                    if (selection == QStringLiteral("forward"))
+                        tab->editor()->setSelection(0, first, 0, last);
+                    else
+                        tab->editor()->setSelection(0, last, 0, first);
+                }
+            } else {
+                QTextCursor cursor(ascii->document());
+                if (selection == QStringLiteral("none")) {
+                    const int caret = boundary == QStringLiteral("start") ? 0
+                        : boundary == QStringLiteral("middle") ? 16 : original.size();
+                    cursor.setPosition(caret);
+                } else if (selection == QStringLiteral("forward")) {
+                    cursor.setPosition(rangeStart);
+                    cursor.setPosition(rangeEnd, QTextCursor::KeepAnchor);
+                } else {
+                    cursor.setPosition(rangeEnd);
+                    cursor.setPosition(rangeStart, QTextCursor::KeepAnchor);
+                }
+                ascii->setTextCursor(cursor);
+            }
+
+            const QString sentinel = QStringLiteral("clipboard-sentinel");
+            QGuiApplication::clipboard()->setText(sentinel);
+            const bool cut = contract.value(QStringLiteral("operation"))
+                             == QStringLiteral("cut");
+            QTest::keyClick(surface, cut ? Qt::Key_X : Qt::Key_C,
+                            Qt::ControlModifier);
+            QApplication::processEvents(QEventLoop::AllEvents, 50);
+
+            QByteArray expected = original;
+            if (selection == QStringLiteral("none")) {
+                QCOMPARE(QGuiApplication::clipboard()->text(), sentinel);
+            } else {
+                const QByteArray selected = original.mid(rangeStart,
+                                                         rangeEnd - rangeStart);
+                const QString expectedClipboard = surface == tab->editor()
+                    ? hexText(selected) : QString::fromLatin1(selected);
+                QCOMPARE(QGuiApplication::clipboard()->text(), expectedClipboard);
+                if (cut)
+                    expected.remove(rangeStart, rangeEnd - rangeStart);
+            }
+            QCOMPARE(tab->l2View()->readByteRange(
+                         0, tab->l2View()->virtualFileSize()), expected);
+            QCOMPARE(tab->isModified(), cut && selection != QStringLiteral("none"));
+
+            if (cut && selection != QStringLiteral("none")) {
+                tab->undo();
+                QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(
+                                              0, tab->l2View()->virtualFileSize()),
+                                          original, 1000);
+                tab->redo();
+                QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(
+                                              0, tab->l2View()->virtualFileSize()),
+                                          expected, 1000);
+            }
+            closeAllEditorTabs(mw_);
+        }
+    }
+
+    void tc_hex_paste_pairwise_contract() {
+        using namespace GuiContractMatrix;
+        closeAllEditorTabs(mw_);
+        const QVector<Dimension> dimensions = {
+            {QStringLiteral("surface"), {QStringLiteral("hex"), QStringLiteral("ascii")}},
+            {QStringLiteral("mode"), {QStringLiteral("OVR"), QStringLiteral("INS")}},
+            {QStringLiteral("selection"), {QStringLiteral("none"),
+                                             QStringLiteral("forward"),
+                                             QStringLiteral("reverse")}},
+            {QStringLiteral("boundary"), {QStringLiteral("start"),
+                                            QStringLiteral("middle"),
+                                            QStringLiteral("end")}},
+            {QStringLiteral("payload"), {QStringLiteral("valid"),
+                                           QStringLiteral("invalid")}},
+        };
+        const QVector<Assignment> cases = pairwise(dimensions);
+        QVERIFY(!cases.isEmpty());
+        QVERIFY(coversEveryValidPair(cases, dimensions));
+
+        const QByteArray original("\0bcdefghijklmnop", 16);
+        for (int caseIndex = 0; caseIndex < cases.size(); ++caseIndex) {
+            const Assignment &contract = cases.at(caseIndex);
+            const QByteArray caseLabel = caseId(contract).toUtf8();
+            qInfo().noquote() << "[HEX-PASTE]" << caseLabel;
+            const QString path = tmpDir_.filePath(
+                QStringLiteral("hex-paste-contract-%1.bin").arg(caseIndex));
+            {
+                QFile source(path);
+                QVERIFY2(source.open(QIODevice::WriteOnly | QIODevice::Truncate),
+                         caseLabel.constData());
+                QCOMPARE(source.write(original), qint64(original.size()));
+            }
+            mw_->openFilesFromExternal(QStringList{path});
+            QVERIFY2(waitForTabCountAndL2(mw_, 1, true, 5000), caseLabel.constData());
+            EditorTab *tab = currentEditorTab(mw_);
+            QVERIFY2(tab && tab->l2View() && tab->viewModeL2() == ViewMode::Hex,
+                     caseLabel.constData());
+            auto *ascii = tab->findChild<QPlainTextEdit *>(
+                QStringLiteral("HexAsciiPreview"));
+            QVERIFY2(ascii && ascii->isVisibleTo(tab), caseLabel.constData());
+            QWidget *surface = contract.value(QStringLiteral("surface"))
+                    == QStringLiteral("hex")
+                ? static_cast<QWidget *>(tab->editor())
+                : static_cast<QWidget *>(ascii);
+            surface->setFocus(Qt::OtherFocusReason);
+            const bool overwrite = contract.value(QStringLiteral("mode"))
+                                   == QStringLiteral("OVR");
+            if (!overwrite)
+                QTest::keyClick(surface, Qt::Key_Insert);
+
+            const QString boundary = contract.value(QStringLiteral("boundary"));
+            const QString selection = contract.value(QStringLiteral("selection"));
+            const int caret = boundary == QStringLiteral("start") ? 0
+                : boundary == QStringLiteral("middle") ? 8 : original.size();
+            const int rangeStart = boundary == QStringLiteral("start") ? 0
+                : boundary == QStringLiteral("middle") ? 7 : original.size() - 2;
+            const int rangeEnd = rangeStart + 2;
+            if (surface == tab->editor()) {
+                if (selection == QStringLiteral("none")) {
+                    tab->editor()->setCursorPosition(0,
+                        caret == original.size() ? tab->editor()->text().size()
+                                                 : caret * 3);
+                } else {
+                    const int first = rangeStart * 3;
+                    const int last = rangeEnd * 3 - 1;
+                    if (selection == QStringLiteral("forward"))
+                        tab->editor()->setSelection(0, first, 0, last);
+                    else
+                        tab->editor()->setSelection(0, last, 0, first);
+                }
+            } else {
+                QTextCursor cursor(ascii->document());
+                if (selection == QStringLiteral("none")) {
+                    cursor.setPosition(caret);
+                } else if (selection == QStringLiteral("forward")) {
+                    cursor.setPosition(rangeStart);
+                    cursor.setPosition(rangeEnd, QTextCursor::KeepAnchor);
+                } else {
+                    cursor.setPosition(rangeEnd);
+                    cursor.setPosition(rangeStart, QTextCursor::KeepAnchor);
+                }
+                ascii->setTextCursor(cursor);
+            }
+
+            const bool valid = contract.value(QStringLiteral("payload"))
+                               == QStringLiteral("valid");
+            const QByteArray inserted = surface == tab->editor()
+                ? QByteArray::fromHex("AABB") : QByteArray("XY");
+            QGuiApplication::clipboard()->setText(valid
+                ? (surface == tab->editor() ? QStringLiteral("AA BB")
+                                            : QStringLiteral("XY"))
+                : (surface == tab->editor() ? QStringLiteral("GG")
+                                            : QStringLiteral("中")));
+
+            QByteArray expected = original;
+            if (valid) {
+                if (selection != QStringLiteral("none")) {
+                    expected.replace(rangeStart, rangeEnd - rangeStart, inserted);
+                } else if (!overwrite) {
+                    expected.insert(caret, inserted);
+                } else if (caret < expected.size()) {
+                    const int replaceLength = qMin(inserted.size(), expected.size() - caret);
+                    expected.replace(caret, replaceLength, inserted.left(replaceLength));
+                }
+                // OVR at EOF is deliberately a no-op: it must not silently
+                // become insertion mode and change the file length.
+            }
+
+            QTest::keyClick(surface, Qt::Key_V, Qt::ControlModifier);
+            QApplication::processEvents(QEventLoop::AllEvents, 80);
+            const QByteArray actual = tab->l2View()->readByteRange(
+                0, tab->l2View()->virtualFileSize());
+            QCOMPARE(actual, expected);
+            QCOMPARE(tab->l2View()->virtualFileSize(), qint64(expected.size()));
+            QCOMPARE(tab->isModified(), expected != original);
+
+            if (expected != original) {
+                tab->undo();
+                QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(
+                                              0, tab->l2View()->virtualFileSize()),
+                                          original, 1000);
+                tab->redo();
+                QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(
+                                              0, tab->l2View()->virtualFileSize()),
+                                          expected, 1000);
+            }
+            closeAllEditorTabs(mw_);
+        }
+    }
+
+    void tc_hex_invalid_direct_input_contract() {
+        using namespace GuiContractMatrix;
+        closeAllEditorTabs(mw_);
+        const QVector<Dimension> dimensions = {
+            {QStringLiteral("surface"), {QStringLiteral("hex"), QStringLiteral("ascii")}},
+            {QStringLiteral("mode"), {QStringLiteral("OVR"), QStringLiteral("INS")}},
+            {QStringLiteral("input"), {QStringLiteral("G"), QStringLiteral("space"),
+                                         QStringLiteral("enter"), QStringLiteral("unicode")}},
+            {QStringLiteral("boundary"), {QStringLiteral("start"), QStringLiteral("end")}},
+        };
+        const Constraint validCase = [](const Assignment &row) {
+            if (row.value(QStringLiteral("surface")) == QStringLiteral("hex"))
+                return true;
+            const QString input = row.value(QStringLiteral("input"));
+            return input == QStringLiteral("enter") || input == QStringLiteral("unicode");
+        };
+        const QVector<Assignment> cases = pairwise(dimensions, validCase);
+        QVERIFY(!cases.isEmpty());
+        QVERIFY(coversEveryValidPair(cases, dimensions, validCase));
+
+        const QByteArray original("\0bcdefghijklmnop", 16);
+        for (int caseIndex = 0; caseIndex < cases.size(); ++caseIndex) {
+            const Assignment &contract = cases.at(caseIndex);
+            const QByteArray caseLabel = caseId(contract).toUtf8();
+            qInfo().noquote() << "[HEX-INVALID]" << caseLabel;
+            const QString path = tmpDir_.filePath(
+                QStringLiteral("hex-invalid-contract-%1.bin").arg(caseIndex));
+            {
+                QFile source(path);
+                QVERIFY2(source.open(QIODevice::WriteOnly | QIODevice::Truncate),
+                         caseLabel.constData());
+                QCOMPARE(source.write(original), qint64(original.size()));
+            }
+            mw_->openFilesFromExternal(QStringList{path});
+            QVERIFY2(waitForTabCountAndL2(mw_, 1, true, 5000), caseLabel.constData());
+            EditorTab *tab = currentEditorTab(mw_);
+            QVERIFY2(tab && tab->l2View() && tab->viewModeL2() == ViewMode::Hex,
+                     caseLabel.constData());
+            auto *ascii = tab->findChild<QPlainTextEdit *>(
+                QStringLiteral("HexAsciiPreview"));
+            QVERIFY2(ascii && ascii->isVisibleTo(tab), caseLabel.constData());
+            QWidget *surface = contract.value(QStringLiteral("surface"))
+                    == QStringLiteral("hex")
+                ? static_cast<QWidget *>(tab->editor())
+                : static_cast<QWidget *>(ascii);
+            surface->setFocus(Qt::OtherFocusReason);
+            if (contract.value(QStringLiteral("mode")) == QStringLiteral("INS"))
+                QTest::keyClick(surface, Qt::Key_Insert);
+            const bool atEnd = contract.value(QStringLiteral("boundary"))
+                               == QStringLiteral("end");
+            if (surface == tab->editor()) {
+                tab->editor()->setCursorPosition(
+                    0, atEnd ? tab->editor()->text().size() : 0);
+            } else {
+                QTextCursor cursor(ascii->document());
+                cursor.setPosition(atEnd ? original.size() : 0);
+                ascii->setTextCursor(cursor);
+            }
+            const QString beforeHex = tab->editor()->text();
+            const QString beforeAscii = ascii->toPlainText();
+            const QString input = contract.value(QStringLiteral("input"));
+            if (input == QStringLiteral("G"))
+                QTest::keyClicks(surface, QStringLiteral("G"));
+            else if (input == QStringLiteral("space"))
+                QTest::keyClick(surface, Qt::Key_Space);
+            else if (input == QStringLiteral("enter"))
+                QTest::keyClick(surface, Qt::Key_Return);
+            else {
+                QKeyEvent unicodeEvent(QEvent::KeyPress, Qt::Key_unknown,
+                                       Qt::NoModifier, QStringLiteral("中"));
+                QApplication::sendEvent(surface, &unicodeEvent);
+            }
+            QApplication::processEvents(QEventLoop::AllEvents, 80);
+
+            QCOMPARE(tab->l2View()->readByteRange(
+                         0, tab->l2View()->virtualFileSize()), original);
+            QCOMPARE(tab->editor()->text(), beforeHex);
+            QCOMPARE(ascii->toPlainText(), beforeAscii);
+            QVERIFY2(!tab->isModified(), caseLabel.constData());
+            QVERIFY2(!mw_->statusBar()->currentMessage().isEmpty(), caseLabel.constData());
+            closeAllEditorTabs(mw_);
+        }
+    }
+
+    void tc_hex_ascii_direct_input_pairwise_contract() {
+        using namespace GuiContractMatrix;
+        closeAllEditorTabs(mw_);
+        const QVector<Dimension> dimensions = {
+            {QStringLiteral("mode"), {QStringLiteral("OVR"), QStringLiteral("INS")}},
+            {QStringLiteral("selection"), {QStringLiteral("none"),
+                                             QStringLiteral("forward"),
+                                             QStringLiteral("reverse")}},
+            {QStringLiteral("boundary"), {QStringLiteral("start"),
+                                            QStringLiteral("middle"),
+                                            QStringLiteral("end")}},
+            {QStringLiteral("character"), {QStringLiteral("Q"), QStringLiteral("~")}},
+        };
+        const QVector<Assignment> cases = pairwise(dimensions);
+        QVERIFY(!cases.isEmpty());
+        QVERIFY(coversEveryValidPair(cases, dimensions));
+        const QByteArray original("\0bcdefghijklmnop", 16);
+
+        for (int caseIndex = 0; caseIndex < cases.size(); ++caseIndex) {
+            const Assignment &contract = cases.at(caseIndex);
+            const QByteArray caseLabel = caseId(contract).toUtf8();
+            qInfo().noquote() << "[HEX-ASCII-TYPE]" << caseLabel;
+            const QString path = tmpDir_.filePath(
+                QStringLiteral("hex-ascii-type-%1.bin").arg(caseIndex));
+            {
+                QFile source(path);
+                QVERIFY2(source.open(QIODevice::WriteOnly | QIODevice::Truncate),
+                         caseLabel.constData());
+                QCOMPARE(source.write(original), qint64(original.size()));
+            }
+            mw_->openFilesFromExternal(QStringList{path});
+            QVERIFY2(waitForTabCountAndL2(mw_, 1, true, 5000), caseLabel.constData());
+            EditorTab *tab = currentEditorTab(mw_);
+            QVERIFY(tab && tab->l2View() && tab->viewModeL2() == ViewMode::Hex);
+            auto *ascii = tab->findChild<QPlainTextEdit *>(
+                QStringLiteral("HexAsciiPreview"));
+            QVERIFY(ascii && ascii->isVisibleTo(tab));
+            ascii->setFocus(Qt::OtherFocusReason);
+            const bool overwrite = contract.value(QStringLiteral("mode"))
+                                   == QStringLiteral("OVR");
+            if (!overwrite)
+                QTest::keyClick(ascii, Qt::Key_Insert);
+
+            const QString boundary = contract.value(QStringLiteral("boundary"));
+            const QString selection = contract.value(QStringLiteral("selection"));
+            const int caret = boundary == QStringLiteral("start") ? 0
+                : boundary == QStringLiteral("middle") ? 8 : original.size();
+            const int rangeStart = boundary == QStringLiteral("start") ? 0
+                : boundary == QStringLiteral("middle") ? 7 : original.size() - 2;
+            const int rangeEnd = rangeStart + 2;
+            QTextCursor cursor(ascii->document());
+            if (selection == QStringLiteral("none")) {
+                cursor.setPosition(caret);
+            } else if (selection == QStringLiteral("forward")) {
+                cursor.setPosition(rangeStart);
+                cursor.setPosition(rangeEnd, QTextCursor::KeepAnchor);
+            } else {
+                cursor.setPosition(rangeEnd);
+                cursor.setPosition(rangeStart, QTextCursor::KeepAnchor);
+            }
+            ascii->setTextCursor(cursor);
+
+            const QByteArray typed = contract.value(QStringLiteral("character")).toLatin1();
+            QByteArray expected = original;
+            if (selection != QStringLiteral("none")) {
+                expected.replace(rangeStart, rangeEnd - rangeStart, typed);
+            } else if (!overwrite) {
+                expected.insert(caret, typed);
+            } else if (caret < expected.size()) {
+                expected.replace(caret, 1, typed);
+            }
+            QTest::keyClicks(ascii, QString::fromLatin1(typed));
+            QApplication::processEvents(QEventLoop::AllEvents, 50);
+            QCOMPARE(tab->l2View()->readByteRange(
+                         0, tab->l2View()->virtualFileSize()), expected);
+            QCOMPARE(tab->l2View()->virtualFileSize(), qint64(expected.size()));
+            QCOMPARE(tab->isModified(), expected != original);
+            if (expected != original) {
+                tab->undo();
+                QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(
+                                              0, tab->l2View()->virtualFileSize()),
+                                          original, 1000);
+                tab->redo();
+                QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(
+                                              0, tab->l2View()->virtualFileSize()),
+                                          expected, 1000);
+            }
+            closeAllEditorTabs(mw_);
+        }
+    }
+
+    void tc_hex_mainwindow_clipboard_actions_follow_focused_surface() {
+        closeAllEditorTabs(mw_);
+        const QByteArray original("\0bcdefghijklmnop", 16);
+        const QString path = tmpDir_.filePath(QStringLiteral("hex-action-focus.bin"));
+        {
+            QFile source(path);
+            QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(source.write(original), qint64(original.size()));
+        }
+        mw_->openFilesFromExternal(QStringList{path});
+        QVERIFY(waitForTabCountAndL2(mw_, 1, true, 5000));
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && tab->l2View() && tab->viewModeL2() == ViewMode::Hex);
+        auto *ascii = tab->findChild<QPlainTextEdit *>(QStringLiteral("HexAsciiPreview"));
+        QVERIFY(ascii && ascii->isVisibleTo(tab));
+        QAction *copyAction = findMenuActionByExactDisplay(mw_, QStringLiteral("复制"));
+        QAction *cutAction = findMenuActionByExactDisplay(mw_, QStringLiteral("剪切"));
+        QAction *pasteAction = findMenuActionByExactDisplay(mw_, QStringLiteral("粘贴"));
+        QVERIFY(copyAction && cutAction && pasteAction);
+
+        QTextCursor asciiSelection(ascii->document());
+        asciiSelection.setPosition(1);
+        asciiSelection.setPosition(3, QTextCursor::KeepAnchor);
+        ascii->setTextCursor(asciiSelection);
+        ascii->setFocus(Qt::OtherFocusReason);
+        QTRY_VERIFY(ascii->hasFocus());
+        copyAction->trigger();
+        QCOMPARE(QGuiApplication::clipboard()->text(), QStringLiteral("bc"));
+
+        cutAction->trigger();
+        QByteArray afterCut = original;
+        afterCut.remove(1, 2);
+        QCOMPARE(tab->l2View()->readByteRange(
+                     0, tab->l2View()->virtualFileSize()), afterCut);
+        tab->undo();
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(
+                                      0, tab->l2View()->virtualFileSize()),
+                                  original, 1000);
+
+        QTextCursor asciiCaret(ascii->document());
+        asciiCaret.setPosition(1);
+        ascii->setTextCursor(asciiCaret);
+        ascii->setFocus(Qt::OtherFocusReason);
+        QGuiApplication::clipboard()->setText(QStringLiteral("XY"));
+        pasteAction->trigger();
+        QByteArray afterPaste = original;
+        afterPaste.replace(1, 2, QByteArray("XY"));
+        QCOMPARE(tab->l2View()->readByteRange(
+                     0, tab->l2View()->virtualFileSize()), afterPaste);
+
+        tab->editor()->setSelection(0, 3, 0, 8); // bytes [1, 3)
+        tab->editor()->setFocus(Qt::OtherFocusReason);
+        QTRY_VERIFY(tab->editor()->hasFocus());
+        copyAction->trigger();
+        QCOMPARE(QGuiApplication::clipboard()->text(), QStringLiteral("58 59"));
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_nine_mib_unknown_binary_unchanged_save_is_noop() {
+        closeAllEditorTabs(mw_);
+        const QString sourcePath = tmpDir_.filePath(
+            QStringLiteral("nine-mib-unknown.dat"));
+        {
+            QFile source(sourcePath);
+            QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QByteArray block(1024 * 1024, '\0');
+            for (int i = 0; i < block.size(); i += 4096)
+                block[i] = char((i / 4096) & 0xff);
+            for (int i = 0; i < 9; ++i)
+                QCOMPARE(source.write(block), qint64(block.size()));
+        }
+        QCOMPARE(QFileInfo(sourcePath).size(), 9LL * 1024 * 1024);
+
+        mw_->openFilesFromExternal(QStringList{sourcePath});
+        QVERIFY(waitForTabCountAndL2(mw_, 1, true, 5000));
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && tab->isBinaryDocument());
+        QCOMPARE(tab->viewModeL2(), ViewMode::Hex);
+        QTRY_VERIFY_WITH_TIMEOUT(tab->l2View() && tab->l2View()->isOpen(), 5000);
+        QVERIFY(!tab->isModified());
+
+        // User journey HEX-BROWSE-001: the file opens as one coherent editor,
+        // not a scroll area containing a second independently scrollable editor.
+        auto visibleBars = [tab](Qt::Orientation orientation) {
+            int count = 0;
+            for (QScrollBar *bar : tab->findChildren<QScrollBar *>()) {
+                if (bar->orientation() == orientation && bar->isVisibleTo(tab))
+                    ++count;
+            }
+            return count;
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(visibleBars(Qt::Vertical), 1, 2000);
+        QCOMPARE(visibleBars(Qt::Horizontal), 0);
+        QVERIFY(!tab->editor()->verticalScrollBar()->isVisibleTo(tab));
+        QVERIFY(!tab->editor()->horizontalScrollBar()->isVisibleTo(tab));
+        auto *ascii = tab->findChild<QPlainTextEdit *>(QStringLiteral("HexAsciiPreview"));
+        QVERIFY(ascii && ascii->isVisibleTo(tab));
+        QWidget *viewport = tab->l2View()->viewport();
+        QCOMPARE(tab->editor()->geometry().topLeft(), QPoint(0, 0));
+        QCOMPARE(ascii->geometry().top(), 0);
+        QCOMPARE(ascii->geometry().right() + 1, viewport->width());
+        QCOMPARE(tab->editor()->geometry().right() + 1, ascii->geometry().left());
+        QCOMPARE(tab->editor()->height(), viewport->height());
+        QCOMPARE(ascii->height(), viewport->height());
+
+        // Drag the only scrollbar to a distant region. The address painted on
+        // the first visible row must match that global row, then a real wheel
+        // gesture must advance both the thumb and the rendered address.
+        QScrollBar *global = tab->l2View()->verticalScrollBar();
+        QVERIFY(global->isVisibleTo(tab));
+        dragScrollBar(global, 0.70);
+        QTRY_VERIFY_WITH_TIMEOUT(global->value() > global->maximum() / 2, 5000);
+        auto visibleAddress = [tab]() -> qint64 {
+            const int first = int(tab->editor()->SendScintilla(
+                QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
+            QByteArray margin(64, '\0');
+            tab->editor()->SendScintilla(QsciScintillaBase::SCI_MARGINGETTEXT,
+                                         first, margin.data());
+            bool ok = false;
+            const qint64 address = QString::fromLatin1(margin.constData())
+                                       .toLongLong(&ok, 16);
+            return ok ? address : -1;
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(visibleAddress(),
+            qint64(global->value()) * tab->l2View()->hexBytesPerRow(), 5000);
+        const int beforeWheel = global->value();
+        const QPointF local(tab->editor()->viewport()->rect().center());
+        QWheelEvent wheel(local,
+                          tab->editor()->viewport()->mapToGlobal(local.toPoint()),
+                          QPoint(), QPoint(0, -120), Qt::NoButton,
+                          Qt::NoModifier, Qt::ScrollUpdate, false);
+        QApplication::sendEvent(tab->editor()->viewport(), &wheel);
+        QTRY_VERIFY_WITH_TIMEOUT(global->value() > beforeWheel, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(visibleAddress(),
+            qint64(global->value()) * tab->l2View()->hexBytesPerRow(), 5000);
+
+        const QString journeyScreenshot = QCoreApplication::applicationDirPath()
+            + QStringLiteral("/gui-hex-nine-mib-single-scroll.png");
+        QVERIFY2(mw_->grab().save(journeyScreenshot), qPrintable(journeyScreenshot));
+
+        QAction *saveAction = findMenuActionByExactDisplay(mw_, QStringLiteral("保存"));
+        QVERIFY(saveAction && !saveAction->isEnabled());
+        DiskFileVersion before;
+        QCOMPARE(captureDiskFileVersion(sourcePath, &before),
+                 DiskFileState::Unchanged);
+        QString error;
+        QVERIFY2(tab->saveFile(&error), qPrintable(error));
+        DiskFileVersion after;
+        QCOMPARE(captureDiskFileVersion(sourcePath, &after),
+                 DiskFileState::Unchanged);
+        QCOMPARE(after.fileIdentity, before.fileIdentity);
+        QCOMPARE(after.modifiedMs, before.modifiedMs);
+        QCOMPARE(after.sampleHash, before.sampleHash);
+        QVERIFY(!QFileInfo::exists(sourcePath
+                                  + QStringLiteral(".notepad-safe-save-tmp")));
+        closeAllEditorTabs(mw_);
+    }
+
     void tc_hex_binary_crash_recovery_restores_bytes_and_position() {
         const QString dataDir = tmpDir_.filePath(QStringLiteral("hex-session-data"));
         QDir().mkpath(dataDir);
@@ -977,7 +2130,7 @@ private slots:
         closeAllEditorTabs(restoredWindow);
         restoredWindow->close();
         delete restoredWindow;
-        qunsetenv("NOTEPADSAFE_DATADIR");
+        qputenv("NOTEPADSAFE_DATADIR", primaryTestDataDir_.toUtf8());
     }
 
     void tc_binary_text_presentation_survives_session_restore() {
@@ -1041,7 +2194,7 @@ private slots:
         // close transaction (accounts workspace, autosave and security-session
         // shutdown). All document resources have already been stopped above.
         delete restoredWindow;
-        qunsetenv("NOTEPADSAFE_DATADIR");
+        qputenv("NOTEPADSAFE_DATADIR", primaryTestDataDir_.toUtf8());
     }
 
     void tc_unified_open_focuses_existing_document() {
@@ -1706,7 +2859,7 @@ private slots:
         QVERIFY(!window->findChild<QLabel *>(QStringLiteral("status.modified"))->isVisible());
         window->close();
         delete window;
-        qunsetenv("NOTEPADSAFE_DATADIR");
+        qputenv("NOTEPADSAFE_DATADIR", primaryTestDataDir_.toUtf8());
 
         // Restore the primary test window's selected appearance after the
         // isolated settings-migration window changed the application palette.
@@ -1764,7 +2917,7 @@ private slots:
         window->close();
         delete window;
         qunsetenv("NOTEPADSAFE_FORCE_HIGH_CONTRAST");
-        qunsetenv("NOTEPADSAFE_DATADIR");
+        qputenv("NOTEPADSAFE_DATADIR", primaryTestDataDir_.toUtf8());
 
         // The palette is process-global; restore the primary window after the
         // isolated accessibility run.

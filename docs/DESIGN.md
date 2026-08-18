@@ -345,6 +345,28 @@ stateDiagram-v2
 
 预览期间可以滚动、复制、跳转、字面搜索和正则搜索，但编辑、粘贴和替换保持禁用。用户可以取消“准备编辑”，继续只读分析。
 
+#### 7.1.0 S1/S2/S3 共用同一编辑器表面
+
+文件大小分级只允许改变数据装载方式和 capability，禁止改变产品界面。Text 的 S1 完整文档、
+S2 预览/晋升/回退和 S3 只读必须进入同一个 `EditorSurface`；用户可见结构和交互契约保持一致：
+
+- 同一字体、字号、颜色、正文边距、当前行、selection、search indicator 和 caret 风格；
+- 同一左侧 gutter 槽位。完整索引时显示精确行号；索引未完成时在相同槽位显示“约/计算中”或
+  全局 byte offset，不得让 gutter 消失、改变宽度或显示窗口局部伪行号；
+- 同一纵向/横向滚动条位置、尺寸、主题和 wheel/Page/drag 手感，任何时刻可见纵向滚动条恰好
+  一条；换行、缩放、标尺、空白符显示和右键菜单使用同一视图配置；
+- 同一查找高亮、书签、复制、标签、状态栏和 Dock 跳转表现。只读 Tier 通过 capability 禁用
+  Cut/Paste/Undo/Replace/Save 等命令，不能换成简陋的“大文件查看器”；
+- S2 从 Preview/Preparing 到 Editable 或 ReadOnlyFallback 时，EditorSurface 本身不被替换、
+  不闪白、不改变几何。只在后台重新绑定 Windowed/Full document model，并恢复同一全局 top、
+  caret、selection、horizontal offset、wrap、zoom、bookmark 和 active search match；
+- Tier/准备/只读原因仅在状态栏和任务中心表达。正文区域不得增加常驻大文件横幅、水印、第二套
+  工具栏或不同的上下文菜单来暴露内部实现。
+
+Hex 同理：B1/B2/B3/Secure Binary 必须共用一个 `HexView`（地址、Hex、ASCII、滚动、选择、
+主题和搜索高亮）；区别仅是 ByteSource 与 writable capability。当前 B1 overlay 与 B2/B3
+`WindowedReadOnlyProvider` Hex 的可见差异属于迁移期 **P0**，在统一 HexView 前不得宣称体验一致。
+
 #### 7.1.1 单滚动条与位置真值
 
 S2 预览不得把带自身滚动条的 QScintilla 叠放在 `QAbstractScrollArea`/另一条滚动条的 viewport 中。目标实现是独立 `WindowedReadOnlyProvider`：
@@ -352,7 +374,9 @@ S2 预览不得把带自身滚动条的 QScintilla 叠放在 `QAbstractScrollAre
 - 预览期隐藏 Scintilla 内部纵向滚动条，只保留一条与编辑区视觉一体的全局滚动条；该滚动条映射 64 位 `SourceBytes` 位置，是鼠标拖动、滚轮、PageUp/PageDown、键盘导航和搜索跳转的唯一位置真值。
 - Scintilla 只负责当前窗口的文本渲染、选择、indicator 和输入法，不拥有独立的“当前窗口滚动到末尾”语义。滚轮和键盘事件先转换为全局导航请求，再决定是否切换窗口。
 - 切换窗口前保存全局 top/caret/anchor/selection；窗口 ready 后按同一全局锚点恢复局部首行和选区。禁止用 `setText()` 后的默认局部位置覆盖用户全局位置，禁止滚动到底自动跳回窗口开头。
-- ILoader 晋升成功后整体切换为完整 `TextEditorProvider`，销毁/隐藏预览全局滚动条，只显示 Scintilla 自己的一条滚动条；晋升前后全局位置、选择和活动搜索命中保持不变。
+- ILoader 晋升成功后把同一 `EditorSurface` 重新绑定到完整 `TextEditorProvider`。内部可以从全局
+  滚动代理切换到 Scintilla 文档滚动，但对用户暴露的滚动条槽位、geometry/style/pageStep 和
+  当前 thumb 位置不得改变；晋升前后全局位置、选择、水平位置和活动搜索命中保持不变。
 - 任何主题、DPI、Text/Hex 呈现和窄窗口下，编辑区可见且可操作的纵向滚动条计数必须严格等于 1。
 
 2026-08-17 审计确认当前 `VirtualFileView(QAbstractScrollArea) + viewport 内 QScintilla overlay` 违反该不变量：两套滚动范围互相独立，局部窗口重灌会重置 Scintilla 可视位置。该路径标记为**不可验收的迁移实现**，不得继续通过同步两个滚动条或增加 debounce 修补；只能提取可复用的按绝对位置读取逻辑后替换视图容器。
@@ -428,12 +452,15 @@ S3 复用 WindowedByteSource、WindowedReadOnlyView、SparseLineIndex 和 Search
 - 跳转 byte offset、已知行号、文件头尾和搜索结果。
 - 有界复制、导出选择、导出匹配行。
 - 字面搜索、完整 PCRE2 正则、结果 Dock、取消和进度。
+- 与 S1 相同入口和外观的自动换行、缩放、字体、主题、选择、书签、右键菜单和搜索高亮；
+  实现可以只重排当前有界窗口，但不得改变全局位置或造成假 EOF。
 - 日志 tail/follow 可作为后续增量功能。
 
 不支持：
 
 - 编辑、粘贴、替换、自动保存、撤销。
-- 全文语法高亮、自动换行、代码折叠、文档地图。
+- 全文语法高亮、代码折叠、文档地图。当前窗口的轻量高亮可以后续按同一 EditorSurface 增强，
+  未实现时语言 capability 明确禁用，但正文布局仍与 S1 Plain Text 一致。
 - 单行无限制渲染；超长行按窗口显示，复制/导出仍流式读取完整范围。
 
 ### 8.1 窗口化显示
@@ -1769,7 +1796,10 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 | P9 S3/B3 分析与统一搜索 | 单滚动 Windowed View、SparseLineIndex、PCRE2、Text/Byte target、可选 scope、有界 SearchScheduler、per-target 增量刷新、分页结果 Dock、typed position、精确异步跳转、可见区高亮和全部打开文档 ReplacePlan | 4.59 GiB/10+ GiB 与混合文件搜索稳定、搜索不等待完整行索引、跨块/跨 Provider 不漏报；全部打开文件查找/替换一致；线程/背压/generation 及 14.5 GUI 专项全部通过 |
 | P10 清理与发布治理 | 删除可见 Vault Dock、生产 `.nsk` 写路径和旧 S2 Patch 写穿，保留必要迁移读取/facade；补齐 SBOM、恢复工具和升级自动化 | 无生产用户路径引用废止架构；内部兼容类型不形成第二套 UX；旧版本迁移测试持续保留 |
 
-截至 2026-08-17，P1–P10 的本次发布用户边界已按十轮路线收敛并通过正式门禁。仍保留的 facade、兼容读取器和类型命名不形成第二套用户路径；后续重构必须保持现有动态旅程和旧数据读取，不能为了“架构更干净”重新引入双滚动、mmap Patch 大文件编辑或修改 Scintilla 存储内核。目录搜索、B2/B3 写穿、Hex 通配符/Data Inspector 等新能力必须另立版本目标，不能倒灌为 0.3.1 的隐性未完成项。
+2026-08-17 的真实用户复审已经推翻“P1–P10 全部收敛、可以发布”的结论。旧门禁只能
+证明其明确断言覆盖的局部行为，不能证明真实编辑器成熟。当前必须保持旧数据读取和已验证的
+加密路径，但 B1 Hex 双滚动、统一搜索动态行为和接近 2 GiB 的 S2 编辑重新列为发布 P0；
+0.3.1 历史包不得作为发布候选。详细当前真值见第 18 章和 `ITERATION_ROADMAP.md` 6.1。
 
 执行以**纵向功能批次**为单位：一个批次同时完成领域接口、命令状态、菜单/工具栏/状态栏、错误与进度、单元测试、GUI smoke、真实进程交互和截图。除阻断构建/数据安全的 P0 问题外，不接受“只修一个按钮、以后再补相邻状态”的零散提交；同一表格行/同一页面的相关缺陷应合并处理，以减少重复构建和 GUI 验证成本。
 
@@ -1818,3 +1848,88 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 - `.deps/src/keepassxc-2.7.12/src/format/Kdbx4Reader.cpp`：读取 `PublicCustomData`。
 - `.deps/src/keepassxc-2.7.12/src/format/Kdbx4Writer.cpp`：序列化并写回 `PublicCustomData`。
 - `.deps/src/keepassxc-2.7.12/tests/TestKdbx4.cpp`：现有 custom data round-trip 测试，可作为产品 key envelope golden test 的基础。
+
+## 18. 真实用户成熟度复审后的强制架构约束（2026-08-17）
+
+本章优先于第 15–17 章中任何“已完成/已收敛”的历史表述。复审方法不是继续枚举按钮，
+而是对每一种 DocumentKind × SizeTier × Presentation 执行真实鼠标、滚轮、键盘、保存、
+搜索结果双击和重启操作，并检查屏幕正文与磁盘字节。仅检查内部 offset、signal 或 worker
+结束不构成 GUI 验收。
+
+### 18.1 本轮确认的共因
+
+1. **滚动位置有两个语义**。旧 S2/S3 用 slider value 表示最后一个 byte anchor，Scintilla
+   却用第一条 display line 表示 viewport；因此 value=max 并不自动意味着最后一屏已覆盖
+   EOF。修复后 `global offset → mmap window → projected position → actual viewport` 必须形成
+   单向闭环，EOF 由 `visibleBottomOffset` 与物理 size 共同断言。
+2. **自动换行产生 display line，不产生 document line**。任何滚轮步进、页滚动、可见顶端
+   和 byte 换算都必须经过 `SCI_VISIBLEFROMDOCLINE`、`SCI_DOCLINEFROMVISIBLE`、
+   `SCI_WRAPCOUNT` 或 point/position API；禁止直接把 wrapped row 当逻辑行号。
+3. **一份文档只能有一个用户可操作的纵向滚动位置**。B1 的 overlay 实现和 B2/B3 的
+   WindowedReadOnlyProvider 现在均只暴露一个全局纵向滚动条，并共享“地址 margin + 纯 Hex +
+   独立 ASCII pane”的可见契约；内部实现仍不相同。禁止重新引入地址/Hex/ASCII 拼接投影、
+   外层与内核双滚动或靠双向同步两个 scrollbar 修补。后续抽取统一 HexEditorProvider 属于
+   架构清债，任何迁移都必须先保持当前动态契约不退化。
+4. **预览期不能伪造行号**。完整 SparseLineIndex 未就绪时，Text gutter 显示精确全局 byte
+   offset；索引或完整 Scintilla 文档就绪后才能显示全局逻辑行号。窗口局部 1..N 永远不可见。
+5. **状态栏临时消息与文档元数据不能争夺布局**。`showMessage()` 独占左侧弹性区域；光标/
+   offset、编码与 EOL、语法/呈现、大小与 tier、dirty 和 task chip 均为 permanent segment。
+6. **Save 的前置条件是 dirty，而不是“当前有文件”**。已命名未修改文档普通 Save 必须严格
+   no-op。用户提到的约 9 MiB PDF 只是 Binary/Unknown → B1 路由的实例，不是 PDF 特例；
+   旧代码无条件进入同路径保存并使用固定可见临时副本，才造成“先备份再保存”的观感。
+   修改后的 B1 小文件仍使用 `QSaveFile` 同目录临时文件 + 原子 replace 来保证崩溃安全，
+   但临时名由平台管理且正常 UI 不暴露；绝不能为了模仿“原地保存”而 truncate 原文件后写入。
+
+### 18.2 当前 Provider 边界
+
+| 路由 | 当前可见 Provider | 本轮状态 | 后续动作 |
+|---|---|---|---|
+| S1 Text `<32 MiB` | 原生 QScintilla | 保持完整编辑基线 | 与 Secure Text 共用搜索/命令动态复审 |
+| S2 Text `32 MiB–<2 GiB` 预览/回退 | WindowedReadOnlyProvider | 单滚动、gutter、wrap 和物理 EOF 本轮修复 | 继续编码、长行、增长日志、搜索跳转组合验收 |
+| S2 Text 晋升后 | 完整 Scintilla ILoader document | 资源允许时可编辑；不能保证每台机器接近 2 GiB | ResourceAdmission 不通过时留在上述只读 Provider |
+| S3 Text `>=2 GiB` | WindowedReadOnlyProvider | 只读分析；本轮正式 2 GiB+ wrap/EOF 通过 | 全量 PCRE2、结果 Dock 与日志增长继续复审 |
+| B2/B3 Hex | WindowedReadOnlyProvider Hex + ASCII pane | 已统一为地址 margin、纯 Hex、独立 ASCII、单滚动；真实大文件与契约用例通过 | 跨窗口鼠标选区、全部搜索分支、右键与 DPI 继续复审 |
+| B1 Hex `<32 MiB` | VirtualFileView + Scintilla/ASCII overlay | 可见三栏与单滚动契约已和 B2/B3 对齐；编辑、保存、Undo 基线通过 | 保留行为门禁后抽取统一 HexEditorProvider，清除内部 overlay 技术债务 |
+
+### 18.3 本轮实现与证据
+
+- WindowedReadOnlyProvider 的 Text margin 改为全局十六进制 byte offset，保证 S2 早期预览
+  有稳定导航 landmark；正式截图 `build/gui-formal-s2-early-status.png` 可见。
+- scrollbar 最大值会把最后一个 window 固定到物理 EOF，并将最后一屏滚入 viewport；
+  `build/gui-formal-s2-eof.png` 可见 `FINAL_FORMAL_S2_EOF_MARKER`，取得正文焦点后连续
+  64 次 Down 仍保持 `value == maximum`。
+- word wrap 滚动按 display line 计算；正式 2 GiB+ S3 脚本把 RangeValue 设为 1,000,000，
+  连续 Down 后仍为 1,000,000，截图为 `build/gui-formal-s3-wrap-eof.png`。
+- 状态栏文档 segment 已改为 permanent widget；S2 恢复消息位于左侧，右侧“行/编码/EOL/
+  呈现/256.00 MiB·S2·预览”无覆盖。
+- 未修改 B1 保存动作禁用且 `EditorTab::saveFile` 为 no-op；GUI 回归同时检查文件 identity、
+  mtime 不变且不存在 `.notepad-safe-save-tmp`。修改后的 B1 通过 QSaveFile 保存、重开和
+  逐字节回读。
+- B2/B3 Hex 已删除旧的“地址 + Hex + ASCII 拼接行”投影，改为 Scintilla 地址 margin、纯 Hex
+  网格和独立 ASCII pane；两栏共用 source-byte 选区并随同一个全局 scrollbar 浏览。
+  `windowedHexUsesUnifiedThreeColumnByteContract` 验证双向选区、nibble 导航、焦点 Copy、
+  Ctrl+A 全源边界、窄宽重排和源文件不变；保留的 228MB/4.9GB 样本验证真实首尾拖动。
+  Provider 邻接回归 9/9、B1 邻接回归 5/5、Hex 搜索邻接回归 4/4 通过；视觉证据为
+  `build/gui-windowed-hex-unified.png`、`build/gui-production-b2-dynamic.png` 和
+  `build/gui-production-s3-dynamic.png`。
+
+自动回归 `windowedTextWrapReachesPhysicalEofAndKeepsGutter` 和
+`tc_hex_binary_open_edit_save_as_reopen_roundtrip`、
+`tc_nine_mib_unknown_binary_unchanged_save_is_noop` 已通过，正式程序脚本也通过。但这组证据
+只关闭上述具体缺陷，不恢复旧“Hex/搜索/整体成熟”的声明。
+
+### 18.4 下一批次（不得拆成零散按钮修复）
+
+1. **Hex 剩余一致性与 Provider 清债批次**：当前 B1/B2/B3 三栏、单滚动可见契约作为不可
+   回退基线；继续覆盖 viewport 边缘自动滚动、跨投影窗口鼠标选区、右键/拖放、搜索模式
+   分支、DPI/theme/辅助功能与保存失败。随后在这些行为门禁下抽取统一 HexEditorProvider，
+   消除 B1 overlay 和窗口 Provider 的内部重复，而不是再次更换用户界面。
+2. **统一 SearchSession 动态复审批次**：Text/Hex × S1/S2/S3/Secure × 当前/全部打开文件，
+   真实打开 Dock、观察增量分组和高亮、双击正文精确 selection、快速切 tab/关闭/编辑导致
+   revision 失效、取消与重跑；Replace All 只覆盖 eligible editable targets 且每文档一次 Undo。
+3. **S2 编辑资源批次**：256 MiB 日常样本与接近 2 GiB 基准样本均执行首/中/尾编辑、
+   Undo/Redo、保存/重开、任务阶段、取消和内存不足回退；峰值资源或超时不合格时产品行为
+   是无损留在 S3 风格只读分析，不是回到 mmap patch 编辑。
+
+以上三批未完成前，不得把成熟度标记为 50% 以上，不得生成新发布候选。每批只运行受影响
+测试和少量邻接回归；阶段门才运行全矩阵，以控制剩余资源。
