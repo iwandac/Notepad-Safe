@@ -23,7 +23,7 @@ caret/selection、状态栏、dirty/Undo 和磁盘结果中适用的部分。
 |---|---|---|---|
 | HX-O01 | 统一打开/路由 | 扩展名伪装、NUL/控制字节、Text/Binary/Secure、B1–B3 | 内容身份决定 Text/Hex；无错误 readAll 或错误 Provider |
 | HX-O02 | Text↔Hex 呈现 | clean/dirty、位置/选择、重开/会话恢复 | payload 不变；菜单/状态/位置一致；转换不保存 |
-| HX-L01 | 三列布局 | Provider×宽度×DPI×主题 | 地址/Hex/ASCII 对齐并利用宽度；无大片空白、裁 nibble、重叠 |
+| HX-L01 | 三列布局 | Provider×宽度×DPI×主题、长距离行高累计 | 地址/Hex/ASCII 使用同一实际像素行高，首行至第 1000 行水平基线不漂移；利用宽度且无大片空白、裁 nibble、重叠 |
 | HX-L02 | 自适应 bytes/row | 15/16/17B、resize 往返、窄/宽 | 只按完整字节和 4B 粒度重排；数据、caret、selection 不变 |
 | HX-N01 | 鼠标定位 | high/low、空格、ASCII、地址、各边界 | caret 吸附有效 byte/nibble；两表面映射同一 global offset |
 | HX-N02 | 左右键 | high↔low、byte±1、BOF/EOF、OVR/INS | 永不停在分隔空格；状态和 ASCII caret 同步 |
@@ -34,11 +34,11 @@ caret/selection、状态栏、dirty/Undo 和磁盘结果中适用的部分。
 | HX-S02 | ASCII 选择 | 正反向、跨行/窗口、末字节 | Hex 镜像精确；方向不改变 payload range |
 | HX-S03 | Select All/清除 | Hex/ASCII、空/单/多窗口 | 全文件或产品明确的有界范围；状态栏 64 位长度准确 |
 | HX-E01 | Hex nibble 输入 | 0–9/A–F/a–f、high/low、OVR/INS、BOF/middle/EOF | OVR 长度不变；INS 插入；两 nibble 合成一 byte；caret 跳转正确 |
-| HX-E02 | 非法 Hex 输入 | G/空格/换行/Unicode、组合键 | payload 不变；可见错误；导航/快捷键不被误拦截 |
+| HX-E02 | 非法 Hex 输入 | G/空格/换行/Unicode、组合键、IME preedit/commit | payload 不变；候选整段原子拒绝；预编辑不进入固定网格；导航/快捷键不被误拦截 |
 | HX-E03 | ASCII 输入 | 0x20–0x7E、0x00/0xFF via paste、Unicode、OVR/INS | Latin-1 规则明确；Hex 即时同步；非法输入无修改 |
 | HX-E04 | Insert 模式切换 | 两表面、切标签、重开、只读 | 单文档共享 OVR/INS；不泄漏；状态栏/能力一致 |
 | HX-D01 | Delete/Backspace | 两表面×模式×选择方向×BOF/middle/EOF | 删除准确；BOF Backspace/EOF Delete no-op；不被字符校验吞掉 |
-| HX-C01 | Copy | 两表面×选择/none×跨行 | Hex 输出规范 bytes；ASCII 输出 Latin-1；payload 不变 |
+| HX-C01 | Copy | 两表面×选择/none×跨行、可打印/控制/NUL bytes | Hex 输出规范 bytes；ASCII 可打印内容输出文本；不可打印内容同时携带私有 raw-byte MIME 与可见 Hex 文本，不能被剪贴板 NUL 截断；payload 不变 |
 | HX-C02 | Cut | 两表面×选择方向×边界×只读 | 剪贴板与删除范围一致；无选择 no-op；只读禁用 |
 | HX-C03 | Paste | 两表面×OVR/INS×选择×合法/非法/空/大输入 | 替换/插入语义正确；错误原子无修改；长度限制生效 |
 | HX-U01 | Undo/Redo | nibble、ASCII、delete、cut、paste、跨表面序列 | 每个用户操作一个合理历史单元；字节/投影/caret/dirty 恢复 |
@@ -89,12 +89,16 @@ caret/selection、状态栏、dirty/Undo 和磁盘结果中适用的部分。
 | HX-C01/C02/HX-U01 | `tc_hex_copy_cut_pairwise_contract` | 9 个 pairwise 案例通过 |
 | HX-C03/HX-U01 | `tc_hex_paste_pairwise_contract` | 9 个 pairwise 案例通过；已修复 OVR 在 EOF/剩余空间不足时增长文件 |
 | HX-E02/E03 | `tc_hex_invalid_direct_input_contract` | 8 个约束 pairwise 案例通过；控制字符/Unicode 原子拒绝，已修复 ASCII Enter 写入 0x0D |
+| HX-E01/E02/E03/E04/P02 | `tc_hex_ime_commit_preserves_byte_grid_contract` | 通过；真实 `QInputMethodEvent` 覆盖 Hex/ASCII preedit 与 commit，混合非法候选整段拒绝；合法 `D8DB` 在 OVR/INS 中分别原子覆盖/插入，Text↔Hex 往返后输入法策略和落盘字节正确；视觉证据 `build/gui-hex-ime-safe.png` |
 | HX-E03/E04/HX-U01 | `tc_hex_ascii_direct_input_pairwise_contract` | 9 个 pairwise 案例通过；已修复 OVR EOF 意外增长 |
 | HX-C01/C02/C03/HX-A01 | `tc_hex_mainwindow_clipboard_actions_follow_focused_surface` | 通过；已修复主窗口 QAction 忽略 ASCII 焦点 |
 | HX-E01/E03/E04/L02/S01/S02/P01/P02/U01 | `tc_hex_binary_open_edit_save_as_reopen_roundtrip` | 部分覆盖，待拆分契约生成 |
 | HX-N04/N05/L01/P01 | `tc_nine_mib_unknown_binary_unchanged_save_is_noop` | 部分覆盖 |
 | HX-N05/HX-C01/HX-Q01 | `s3ProductionProviderDragMatchesRenderedHex`、`b2BinaryUsesStableSingleScrollFallback` | 保留的 4.9GB/228MB 样本通过；拖动地址一致、精确 byte Copy、写键/命令不改源、Ctrl+Home/End 到物理首尾 |
 | HX-L01/L02/HX-N02/HX-S01/S02/S03/HX-C01/HX-Q01 | `windowedHexUsesUnifiedThreeColumnByteContract` | 通过；B2/B3 已改为与 B1 相同的“地址 margin + 纯 Hex + 独立 ASCII + 单一全局滚动条”契约，并证明双向选区、逐 nibble 导航、焦点敏感 Copy、Ctrl+A 全源边界、窄宽重排与源文件不变 |
+| HX-N04/HX-N05 | `windowedHexBothPanesWheelInLockstep`、`tc_nine_mib_unknown_binary_unchanged_save_is_noop` | 通过；Hex/ASCII 两个表面的 angle/pixel wheel 均驱动同一全局位置，屏幕首行逐行一致；B1/B2/B3 跨 256KiB 投影边界即时换窗，无停顿后跳跃、回跳或两栏漂移 |
+| HX-O02 | `windowedBinaryTextPresentationUsesTextLineNumberGutter`、`tc_binary_text_presentation_survives_session_restore` | 通过；Binary 切到 Text 后 margin 改为十进制文本行号，ASCII pane 隐藏；B1 与 Windowed Provider 及会话恢复均不残留 Hex 地址 gutter |
+| HX-L01/HX-S02/HX-C01/HX-O02/HX-F02 | `tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers` | 通过；直接只读打开保留的 32,111,104-byte `tinytestfile`，逐行核对 0–1000 行 Hex/ASCII 实际像素行高；在 ASCII 表面真实从右向左拖选 Hex 地址 `0x416–0x418`、source `[0x416,0x419)`=`01 E9 24`，复制后保留 raw bytes 并自动进入 Hex bytes 查找；Find Next 跳过当前选区命中下一处同 bytes，重置到 BOF 后精确回到 `0x416`；切换 Text 后 75% 窗口首行显示由源文件前缀换行数计算的绝对十进制行号 64591；视觉证据 `build/gui-tiny-hex-aligned-reverse-selection.png`、`build/gui-tiny-hex-raw-byte-search.png`、`build/gui-tiny-binary-text-absolute-lines.png` |
 | HX-R01 | `tc_hex_binary_crash_recovery_restores_bytes_and_position` | 基线通过，编辑原语待展开 |
 | HX-O02 | `tc_binary_text_presentation_survives_session_restore` | 基线通过 |
 | HX-F02 | `tc_fr_011_hex_byte_find_all_highlight_and_double_click` | 当前文件基线通过 |
@@ -104,6 +108,6 @@ caret/selection、状态栏、dirty/Undo 和磁盘结果中适用的部分。
 
 - **2026-08-17 已关闭可见界面分裂**：B2/B3 不再把地址、Hex、ASCII 拼成一行；B1/B2/B3 均为地址 margin、纯 Hex 网格、独立 ASCII pane 和唯一全局纵向滚动条。`windowedHexUsesUnifiedThreeColumnByteContract` 与真实 228MB/4.9GB 样本共同作为禁止回退到旧拼接投影/双滚动的永久哨兵。
 - B1 的鼠标拖到 viewport 边缘自动滚动、跨活动窗口选区尚未自动证明。
-- B2/B3 已证明焦点敏感 Copy、逐 nibble 键盘导航、正反向选区、Ctrl+A 全源边界、常用写键/命令 no-op 和 Ctrl+Home/End；跨投影窗口鼠标选区、右键/Replace/拖放等其余入口尚未完成专项生成。
+- B2/B3 已证明焦点敏感 Copy、逐 nibble 键盘导航、正反向选区、Ctrl+A 全源边界、两表面 angle/pixel wheel、跨投影滚动、常用写键/命令 no-op 和 Ctrl+Home/End；跨投影窗口鼠标选区、右键/Replace/拖放等其余入口尚未完成专项生成。
 - Hex Find Next/Prev、正则开关差异、Replace/Replace All 禁用边界，以及搜索结果跨窗口高亮仍只有局部证据。
 - DPI/theme/辅助功能、右键菜单、超限剪贴板、保存冲突/失败、每种编辑原语的恢复日志仍待验证。

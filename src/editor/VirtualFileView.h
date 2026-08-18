@@ -92,6 +92,15 @@ public:
     void closeFile(bool allowProcessEvents = true);
 
     bool isOpen() const { return m_memoryBacked || mmapBase_ != nullptr; }
+    // Windowed S2/S3 presentation owns its own bounded projection. Its hidden
+    // compatibility mmap exists only for search and must not compete by
+    // building a second full-file line index.
+    void setFullLineIndexBuildEnabled(bool enabled) {
+        m_fullLineIndexBuildEnabled = enabled;
+    }
+    bool fullLineIndexBuildEnabled() const {
+        return m_fullLineIndexBuildEnabled;
+    }
     bool isMemoryBacked() const { return m_memoryBacked; }
     QString filePath() const { return file_.fileName(); }
     qint64 fileSize() const { return mmapSize_; }
@@ -149,6 +158,10 @@ public:
     // 替换 [byteOffset, byteOffset+oldLength) 为 newData（查找/替换、回退操作核心）
     bool replaceBytes(qint64 byteOffset, qint32 oldLength, const QByteArray& newData,
                       QString* errMsg = nullptr);
+    // LargeFileSearch can mutate the shared PatchList in one batch. Route the
+    // resulting dirty/undo/layout transition back through the same observable
+    // contract as interactive edits.
+    void notifyExternalPatchMutation();
     // 删除当前选区；若无选区则什么都不做。返回 true 表示执行了删除。
     bool removeSelection(QString* errMsg = nullptr);
     // 撤销 / 重做（委托 PatchList）
@@ -388,6 +401,7 @@ private:
     bool       m_memoryBacked = false;
     uchar*     mmapBase_ = nullptr;
     qint64     mmapSize_ = 0;
+    bool       m_fullLineIndexBuildEnabled = true;
 
     LineIndex  lineIndex_;
     PatchList  patches_;

@@ -16,6 +16,7 @@
 #include <QUuid>
 #include <cstring>
 #include <algorithm>
+#include <utility>
 
 namespace {
 
@@ -55,10 +56,17 @@ bool prepareSearchPattern(const QString &pattern, const LargeFileSearch::Options
         *usePcre2 = false;
         return LargeFileSearch::parseHexBytePattern(pattern, literal, error);
     }
-    // Exact case-sensitive literals retain the linear KMP path. Regex,
-    // Unicode case folding and Unicode word boundaries use the same PCRE2
-    // provider as the in-memory editor.
-    *usePcre2 = opts.regexMode || opts.wholeWord || !opts.caseSensitive;
+    // Binary documents are not guaranteed to be valid UTF-8.  Their default
+    // (non-regex) query is therefore a raw-byte literal search, with the KMP
+    // path providing ASCII-only case folding when requested.  Routing that
+    // state through PCRE2 made the unchecked "regular expression" option lie:
+    // arbitrary binary files failed UTF-8 validation before a literal search
+    // could start.  Text documents retain PCRE2's Unicode case folding and
+    // Unicode word-boundary semantics.
+    const bool binaryLiteral = opts.byteContextMode
+        && !opts.regexMode && !opts.wholeWord;
+    *usePcre2 = opts.regexMode || opts.wholeWord
+        || (!opts.caseSensitive && !binaryLiteral);
     if (!*usePcre2)
         *literal = pattern.toUtf8();
     if (pattern.isEmpty() || (!*usePcre2 && literal->isEmpty())) {
@@ -546,8 +554,11 @@ bool LargeFileSearch::scanAllBounded(
         }
     } else {
         Pcre2Regex compiled;
+        const bool binaryWholeWord = opts.byteContextMode
+            && !opts.regexMode && opts.wholeWord;
         if (!compiled.compile(pattern, !opts.regexMode, opts.caseSensitive,
-                              opts.wholeWord, &scanError_)) {
+                              opts.wholeWord, &scanError_,
+                              !binaryWholeWord)) {
             return false;
         }
 
@@ -880,7 +891,7 @@ qint64 LargeFileSearch::findPrev(qint64 fromByte, LargeFileSearchMatch* outMatch
 }
 
 // ============================================================================
-//  replaceAll（§5.6 步骤 3，同步执行，1000 条 = 1 UndoGroup）
+//  replaceAll（§5.6 步骤 3，同步执行；进度分批，用户可见事务始终为 1 UndoGroup）
 // ============================================================================
 bool LargeFileSearch::replaceAll(const QString& pattern, const QString& replacement,
                                  const Options& optsIn, PatchList& patches,
@@ -956,9 +967,116 @@ bool LargeFileSearch::replaceAll(const QString& pattern, const QString& replacem
         return true;
     }
 
+    // Offsets and capture expansions are defined against the same immutable
+    // pre-replacement snapshot. Sort first so the replacement byte vector
+    // remains index-aligned while patches are later applied back-to-front.
+    std::sort(allMatches.begin(), allMatches.end(),
+              [](const LargeFileSearchMatch& a, const LargeFileSearchMatch& b) {
+                  return a.byteOffset > b.byteOffset;
+              });
+    QVector<QByteArray> expandedReplacements;
+    const auto wipeExpansions = qScopeGuard([&] {
+        if (!replBytes.isEmpty())
+            replBytes.fill(0);
+        for (QByteArray &value : expandedReplacements) {
+            if (!value.isEmpty())
+                value.fill(0);
+        }
+    });
+    if (opts.regexMode) {
+        Pcre2Regex compiled;
+        QString expansionError;
+        if (!compiled.compile(pattern, false, opts.caseSensitive,
+                              opts.wholeWord, &expansionError)) {
+            if (errMsg) *errMsg = expansionError;
+            return false;
+        }
+
+        const uchar *subject = mmapBase_;
+        QTemporaryFile snapshot(QDir(overrunDir()).filePath(
+            QStringLiteral("regex_replace_snapshot_XXXXXX.tmp")));
+        uchar *snapshotMap = nullptr;
+        if (patchList_ && patchList_->isModified()) {
+            snapshot.setAutoRemove(true);
+            if (!snapshot.open()) {
+                if (errMsg) {
+                    *errMsg = QObject::tr("无法创建正则替换快照：%1")
+                                  .arg(snapshot.errorString());
+                }
+                return false;
+            }
+            constexpr qint64 SnapshotChunk = Q_INT64_C(16) * 1024 * 1024;
+            for (qint64 start = 0; start < virtualSize; start += SnapshotChunk) {
+                if (cancel_.load()) {
+                    if (errMsg) *errMsg = QObject::tr("取消");
+                    return false;
+                }
+                const qint64 end = qMin(virtualSize, start + SnapshotChunk);
+                QByteArray chunk = readVirtualBytes(start, end);
+                const bool writeOk = chunk.size() == end - start
+                    && snapshot.write(chunk) == chunk.size();
+                if (!chunk.isEmpty())
+                    chunk.fill(0);
+                if (!writeOk) {
+                    if (errMsg) {
+                        *errMsg = QObject::tr("无法写入正则替换快照：%1")
+                                      .arg(snapshot.errorString());
+                    }
+                    return false;
+                }
+            }
+            if (!snapshot.flush()) {
+                if (errMsg) {
+                    *errMsg = QObject::tr("无法刷新正则替换快照：%1")
+                                  .arg(snapshot.errorString());
+                }
+                return false;
+            }
+            snapshotMap = snapshot.map(0, virtualSize);
+            if (!snapshotMap && virtualSize > 0) {
+                if (errMsg) {
+                    *errMsg = QObject::tr("无法映射正则替换快照：%1")
+                                  .arg(snapshot.errorString());
+                }
+                return false;
+            }
+            subject = snapshotMap;
+        }
+        const auto unmapSnapshot = qScopeGuard([&] {
+            if (snapshotMap)
+                snapshot.unmap(snapshotMap);
+        });
+        expandedReplacements.reserve(allMatches.size());
+        for (const LargeFileSearchMatch &match : std::as_const(allMatches)) {
+            QByteArray expanded;
+            if (!compiled.expandReplacementAt(
+                    subject, virtualSize, match.byteOffset, match.length,
+                    replacement, &expanded, &expansionError)) {
+                if (errMsg) *errMsg = expansionError;
+                return false;
+            }
+            expandedReplacements.append(std::move(expanded));
+        }
+    }
+
     // Step 2：压力检测（估算替换导致的内存增量 = Σ|replBytes.size() - m.length|）
     qint64 estSize = 0;
-    for (auto& m : allMatches) estSize += qAbs<qint64>(replBytes.size() - m.length);
+    qint64 undoBytes = patches.l1Bytes();
+    for (qsizetype index = 0; index < allMatches.size(); ++index) {
+        const qsizetype replacementSize = opts.regexMode
+            ? expandedReplacements.at(index).size() : replBytes.size();
+        estSize += qAbs<qint64>(replacementSize - allMatches.at(index).length);
+        const qint64 recordBytes = qint64(allMatches.at(index).length)
+            + replacementSize + 128;
+        if (recordBytes < 0 || undoBytes > patches.l1Limit() - recordBytes) {
+            if (errMsg) {
+                *errMsg = QObject::tr(
+                    "全部替换超过当前可撤销内存预算；尚未修改文件。请缩小范围后分批执行。");
+            }
+            return false;
+        }
+        undoBytes += recordBytes;
+    }
     if (cb.onPressureSoftWarn && patches.pressureWillExceedSoftWarn(estSize)) {
         bool decision = cb.onPressureSoftWarn(
             QObject::tr("预估替换将使 Patch 达到 ~%1 MB，建议中间保存后再继续。是否立即保存并继续？")
@@ -979,16 +1097,27 @@ bool LargeFileSearch::replaceAll(const QString& pattern, const QString& replacem
         }
     }
 
-    // Step 3：1000 条 = 1 UndoGroup；按 byteOffset 从大到小替换（避免 offset 漂移）
-    //   每一条 replace 内部把 oldSnapshot 和 newText 正确填好，保证 undo 严格回滚。
+    // Step 3：一次 Replace All = 一个 UndoGroup。BATCH 只控制进度/取消
+    // 检查频率，不能改变用户可见的撤销边界。预算检查保证该 group 不会
+    // spill 到会清空 undo history 的 L2 cold storage。
     const int BATCH = DynamicThresholds::instance().REPLACE_BATCH_SIZE;
     qint64 done = 0;
-    std::sort(allMatches.begin(), allMatches.end(),
-              [](const LargeFileSearchMatch& a, const LargeFileSearchMatch& b) { return a.byteOffset > b.byteOffset; });
-
+    qint64 applied = 0;
+    bool groupOpen = true;
+    patches.beginUndoGroup();
+    const auto rollbackUncommitted = qScopeGuard([&] {
+        if (!groupOpen)
+            return;
+        patches.endUndoGroup();
+        if (applied > 0) {
+            QString rollbackError;
+            if (!patches.undo(&rollbackError) && errMsg) {
+                *errMsg += QObject::tr("；自动回滚失败：%1").arg(rollbackError);
+            }
+        }
+    });
     for (qint64 bStart = 0; bStart < total; bStart += BATCH) {
         if (cancel_.load()) { if (errMsg) *errMsg = QStringLiteral("取消"); return false; }
-        patches.beginUndoGroup();
         qint64 bEnd = qMin<qint64>(bStart + BATCH, total);
         for (qint64 i = bStart; i < bEnd; ++i) {
             const LargeFileSearchMatch& m = allMatches[int(i)];
@@ -997,16 +1126,18 @@ bool LargeFileSearch::replaceAll(const QString& pattern, const QString& replacem
                 oldBytes = readVirtualBytes(m.byteOffset, m.byteOffset + m.length);
             }
             if (oldBytes.size() < m.length) oldBytes.resize(m.length, '\0');
+            const QByteArray &replacementBytes = opts.regexMode
+                ? expandedReplacements.at(int(i)) : replBytes;
             QString localErr;
-            bool ok = patches.replaceWithSnapshots(m.byteOffset, m.length, replBytes, oldBytes,
+            bool ok = patches.replaceWithSnapshots(m.byteOffset, m.length,
+                                                   replacementBytes, oldBytes,
                                                    &localErr);
             if (!ok) {
                 if (errMsg) *errMsg = QObject::tr("第 %1 处替换失败：%2").arg(i).arg(localErr);
-                patches.endUndoGroup();
                 return false;
             }
+            ++applied;
         }
-        patches.endUndoGroup();
         done = bEnd;
         if (cb.progressBatch) cb.progressBatch(done, total);
 
@@ -1024,6 +1155,8 @@ bool LargeFileSearch::replaceAll(const QString& pattern, const QString& replacem
             }
         }
     }
+    patches.endUndoGroup();
+    groupOpen = false;
     if (outReplacedCount) *outReplacedCount = done;
     return true;
 }

@@ -30,11 +30,13 @@
 #include <QtCore/QCoreApplication>
 #include <QtCore/QTimer>
 #include <QtCore/QUuid>
+#include <algorithm>
 
 #include "SmokeTestBase.h"
 #include "EditorTab.h"
 #include "FindReplaceDialog.h"
 #include "VirtualFileView.h"
+#include "LargeFileVerticalSlice.h"
 #include "LineIndex.h"
 #include "PatchList.h"
 #include "SearchResultsDock.h"
@@ -91,7 +93,7 @@ private slots:
     // 结果因正文编辑失效后，可用原查询上下文一键重跑并恢复精确跳转。
     void tc_fr_014_invalidated_result_rerun_from_dock();
 
-    // 全部打开文件替换：仅修改可编辑 Text，明确跳过 L2/只读目标；
+    // 全部打开文件替换：修改所有策略可写 Text（包含可编辑 L2），明确跳过真正只读目标；
     // 每个文档一个 undo group，且不会自动写盘。
     void tc_fr_015_all_open_replace_transaction_and_skip_summary();
 
@@ -106,6 +108,53 @@ private slots:
     // 模型驱动试点：一份正则参数契约自动贯穿 Find All 与 Find Next，
     // 并检查 literal/escaped-regex 等价关系和非法表达式分流。
     void tc_fr_018_regex_contract_model_runs_gui_variants();
+
+    // 查询选项状态机：穷举每个合法模式组合，并真实点击所有禁用的冲突选项，
+    // 保证 GUI 无法形成 regex+whole-word / regex+hex / hex+text-options。
+    void tc_fr_019_query_option_state_machine_exhaustive();
+
+    // Replace 按钮必须替换当前已选中的匹配，而不是先跳到下一处再替换。
+    // 同时验证替换后自动选中下一处，连续操作不跳项。
+    void tc_fr_020_replace_button_uses_current_match_then_advances();
+
+    // 每个文本查询选项不仅要有正确 enabled 状态，还必须真实改变 Find All
+    // 与重复 Find Next 的 authoritative byte ranges；wrap 只改变边界导航。
+    void tc_fr_021_text_option_semantics_all_legal_combinations();
+
+    // Hex 查询格式等价类、非法输入原子拒绝、Find All/Next ranges 与 wrap。
+    void tc_fr_022_hex_query_formats_errors_and_navigation();
+
+    // 正则替换必须展开编号/命名捕获；单次与全部替换使用相同语法且不写入字面 `$1`。
+    void tc_fr_023_regex_capture_replacement_gui_contract();
+
+    // L2 patch Provider 必须与 S1 使用同一捕获展开语义，并保持单次/全部 Undo 边界。
+    void tc_fr_024_l2_regex_capture_replacement_consistency();
+
+    // 替换值等价类：删除/短长/Unicode/Literal 元语法，以及失败前原子拒绝和 Undo/Redo。
+    void tc_fr_025_replacement_value_contract_and_atomic_failures();
+
+    // L2 Replace All 跨过内部进度批次仍必须只有一个用户可见 Undo/Redo 事务。
+    void tc_fr_026_l2_replace_all_over_batch_is_one_undo();
+
+    // 保留的 4.9 GB S3 样本：正式对话框/Dock/双击/窗口化 Provider 全链精确到 64 位 byte range。
+    void tc_fr_027_real_s3_find_all_dock_double_click();
+
+    // 同一真实 S3 样本：首次 Find Next 等待异步 mmap，重复导航读取可见 Provider 选区而非隐藏后端。
+    void tc_fr_028_real_s3_find_next_preparation_and_repeat_boundary();
+
+    // 结果超过常驻内存上限后进入 spool；Dock 仍虚拟展示并可精确双击最后一条结果。
+    void tc_fr_029_result_spool_virtual_tail_navigation();
+
+    // 2 GiB 后的有效 UTF-8 S3 Text：Regex/大小写/Dock/双击与只读替换边界。
+    void tc_fr_030_sparse_s3_text_regex_after_two_gib();
+
+    // 真实 Binary S3 默认仅勾选循环查找：复制的文本必须按原始字节字面量
+    // 搜索，不能暗中进入 PCRE2 并报“正文不是有效 UTF-8”。
+    void tc_fr_031_real_s3_default_literal_is_not_regex();
+
+    // 可移植的非法 UTF-8 Binary 门禁：不依赖保留的大文件，也必须证明
+    // 默认 Literal + ASCII 不区分大小写不会进入正则引擎。
+    void tc_fr_032_invalid_utf8_binary_default_literal_portable();
 };
 
 // -------- 构造测试文件：N 行，其中 K 处包含 "__TEST_OLD__" 标记 --------
@@ -811,14 +860,35 @@ void SmokeFindReplace::tc_fr_010_all_open_cancel_and_rerun()
     auto *findAll = dialog.findChild<QPushButton *>(QStringLiteral("findAllButton"));
     auto *cancel = dialog.findChild<QPushButton *>(QStringLiteral("cancelSearchButton"));
     auto *close = dialog.findChild<QPushButton *>(QStringLiteral("closeSearchButton"));
+    auto *next = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+    auto *previous = dialog.findChild<QPushButton *>(QStringLiteral("findPreviousButton"));
+    auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+    auto *hex = dialog.findChild<QCheckBox *>(QStringLiteral("hexBytesCheck"));
+    auto *caseSensitive = dialog.findChild<QCheckBox *>(
+        QStringLiteral("caseSensitiveSearchCheck"));
+    auto *wholeWord = dialog.findChild<QCheckBox *>(
+        QStringLiteral("wholeWordSearchCheck"));
+    auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
     auto *summary = dock.findChild<QLabel *>(QStringLiteral("searchResultsSummary"));
     auto *tree = dock.findChild<QTreeView *>();
-    QVERIFY(pattern && scope && findAll && cancel && close && summary && tree);
+    QVERIFY(pattern && scope && findAll && cancel && close && next && previous
+            && regex && hex && caseSensitive && wholeWord && wrap
+            && summary && tree);
     pattern->setText(marker);
     scope->setCurrentIndex(scope->findData(1));
     QTest::mouseClick(findAll, Qt::LeftButton);
     QVERIFY(cancel->isVisible() && cancel->isEnabled());
     QVERIFY(close->isVisible() && close->isEnabled());
+    QVERIFY(!pattern->isEnabled());
+    QVERIFY(!scope->isEnabled());
+    QVERIFY(!next->isEnabled());
+    QVERIFY(!previous->isEnabled());
+    QVERIFY(!findAll->isEnabled());
+    QVERIFY(!regex->isEnabled());
+    QVERIFY(!hex->isEnabled());
+    QVERIFY(!caseSensitive->isEnabled());
+    QVERIFY(!wholeWord->isEnabled());
+    QVERIFY(!wrap->isEnabled());
 
     // The first target dispatch is queued before this cancellation. At most a
     // completed prefix may remain; undispatched targets must not be scanned.
@@ -953,6 +1023,7 @@ void SmokeFindReplace::tc_fr_012_hex_byte_all_open_filters_text_targets()
     workspace.resize(1100, 650);
     auto *textTab = new EditorTab(&workspace);
     auto *binaryTab = new EditorTab(&workspace);
+    auto *lockedTab = new EditorTab(&workspace);
     QString error;
     QVERIFY(textTab->loadFile(textPath));
     QVERIFY2(binaryTab->openLargeFileL2(binaryPath, &error, false,
@@ -960,6 +1031,11 @@ void SmokeFindReplace::tc_fr_012_hex_byte_all_open_filters_text_targets()
                                         L2ContentKind::Binary), qPrintable(error));
     workspace.addTab(textTab, QStringLiteral("Text"));
     workspace.addTab(binaryTab, QStringLiteral("Binary"));
+    lockedTab->initializeSecureDocument(
+        QUuid::createUuid(), QStringLiteral("Locked search target"),
+        QStringLiteral("DE AD BE EF"));
+    lockedTab->maskSecureDocument();
+    workspace.addTab(lockedTab, QStringLiteral("Locked"));
     workspace.setCurrentWidget(textTab);
     workspace.show();
     QVERIFY(QTest::qWaitForWindowExposed(&workspace));
@@ -995,7 +1071,8 @@ void SmokeFindReplace::tc_fr_012_hex_byte_all_open_filters_text_targets()
     pattern->setText(QStringLiteral("DE AD BE EF"));
     QTest::mouseClick(findAll, Qt::LeftButton);
     QTRY_VERIFY_WITH_TIMEOUT(!cancel->isVisible(), 5000);
-    QVERIFY(status->text().contains(QStringLiteral("跳过 1 个文本文件")));
+    QVERIFY(status->text().contains(QStringLiteral("跳过文本 1 个")));
+    QVERIFY(status->text().contains(QStringLiteral("锁定文档 1 个")));
 
     auto *tree = dock.findChild<QTreeView *>();
     QVERIFY(tree && tree->model());
@@ -1195,18 +1272,18 @@ void SmokeFindReplace::tc_fr_015_all_open_replace_transaction_and_skip_summary()
         QByteArray("first ") + marker.toUtf8() + " and " + marker.toUtf8() + "\r\n";
     const QByteArray secondOriginal =
         QByteArray("second ") + marker.toUtf8() + "\r\n";
-    const QByteArray readonlyOriginal =
-        QByteArray("readonly ") + marker.toUtf8() + "\r\n";
+    const QByteArray l2Original =
+        QByteArray("editable-l2 ") + marker.toUtf8() + "\r\n";
     const QString firstPath = createSmallTestFile(firstOriginal, "fr-015-first.txt");
     const QString secondPath = createSmallTestFile(secondOriginal, "fr-015-second.txt");
-    const QString readonlyPath = createSmallTestFile(readonlyOriginal, "fr-015-readonly.txt");
+    const QString l2Path = createSmallTestFile(l2Original, "fr-015-editable-l2.txt");
 
     QTabWidget workspace;
     workspace.resize(1050, 650);
     auto *first = new EditorTab(&workspace);
     auto *second = new EditorTab(&workspace);
     auto *secure = new EditorTab(&workspace);
-    auto *readonly = new EditorTab(&workspace);
+    auto *l2 = new EditorTab(&workspace);
     QVERIFY(first->loadFile(firstPath));
     QVERIFY(second->loadFile(secondPath));
     secure->initializeSecureDocument(
@@ -1214,12 +1291,13 @@ void SmokeFindReplace::tc_fr_015_all_open_replace_transaction_and_skip_summary()
         QStringLiteral("secure %1\r\n").arg(marker));
     QVERIFY(secure->isSecureDocument());
     QString error;
-    QVERIFY2(readonly->openLargeFileL2(readonlyPath, &error, false), qPrintable(error));
-    QVERIFY(readonly->isL2Mode());
+    QVERIFY2(l2->openLargeFileL2(l2Path, &error, false), qPrintable(error));
+    QVERIFY(l2->isL2Mode());
+    QVERIFY(!l2->isReadOnlyByPolicy());
     workspace.addTab(first, QStringLiteral("first"));
     workspace.addTab(second, QStringLiteral("second"));
     workspace.addTab(secure, QStringLiteral("secure"));
-    workspace.addTab(readonly, QStringLiteral("readonly"));
+    workspace.addTab(l2, QStringLiteral("editable-l2"));
     workspace.setCurrentWidget(first);
     workspace.show();
     QVERIFY(QTest::qWaitForWindowExposed(&workspace));
@@ -1275,16 +1353,18 @@ void SmokeFindReplace::tc_fr_015_all_open_replace_transaction_and_skip_summary()
 
     QVERIFY(sawConfirmation);
     QVERIFY(sawCompletion);
-    QVERIFY(confirmationText.contains(QStringLiteral("3 个可编辑文本文件")));
-    QVERIFY(confirmationText.contains(QStringLiteral("4 处匹配")));
-    QVERIFY(confirmationText.contains(QStringLiteral("只读/未晋升大文件 1 个")));
+    QVERIFY(confirmationText.contains(QStringLiteral("4 个可编辑文本文件")));
+    QVERIFY(confirmationText.contains(QStringLiteral("5 处匹配")));
+    QVERIFY(confirmationText.contains(QStringLiteral("只读/未晋升大文件 0 个")));
     QCOMPARE(first->editor()->text().count(replacement), 2);
     QCOMPARE(second->editor()->text().count(replacement), 1);
     QCOMPARE(secure->editor()->text().count(replacement), 1);
-    QVERIFY(!readonly->editor()->text().contains(replacement));
+    QCOMPARE(l2->l2View()->readByteRange(
+                 0, l2->l2View()->virtualFileSize()).count(replacement.toUtf8()), 1);
     QVERIFY(first->isModified());
     QVERIFY(second->isModified());
     QVERIFY(secure->isModified());
+    QVERIFY(l2->isModified());
     QVERIFY(status->text().contains(QStringLiteral("文件尚未保存")));
 
     // No implicit disk write, and each document is exactly one undo unit.
@@ -1300,10 +1380,15 @@ void SmokeFindReplace::tc_fr_015_all_open_replace_transaction_and_skip_summary()
     QCOMPARE(first->editor()->text(), QString::fromUtf8(firstOriginal));
     QCOMPARE(second->editor()->text(), QString::fromUtf8(secondOriginal));
     QCOMPARE(secure->editor()->text(), QStringLiteral("secure %1\r\n").arg(marker));
+    l2->undo();
+    QCOMPARE(l2->l2View()->readByteRange(0, l2->l2View()->virtualFileSize()), l2Original);
+    QFile l2Disk(l2Path);
+    QVERIFY(l2Disk.open(QIODevice::ReadOnly));
+    QCOMPARE(l2Disk.readAll(), l2Original);
 
     QVERIFY(dialog.grab().save(QDir(QCoreApplication::applicationDirPath())
         .filePath(QStringLiteral("gui-all-open-replace-complete.png"))));
-    readonly->shutdownL2BeforeClose();
+    l2->shutdownL2BeforeClose();
     dock.close();
     workspace.close();
 }
@@ -1548,6 +1633,1300 @@ void SmokeFindReplace::tc_fr_018_regex_contract_model_runs_gui_variants()
     // shared wrong implementation even if individual result counts happen to
     // look plausible.
     QCOMPARE(literalDotResults, escapedRegexDotResults);
+}
+
+void SmokeFindReplace::tc_fr_019_query_option_state_machine_exhaustive()
+{
+    const QString textPath = createSmallTestFile(
+        QByteArray("cat Cat scatter\n"), QStringLiteral("fr-019-text.log"));
+    QByteArray binaryBytes(64, '\0');
+    binaryBytes.replace(8, 3, QByteArray::fromHex("CA7F00"));
+    const QString binaryPath = createSmallTestFile(
+        binaryBytes, QStringLiteral("fr-019-binary.bin"));
+
+    QTabWidget workspace;
+    workspace.resize(1000, 620);
+    auto *textTab = new EditorTab(&workspace);
+    auto *binaryTab = new EditorTab(&workspace);
+    auto *lockedTab = new EditorTab(&workspace);
+    QVERIFY(textTab->loadFile(textPath));
+    QString openError;
+    QVERIFY2(binaryTab->openLargeFileL2(
+                 binaryPath, &openError, false,
+                 L2Presentation::Hex, L2ContentKind::Binary),
+             qPrintable(openError));
+    workspace.addTab(textTab, QStringLiteral("Text"));
+    workspace.addTab(binaryTab, QStringLiteral("Binary"));
+    lockedTab->initializeSecureDocument(
+        QUuid::createUuid(), QStringLiteral("Locked"), QStringLiteral("cat"));
+    lockedTab->maskSecureDocument();
+    QVERIFY(lockedTab->isSecureDocumentMasked());
+    workspace.addTab(lockedTab, QStringLiteral("Locked"));
+    workspace.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&workspace));
+
+    SearchResultsDock dock;
+    FindReplaceDialog dialog(&workspace);
+    dialog.setTabWidget(&workspace);
+    dialog.setSearchResultsDock(&dock);
+    dialog.setActiveTab(textTab);
+    dialog.showReplaceMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *scope = dialog.findChild<QComboBox *>(QStringLiteral("searchScopeCombo"));
+    auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+    auto *hex = dialog.findChild<QCheckBox *>(QStringLiteral("hexBytesCheck"));
+    auto *caseSensitive = dialog.findChild<QCheckBox *>(
+        QStringLiteral("caseSensitiveSearchCheck"));
+    auto *wholeWord = dialog.findChild<QCheckBox *>(
+        QStringLiteral("wholeWordSearchCheck"));
+    auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
+    auto *next = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+    auto *previous = dialog.findChild<QPushButton *>(
+        QStringLiteral("findPreviousButton"));
+    auto *findAll = dialog.findChild<QPushButton *>(QStringLiteral("findAllButton"));
+    auto *replacement = dialog.findChild<QLineEdit *>(QStringLiteral("replaceTextEdit"));
+    auto *replace = dialog.findChild<QPushButton *>(QStringLiteral("replaceButton"));
+    auto *replaceAll = dialog.findChild<QPushButton *>(QStringLiteral("replaceAllButton"));
+    QVERIFY(pattern && scope && regex && hex && caseSensitive && wholeWord
+            && wrap && next && previous && findAll && replacement && replace
+            && replaceAll);
+
+    const auto clearInterpretation = [&]() {
+        regex->setChecked(false);
+        hex->setChecked(false);
+        caseSensitive->setChecked(false);
+        wholeWord->setChecked(false);
+        QApplication::processEvents(QEventLoop::AllEvents, 20);
+    };
+    const auto assertNoConflict = [&](const QByteArray &caseId) {
+        QVERIFY2(!(regex->isChecked() && wholeWord->isChecked()), caseId.constData());
+        QVERIFY2(!(regex->isChecked() && hex->isChecked()), caseId.constData());
+        QVERIFY2(!(hex->isChecked() && caseSensitive->isChecked()), caseId.constData());
+        QVERIFY2(!(hex->isChecked() && wholeWord->isChecked()), caseId.constData());
+    };
+
+    // Empty queries are not executable actions; the user must not be offered
+    // buttons that silently do nothing.
+    pattern->clear();
+    QTRY_VERIFY(!next->isEnabled());
+    QVERIFY(!previous->isEnabled());
+    QVERIFY(!findAll->isEnabled());
+    QVERIFY(!replace->isEnabled());
+    QVERIFY(!replaceAll->isEnabled());
+    QVERIFY(replacement->isEnabled());
+    pattern->setText(QStringLiteral("cat"));
+    QTRY_VERIFY(next->isEnabled());
+    QVERIFY(previous->isEnabled());
+    QVERIFY(findAll->isEnabled());
+
+    struct TargetContext {
+        EditorTab *active = nullptr;
+        int scopeData = 0;
+        bool byteModeAvailable = false;
+        bool searchExecutable = true;
+        const char *id = nullptr;
+    };
+    const QVector<TargetContext> contexts = {
+        {textTab, 0, false, true, "current-text"},
+        {binaryTab, 0, true, true, "current-binary"},
+        {lockedTab, 0, false, false, "current-locked"},
+        {textTab, 1, true, true, "all-open-mixed"},
+    };
+
+    for (const TargetContext &context : contexts) {
+        workspace.setCurrentWidget(context.active);
+        dialog.setActiveTab(context.active);
+        scope->setCurrentIndex(scope->findData(context.scopeData));
+        QTRY_COMPARE(scope->currentData().toInt(), context.scopeData);
+        const bool singleReplaceExpected = context.scopeData == 0
+            && !context.active->isBinaryDocument()
+            && !context.active->isSecureDocumentMasked();
+        const bool replaceAllExpected = context.scopeData == 1
+            || singleReplaceExpected;
+
+        // Literal mode: case/whole/wrap are independent legal dimensions.
+        for (int flags = 0; flags < 8; ++flags) {
+            clearInterpretation();
+            const bool wantCase = flags & 1;
+            const bool wantWhole = flags & 2;
+            const bool wantWrap = flags & 4;
+            wrap->setChecked(wantWrap);
+            if (wantCase)
+                QTest::mouseClick(caseSensitive, Qt::LeftButton);
+            if (wantWhole)
+                QTest::mouseClick(wholeWord, Qt::LeftButton);
+            const QByteArray id = QByteArray(context.id)
+                + "-literal-" + QByteArray::number(flags);
+            QVERIFY2(!regex->isChecked() && !hex->isChecked(), id.constData());
+            QCOMPARE(caseSensitive->isChecked(), wantCase);
+            QCOMPARE(wholeWord->isChecked(), wantWhole);
+            QCOMPARE(wrap->isChecked(), wantWrap);
+            QVERIFY2(caseSensitive->isEnabled(), id.constData());
+            QVERIFY2(wholeWord->isEnabled(), id.constData());
+            QCOMPARE(hex->isEnabled(),
+                     context.byteModeAvailable && !wantCase && !wantWhole);
+            QCOMPARE(regex->isEnabled(), !wantWhole);
+            QCOMPARE(replacement->isEnabled(), replaceAllExpected);
+            QCOMPARE(replace->isEnabled(), singleReplaceExpected);
+            QCOMPARE(replaceAll->isEnabled(), replaceAllExpected);
+            QCOMPARE(next->isEnabled(), context.searchExecutable);
+            QCOMPARE(previous->isEnabled(), context.searchExecutable);
+            QCOMPARE(findAll->isEnabled(), context.searchExecutable);
+            assertNoConflict(id);
+        }
+
+        // Regex mode: match-case and wrap remain meaningful; whole-word and
+        // byte mode are disabled and real mouse clicks cannot change them.
+        for (int flags = 0; flags < 4; ++flags) {
+            clearInterpretation();
+            QVERIFY(regex->isEnabled());
+            QTest::mouseClick(regex, Qt::LeftButton);
+            const bool wantCase = flags & 1;
+            const bool wantWrap = flags & 2;
+            caseSensitive->setChecked(wantCase);
+            wrap->setChecked(wantWrap);
+            const QByteArray id = QByteArray(context.id)
+                + "-regex-" + QByteArray::number(flags);
+            QVERIFY2(regex->isChecked(), id.constData());
+            QVERIFY2(caseSensitive->isEnabled(), id.constData());
+            QVERIFY2(!wholeWord->isEnabled() && !wholeWord->isChecked(),
+                     id.constData());
+            QVERIFY2(!hex->isEnabled() && !hex->isChecked(), id.constData());
+            QTest::mouseClick(wholeWord, Qt::LeftButton);
+            QTest::mouseClick(hex, Qt::LeftButton);
+            QVERIFY2(regex->isChecked() && !wholeWord->isChecked()
+                         && !hex->isChecked(), id.constData());
+            QCOMPARE(wrap->isChecked(), wantWrap);
+            QCOMPARE(replacement->isEnabled(), replaceAllExpected);
+            QCOMPARE(replace->isEnabled(), singleReplaceExpected);
+            QCOMPARE(replaceAll->isEnabled(), replaceAllExpected);
+            QCOMPARE(next->isEnabled(), context.searchExecutable);
+            QCOMPARE(previous->isEnabled(), context.searchExecutable);
+            QCOMPARE(findAll->isEnabled(), context.searchExecutable);
+            assertNoConflict(id);
+        }
+
+        clearInterpretation();
+        QCOMPARE(hex->isEnabled(), context.byteModeAvailable);
+        if (context.byteModeAvailable) {
+            // Byte mode: only scope and wrap remain meaningful. All text
+            // interpretation controls are disabled, unchecked and immutable.
+            QTest::mouseClick(hex, Qt::LeftButton);
+            for (const bool wantWrap : {false, true}) {
+                wrap->setChecked(wantWrap);
+                const QByteArray id = QByteArray(context.id)
+                    + "-hex-" + (wantWrap ? "wrap" : "nowrap");
+                QVERIFY2(hex->isChecked(), id.constData());
+                QVERIFY2(!regex->isEnabled() && !regex->isChecked(), id.constData());
+                QVERIFY2(!caseSensitive->isEnabled()
+                             && !caseSensitive->isChecked(), id.constData());
+                QVERIFY2(!wholeWord->isEnabled() && !wholeWord->isChecked(),
+                         id.constData());
+                QTest::mouseClick(regex, Qt::LeftButton);
+                QTest::mouseClick(caseSensitive, Qt::LeftButton);
+                QTest::mouseClick(wholeWord, Qt::LeftButton);
+                QVERIFY2(hex->isChecked() && !regex->isChecked()
+                             && !caseSensitive->isChecked()
+                             && !wholeWord->isChecked(), id.constData());
+                QCOMPARE(wrap->isChecked(), wantWrap);
+                QVERIFY2(!replacement->isEnabled(), id.constData());
+                QVERIFY2(!replace->isEnabled(), id.constData());
+                QVERIFY2(!replaceAll->isEnabled(), id.constData());
+                assertNoConflict(id);
+            }
+        }
+    }
+
+    QVERIFY(dialog.grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-search-option-state-machine.png"))));
+    binaryTab->shutdownL2BeforeClose();
+    dialog.close();
+    workspace.close();
+}
+
+void SmokeFindReplace::tc_fr_020_replace_button_uses_current_match_then_advances()
+{
+    const QString path = createSmallTestFile(
+        QByteArray("first cat middle cat last\n"),
+        QStringLiteral("fr-020-current-match.txt"));
+    EditorTab editor;
+    editor.resize(900, 500);
+    QVERIFY(editor.loadFile(path));
+    editor.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&editor));
+
+    FindReplaceDialog dialog;
+    dialog.setActiveTab(&editor);
+    dialog.showReplaceMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *replacement = dialog.findChild<QLineEdit *>(QStringLiteral("replaceTextEdit"));
+    auto *next = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+    auto *replace = dialog.findChild<QPushButton *>(QStringLiteral("replaceButton"));
+    auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
+    QVERIFY(pattern && replacement && next && replace && wrap);
+    pattern->setText(QStringLiteral("cat"));
+    replacement->setText(QStringLiteral("DOG"));
+    wrap->setChecked(false);
+    editor.editor()->setCursorPosition(0, 0);
+
+    QTest::mouseClick(next, Qt::LeftButton);
+    QCOMPARE(editor.editor()->selectedText(), QStringLiteral("cat"));
+    QCOMPARE(editor.editor()->SendScintilla(
+                 QsciScintillaBase::SCI_GETSELECTIONSTART), 6L);
+
+    QTest::mouseClick(replace, Qt::LeftButton);
+    QCOMPARE(editor.editor()->text(),
+             QStringLiteral("first DOG middle cat last\n"));
+    QCOMPARE(editor.editor()->selectedText(), QStringLiteral("cat"));
+    QCOMPARE(editor.editor()->SendScintilla(
+                 QsciScintillaBase::SCI_GETSELECTIONSTART), 17L);
+
+    QTest::mouseClick(replace, Qt::LeftButton);
+    QCOMPARE(editor.editor()->text(),
+             QStringLiteral("first DOG middle DOG last\n"));
+    QVERIFY(editor.editor()->selectedText().isEmpty());
+
+    QVERIFY(dialog.grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-replace-current-then-next.png"))));
+    dialog.close();
+    editor.close();
+}
+
+void SmokeFindReplace::tc_fr_021_text_option_semantics_all_legal_combinations()
+{
+    struct Variant {
+        bool regex = false;
+        bool caseSensitive = false;
+        bool wholeWord = false;
+        QVector<qint64> offsets;
+        const char *id = nullptr;
+    };
+    const QVector<Variant> variants = {
+        {false, false, false, {0, 4, 9, 16, 20, 24}, "literal-i-part"},
+        {false, true,  false, {0, 9, 16, 20, 24}, "literal-s-part"},
+        {false, false, true,  {0, 4, 24}, "literal-i-word"},
+        {false, true,  true,  {0, 24}, "literal-s-word"},
+        {true,  false, false, {0, 4, 9, 16, 20, 24}, "regex-i"},
+        {true,  true,  false, {0, 9, 16, 20, 24}, "regex-s"},
+    };
+    const QByteArray corpus("cat\nCat\nscatter\ncat_cat\ncat.\n");
+
+    for (const Variant &variant : variants) {
+        const QString path = createSmallTestFile(
+            corpus, QStringLiteral("fr-021-%1.log").arg(variant.id));
+        EditorTab editor;
+        editor.resize(900, 500);
+        QVERIFY2(editor.loadFile(path), variant.id);
+        editor.show();
+        QVERIFY2(QTest::qWaitForWindowExposed(&editor), variant.id);
+        SearchResultsDock dock;
+        FindReplaceDialog dialog;
+        dialog.setActiveTab(&editor);
+        dialog.setSearchResultsDock(&dock);
+        dialog.showFindMode();
+        QVERIFY2(QTest::qWaitForWindowExposed(&dialog), variant.id);
+
+        auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+        auto *caseSensitive = dialog.findChild<QCheckBox *>(
+            QStringLiteral("caseSensitiveSearchCheck"));
+        auto *wholeWord = dialog.findChild<QCheckBox *>(
+            QStringLiteral("wholeWordSearchCheck"));
+        auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
+        auto *next = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+        auto *previous = dialog.findChild<QPushButton *>(
+            QStringLiteral("findPreviousButton"));
+        auto *findAll = dialog.findChild<QPushButton *>(QStringLiteral("findAllButton"));
+        auto *status = dialog.findChild<QLabel *>(QStringLiteral("findStatusLabel"));
+        auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+        QVERIFY2(pattern && regex && caseSensitive && wholeWord && wrap
+                     && next && previous && findAll && status && tree, variant.id);
+        pattern->setText(variant.regex ? QStringLiteral("c.t")
+                                       : QStringLiteral("cat"));
+        regex->setChecked(variant.regex);
+        caseSensitive->setChecked(variant.caseSensitive);
+        wholeWord->setChecked(variant.wholeWord);
+        wrap->setChecked(false);
+        QTest::mouseClick(findAll, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(tree->model() != nullptr, 2000);
+
+        QVector<qint64> dockOffsets;
+        for (int row = 0; row < tree->model()->rowCount(); ++row) {
+            const QModelIndex index = tree->model()->index(
+                row, SearchResultsModel::COL_CONTEXT);
+            const QVariantList ranges =
+                index.data(SearchResultsModel::MatchByteRangesRole).toList();
+            for (const QVariant &entry : ranges) {
+                dockOffsets.append(entry.toMap()
+                    .value(QStringLiteral("byteOffset")).toLongLong());
+            }
+        }
+        QCOMPARE(dockOffsets, variant.offsets);
+
+        editor.resetSearchPosition(true);
+        QVector<qint64> navigationOffsets;
+        for (qsizetype i = 0; i < variant.offsets.size(); ++i) {
+            QTest::mouseClick(next, Qt::LeftButton);
+            navigationOffsets.append(editor.editor()->SendScintilla(
+                QsciScintillaBase::SCI_GETSELECTIONSTART));
+        }
+        QCOMPARE(navigationOffsets, variant.offsets);
+        QTest::mouseClick(next, Qt::LeftButton);
+        QVERIFY2(status->text().contains(QStringLiteral("未找到更多匹配")),
+                 variant.id);
+
+        editor.resetSearchPosition(false);
+        QVector<qint64> reverseOffsets;
+        for (qsizetype i = variant.offsets.size(); i > 0; --i) {
+            QTest::mouseClick(previous, Qt::LeftButton);
+            reverseOffsets.append(editor.editor()->SendScintilla(
+                QsciScintillaBase::SCI_GETSELECTIONSTART));
+        }
+        QVector<qint64> expectedReverse = variant.offsets;
+        std::reverse(expectedReverse.begin(), expectedReverse.end());
+        QCOMPARE(reverseOffsets, expectedReverse);
+        QTest::mouseClick(previous, Qt::LeftButton);
+        QVERIFY2(status->text().contains(QStringLiteral("未找到更多匹配")),
+                 variant.id);
+
+        // Wrap changes only navigation after the final hit; the query result
+        // set and its order remain exactly the same.
+        wrap->setChecked(true);
+        QTest::mouseClick(previous, Qt::LeftButton);
+        QCOMPARE(editor.editor()->SendScintilla(
+                     QsciScintillaBase::SCI_GETSELECTIONSTART),
+                 variant.offsets.last());
+        dialog.close();
+        dock.close();
+        editor.close();
+    }
+}
+
+void SmokeFindReplace::tc_fr_022_hex_query_formats_errors_and_navigation()
+{
+    QByteArray content(96, '\0');
+    const QByteArray marker = QByteArray::fromHex("DEADBEEF");
+    for (const int offset : {0, 15, 92})
+        content.replace(offset, marker.size(), marker);
+    const QString path = createSmallTestFile(
+        content, QStringLiteral("fr-022-hex-formats.bin"));
+    QString openError;
+    QVERIFY2(tab()->openLargeFileL2(
+                 path, &openError, false,
+                 L2Presentation::Hex, L2ContentKind::Binary),
+             qPrintable(openError));
+
+    SearchResultsDock dock;
+    FindReplaceDialog dialog(container_);
+    dialog.setActiveTab(tab());
+    dialog.setSearchResultsDock(&dock);
+    dialog.showFindMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *hex = dialog.findChild<QCheckBox *>(QStringLiteral("hexBytesCheck"));
+    auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
+    auto *next = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+    auto *findAll = dialog.findChild<QPushButton *>(QStringLiteral("findAllButton"));
+    auto *cancel = dialog.findChild<QPushButton *>(QStringLiteral("cancelSearchButton"));
+    auto *status = dialog.findChild<QLabel *>(QStringLiteral("findStatusLabel"));
+    auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+    QVERIFY(pattern && hex && wrap && next && findAll && cancel && status && tree);
+    QVERIFY(hex->isEnabled());
+    QTest::mouseClick(hex, Qt::LeftButton);
+    QVERIFY(hex->isChecked());
+
+    const QStringList equivalentFormats = {
+        QStringLiteral("DEADBEEF"),
+        QStringLiteral("de ad be ef"),
+        QStringLiteral("DE-AD-BE-EF"),
+        QStringLiteral("0xDE,0xAD,0xBE,0xEF"),
+        QStringLiteral("DE_AD_BE_EF"),
+    };
+    const QVector<qint64> expectedOffsets = {0, 15, 92};
+    for (const QString &query : equivalentFormats) {
+        pattern->setText(query);
+        wrap->setChecked(false);
+        QTest::mouseClick(findAll, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!cancel->isVisible(), 5000);
+        auto *model = qobject_cast<SearchResultsModel *>(tree->model());
+        QVERIFY2(model, qPrintable(query));
+        QCOMPARE(model->totalMatches(), qint64(expectedOffsets.size()));
+        QVector<qint64> actual;
+        for (int row = 0; row < model->rowCount(); ++row) {
+            const GroupedSearchLine &group = model->groupedLineAt(row);
+            for (const auto &range : group.matchByteRanges)
+                actual.append(range.first);
+        }
+        QCOMPARE(actual, expectedOffsets);
+
+        tab()->resetSearchPosition(true);
+        QVector<qint64> navigated;
+        for (qsizetype index = 0; index < expectedOffsets.size(); ++index) {
+            QTest::mouseClick(next, Qt::LeftButton);
+            navigated.append(tab()->l2View()->selectionStart());
+            QCOMPARE(currentSelectionBytes(), marker);
+        }
+        QCOMPARE(navigated, expectedOffsets);
+        QTest::mouseClick(next, Qt::LeftButton);
+        QVERIFY(status->text().contains(QStringLiteral("未找到更多匹配")));
+        wrap->setChecked(true);
+        QTest::mouseClick(next, Qt::LeftButton);
+        QCOMPARE(tab()->l2View()->selectionStart(), qint64(0));
+    }
+
+    QAbstractItemModel *validModel = tree->model();
+    QVERIFY(validModel);
+    const QStringList invalidFormats = {
+        QStringLiteral("D"),
+        QStringLiteral("DE AD BZ"),
+        QStringLiteral("0x"),
+    };
+    for (const QString &query : invalidFormats) {
+        pattern->setText(query);
+        QTest::mouseClick(findAll, Qt::LeftButton);
+        QVERIFY2(!status->text().isEmpty(), qPrintable(query));
+        QCOMPARE(tree->model(), validModel);
+        QVERIFY(!cancel->isVisible());
+    }
+
+    QVERIFY(dialog.grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-hex-search-formats.png"))));
+    dock.close();
+}
+
+void SmokeFindReplace::tc_fr_023_regex_capture_replacement_gui_contract()
+{
+    const QString path = createSmallTestFile(
+        QByteArray("name=alice id=42\nname=bob id=7\n"),
+        QStringLiteral("fr-023-regex-replace.txt"));
+    EditorTab editor;
+    editor.resize(900, 500);
+    QVERIFY(editor.loadFile(path));
+    editor.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&editor));
+
+    FindReplaceDialog dialog;
+    dialog.setActiveTab(&editor);
+    dialog.showReplaceMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *replacement = dialog.findChild<QLineEdit *>(QStringLiteral("replaceTextEdit"));
+    auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+    auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
+    auto *next = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+    auto *replace = dialog.findChild<QPushButton *>(QStringLiteral("replaceButton"));
+    auto *replaceAll = dialog.findChild<QPushButton *>(QStringLiteral("replaceAllButton"));
+    QVERIFY(pattern && replacement && regex && wrap && next && replace && replaceAll);
+    pattern->setText(QStringLiteral("name=(?<who>\\w+) id=(\\d+)"));
+    replacement->setText(QStringLiteral("$2:${who}"));
+    QTest::mouseClick(regex, Qt::LeftButton);
+    wrap->setChecked(false);
+    editor.editor()->setCursorPosition(0, 0);
+
+    QTest::mouseClick(next, Qt::LeftButton);
+    QCOMPARE(editor.editor()->selectedText(), QStringLiteral("name=alice id=42"));
+    QTest::mouseClick(replace, Qt::LeftButton);
+    QCOMPARE(editor.editor()->text(),
+             QStringLiteral("42:alice\nname=bob id=7\n"));
+    QCOMPARE(editor.editor()->selectedText(), QStringLiteral("name=bob id=7"));
+
+    bool sawCompletion = false;
+    QTimer modalDriver;
+    modalDriver.setInterval(20);
+    connect(&modalDriver, &QTimer::timeout, this, [&]() {
+        auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+        if (!box)
+            return;
+        if (box->windowTitle() == QStringLiteral("替换完成")) {
+            sawCompletion = true;
+            if (auto *ok = box->button(QMessageBox::Ok))
+                QTest::mouseClick(ok, Qt::LeftButton);
+        }
+    });
+    modalDriver.start();
+    QTest::mouseClick(replaceAll, Qt::LeftButton);
+    modalDriver.stop();
+    QVERIFY(sawCompletion);
+    QCOMPARE(editor.editor()->text(), QStringLiteral("42:alice\n7:bob\n"));
+    QVERIFY(!editor.editor()->text().contains(QStringLiteral("$2")));
+    QVERIFY(!editor.editor()->text().contains(QStringLiteral("${who}")));
+
+    editor.undo();
+    QCOMPARE(editor.editor()->text(),
+             QStringLiteral("42:alice\nname=bob id=7\n"));
+    QVERIFY(dialog.grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-regex-capture-replace.png"))));
+    dialog.close();
+    editor.close();
+}
+
+void SmokeFindReplace::tc_fr_024_l2_regex_capture_replacement_consistency()
+{
+    const QByteArray original("name=alice id=42\nname=bob id=7\n");
+    const QString path = createSmallTestFile(
+        original, QStringLiteral("fr-024-l2-regex-replace.txt"));
+    QString openError;
+    QVERIFY2(openL2(path, &openError), qPrintable(openError));
+
+    FindReplaceDialog dialog(container_);
+    dialog.setActiveTab(tab());
+    dialog.showReplaceMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *replacement = dialog.findChild<QLineEdit *>(QStringLiteral("replaceTextEdit"));
+    auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+    auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
+    auto *next = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+    auto *replace = dialog.findChild<QPushButton *>(QStringLiteral("replaceButton"));
+    auto *replaceAll = dialog.findChild<QPushButton *>(QStringLiteral("replaceAllButton"));
+    QVERIFY(pattern && replacement && regex && wrap && next && replace && replaceAll);
+    pattern->setText(QStringLiteral("name=(?<who>\\w+) id=(\\d+)"));
+    replacement->setText(QStringLiteral("$2:${who}"));
+    QTest::mouseClick(regex, Qt::LeftButton);
+    wrap->setChecked(false);
+    tab()->resetSearchPosition(true);
+
+    QTest::mouseClick(next, Qt::LeftButton);
+    QCOMPARE(currentSelectionBytes(), QByteArray("name=alice id=42"));
+    QTest::mouseClick(replace, Qt::LeftButton);
+    QCOMPARE(readByteRange(0, view()->virtualFileSize()),
+             QByteArray("42:alice\nname=bob id=7\n"));
+    QCOMPARE(currentSelectionBytes(), QByteArray("name=bob id=7"));
+
+    bool sawCompletion = false;
+    QTimer modalDriver;
+    modalDriver.setInterval(20);
+    connect(&modalDriver, &QTimer::timeout, this, [&]() {
+        auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+        if (!box)
+            return;
+        if (box->windowTitle() == QStringLiteral("替换完成")) {
+            sawCompletion = true;
+            if (auto *ok = box->button(QMessageBox::Ok))
+                QTest::mouseClick(ok, Qt::LeftButton);
+        }
+    });
+    modalDriver.start();
+    QTest::mouseClick(replaceAll, Qt::LeftButton);
+    modalDriver.stop();
+    QVERIFY(sawCompletion);
+    QCOMPARE(readByteRange(0, view()->virtualFileSize()),
+             QByteArray("42:alice\n7:bob\n"));
+    tab()->undo();
+    QCOMPARE(readByteRange(0, view()->virtualFileSize()),
+             QByteArray("42:alice\nname=bob id=7\n"));
+    QVERIFY(dialog.grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-l2-regex-capture-replace.png"))));
+}
+
+void SmokeFindReplace::tc_fr_025_replacement_value_contract_and_atomic_failures()
+{
+    const QString original = QStringLiteral("A TOKEN B TOKEN C\n");
+    const QString path = createSmallTestFile(
+        original.toUtf8(), QStringLiteral("fr-025-replacement-values.txt"));
+    EditorTab editor;
+    editor.resize(920, 520);
+    QVERIFY(editor.loadFile(path));
+    editor.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&editor));
+
+    FindReplaceDialog dialog;
+    dialog.setActiveTab(&editor);
+    dialog.showReplaceMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *replacement = dialog.findChild<QLineEdit *>(QStringLiteral("replaceTextEdit"));
+    auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+    auto *replaceAll = dialog.findChild<QPushButton *>(QStringLiteral("replaceAllButton"));
+    auto *status = dialog.findChild<QLabel *>(QStringLiteral("findStatusLabel"));
+    QVERIFY(pattern && replacement && regex && replaceAll && status);
+
+    QString modalTitle;
+    QString modalText;
+    const auto clickReplaceAllAndDismiss = [&]() {
+        modalTitle.clear();
+        modalText.clear();
+        QTimer driver;
+        driver.setInterval(10);
+        connect(&driver, &QTimer::timeout, this, [&]() {
+            auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+            if (!box)
+                return;
+            modalTitle = box->windowTitle();
+            modalText = box->text();
+            if (auto *button = box->button(QMessageBox::Ok))
+                QTest::mouseClick(button, Qt::LeftButton);
+        });
+        driver.start();
+        QTest::mouseClick(replaceAll, Qt::LeftButton);
+        driver.stop();
+        QVERIFY2(!modalTitle.isEmpty(), "Replace All did not produce completion/error feedback");
+    };
+
+    struct LiteralVariant {
+        QString replacement;
+        const char *id = nullptr;
+    };
+    const QVector<LiteralVariant> literalVariants = {
+        {QString(), "delete"},
+        {QStringLiteral("X"), "short"},
+        {QStringLiteral("LONGER_世界_😀"), "long-unicode"},
+        {QStringLiteral("$1\\n${name}\\1"), "literal-meta-syntax"},
+    };
+    pattern->setText(QStringLiteral("TOKEN"));
+    QVERIFY(!regex->isChecked());
+    for (const LiteralVariant &variant : literalVariants) {
+        replacement->setText(variant.replacement);
+        QVERIFY2(replaceAll->isEnabled(), variant.id);
+        clickReplaceAllAndDismiss();
+        QCOMPARE(modalTitle, QStringLiteral("替换完成"));
+        QString expected = original;
+        expected.replace(QStringLiteral("TOKEN"), variant.replacement);
+        QCOMPARE(editor.editor()->text(), expected);
+        QVERIFY2(editor.isModified(), variant.id);
+
+        editor.undo();
+        QCOMPARE(editor.editor()->text(), original);
+        editor.redo();
+        QCOMPARE(editor.editor()->text(), expected);
+        editor.undo();
+        QCOMPARE(editor.editor()->text(), original);
+    }
+
+    // Replacement expansion errors and zero-length patterns are rejected
+    // before the first byte changes. The previous valid document remains
+    // available and no partial undo record is created.
+    regex->setChecked(true);
+    pattern->setText(QStringLiteral("(TOKEN)"));
+    replacement->setText(QStringLiteral("${missing}"));
+    clickReplaceAllAndDismiss();
+    QCOMPARE(modalTitle, QStringLiteral("替换失败"));
+    QVERIFY(!modalText.isEmpty());
+    QCOMPARE(editor.editor()->text(), original);
+
+    pattern->setText(QStringLiteral("(?=TOKEN)"));
+    replacement->setText(QStringLiteral("prefix"));
+    clickReplaceAllAndDismiss();
+    QCOMPARE(modalTitle, QStringLiteral("替换失败"));
+    QVERIFY(status->text().contains(QStringLiteral("零长度")));
+    QCOMPARE(editor.editor()->text(), original);
+
+    QFile disk(path);
+    QVERIFY(disk.open(QIODevice::ReadOnly));
+    QCOMPARE(disk.readAll(), original.toUtf8());
+    QVERIFY(dialog.grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-replacement-value-contract.png"))));
+    dialog.close();
+    editor.close();
+}
+
+void SmokeFindReplace::tc_fr_026_l2_replace_all_over_batch_is_one_undo()
+{
+    constexpr int MatchCount = 1205;
+    QByteArray original;
+    original.reserve(MatchCount * 2);
+    for (int i = 0; i < MatchCount; ++i)
+        original.append("x,");
+    const QString path = createSmallTestFile(
+        original, QStringLiteral("fr-026-l2-over-batch.txt"));
+    QString error;
+    QVERIFY2(openL2(path, &error), qPrintable(error));
+
+    FindReplaceDialog dialog(container_);
+    dialog.setActiveTab(tab());
+    dialog.showReplaceMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *replacement = dialog.findChild<QLineEdit *>(QStringLiteral("replaceTextEdit"));
+    auto *replaceAll = dialog.findChild<QPushButton *>(QStringLiteral("replaceAllButton"));
+    QVERIFY(pattern && replacement && replaceAll);
+    pattern->setText(QStringLiteral("x"));
+    replacement->setText(QStringLiteral("yy"));
+
+    bool completed = false;
+    QTimer modalDriver;
+    modalDriver.setInterval(10);
+    connect(&modalDriver, &QTimer::timeout, this, [&]() {
+        auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+        if (!box)
+            return;
+        completed = box->windowTitle() == QStringLiteral("替换完成");
+        if (auto *ok = box->button(QMessageBox::Ok))
+            QTest::mouseClick(ok, Qt::LeftButton);
+    });
+    modalDriver.start();
+    QTest::mouseClick(replaceAll, Qt::LeftButton);
+    modalDriver.stop();
+    QVERIFY(completed);
+    const QByteArray replaced = readByteRange(0, view()->virtualFileSize());
+    QCOMPARE(replaced.count("yy"), MatchCount);
+    QVERIFY(tab()->isModified());
+
+    tab()->undo();
+    QCOMPARE(readByteRange(0, view()->virtualFileSize()), original);
+    QVERIFY(tab()->canRedoCommand());
+    tab()->redo();
+    QCOMPARE(readByteRange(0, view()->virtualFileSize()), replaced);
+    tab()->undo();
+    QCOMPARE(readByteRange(0, view()->virtualFileSize()), original);
+}
+
+void SmokeFindReplace::tc_fr_027_real_s3_find_all_dock_double_click()
+{
+    const QString path = QDir(QCoreApplication::applicationDirPath())
+        .absoluteFilePath(QStringLiteral("../../bigtestfile"));
+    if (!QFileInfo::exists(path))
+        QSKIP("retained 4.9 GB S3 fixture is not available");
+    const qint64 size = QFileInfo(path).size();
+    QVERIFY(size > 2LL * 1024 * 1024 * 1024);
+    const qint64 target = size * 3 / 4;
+    QFile source(path);
+    QVERIFY(source.open(QIODevice::ReadOnly));
+    QVERIFY(source.seek(target));
+    const QByteArray signature = source.read(32);
+    QCOMPARE(signature.size(), 32);
+    source.close();
+
+    QString error;
+    QVERIFY2(tab()->openLargeFileL2(
+                 path, &error, false,
+                 L2Presentation::Hex, L2ContentKind::Binary),
+             qPrintable(error));
+    QVERIFY(tab()->isReadOnlyByPolicy());
+    QVERIFY(tab()->isL2Mode());
+    auto *provider = tab()->windowedReadOnlyProvider();
+    QVERIFY(provider);
+    QCOMPARE(provider->fileSize(), size);
+
+    SearchResultsDock dock;
+    dock.resize(1100, 360);
+    dock.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&dock));
+    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToTabByteOffset);
+    connect(&dock, &SearchResultsDock::jumpToTabByteOffset,
+            tab(), [](EditorTab *targetTab, qint64 offset, int length) {
+                if (targetTab)
+                    targetTab->gotoByteOffset(offset, length);
+            });
+
+    FindReplaceDialog dialog(container_);
+    dialog.setActiveTab(tab());
+    dialog.setSearchResultsDock(&dock);
+    dialog.showFindMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *hex = dialog.findChild<QCheckBox *>(QStringLiteral("hexBytesCheck"));
+    auto *findAll = dialog.findChild<QPushButton *>(QStringLiteral("findAllButton"));
+    auto *cancel = dialog.findChild<QPushButton *>(QStringLiteral("cancelSearchButton"));
+    auto *status = dialog.findChild<QLabel *>(QStringLiteral("findStatusLabel"));
+    auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+    QVERIFY(pattern && hex && findAll && cancel && status && tree);
+    QVERIFY(hex->isEnabled());
+    QTest::mouseClick(hex, Qt::LeftButton);
+    const QString hexPattern = QString::fromLatin1(signature.toHex(' ').toUpper());
+    pattern->setText(hexPattern);
+    QCOMPARE(pattern->text(), hexPattern);
+    QSignalSpy findAllClickSpy(findAll, &QPushButton::clicked);
+
+    QElapsedTimer elapsed;
+    elapsed.start();
+    QTest::mouseClick(findAll, Qt::LeftButton);
+    QCOMPARE(findAllClickSpy.count(), 1);
+    QVERIFY(!findAll->isEnabled());
+    QVERIFY(cancel->isVisible());
+    QVERIFY(status->text().contains(QStringLiteral("准备"))
+            || status->text().contains(QStringLiteral("搜索")));
+    QTRY_VERIFY_WITH_TIMEOUT(cancel->isVisible() || tree->model() != nullptr, 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(!cancel->isVisible(), 120000);
+    qInfo() << "S3_DIALOG_DOCK_SEARCH_MS=" << elapsed.elapsed();
+    auto *model = qobject_cast<SearchResultsModel *>(tree->model());
+    QVERIFY(model);
+    QVERIFY(model->totalMatches() >= 1);
+
+    int targetRow = -1;
+    for (int row = 0; row < model->rowCount() && targetRow < 0; ++row) {
+        const GroupedSearchLine &group = model->groupedLineAt(row);
+        for (const auto &range : group.matchByteRanges) {
+            if (range.first == target && range.second == signature.size()) {
+                targetRow = row;
+                break;
+            }
+        }
+    }
+    QVERIFY2(targetRow >= 0, "real S3 target range missing from SearchResultsModel");
+    const QModelIndex contextIndex = model->index(
+        targetRow, SearchResultsModel::COL_CONTEXT);
+    tree->scrollTo(contextIndex);
+    QApplication::processEvents(QEventLoop::AllEvents, 80);
+    const QRect rect = tree->visualRect(contextIndex);
+    QVERIFY(rect.isValid());
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                      Qt::NoModifier, rect.center());
+    QTest::mouseDClick(tree->viewport(), Qt::LeftButton,
+                       Qt::NoModifier, rect.center());
+    QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 3000);
+    QCOMPARE(jumpSpy.first().at(1).toLongLong(), target);
+    QCOMPARE(jumpSpy.first().at(2).toInt(), signature.size());
+    QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(), target, 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(),
+                              target + signature.size(), 5000);
+    QCOMPARE(provider->sourceBytes(target, signature.size()), signature);
+    QCOMPARE(provider->visibleVerticalScrollBarCount(), 1);
+
+    const QString outputDir = QCoreApplication::applicationDirPath();
+    QVERIFY(dock.grab().save(
+        QDir(outputDir).filePath(QStringLiteral("gui-s3-real-search-dock.png"))));
+    QVERIFY(container_->grab().save(
+        QDir(outputDir).filePath(QStringLiteral("gui-s3-real-search-editor.png"))));
+    dock.close();
+}
+
+void SmokeFindReplace::tc_fr_028_real_s3_find_next_preparation_and_repeat_boundary()
+{
+    const QString path = QDir(QCoreApplication::applicationDirPath())
+        .absoluteFilePath(QStringLiteral("../../bigtestfile"));
+    if (!QFileInfo::exists(path))
+        QSKIP("retained 4.9 GB S3 fixture is not available");
+    const qint64 size = QFileInfo(path).size();
+    QVERIFY(size > 2LL * 1024 * 1024 * 1024);
+    const qint64 target = size * 3 / 4;
+    QFile source(path);
+    QVERIFY(source.open(QIODevice::ReadOnly));
+    QVERIFY(source.seek(target));
+    const QByteArray signature = source.read(32);
+    QCOMPARE(signature.size(), 32);
+    source.close();
+
+    QString error;
+    QVERIFY2(tab()->openLargeFileL2(
+                 path, &error, false,
+                 L2Presentation::Hex, L2ContentKind::Binary),
+             qPrintable(error));
+    auto *provider = tab()->windowedReadOnlyProvider();
+    QVERIFY(provider);
+
+    FindReplaceDialog dialog(container_);
+    dialog.setActiveTab(tab());
+    dialog.showFindMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *hex = dialog.findChild<QCheckBox *>(QStringLiteral("hexBytesCheck"));
+    auto *next = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+    auto *previous = dialog.findChild<QPushButton *>(QStringLiteral("findPreviousButton"));
+    auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
+    auto *cancel = dialog.findChild<QPushButton *>(QStringLiteral("cancelSearchButton"));
+    auto *status = dialog.findChild<QLabel *>(QStringLiteral("findStatusLabel"));
+    QVERIFY(pattern && hex && next && previous && wrap && cancel && status);
+    QTest::mouseClick(hex, Qt::LeftButton);
+    wrap->setChecked(false);
+    pattern->setText(QString::fromLatin1(signature.toHex(' ').toUpper()));
+
+    QElapsedTimer firstElapsed;
+    firstElapsed.start();
+    QTest::mouseClick(next, Qt::LeftButton);
+    qInfo() << "S3_DIALOG_FIND_NEXT_MS=" << firstElapsed.elapsed();
+    QCOMPARE(provider->selectionStartOffset(), target);
+    QCOMPARE(provider->selectionEndOffset(), target + signature.size());
+    QCOMPARE(provider->sourceBytes(target, signature.size()), signature);
+    QVERIFY(!cancel->isVisible());
+
+    // The visible provider selection is the current match. A second forward
+    // command must advance beyond it and hit the non-wrapping boundary; it
+    // must not rediscover the same range from the hidden mmap view.
+    QElapsedTimer cachedElapsed;
+    cachedElapsed.start();
+    QTest::mouseClick(next, Qt::LeftButton);
+    QVERIFY(cachedElapsed.elapsed() < 1000);
+    QVERIFY(status->text().contains(QStringLiteral("未找到"))
+            || status->text().contains(QStringLiteral("边界")));
+    QCOMPARE(provider->selectionStartOffset(), target);
+    QCOMPARE(provider->selectionEndOffset(), target + signature.size());
+
+    QTest::mouseClick(previous, Qt::LeftButton);
+    QVERIFY(status->text().contains(QStringLiteral("未找到"))
+            || status->text().contains(QStringLiteral("边界")));
+    wrap->setChecked(true);
+    QTest::mouseClick(next, Qt::LeftButton);
+    QCOMPARE(provider->selectionStartOffset(), target);
+    QCOMPARE(provider->selectionEndOffset(), target + signature.size());
+    QCOMPARE(provider->visibleVerticalScrollBarCount(), 1);
+    QVERIFY(container_->grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-s3-real-find-next.png"))));
+}
+
+void SmokeFindReplace::tc_fr_029_result_spool_virtual_tail_navigation()
+{
+    constexpr int MatchCount = 60050; // Always exceeds MAX_MATCHES_MEM <= 50000.
+    const QByteArray marker("OVERFLOW_HIT");
+    QByteArray payload;
+    payload.reserve(MatchCount * 24);
+    qint64 expectedLastOffset = -1;
+    for (int index = 0; index < MatchCount; ++index) {
+        expectedLastOffset = payload.size();
+        payload.append(marker);
+        payload.append(' ');
+        payload.append(QByteArray::number(index));
+        payload.append('\n');
+    }
+    const QString path = createSmallTestFile(
+        payload, QStringLiteral("fr-029-result-spool.log"));
+    QVERIFY2(openL2(path), "unable to open result-spool fixture");
+
+    SearchResultsDock dock;
+    dock.resize(1100, 420);
+    dock.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&dock));
+    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToTabByteOffset);
+    connect(&dock, &SearchResultsDock::jumpToTabByteOffset,
+            tab(), [](EditorTab *targetTab, qint64 offset, int length) {
+                if (targetTab)
+                    targetTab->gotoByteOffset(offset, length);
+            });
+
+    FindReplaceDialog dialog(container_);
+    dialog.setActiveTab(tab());
+    dialog.setSearchResultsDock(&dock);
+    dialog.showFindMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *findAll = dialog.findChild<QPushButton *>(QStringLiteral("findAllButton"));
+    auto *cancel = dialog.findChild<QPushButton *>(QStringLiteral("cancelSearchButton"));
+    auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+    QVERIFY(pattern && findAll && cancel && tree);
+    pattern->setText(QString::fromLatin1(marker));
+    QTest::mouseClick(findAll, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(cancel->isVisible() || tree->model(), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(!cancel->isVisible(), 30000);
+
+    auto *model = qobject_cast<SearchResultsModel *>(tree->model());
+    QVERIFY(model);
+    QCOMPARE(model->totalMatches(), qint64(MatchCount));
+    QCOMPARE(model->rowCount(), MatchCount);
+    LargeFileSearch *engine = view()->searchEngine();
+    QVERIFY(engine);
+    QVERIFY(engine->overrunCount() > 0);
+    QVERIFY(!engine->overrunFilePath().isEmpty());
+    QVERIFY(QFileInfo::exists(engine->overrunFilePath()));
+    QVERIFY(engine->memoryMatches().size() <= 50000);
+
+    const int tailRow = MatchCount - 1;
+    const GroupedSearchLine &tail = model->groupedLineAt(tailRow);
+    QCOMPARE(tail.firstByteOffset, expectedLastOffset);
+    QCOMPARE(tail.firstLength, marker.size());
+    QCOMPARE(tail.matchByteRanges.size(), 1);
+    QCOMPARE(tail.matchByteRanges.first().first, expectedLastOffset);
+
+    const QModelIndex tailIndex = model->index(
+        tailRow, SearchResultsModel::COL_CONTEXT);
+    tree->scrollTo(tailIndex, QAbstractItemView::PositionAtCenter);
+    QApplication::processEvents(QEventLoop::AllEvents, 100);
+    const QRect tailRect = tree->visualRect(tailIndex);
+    QVERIFY(tailRect.isValid());
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                      Qt::NoModifier, tailRect.center());
+    QTest::mouseDClick(tree->viewport(), Qt::LeftButton,
+                       Qt::NoModifier, tailRect.center());
+    QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 3000);
+    QCOMPARE(jumpSpy.first().at(1).toLongLong(), expectedLastOffset);
+    QCOMPARE(jumpSpy.first().at(2).toInt(), marker.size());
+    QTRY_COMPARE_WITH_TIMEOUT(view()->selectionStart(), expectedLastOffset, 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(view()->selectionEnd(),
+                              expectedLastOffset + marker.size(), 3000);
+    QCOMPARE(currentSelectionBytes(), marker);
+    QVERIFY(dock.grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-search-result-spool-tail.png"))));
+    dock.close();
+}
+
+void SmokeFindReplace::tc_fr_030_sparse_s3_text_regex_after_two_gib()
+{
+    constexpr qint64 TwoGiB = 2LL * 1024 * 1024 * 1024;
+    constexpr qint64 FileSize = TwoGiB + 16LL * 1024 * 1024;
+    constexpr qint64 MarkerWriteOffset = TwoGiB + 4LL * 1024 * 1024 + 123;
+    const QByteArray line("\nS3_REGEX_739_END\n");
+    const QByteArray matchBytes("S3_REGEX_739_END");
+    const qint64 expectedOffset = MarkerWriteOffset + 1;
+    const QString path = tmpDir_.filePath(QStringLiteral("fr-030-s3-text.log"));
+    QFile source(path);
+    QVERIFY(source.open(QIODevice::ReadWrite));
+    QVERIFY(source.resize(FileSize));
+    QVERIFY(source.seek(MarkerWriteOffset));
+    QCOMPARE(source.write(line), qint64(line.size()));
+    source.close();
+    QCOMPARE(QFileInfo(path).size(), FileSize);
+
+    QString error;
+    QVERIFY2(tab()->openLargeFileL2(
+                 path, &error, false,
+                 L2Presentation::Text, L2ContentKind::Text),
+             qPrintable(error));
+    QVERIFY(tab()->isL2Mode());
+    QVERIFY(tab()->isReadOnlyByPolicy());
+    QVERIFY(!tab()->isBinaryDocument());
+    auto *provider = tab()->windowedReadOnlyProvider();
+    QVERIFY(provider);
+    QCOMPARE(provider->fileSize(), FileSize);
+
+    SearchResultsDock dock;
+    dock.resize(1100, 360);
+    dock.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&dock));
+    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToTabByteOffset);
+    connect(&dock, &SearchResultsDock::jumpToTabByteOffset,
+            tab(), [](EditorTab *targetTab, qint64 offset, int length) {
+                if (targetTab)
+                    targetTab->gotoByteOffset(offset, length);
+            });
+
+    FindReplaceDialog dialog(container_);
+    dialog.setActiveTab(tab());
+    dialog.setSearchResultsDock(&dock);
+    dialog.showReplaceMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *replacement = dialog.findChild<QLineEdit *>(QStringLiteral("replaceTextEdit"));
+    auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+    auto *caseSensitive = dialog.findChild<QCheckBox *>(
+        QStringLiteral("caseSensitiveSearchCheck"));
+    auto *wholeWord = dialog.findChild<QCheckBox *>(QStringLiteral("wholeWordSearchCheck"));
+    auto *findAll = dialog.findChild<QPushButton *>(QStringLiteral("findAllButton"));
+    auto *replace = dialog.findChild<QPushButton *>(QStringLiteral("replaceButton"));
+    auto *replaceAll = dialog.findChild<QPushButton *>(QStringLiteral("replaceAllButton"));
+    auto *cancel = dialog.findChild<QPushButton *>(QStringLiteral("cancelSearchButton"));
+    auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+    QVERIFY(pattern && replacement && regex && caseSensitive && wholeWord
+            && findAll && replace && replaceAll && cancel && tree);
+    QVERIFY(regex->isEnabled());
+    QTest::mouseClick(regex, Qt::LeftButton);
+    QVERIFY(regex->isChecked());
+    QVERIFY(caseSensitive->isEnabled());
+    caseSensitive->setChecked(false);
+    QVERIFY(!wholeWord->isEnabled());
+    QVERIFY(!replacement->isEnabled());
+    QVERIFY(!replace->isEnabled());
+    QVERIFY(!replaceAll->isEnabled());
+    pattern->setText(QStringLiteral("s3_regex_([0-9]+)_end"));
+
+    QTest::mouseClick(findAll, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(cancel->isVisible() || tree->model(), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(!cancel->isVisible(), 120000);
+    auto *model = qobject_cast<SearchResultsModel *>(tree->model());
+    QVERIFY(model);
+    QCOMPARE(model->totalMatches(), qint64(1));
+    const GroupedSearchLine &result = model->groupedLineAt(0);
+    QCOMPARE(result.firstByteOffset, expectedOffset);
+    QCOMPARE(result.firstLength, matchBytes.size());
+    QVERIFY(result.lineContext.contains(matchBytes));
+
+    const QModelIndex contextIndex = model->index(
+        0, SearchResultsModel::COL_CONTEXT);
+    const QRect rect = tree->visualRect(contextIndex);
+    QVERIFY(rect.isValid());
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                      Qt::NoModifier, rect.center());
+    QTest::mouseDClick(tree->viewport(), Qt::LeftButton,
+                       Qt::NoModifier, rect.center());
+    QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 3000);
+    QCOMPARE(jumpSpy.first().at(1).toLongLong(), expectedOffset);
+    QCOMPARE(jumpSpy.first().at(2).toInt(), matchBytes.size());
+    QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(), expectedOffset, 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(),
+                              expectedOffset + matchBytes.size(), 5000);
+    QCOMPARE(provider->sourceBytes(expectedOffset, matchBytes.size()), matchBytes);
+    QCOMPARE(provider->visibleVerticalScrollBarCount(), 1);
+    QVERIFY(dock.grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-s3-text-regex-after-2g-dock.png"))));
+    QVERIFY(container_->grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-s3-text-regex-after-2g-editor.png"))));
+    dock.close();
+}
+
+void SmokeFindReplace::tc_fr_031_real_s3_default_literal_is_not_regex()
+{
+    const QString path = QDir(QCoreApplication::applicationDirPath())
+        .absoluteFilePath(QStringLiteral("../../bigtestfile"));
+    if (!QFileInfo::exists(path))
+        QSKIP("retained 4.9 GB S3 fixture is not available");
+    const qint64 size = QFileInfo(path).size();
+    QVERIFY(size > 2LL * 1024 * 1024 * 1024);
+
+    // Reproduce a user copying text from the ASCII side of the Hex view.  A
+    // 12-byte printable run is effectively unique in this random fixture but
+    // remains ordinary text that QLineEdit can hold without transformation.
+    const qint64 probeOffset = size * 3 / 4;
+    QFile source(path);
+    QVERIFY(source.open(QIODevice::ReadOnly));
+    QVERIFY(source.seek(probeOffset));
+    const QByteArray probe = source.read(1024 * 1024);
+    QCOMPARE(probe.size(), 1024 * 1024);
+    QByteArray copiedText;
+    qint64 copiedOffset = -1;
+    for (qsizetype start = 0; start + 12 <= probe.size(); ++start) {
+        bool printable = true;
+        bool hasLetter = false;
+        for (qsizetype index = 0; index < 12; ++index) {
+            const uchar value = uchar(probe.at(start + index));
+            if (value < 0x20 || value > 0x7e) {
+                printable = false;
+                break;
+            }
+            hasLetter = hasLetter
+                || (value >= 'A' && value <= 'Z')
+                || (value >= 'a' && value <= 'z');
+        }
+        if (printable && hasLetter) {
+            copiedText = probe.mid(start, 12);
+            copiedOffset = probeOffset + start;
+            break;
+        }
+    }
+    QVERIFY2(copiedOffset >= 0, "no printable copied-text fixture found");
+    source.close();
+
+    QString error;
+    QVERIFY2(tab()->openLargeFileL2(
+                 path, &error, false,
+                 L2Presentation::Hex, L2ContentKind::Binary),
+             qPrintable(error));
+    auto *provider = tab()->windowedReadOnlyProvider();
+    QVERIFY(provider);
+
+    FindReplaceDialog dialog(container_);
+    dialog.setActiveTab(tab());
+    dialog.showFindMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+    auto *hex = dialog.findChild<QCheckBox *>(QStringLiteral("hexBytesCheck"));
+    auto *caseSensitive = dialog.findChild<QCheckBox *>(
+        QStringLiteral("caseSensitiveSearchCheck"));
+    auto *wholeWord = dialog.findChild<QCheckBox *>(QStringLiteral("wholeWordSearchCheck"));
+    auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
+    auto *next = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+    auto *status = dialog.findChild<QLabel *>(QStringLiteral("findStatusLabel"));
+    QVERIFY(pattern && regex && hex && caseSensitive && wholeWord
+            && wrap && next && status);
+
+    // This is the product default reported by the user: only Wrap is checked.
+    QVERIFY(!regex->isChecked());
+    QVERIFY(!hex->isChecked());
+    QVERIFY(!caseSensitive->isChecked());
+    QVERIFY(!wholeWord->isChecked());
+    QVERIFY(wrap->isChecked());
+    pattern->setText(QString::fromLatin1(copiedText));
+
+    QElapsedTimer elapsed;
+    elapsed.start();
+    QTest::mouseClick(next, Qt::LeftButton);
+    qInfo() << "S3_DEFAULT_LITERAL_FIND_NEXT_MS=" << elapsed.elapsed();
+    QVERIFY2(tab()->lastSearchError().isEmpty(),
+             qPrintable(tab()->lastSearchError()));
+    QVERIFY(!status->text().contains(QStringLiteral("正则")));
+    QVERIFY(!status->text().contains(QStringLiteral("UTF-8")));
+    QCOMPARE(provider->selectionStartOffset(), copiedOffset);
+    QCOMPARE(provider->selectionEndOffset(), copiedOffset + copiedText.size());
+    QCOMPARE(provider->sourceBytes(copiedOffset, copiedText.size()), copiedText);
+    QCOMPARE(provider->visibleVerticalScrollBarCount(), 1);
+    QVERIFY(container_->grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-s3-default-literal-copied-text.png"))));
+}
+
+void SmokeFindReplace::tc_fr_032_invalid_utf8_binary_default_literal_portable()
+{
+    QByteArray payload;
+    payload.append(char(0xff));
+    payload.append(char(0xfe));
+    payload.append(char(0x80));
+    payload.append("prefix-CopyMeToken-suffix");
+    payload.append(char(0xc0));
+    payload.append(" cat catalog _cat cat!");
+    const qint64 expectedOffset = payload.indexOf("CopyMeToken");
+    const qint64 firstWholeWord = payload.indexOf("cat", int(expectedOffset));
+    const qint64 secondWholeWord = payload.lastIndexOf("cat");
+    QVERIFY(expectedOffset >= 0);
+    QVERIFY(firstWholeWord >= 0 && secondWholeWord > firstWholeWord);
+    const QString path = createSmallTestFile(
+        payload, QStringLiteral("fr-032-invalid-utf8.bin"));
+
+    QString error;
+    QVERIFY2(tab()->openLargeFileL2(
+                 path, &error, false,
+                 L2Presentation::Hex, L2ContentKind::Binary),
+             qPrintable(error));
+    auto *provider = tab()->windowedReadOnlyProvider();
+    QVERIFY(provider || view());
+
+    FindReplaceDialog dialog(container_);
+    dialog.setActiveTab(tab());
+    dialog.showFindMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+    auto *hex = dialog.findChild<QCheckBox *>(QStringLiteral("hexBytesCheck"));
+    auto *caseSensitive = dialog.findChild<QCheckBox *>(
+        QStringLiteral("caseSensitiveSearchCheck"));
+    auto *wholeWord = dialog.findChild<QCheckBox *>(QStringLiteral("wholeWordSearchCheck"));
+    auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
+    auto *next = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+    auto *status = dialog.findChild<QLabel *>(QStringLiteral("findStatusLabel"));
+    QVERIFY(pattern && regex && hex && caseSensitive && wholeWord
+            && wrap && next && status);
+    QVERIFY(!regex->isChecked() && !hex->isChecked()
+            && !caseSensitive->isChecked() && !wholeWord->isChecked()
+            && wrap->isChecked());
+
+    // Deliberately change case. Binary Literal's documented insensitive mode
+    // folds ASCII bytes but never validates unrelated bytes as UTF-8.
+    pattern->setText(QStringLiteral("copymetoken"));
+    QTest::mouseClick(next, Qt::LeftButton);
+    QVERIFY2(tab()->lastSearchError().isEmpty(),
+             qPrintable(tab()->lastSearchError()));
+    QVERIFY(!status->text().contains(QStringLiteral("正则")));
+    QVERIFY(!status->text().contains(QStringLiteral("UTF-8")));
+    if (provider) {
+        QCOMPARE(provider->selectionStartOffset(), expectedOffset);
+        QCOMPARE(provider->selectionEndOffset(),
+                 expectedOffset + qint64(QByteArrayLiteral("CopyMeToken").size()));
+        QCOMPARE(provider->sourceBytes(expectedOffset, 11),
+                 QByteArrayLiteral("CopyMeToken"));
+    } else {
+        QCOMPARE(view()->selectionStart(), expectedOffset);
+        QCOMPARE(view()->selectionEnd(),
+                 expectedOffset + qint64(QByteArrayLiteral("CopyMeToken").size()));
+        QCOMPARE(readByteRange(expectedOffset, expectedOffset + 11),
+                 QByteArrayLiteral("CopyMeToken"));
+    }
+
+    // Whole word remains a literal query with an ASCII byte boundary in a
+    // Binary subject. It must skip catalog/_cat and must not validate the
+    // unrelated FF/FE/80/C0 bytes as UTF-8 or expose a regex error.
+    pattern->setText(QStringLiteral("cat"));
+    QTest::mouseClick(wholeWord, Qt::LeftButton);
+    QVERIFY(wholeWord->isChecked());
+    QVERIFY(!regex->isChecked());
+    tab()->resetSearchPosition(true);
+    QTest::mouseClick(next, Qt::LeftButton);
+    QCOMPARE(view()->selectionStart(), firstWholeWord);
+    QCOMPARE(view()->selectionEnd(), firstWholeWord + 3);
+    QVERIFY(tab()->lastSearchError().isEmpty());
+    QTest::mouseClick(next, Qt::LeftButton);
+    QCOMPARE(view()->selectionStart(), secondWholeWord);
+    QCOMPARE(view()->selectionEnd(), secondWholeWord + 3);
+    QVERIFY(tab()->lastSearchError().isEmpty());
 }
 
 QTEST_MAIN(SmokeFindReplace)

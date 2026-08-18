@@ -118,6 +118,7 @@ private:
     bool m_hexRelayoutPending = false;
     bool m_syncingHexSelection = false;
     bool m_syncingAsciiSelection = false;
+    bool m_asciiMouseSelecting = false;
     qint64 m_selectionAnchor = -1;
     qint64 m_selectionCaret = -1;
     QFileSystemWatcher *m_fileWatcher = nullptr;

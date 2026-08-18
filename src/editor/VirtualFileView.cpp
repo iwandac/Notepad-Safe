@@ -392,7 +392,7 @@ void VirtualFileView::onMmapReady(quintptr ptr, qint64 size, LineIndex quickInde
 
     // Hex 按固定 16 字节分行，不依赖文本 LineIndex。到这里 mmap 已经可用，
     // 直接结束加载状态，避免创建无价值的后台索引任务。
-    if (m_viewMode == ViewMode::Hex) {
+    if (m_viewMode == ViewMode::Hex || !m_fullLineIndexBuildEnabled) {
         emit lineBuildProgress(0, 0);
         emit lineBuildFinished(true);
         return;
@@ -1350,6 +1350,19 @@ bool VirtualFileView::replaceBytes(qint64 byteOffset, qint32 oldLength, const QB
     emit undoRedoChanged();
     viewport()->update();
     return true;
+}
+
+void VirtualFileView::notifyExternalPatchMutation()
+{
+    const qint64 size = virtualFileSize();
+    cursorByte_ = qBound<qint64>(0, cursorByte_, size);
+    selStartByte_ = qBound<qint64>(0, selStartByte_, size);
+    selEndByte_ = qBound<qint64>(0, selEndByte_, size);
+    selAnchorByte_ = qBound<qint64>(0, selAnchorByte_, size);
+    updateScrollBarsFromContent();
+    emit saveNeededChanged(patches_.isModified());
+    emit undoRedoChanged();
+    viewport()->update();
 }
 
 bool VirtualFileView::removeSelection(QString* errMsg) {

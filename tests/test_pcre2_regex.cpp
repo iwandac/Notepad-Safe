@@ -68,6 +68,34 @@ int main(int argc, char **argv)
           "zero-length scan terminates");
     check(zeroCount == 1, "zero-length scan does not loop");
 
+    const QByteArray captureSubject("name=alice id=42");
+    Pcre2Regex captures;
+    check(captures.compile(
+              QStringLiteral("name=(?<who>\\w+) id=(\\d+)(?: tag=(\\w+))?"),
+              false, true, false, &error),
+          "capture expression compiles");
+    QByteArray expanded;
+    check(captures.expandReplacementAt(
+              reinterpret_cast<const uchar *>(captureSubject.constData()),
+              captureSubject.size(), 0, captureSubject.size(),
+              QStringLiteral("$2:${who}:$3:$$:\\n:\\1"),
+              &expanded, &error),
+          "numbered, named, optional and escaped replacement expands");
+    check(expanded == QByteArray("42:alice::$:\n:alice"),
+          "expanded replacement bytes are exact");
+    check(!captures.expandReplacementAt(
+              reinterpret_cast<const uchar *>(captureSubject.constData()),
+              captureSubject.size(), 0, captureSubject.size(),
+              QStringLiteral("${missing}"), &expanded, &error),
+          "missing named capture is rejected");
+    check(error.contains(QStringLiteral("不存在")),
+          "missing capture has visible diagnostic");
+    check(!captures.expandReplacementAt(
+              reinterpret_cast<const uchar *>(captureSubject.constData()),
+              captureSubject.size(), 0, captureSubject.size(),
+              QStringLiteral("${who"), &expanded, &error),
+          "unterminated named capture is rejected");
+
     std::atomic<bool> cancelled{true};
     check(regex.scan(
               reinterpret_cast<const uchar *>(subject.constData()), subject.size(),

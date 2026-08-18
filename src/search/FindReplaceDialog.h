@@ -93,6 +93,7 @@ private:
     bool m_multiWholeWord = false;
     bool m_multiHexBytes = false;
     int m_multiSkippedTextTargets = 0;
+    int m_multiSkippedLockedTargets = 0;
     bool m_multiDispatchComplete = false;
     bool m_multiCancelRequested = false;
 

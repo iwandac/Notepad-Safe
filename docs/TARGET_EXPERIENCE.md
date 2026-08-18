@@ -175,7 +175,7 @@ Windowed Provider 是一个无限文档的有限投影，必须模拟普通编�
 | `LF-UX-002` | **Round 9 已关闭。** wheel/pixelDelta 在窗口内逐行移动，只在重叠边界换页 | 小幅滚轮显示相邻行；跨窗口无重复、gap、闪回和大跳 | 五个窗口双向滚轮/触控板、末尾稳定等待与 4.59 GiB 搜索跳转通过；`gui-largefile-200dpi-round9.txt` |
 | `HEX-UX-001` | **Round 3 已关闭核心阻断。** offset/Hex/ASCII 共用 byte selection，B1 编辑/Undo/保存与搜索跳转已动态验收；字节通配符和 Inspector 留作后续增强 | offset、Hex、ASCII、caret、selection、编辑、搜索和保存形成一致模型 | `gui-hex-round3-slice.txt`、`gui-hex-search-final.txt` 与逐字节 round-trip 均通过 |
 | `HEX-UX-002` | **Round 9 已关闭。** B1/B2/B3 均按 viewport 选择完整 4-byte 分组；宽窄重排不裁切首末 nibble，也不继承旧横向偏移 | 依据窗口宽度采用合适 bytes-per-row；窄/宽窗口紧凑可读 | 默认/窄宽截图及实际 200% DPI 编辑—保存—重开、崩溃恢复 4/4 通过；`gui-hex-200dpi-round9.txt` |
-| `TIER-UX-003` | **部分关闭。** Binary 可见契约已统一：B1/B2/B3 均为地址 margin、纯 Hex 网格、独立 ASCII pane 和唯一全局纵向滚动条；内部 Provider 仍不同。Text S1/S2/S3 的几何与模式迁移一致性尚未关闭 | Text 各 Tier 共用 EditorSurface；Binary 各 Tier 共用 HexView 可见契约；只允许 capability/状态文案不同 | `windowedHexUsesUnifiedThreeColumnByteContract`、真实 228MB/4.9GB 样本与 B1 邻接回归通过；Binary 截图 differential 已建立。Text 同内容切片及 S2 Preview→Editable/Fallback 逐帧无几何变化仍待证明 |
+| `TIER-UX-003` | **部分关闭。** Binary 可见契约已统一：B1/B2/B3 均为地址 margin、纯 Hex 网格、独立 ASCII pane、两表面同步滚轮和唯一全局纵向滚动条；Binary→Text 后统一切换为文本行号。内部 Provider 仍不同，Text S1/S2/S3 的几何与模式迁移一致性尚未关闭 | Text 各 Tier 共用 EditorSurface；Binary 各 Tier 共用 HexView 可见契约；只允许 capability/状态文案不同 | `windowedHexUsesUnifiedThreeColumnByteContract`、`windowedHexBothPanesWheelInLockstep`、Binary→Text gutter/会话恢复、真实 228MB/4.9GB 样本与 B1 邻接回归通过；Text 同内容切片及 S2 Preview→Editable/Fallback 逐帧无几何变化仍待证明 |
 
 除上述已复现项外，下面是必须主动探索的风险。它们不表示已经观察到缺陷，但在关闭对应旅程前必须用动态测试证明不存在：
 
@@ -217,6 +217,7 @@ Windowed Provider 是一个无限文档的有限投影，必须模拟普通编�
 - Hex 和 ASCII 两栏选择完全同步；Shift、鼠标拖选、Ctrl+A、选择范围、Go to Offset 使用 byte range。
 - 状态栏显示 absolute offset、selection byte count、INS/OVR、文件大小和 B1/B2/B3 能力。
 - Copy 默认提供人可读 Hex；“复制为”支持原始 bytes、十六进制、ASCII/UTF-8、C array。Paste 先验证格式并在执行前确定插入/覆盖语义。
+- Hex/ASCII 字节面不承载 Unicode 输入法预编辑文本。IME 候选提交必须先整段校验：Hex 仅接受 `0–9/A–F`，ASCII 仅接受可打印单字节 Latin-1；非法候选原子拒绝，合法多 nibble 提交作为一个字节事务进入 OVR/INS 和 Undo，不得直接改写显示投影。切回 Text 后必须恢复正常中文输入法。
 - B1 可支持插入和覆盖，并有 Undo/Redo、保存和 hash round-trip。
 - B2 固定长度写穿只有在 crash-safe journal、外部冲突、跨窗口撤销和保存测试通过后启用；当前稳定策略是只读单滚动 fallback。
 - B3 永久只读；任何键入、Paste、Cut、Delete 和 Replace 都不能修改 mmap 或产生误导 dirty 标记。
@@ -224,16 +225,32 @@ Windowed Provider 是一个无限文档的有限投影，必须模拟普通编�
 
 ### 7.3 Hex 搜索
 
-- 查询类型明确为 Hex bytes、ASCII、UTF-8 text；Hex 支持空格和 byte wildcard，错误输入就地解释。
+- 查询类型明确为 Hex bytes、ASCII、UTF-8 text。当前发布的 Hex bytes 接受连续、空格、逗号、
+  连字符、下划线和逐字节 `0x` 写法；byte wildcard 属于后续显式语法扩展，不能在未实现时展示。
 - Find Next/Previous、Find All、范围和结果 Dock 与 Text 共用 SearchSession，但 Match 的 PositionSpace 为 SourceBytes。
 - 双击结果后必须同时定位 offset、Hex selection 和 ASCII selection；不能只滚到大概窗口。
-- Replace 只对可编辑 B1/B2 且长度规则满足当前模式时启用；混合范围中明确列出只读跳过项。
+- 当前发布的搜索对话框不提供 Hex bytes Replace；替换输入和两个替换按钮必须灰显，字节修改走
+  Hex 编辑器的 INS/OVR、选择、粘贴和 Undo 契约。未来若增加 bytes Replace，需另行定义长度、
+  wildcard 捕获和 B1/B2 写入事务，不能误走 Text replacement。
 
 ## 8. 搜索、替换和日志分析
 
 ### 8.1 单一查询体验
 
 Ctrl+F 打开同一个非模态查找界面。范围默认“当前文件”，用户可明确选择“全部打开文件”；切标签不会暗自把当前文件升级为全局任务。本次发布不显示尚未实现的“文件夹”范围。
+
+查询解释是一个三态状态机，而不是可任意叠加的复选框集合：
+
+| 模式 | 可选项 | 必须灰显并清空 |
+|---|---|---|
+| Literal | 区分大小写、整词、循环、范围 | 无 |
+| Regex | 区分大小写、循环、范围 | 整词、Hex bytes |
+| Hex bytes | 循环、范围 | Regex、区分大小写、整词、全部替换控件 |
+
+范围内没有 Binary/Hex target 时 Hex bytes 灰显；查询为空时所有执行按钮灰显；后台 Find All
+运行时 query、模式、范围、导航、替换和重复启动全部灰显，只保留取消和关闭。禁用控件必须
+经真实点击保持不变，领域层仍防御程序化非法状态。模式切换不得依靠“先允许错误组合、点击后再
+互相取消”来维持正确性。
 
 - 查找、F3/Shift+F3、查找全部和替换共享 query、case、whole-word、regex/byte mode 和 scope。
 - 当前文件即时高亮所有可见命中，活动命中有独立样式；overview ruler 可显示全文件分布，但不能代替结果列表。
@@ -243,6 +260,22 @@ Ctrl+F 打开同一个非模态查找界面。范围默认“当前文件”，�
 - 双击结果必须打开/激活正确标签，等待目标 Provider 窗口 ready，滚动到关键词、选中精确 range 并在正文保留清晰高亮。
 - 快速双击两个远距离结果时，最终位置属于最后一次点击；旧异步 request 不能覆盖新请求。
 - 百万结果使用虚拟化/分页和有界内存；取消后保留部分结果并标记“不完整”，不能报告为完整零结果。
+
+2026-08-17 的正式 GUI 代表验证已直接打开保留的 4,928,168,473-byte S3 样本：在 Hex 模式
+输入 75% 位置的 32-byte signature 并点击“查找全部”，对话框先进入可取消的 mmap 准备态，
+随后 Dock 得到带 64 位 offset 的唯一结果；真实双击后窗口化正文精确选中跨显示行的 32 bytes，
+且仅有一条纵向滚动条。另一全新 S3 标签从“查找下一个”进入相同准备态，首次命中后重复
+forward/backward 不再读取隐藏后端的空选区，非循环边界与 wrap 均正确。完整搜索/替换专项为
+30 个功能用例全部通过；另以 60,050 个分行结果证明越过 50,000 条常驻上限后，临时 spool 的
+最后一行仍能在 Dock 即时显示、高亮并双击到精确正文范围。这项证据不替代可控编码
+语料、百万级压力和跨全部锁定入口清理门禁。2 GiB 后的有效 UTF-8 S3 Text Regex 也已证明
+大小写不敏感匹配、64 位结果、双击和只读替换边界；安全优先的 UTF-8 全量验证 + PCRE2 扫描
+当前为两遍读取，本机优化后 59.2 s，应在 UI 中如实呈现进度，不能与 Hex/Literal 性能混为一谈。
+Binary/Hex 文档中未勾选“正则表达式”的普通文本查询必须始终按原始字节 Literal 执行；默认
+不区分大小写只折叠 ASCII，不能为了 Unicode case-fold 暗中进入 PCRE2 并要求整个二进制文件
+是有效 UTF-8。显式 Regex 仍是文本语义，可以对无效 UTF-8 给出明确失败。真实 4.9 GB 样本的
+默认复制文本 Find Next 已由 `tc_fr_031` 验证。
+同一规则由 `tc_fr_032` 使用确定含非法 UTF-8 的小型 Binary 固化为可移植快速回归。
 
 ### 8.2 语义一致性
 
@@ -258,6 +291,14 @@ Ctrl+F 打开同一个非模态查找界面。范围默认“当前文件”，�
 - 当前文件 Replace/Replace All 作用于当前可编辑 target，并形成可撤销操作组。
 - 全部打开文件先生成 eligible/skipped/failed manifest，再对 S1、已晋升 S2 和 Secure Text 等兼容目标执行；S3/B3/S2 Preview 明确跳过。
 - 批量替换成功后保持各自 PersistenceKind，只标脏、不自动把安全文件解密保存或把普通文件加密。
+- Replace 在当前命中已经选中时先替换该命中，再选择下一处；不得先 Find Next 而跳过用户看到的
+  当前项。Literal replacement 中 `$1`、`${name}`、`\1`、`\n` 全部按字面写入；Regex
+  replacement 支持 `$0/$1…`、`${name}`、`$$`、`\1`、`\n/\r/\t/\\`，缺失捕获或不完整模板
+  在首个字节修改前拒绝。空 replacement 是合法删除，空 query 禁止执行；零长度 Regex 的
+  Replace All 在定义出安全推进/Undo 语义前明确拒绝。
+- 全部打开文件范围只修改策略可写 Text target；Binary、锁定安全文档和真正只读 Provider
+  列入跳过摘要。可编辑 Provider 不能仅因内部实现名为 L2 就被静默跳过；同一 target 能执行
+  当前文件替换，就必须通过同一 capability 判定参与全部打开文件替换。
 - 文件夹替换必须有独立预览/备份/提交流程；不能把打开文档的 Undo 幻觉扩展到任意磁盘目录。
 
 ## 9. 安全 Note 的无缝体验

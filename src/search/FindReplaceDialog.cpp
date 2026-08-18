@@ -4,6 +4,7 @@
 #include "SearchResultsModel.h"
 #include "LargeFileSearch.h"
 #include "Pcre2Regex.h"
+#include "ByteClipboard.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QLineEdit>
@@ -20,7 +21,16 @@
 #include <QTabWidget>
 #include <QPointer>
 #include <QSharedPointer>
+#include <QSignalBlocker>
 #include <utility>
+
+namespace {
+bool isSearchableDocument(EditorTab *tab)
+{
+    return tab && !tab->isSecureDocumentMasked()
+        && !tab->isSecureDocumentTransitioning();
+}
+}
 
 FindReplaceDialog::FindReplaceDialog(QWidget *parent)
     : QDialog(parent)
@@ -162,20 +172,56 @@ void FindReplaceDialog::buildUi()
     connect(m_closeBtn, &QPushButton::clicked, this, &QDialog::close);
     connect(m_findEdit, &QLineEdit::returnPressed, this, &FindReplaceDialog::onFindNext);
     // 查找参数变化时通知主窗口
-    connect(m_findEdit, &QLineEdit::textChanged, this, &FindReplaceDialog::emitFindParameters);
-    connect(m_regexCheck, &QCheckBox::toggled, this, &FindReplaceDialog::emitFindParameters);
-    connect(m_regexCheck, &QCheckBox::toggled, this, [this](bool checked) {
-        if (checked && m_hexBytesCheck->isChecked())
-            m_hexBytesCheck->setChecked(false);
+    connect(m_findEdit, &QLineEdit::textChanged, this, [this](const QString &text) {
+        QByteArray rawBytes;
+        QString clipboardText;
+        bool recognizedRawBytes = false;
+        if (m_hexBytesCheck && !m_hexBytesCheck->isChecked()
+            && m_hexBytesCheck->isEnabled()
+            && ByteClipboard::clipboardHexSearch(&rawBytes, &clipboardText)
+            && text == clipboardText) {
+            m_hexBytesCheck->setChecked(true);
+            recognizedRawBytes = true;
+            if (!rawBytes.isEmpty())
+                rawBytes.fill(0);
+        }
         updateQueryUi();
+        if (recognizedRawBytes && m_statusLabel) {
+            m_statusLabel->setText(QStringLiteral(
+                "已识别 Hex 字符栏中的不可打印字节，按原始字节搜索。"));
+        }
+        emitFindParameters();
+    });
+    connect(m_regexCheck, &QCheckBox::toggled, this, [this](bool checked) {
+        if (checked) {
+            const QSignalBlocker blockHex(m_hexBytesCheck);
+            const QSignalBlocker blockWord(m_wordCheck);
+            m_hexBytesCheck->setChecked(false);
+            m_wordCheck->setChecked(false);
+        }
+        updateQueryUi();
+        emitFindParameters();
     });
     connect(m_hexBytesCheck, &QCheckBox::toggled, this, [this](bool checked) {
-        if (checked && m_regexCheck->isChecked())
+        if (checked) {
+            const QSignalBlocker blockRegex(m_regexCheck);
+            const QSignalBlocker blockCase(m_caseCheck);
+            const QSignalBlocker blockWord(m_wordCheck);
             m_regexCheck->setChecked(false);
+            m_caseCheck->setChecked(false);
+            m_wordCheck->setChecked(false);
+        }
         updateQueryUi();
+        emitFindParameters();
     });
-    connect(m_caseCheck, &QCheckBox::toggled, this, &FindReplaceDialog::emitFindParameters);
-    connect(m_wordCheck, &QCheckBox::toggled, this, &FindReplaceDialog::emitFindParameters);
+    connect(m_caseCheck, &QCheckBox::toggled, this, [this]() {
+        updateQueryUi();
+        emitFindParameters();
+    });
+    connect(m_wordCheck, &QCheckBox::toggled, this, [this]() {
+        updateQueryUi();
+        emitFindParameters();
+    });
     connect(m_scopeCombo, &QComboBox::currentIndexChanged, this, [this]() {
         updateQueryUi();
     });
@@ -262,6 +308,15 @@ void FindReplaceDialog::notifyTabOpened(EditorTab *tab)
     for (const QPointer<EditorTab> &known : std::as_const(m_multiTabs)) {
         if (known == tab)
             return;
+    }
+    if (!isSearchableDocument(tab)) {
+        ++m_multiSkippedLockedTargets;
+        if (m_statusLabel) {
+            m_statusLabel->setText(
+                QStringLiteral("新打开的锁定文档不属于当前搜索；已跳过 %1 个锁定文档。")
+                    .arg(m_multiSkippedLockedTargets));
+        }
+        return;
     }
     if (m_multiHexBytes && !tab->isBinaryDocument()) {
         ++m_multiSkippedTextTargets;
@@ -366,38 +421,79 @@ void FindReplaceDialog::updateQueryUi()
 {
     if (!m_hexBytesCheck)
         return;
-    bool hasBinaryTarget = m_tab && m_tab->isBinaryDocument();
+    const bool busy = m_l2SearchInProgress;
+    bool hasBinaryTarget = isSearchableDocument(m_tab)
+        && m_tab->isBinaryDocument();
+    bool hasSearchableTarget = isSearchableDocument(m_tab);
     if (allOpenScope()) {
         hasBinaryTarget = false;
+        hasSearchableTarget = false;
         for (EditorTab *tab : openTabs()) {
-            if (tab && tab->isBinaryDocument()) {
+            if (!isSearchableDocument(tab))
+                continue;
+            hasSearchableTarget = true;
+            if (tab->isBinaryDocument()) {
                 hasBinaryTarget = true;
-                break;
             }
         }
     }
-    if (!hasBinaryTarget && hexBytesMode())
+    // Keep one stable interpretation state. Programmatic callers can still
+    // set disabled QCheckBoxes, so normalize here as a defensive domain gate;
+    // real users are prevented from producing these combinations by the
+    // enabled-state rules below.
+    if (!hasBinaryTarget && m_hexBytesCheck->isChecked()) {
+        const QSignalBlocker blocker(m_hexBytesCheck);
         m_hexBytesCheck->setChecked(false);
+    }
+    if (m_hexBytesCheck->isChecked()) {
+        const QSignalBlocker blockRegex(m_regexCheck);
+        const QSignalBlocker blockCase(m_caseCheck);
+        const QSignalBlocker blockWord(m_wordCheck);
+        m_regexCheck->setChecked(false);
+        m_caseCheck->setChecked(false);
+        m_wordCheck->setChecked(false);
+    } else if (m_regexCheck->isChecked()) {
+        const QSignalBlocker blockWord(m_wordCheck);
+        m_wordCheck->setChecked(false);
+    }
 
     const bool hex = hexBytesMode();
-    m_hexBytesCheck->setEnabled(!m_l2SearchInProgress && hasBinaryTarget);
+    const bool regex = m_regexCheck->isChecked();
+    const bool caseSensitive = m_caseCheck->isChecked();
+    const bool wholeWord = m_wordCheck->isChecked();
+    const bool hasQuery = m_tab && !currentFindText().isEmpty();
+    const bool queryExecutable = hasQuery && hasSearchableTarget
+        && (!hex || hasBinaryTarget);
+
+    m_hexBytesCheck->setEnabled(!busy && hasBinaryTarget && !regex
+                                && !caseSensitive && !wholeWord);
     m_hexBytesCheck->setToolTip(hasBinaryTarget
         ? QStringLiteral("按原始字节搜索，例如 DE AD BE EF 或 0xDE,0xAD")
         : QStringLiteral("当前搜索范围没有 Binary/Hex 文档"));
     m_findEdit->setPlaceholderText(hex
         ? QStringLiteral("例如 DE AD BE EF") : QString());
-    m_regexCheck->setEnabled(!m_l2SearchInProgress && !hex);
-    m_caseCheck->setEnabled(!m_l2SearchInProgress && !hex);
-    m_wordCheck->setEnabled(!m_l2SearchInProgress && !hex);
+    m_regexCheck->setEnabled(!busy && !hex && !wholeWord);
+    m_caseCheck->setEnabled(!busy && !hex);
+    m_wordCheck->setEnabled(!busy && !hex && !regex);
+    m_wrapCheck->setEnabled(!busy);
+    m_scopeCombo->setEnabled(!busy);
+    m_findEdit->setEnabled(!busy);
+    m_findNextBtn->setEnabled(!busy && queryExecutable);
+    m_findPrevBtn->setEnabled(!busy && queryExecutable);
+    m_findAllBtn->setEnabled(!busy && queryExecutable);
 
-    const bool currentReplaceAllowed = !m_l2SearchInProgress && !allOpenScope() && !hex
-                                       && m_tab && !m_tab->isReadOnlyByPolicy();
+    const auto replaceableTextTarget = [](EditorTab *tab) {
+        return tab && !tab->isReadOnlyByPolicy() && !tab->isBinaryDocument()
+            && !tab->isSecureDocumentMasked()
+            && !tab->isSecureDocumentTransitioning();
+    };
+    const bool currentTargetReplaceable = replaceableTextTarget(m_tab);
+    const bool currentReplaceAllowed = !busy && hasQuery && !allOpenScope() && !hex
+                                       && currentTargetReplaceable;
     bool allOpenReplaceAllowed = false;
-    if (!m_l2SearchInProgress && allOpenScope() && !hex) {
+    if (!busy && hasQuery && allOpenScope() && !hex) {
         for (EditorTab *tab : openTabs()) {
-            if (tab && !tab->isL2Mode() && !tab->isReadOnlyByPolicy()
-                && !tab->isBinaryDocument() && !tab->isSecureDocumentMasked()
-                && !tab->isSecureDocumentTransitioning()) {
+            if (replaceableTextTarget(tab)) {
                 allOpenReplaceAllowed = true;
                 break;
             }
@@ -407,8 +503,22 @@ void FindReplaceDialog::updateQueryUi()
     // follows the selected scope and can transact across editable open tabs.
     m_replaceBtn->setEnabled(currentReplaceAllowed);
     m_replaceAllBtn->setEnabled(currentReplaceAllowed || allOpenReplaceAllowed);
-    m_replaceEdit->setEnabled(!m_l2SearchInProgress && !hex);
-    if (!m_l2SearchInProgress && m_statusLabel) {
+    // The replacement value remains editable for an empty query, but only
+    // where the selected scope contains a policy-writable Text target.
+    bool scopeHasReplaceableTarget = currentTargetReplaceable;
+    if (allOpenScope()) {
+        scopeHasReplaceableTarget = false;
+        for (EditorTab *tab : openTabs()) {
+            if (replaceableTextTarget(tab)) {
+                scopeHasReplaceableTarget = true;
+                break;
+            }
+        }
+    }
+    const bool replacementValueAllowed = !busy && !hex
+        && scopeHasReplaceableTarget;
+    m_replaceEdit->setEnabled(replacementValueAllowed);
+    if (!busy && m_statusLabel) {
         if (hex && m_replaceMode)
             m_statusLabel->setText(QStringLiteral("十六进制字节模式当前只执行查找；字节编辑请直接在 Hex 视图完成。"));
         else if (allOpenScope() && m_replaceMode)
@@ -443,11 +553,18 @@ void FindReplaceDialog::findAcrossTabs(bool forward)
     bool queryError = false;
     const bool hex = hexBytesMode();
     const auto findIn = [this, &pattern, forward, &queryError, hex](EditorTab *tab, bool wrap) {
-        if (hex && (!tab || !tab->isBinaryDocument()))
+        if (!isSearchableDocument(tab)
+            || (hex && !tab->isBinaryDocument()))
             return false;
+        const bool ownsBusyState = tab && tab->isL2Mode()
+            && !m_l2SearchInProgress;
+        if (ownsBusyState)
+            setL2SearchUiBusy(true, QObject::tr("正在搜索大文件…"));
         const bool found = tab && tab->findNext(
             pattern, m_regexCheck->isChecked(), m_caseCheck->isChecked(),
             m_wordCheck->isChecked(), forward, wrap, hex);
+        if (ownsBusyState)
+            setL2SearchUiBusy(false);
         if (!found && tab && !tab->lastSearchError().isEmpty()) {
             queryError = true;
             if (m_statusLabel)
@@ -456,6 +573,11 @@ void FindReplaceDialog::findAcrossTabs(bool forward)
         return found;
     };
     if (!allOpenScope() || !m_tabWidget) {
+        if (!isSearchableDocument(m_tab)) {
+            if (m_statusLabel)
+                m_statusLabel->setText(QStringLiteral("当前安全文档已锁定，无法搜索正文。"));
+            return;
+        }
         if (hex && !m_tab->isBinaryDocument()) {
             if (m_statusLabel)
                 m_statusLabel->setText(QStringLiteral("十六进制字节搜索仅适用于 Binary/Hex 文档。"));
@@ -539,18 +661,32 @@ void FindReplaceDialog::onReplace()
     QString pattern = currentFindText();
     if (pattern.isEmpty()) return;
     emitFindParameters();
-    // 先查找当前匹配，然后替换，然后跳到下一个
-    bool found = m_tab->findNext(pattern, m_regexCheck->isChecked(),
-                                 m_caseCheck->isChecked(), m_wordCheck->isChecked(),
-                                 true, m_wrapCheck->isChecked());
+    // Replace owns the currently selected match. Calling findNext first would
+    // skip a match that the user just selected with Find Next/F3. Only locate
+    // a match when the current selection is not a result of the same query.
+    const bool regex = m_regexCheck->isChecked();
+    const bool caseSensitive = m_caseCheck->isChecked();
+    const bool wholeWord = m_wordCheck->isChecked();
+    bool found = m_tab->currentSelectionMatchesSearch(
+        pattern, regex, caseSensitive, wholeWord);
+    if (!found) {
+        found = m_tab->findNext(pattern, regex, caseSensitive, wholeWord,
+                                true, m_wrapCheck->isChecked());
+    }
     if (!found && !m_tab->lastSearchError().isEmpty()) {
         if (m_statusLabel) m_statusLabel->setText(m_tab->lastSearchError());
         return;
     }
     if (found) {
-        m_tab->replaceCurrent(currentReplaceText());
-        m_tab->findNext(pattern, m_regexCheck->isChecked(),
-                        m_caseCheck->isChecked(), m_wordCheck->isChecked(),
+        QString replaceError;
+        if (!m_tab->replaceCurrentSearchMatch(
+                pattern, currentReplaceText(), regex, caseSensitive,
+                wholeWord, &replaceError)) {
+            if (m_statusLabel)
+                m_statusLabel->setText(replaceError);
+            return;
+        }
+        m_tab->findNext(pattern, regex, caseSensitive, wholeWord,
                         true, m_wrapCheck->isChecked());
     }
 }
@@ -588,7 +724,7 @@ void FindReplaceDialog::onReplaceAll()
                 ++skippedBinary;
                 continue;
             }
-            if (tab->isL2Mode() || tab->isReadOnlyByPolicy()) {
+            if (tab->isReadOnlyByPolicy()) {
                 ++skippedReadOnly;
                 continue;
             }
@@ -712,6 +848,11 @@ void FindReplaceDialog::onFindAll()
     QString pattern = currentFindText();
     if (pattern.isEmpty()) return;
     emitFindParameters();
+    if (!allOpenScope() && !isSearchableDocument(m_tab)) {
+        if (m_statusLabel)
+            m_statusLabel->setText(QStringLiteral("当前安全文档已锁定，无法搜索正文。"));
+        return;
+    }
 
     // Validate once before routing the query to one or many documents.  An
     // invalid expression is a query error, not a successful search with zero
@@ -798,7 +939,12 @@ void FindReplaceDialog::startAllOpenFindAll()
     m_multiTabs.reserve(rawTabs.size());
     const bool hex = hexBytesMode();
     m_multiSkippedTextTargets = 0;
+    m_multiSkippedLockedTargets = 0;
     for (EditorTab *tab : rawTabs) {
+        if (!isSearchableDocument(tab)) {
+            ++m_multiSkippedLockedTargets;
+            continue;
+        }
         if (hex && (!tab || !tab->isBinaryDocument())) {
             ++m_multiSkippedTextTargets;
             continue;
@@ -814,10 +960,10 @@ void FindReplaceDialog::startAllOpenFindAll()
     m_multiDispatchComplete = false;
     m_multiCancelRequested = false;
     m_resultsDock->beginMultiFileResults(pattern, m_multiTabs.size());
-    const QString startStatus = hex && m_multiSkippedTextTargets > 0
-        ? QStringLiteral("正在搜索 %1 个 Binary/Hex 文档；已跳过 %2 个文本文件…")
-              .arg(m_multiTabs.size()).arg(m_multiSkippedTextTargets)
-        : QStringLiteral("正在搜索全部打开文件…");
+    const QString startStatus = QStringLiteral(
+        "正在搜索 %1 个打开文件；已跳过文本 %2 个、锁定 %3 个…")
+        .arg(m_multiTabs.size()).arg(m_multiSkippedTextTargets)
+        .arg(m_multiSkippedLockedTargets);
     setL2SearchUiBusy(true, startStatus);
     QTimer::singleShot(0, this, [this, generation]() {
         dispatchNextMultiTarget(generation);
@@ -930,10 +1076,12 @@ void FindReplaceDialog::finishMultiSearchIfReady(int generation)
     setL2SearchUiBusy(false);
     if (cancelled && m_statusLabel)
         m_statusLabel->setText(QStringLiteral("搜索已取消，已保留完成的结果。"));
-    else if (m_multiHexBytes && m_multiSkippedTextTargets > 0 && m_statusLabel)
+    else if ((m_multiSkippedTextTargets > 0 || m_multiSkippedLockedTargets > 0)
+             && m_statusLabel)
         m_statusLabel->setText(
-            QStringLiteral("搜索完成：已搜索 Binary/Hex 文档，跳过 %1 个文本文件。")
-                .arg(m_multiSkippedTextTargets));
+            QStringLiteral("搜索完成：跳过文本 %1 个、锁定文档 %2 个。")
+                .arg(m_multiSkippedTextTargets)
+                .arg(m_multiSkippedLockedTargets));
     m_multiCancelRequested = false;
 }
 

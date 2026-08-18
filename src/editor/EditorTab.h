@@ -31,6 +31,7 @@ class QStackedWidget;
 class QIODevice;
 class ILoader;
 class QKeyEvent;
+class QInputMethodEvent;
 class QPlainTextEdit;
 
 // 语法类型
@@ -169,9 +170,16 @@ public:
                   bool wholeWord, bool forward, bool wrap,
                   bool hexBytes = false);
     void resetSearchPosition(bool forward);
+    bool currentSelectionMatchesSearch(const QString &pattern, bool regex,
+                                       bool caseSensitive, bool wholeWord,
+                                       bool hexBytes = false);
+    bool replaceCurrentSearchMatch(const QString &find,
+                                   const QString &replacement,
+                                   bool regex, bool caseSensitive,
+                                   bool wholeWord, QString *error = nullptr);
     // replace 当前匹配（需先 findNext）
     void replaceCurrent(const QString &replaceText);
-    // replaceAll 返回替换次数（L2：按 1000 条/UndoGroup 原子批）
+    // replaceAll 返回替换次数（L2：预算内一次命令对应一个 UndoGroup）
     int replaceAll(const QString &find, const QString &replace, bool regex,
                    bool caseSensitive, bool wholeWord);
     // findAll 收集所有匹配；L1 走 QVector、L2 走 SearchResultsModel
@@ -385,8 +393,10 @@ private:
     void ensureHexAsciiPreview(QWidget *parent);
     void layoutL2Overlay();
     void alignHexOverlayToGlobalScroll();
+    void refreshTextProjectionMargin();
     bool handleHexKeyPress(QKeyEvent *event);
     bool handleHexAsciiKeyPress(QKeyEvent *event);
+    bool handleHexInputMethodEvent(QInputMethodEvent *event, bool asciiSurface);
     bool handleHexInsertModeKey(QKeyEvent *event);
     bool hexSelectionByteRange(qint64 *start, qint64 *end,
                                int *nibble = nullptr) const;
@@ -468,6 +478,7 @@ private:
         quint64 contentRevision = 0;
         QPointer<QObject> parentForModel;
         QMetaObject::Connection waitLineBuildConn;
+        QMetaObject::Connection waitMapFailedConn;
         QMetaObject::Connection searchProgressConn;
         QMetaObject::Connection searchPartialConn;
         QMetaObject::Connection searchFinishedConn;

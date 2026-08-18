@@ -29,11 +29,22 @@ public:
     Pcre2Regex &operator=(const Pcre2Regex &) = delete;
 
     // literal=true escapes the user text before compilation. wholeWord uses
-    // Unicode letter/number/underscore boundaries in every file tier.
+    // Unicode letter/number/underscore boundaries in text mode and ASCII
+    // byte boundaries when utfMode=false (Binary literal search).
     bool compile(const QString &pattern, bool literal, bool caseSensitive,
-                 bool wholeWord, QString *error = nullptr);
+                 bool wholeWord, QString *error = nullptr,
+                 bool utfMode = true);
 
     bool isValid() const;
+
+    // Re-match one authoritative byte range and expand replacement references.
+    // Supported syntax: $0/$1.., ${name}, $$, \1, \n, \r, \t and \\.
+    // The subject must be the same valid UTF-8 snapshot used to obtain the
+    // range; an invalid/missing capture is an error, never literal fallback.
+    bool expandReplacementAt(const uchar *subject, qint64 subjectSize,
+                             qint64 matchOffset, qint64 matchLength,
+                             const QString &replacement, QByteArray *expanded,
+                             QString *error = nullptr) const;
 
     // subject must remain alive for the duration of this call. Match offsets
     // and lengths are UTF-8 byte coordinates, which map directly to mmap and

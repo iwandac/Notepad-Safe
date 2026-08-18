@@ -35,6 +35,7 @@
 #include <QtGui/QKeySequence>
 #include <QtGui/QClipboard>
 #include <QtGui/QContextMenuEvent>
+#include <QtGui/QInputMethodEvent>
 #include <QtGui/QTextCursor>
 #include <QtGui/QTextBlock>
 #include <QtGui/QWheelEvent>
@@ -457,15 +458,15 @@ private slots:
     void tc_sr02_comfort_c_trigger_replace_action_shows_dialog() {
         // showReplaceDialog 会先拿 currentTab()：若 MainWindow 没有任何 tab（MainWindow 构造
         //   函数本身不 new 空 tab，空 tab 只在 restoreSession() 结束时或 newFile 时补），
-        //   showReplaceDialog 就 early return 不 show。这里如果 count==0 就触发「文件→新建」
-        //   动作造一个空 tab（当前产品默认是加密笔记，等价于 Ctrl+N），是用户点 Ctrl+R
-        //   前一定满足的前置。
+        //   showReplaceDialog 就 early return 不 show。不要用「文件→新建」造前置：产品默认
+        //   SecureDraft，在隔离测试身份下会正确打开首次安全设置模态框并阻塞本用例。
+        //   改为通过统一外部打开入口载入 QTemporaryDir 内的普通文本，仍然覆盖真实 MainWindow。
         if (tabCount(mw_) == 0) {
-            auto* actNew = mw_->findChild<QAction *>(QStringLiteral("file.new"));
-            QVERIFY2(actNew != nullptr,
-                     "SR02-C 需要先造空 tab，但找不到统一的新建命令 file.new");
-            actNew->trigger();
-            QApplication::processEvents(QEventLoop::AllEvents, 80);
+            const QString fixture = makeL1FixtureFile(
+                tmpDir_, QStringLiteral("sr02-replace-entry.txt"));
+            QVERIFY2(!fixture.isEmpty(), "SR02-C 无法创建隔离的普通文本 fixture");
+            mw_->openFilesFromExternal(QStringList{fixture});
+            QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
         }
         auto* tabBefore = currentEditorTab(mw_);
         QVERIFY2(tabBefore != nullptr, "SR02-C 前置：MainWindow 当前没有激活的 EditorTab，showReplaceDialog 会 early return 不弹窗");
@@ -1803,6 +1804,126 @@ private slots:
         }
     }
 
+    void tc_hex_ime_commit_preserves_byte_grid_contract() {
+        closeAllEditorTabs(mw_);
+        const QByteArray original = QByteArray::fromHex(
+            "4885c00f8499008b01488bf8010f8f8e");
+        const auto formattedHex = [](const QByteArray &bytes, int row) {
+            QString text;
+            for (int i = 0; i < bytes.size(); ++i) {
+                if (i > 0)
+                    text.append(i % row == 0 ? QLatin1Char('\n')
+                                             : QLatin1Char(' '));
+                text.append(QStringLiteral("%1").arg(
+                    quint8(bytes.at(i)), 2, 16, QLatin1Char('0')).toUpper());
+            }
+            return text;
+        };
+
+        for (const bool overwrite : {true, false}) {
+            const QString mode = overwrite ? QStringLiteral("OVR")
+                                           : QStringLiteral("INS");
+            const QString path = tmpDir_.filePath(
+                QStringLiteral("hex-ime-%1.bin").arg(mode.toLower()));
+            {
+                QFile source(path);
+                QVERIFY2(source.open(QIODevice::WriteOnly | QIODevice::Truncate),
+                         qPrintable(source.errorString()));
+                QCOMPARE(source.write(original), qint64(original.size()));
+            }
+            mw_->openFilesFromExternal(QStringList{path});
+            QVERIFY2(waitForTabCountAndL2(mw_, 1, true, 5000), qPrintable(mode));
+            EditorTab *tab = currentEditorTab(mw_);
+            QVERIFY2(tab && tab->l2View() && tab->viewModeL2() == ViewMode::Hex,
+                     qPrintable(mode));
+            auto *ascii = tab->findChild<QPlainTextEdit *>(
+                QStringLiteral("HexAsciiPreview"));
+            QVERIFY2(ascii && ascii->isVisibleTo(tab), qPrintable(mode));
+
+            // Native composition must never be rendered into either fixed
+            // byte projection. Directly dispatched events below reproduce the
+            // route used by Chinese IMEs even on a non-Chinese CI machine.
+            QVERIFY(!tab->editor()->testAttribute(Qt::WA_InputMethodEnabled));
+            QVERIFY(!ascii->testAttribute(Qt::WA_InputMethodEnabled));
+            tab->editor()->setFocus(Qt::OtherFocusReason);
+            if (!overwrite)
+                QTest::keyClick(tab->editor(), Qt::Key_Insert);
+            tab->editor()->setCursorPosition(0, 3); // byte 1, high nibble
+
+            const QString pristineProjection = tab->editor()->text();
+            QInputMethodEvent preedit(QStringLiteral("D8DB"), {});
+            QApplication::sendEvent(tab->editor(), &preedit);
+            QApplication::processEvents(QEventLoop::AllEvents, 30);
+            QCOMPARE(tab->editor()->text(), pristineProjection);
+            QCOMPARE(tab->l2View()->readByteRange(0, original.size()), original);
+
+            // The whole IME commit is validated before the first byte is
+            // changed. A valid-looking prefix plus Chinese/non-Hex tail must
+            // not partially overwrite the file or leak into the grid.
+            QInputMethodEvent invalidCommit;
+            invalidCommit.setCommitString(QStringLiteral("D8中G"));
+            QApplication::sendEvent(tab->editor(), &invalidCommit);
+            QApplication::processEvents(QEventLoop::AllEvents, 30);
+            QCOMPARE(tab->editor()->text(), pristineProjection);
+            QCOMPARE(tab->l2View()->readByteRange(0, original.size()), original);
+            QVERIFY(!tab->isModified());
+            QVERIFY(!mw_->statusBar()->currentMessage().isEmpty());
+
+            QInputMethodEvent validCommit;
+            validCommit.setCommitString(QStringLiteral("D8DB"));
+            QApplication::sendEvent(tab->editor(), &validCommit);
+            QApplication::processEvents(QEventLoop::AllEvents, 80);
+
+            QByteArray expected = original;
+            if (overwrite) {
+                expected[1] = char(0xd8);
+                expected[2] = char(0xdb);
+            } else {
+                expected.insert(1, QByteArray::fromHex("d8db"));
+            }
+            QCOMPARE(tab->l2View()->virtualFileSize(), qint64(expected.size()));
+            QTRY_COMPARE_WITH_TIMEOUT(
+                tab->editor()->text(),
+                formattedHex(expected, tab->l2View()->hexBytesPerRow()), 1000);
+            QTRY_COMPARE_WITH_TIMEOUT(
+                tab->l2View()->readByteRange(0, expected.size()), expected, 1000);
+            QVERIFY(tab->isModified());
+
+            const QString committedProjection = tab->editor()->text();
+            const QString committedAscii = ascii->toPlainText();
+            QInputMethodEvent invalidAsciiCommit;
+            invalidAsciiCommit.setCommitString(QStringLiteral("中"));
+            QApplication::sendEvent(ascii, &invalidAsciiCommit);
+            QApplication::processEvents(QEventLoop::AllEvents, 30);
+            QCOMPARE(tab->editor()->text(), committedProjection);
+            QCOMPARE(ascii->toPlainText(), committedAscii);
+            QCOMPARE(tab->l2View()->readByteRange(0, expected.size()), expected);
+
+            if (overwrite) {
+                const QString screenshot = QCoreApplication::applicationDirPath()
+                    + QStringLiteral("/gui-hex-ime-safe.png");
+                QVERIFY2(mw_->grab().save(screenshot), qPrintable(screenshot));
+            }
+
+            // The byte-editor policy must not leak into ordinary text mode;
+            // Chinese IME remains available when the same Scintilla instance
+            // is reused as a text editor.
+            tab->setViewModeL2(ViewMode::Text);
+            QVERIFY(tab->editor()->testAttribute(Qt::WA_InputMethodEnabled));
+            QTRY_COMPARE_WITH_TIMEOUT(
+                tab->l2View()->readByteRange(0, expected.size()), expected, 1000);
+            tab->setViewModeL2(ViewMode::Hex);
+            QVERIFY(!tab->editor()->testAttribute(Qt::WA_InputMethodEnabled));
+
+            QString saveError;
+            QVERIFY2(tab->saveFile(&saveError), qPrintable(saveError));
+            QFile saved(path);
+            QVERIFY(saved.open(QIODevice::ReadOnly));
+            QCOMPARE(saved.readAll(), expected);
+            closeAllEditorTabs(mw_);
+        }
+    }
+
     void tc_hex_ascii_direct_input_pairwise_contract() {
         using namespace GuiContractMatrix;
         closeAllEditorTabs(mw_);
@@ -2030,6 +2151,45 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(visibleAddress(),
             qint64(global->value()) * tab->l2View()->hexBytesPerRow(), 5000);
 
+        // Put the visible projection on its final local row and then wheel from
+        // the ASCII pane. A mature Hex editor must replace the bounded window
+        // during the gesture; waiting for an old debounce timer produces a
+        // visible pause followed by a jump and leaves the two byte panes stale.
+        const int projectedLines = int(tab->editor()->SendScintilla(
+            QsciScintillaBase::SCI_GETLINECOUNT));
+        const int linesOnScreen = qMax(1, int(tab->editor()->SendScintilla(
+            QsciScintillaBase::SCI_LINESONSCREEN)));
+        const int localLastFirst = qMax(0, projectedLines - linesOnScreen);
+        const qint64 windowFirstAddress = [&]() {
+            QByteArray margin(64, '\0');
+            tab->editor()->SendScintilla(QsciScintillaBase::SCI_MARGINGETTEXT,
+                                         0UL, static_cast<void *>(margin.data()));
+            bool ok = false;
+            const qint64 result = QString::fromLatin1(margin.constData())
+                                      .toLongLong(&ok, 16);
+            return ok ? result : qint64(-1);
+        }();
+        QVERIFY(windowFirstAddress >= 0);
+        global->setValue(int(windowFirstAddress / tab->l2View()->hexBytesPerRow())
+                         + localLastFirst);
+        QTRY_COMPARE_WITH_TIMEOUT(visibleAddress(),
+            qint64(global->value()) * tab->l2View()->hexBytesPerRow(), 5000);
+        const qint64 beforeBoundaryWheelAddress = visibleAddress();
+        const QPointF asciiLocal(ascii->viewport()->rect().center());
+        QWheelEvent asciiWheel(
+            asciiLocal, ascii->viewport()->mapToGlobal(asciiLocal.toPoint()),
+            QPoint(), QPoint(0, -120), Qt::NoButton, Qt::NoModifier,
+            Qt::ScrollUpdate, false);
+        QApplication::sendEvent(ascii->viewport(), &asciiWheel);
+        QCoreApplication::processEvents();
+        QVERIFY(global->value() * tab->l2View()->hexBytesPerRow()
+                > beforeBoundaryWheelAddress);
+        QCOMPARE(visibleAddress(),
+                 qint64(global->value()) * tab->l2View()->hexBytesPerRow());
+        QCOMPARE(ascii->cursorForPosition(QPoint(2, 2)).blockNumber(),
+                 int(tab->editor()->SendScintilla(
+                     QsciScintillaBase::SCI_GETFIRSTVISIBLELINE)));
+
         const QString journeyScreenshot = QCoreApplication::applicationDirPath()
             + QStringLiteral("/gui-hex-nine-mib-single-scroll.png");
         QVERIFY2(mw_->grab().save(journeyScreenshot), qPrintable(journeyScreenshot));
@@ -2159,6 +2319,8 @@ private slots:
         source->setViewModeL2(ViewMode::Text);
         QTRY_COMPARE_WITH_TIMEOUT(source->viewModeL2(), ViewMode::Text, 2000);
         QVERIFY(source->isBinaryDocument());
+        QTRY_COMPARE_WITH_TIMEOUT(source->editor()->marginType(0),
+                                  QsciScintilla::NumberMargin, 2000);
 
         SessionManager session(dataDir);
         QVERIFY(session.saveSession({source}, 0, false));
@@ -2181,6 +2343,7 @@ private slots:
                                  && restored->l2View()->isOpen(), 5000);
         QCOMPARE(restored->viewModeL2(), ViewMode::Text);
         QVERIFY(restored->isBinaryDocument());
+        QCOMPARE(restored->editor()->marginType(0), QsciScintilla::NumberMargin);
         QVERIFY(restored->editor()->text().startsWith(
             QStringLiteral("BINARY-AS-TEXT")));
         QVERIFY(!restored->editor()->text().startsWith(

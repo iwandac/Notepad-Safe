@@ -48,12 +48,12 @@
 | L03 | S3/B2/B3 只读 | 2 GiB 边界、保留真实大文件、Text/Hex | 全文可浏览/搜索/有界复制；编辑/替换显式禁用；不创建完整内存副本 |
 | L04 | 大文件连续浏览 | 拖动、滚轮、pixelDelta、Page、wrap、横向长行、静置 | 单滚动；窗口间无 gap/重复/回跳；物理 EOF 可达；UI heartbeat 持续 |
 | L05 | 文件增长/轮转 | 追加、截断、同路径替换、搜索运行中变化 | 新尾可达；位置钳制；generation 正确失效/增量；无持久锁阻止外部替换 |
-| S01 | 当前文件查找 | Text S1/S2/S3/Secure、Hex B1/B2/B3；literal/regex/bytes；正则/大小写/整词/循环各自两态判别语料 | 每个选项只改变其声明语义；literal `a.b` 只命中字面点、regex `a.b` 可命中任意字符；F3/Shift+F3 选中真实正文，不只更新 offset |
+| S01 | 当前文件查找 | Text S1/S2/S3/Secure、Hex B1/B2/B3；literal/regex/bytes；所有合法 case/whole/wrap 组合；非法组合真实点击 | 每个选项只改变其声明语义；冲突控件灰显且不可改变；Find Next/Previous/All ranges 同序；F3/Shift+F3 选中真实正文 |
 | S02 | 查找全部/Dock | 0/1/多命中、同一行多命中、head/middle/边界/EOF | 渐进分组、上下文和高亮正确；Dock 可见/关闭/重开状态正确 |
 | S03 | Dock 双击导航 | 跨标签/Provider、快速 A/B/C、旧 revision、关闭目标 | 激活正确目标；最后请求胜出；正文可见 selection 精确；旧结果拒绝跳转 |
 | S04 | 全部打开文件 | 混合 Text/Hex/Secure/locked/S1–S3、运行中增删标签/取消 | 显式 scope；受控并发和增量结果；跳过有原因；取消停止增长且保留完成项 |
 | S05 | 搜索失效/增量 | 编辑 debounce、S3 追加、截断/替换、重跑 | 只影响变化 target；generation/revision 不混；旧高亮/结果不误导航 |
-| S06 | 替换 | 当前/全部打开、单次/全部、eligible/skipped、失败/Undo | 查询语义一致；每文档一个 Undo；跨文档预检/回滚；成功不自动保存 |
+| S06 | 替换 | 当前/全部打开、单次/全部、空/短/长/Unicode、literal 元语法、regex 编号/命名捕获、eligible/skipped、失败/Undo/Redo | 当前选中项不跳过；literal 不展开；regex S1/L2 同语法；错误 mutation 前拒绝；每文档一个 Undo；成功不自动保存 |
 | C01 | 首次安全身份 | 建立、恢复密钥展示/验证、取消、错误密码 | 流程闭环且返回文档；秘密不进日志/设置；错误不建立半身份 |
 | C02 | 七天会话 | 有效、过期、重启、系统锁屏、显式锁定 | 有效期内加解密零提示；过期才询问；显式锁定清 capsule；状态不误导 |
 | C03 | 安全 Note | 新建/打开/编辑/搜索/保存/崩溃恢复 | 解密后拥有完整 Text 体验；普通操作不出现保险箱分叉；密文/恢复点正确 |
@@ -113,6 +113,9 @@
 | K17 | Hex 双投影/状态历史不同步 | Undo/Redo 后 Hex 与 ASCII 内容不同，或实际 OVR/INS 与长期状态栏不一致 |
 | K18 | Hex 选择按投影字符而非源字节 | Shift/鼠标拖选只覆盖半个 nibble 或分隔符；Hex/ASCII/复制删除得到不同 byte range；拖选事件递归卡死 |
 | K19 | Hex 命令忽略当前输入面 | ASCII 栏有焦点时主菜单 Copy/Cut/Paste 仍按 Hex 文本解释，或反之 |
+| K20 | 查询状态产生非法组合 | Regex+整词、Regex+Hex、Hex+大小写/整词仍可同时勾选，或 Binary/只读/锁定文档仍启用替换 |
+| K21 | Replace 跳过当前命中 | 用户已选中命中后点击 Replace 却先跳到下一处；或 L1 依赖另一套 Scintilla 查找会话导致无修改 |
+| K22 | L2 批量替换显示 clean | PatchList 已改变但标签 dirty、revision、Undo/Redo、scroll range 或正文 repaint 未更新 |
 
 ## 5. 参数契约展开规则
 
@@ -126,6 +129,7 @@
 | 循环关闭/开启 | caret 位于最后命中之后，正文前部有命中 | 关闭停在边界；开启回到首个命中 |
 | 当前/全部打开 | 两标签各有同一查询，另有不匹配标签 | 当前只返回活动标签；全部按受控并发返回两个目标 |
 | 文本/十六进制字节 | 文本 `41 42` 与原始字节 `0x41 0x42` 可区分 | 文本按字符查询；bytes 按字节序列查询且互斥选项生效 |
+| 替换模板 Literal/Regex | replacement `$1\\n${name}\\1`，Regex 含编号/命名捕获 | Literal 逐字符写入；Regex 按统一模板展开；缺失捕获在修改前失败 |
 
 每个参数至少贯穿“查找下一个 + 查找全部”；影响替换时再贯穿“单次替换 + 全部替换”。
 同一契约必须在适用的 S1/S2/S3/Secure Provider 上保持语义一致，Provider 只允许改变执行策略，
@@ -136,6 +140,20 @@
 （例如 `literal(q) == regex(escape(q))`）以及包含/单调关系（例如 whole-word 结果是非 whole-word
 结果的子集）。首个试点为 `tc_fr_018_regex_contract_model_runs_gui_variants`：由契约表循环生成真实
 GUI 操作，覆盖 literal、regex、escaped regex、非法表达式、Find All、重复 Find Next 和边界行为。
+
+搜索/替换专项的完整有限状态、query/command/Dock/Replace/Provider 矩阵由
+`SEARCH_REPLACE_CONTRACT_MATRIX.md` 管理。当前自动证据包括 `tc_fr_019` 的 4 种目标上下文下
+Literal 8、Regex 4、Hex 2 合法组合与冲突控件真实点击，以及 `tc_fr_020`–`tc_fr_026` 的
+导航、Hex 格式、S1/L2 捕获替换、空/短/长/Unicode/Literal replacement、原子失败和 Undo/Redo；
+`tc_fr_027` 进一步在保留的 4.9 GB S3 样本上覆盖正式对话框、异步 mmap 准备、结果 Dock、
+64 位 byte range、真实双击跳转和单滚动条正文选区；`tc_fr_028` 从全新 S3 标签覆盖首次
+Find Next、busy/cancel 状态、可见 Provider 选区、重复 forward/backward、非循环边界和 wrap；
+`tc_fr_029` 以 60,050 个分行结果覆盖常驻上限、临时 spool、稀疏虚拟尾行读取及尾项双击；
+`tc_fr_030` 以 2 GiB+ 稀疏有效 UTF-8 Text 覆盖 Regex/case、2 GiB 后 64 位位置、Dock/正文
+双击及 S3 替换禁用边界；`tc_fr_031` 直接在保留的 4.9 GB Binary S3 上覆盖默认仅循环查找
+的 Literal 文本输入，保证未勾正则时不会暗中触发 PCRE2 的 UTF-8 要求。
+同一契约由 `tc_fr_032` 用含非法 UTF-8 的小型 Binary 做可移植快速门禁，并验证 ASCII
+不区分大小写。
 
 复杂模块使用 `GuiContractMatrix` 自动生成合法的 pairwise 状态组合，并在失败信息中输出稳定 case ID。
 Hex 首个专项为 `tc_hex_delete_backspace_pairwise_contract`，自动覆盖 Hex/ASCII 输入面、OVR/INS、

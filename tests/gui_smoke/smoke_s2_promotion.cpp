@@ -2,22 +2,30 @@
 #include <QtTest/QSignalSpy>
 
 #include <QApplication>
+#include <QAbstractTextDocumentLayout>
 #include <QClipboard>
+#include <QCheckBox>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QLineEdit>
+#include <QMimeData>
 #include <QPlainTextEdit>
+#include <QPushButton>
 #include <QSaveFile>
 #include <QScrollBar>
 #include <QStyle>
 #include <QStyleOptionSlider>
 #include <QTemporaryDir>
 #include <QTextCursor>
+#include <QTextBlock>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QWidget>
 
 #include "EditorTab.h"
+#include "ByteClipboard.h"
+#include "FindReplaceDialog.h"
 #include "LargeFileVerticalSlice.h"
 #include "VirtualFileView.h"
 #include "DraftStore.h"
@@ -131,6 +139,151 @@ private slots:
                  sci(s1, QsciScintillaBase::SCI_GETWRAPINDENTMODE));
     }
 
+    void tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers()
+    {
+        const QString path = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
+            .absoluteFilePath(QStringLiteral("../tinytestfile"));
+        QVERIFY2(QFileInfo::exists(path), qPrintable(path));
+        QCOMPARE(QFileInfo(path).size(), qint64(32111104));
+
+        QWidget window;
+        window.setWindowTitle(QStringLiteral("tinytestfile Hex contract"));
+        window.resize(1280, 820);
+        auto *layout = new QVBoxLayout(&window);
+        layout->setContentsMargins(0, 0, 0, 0);
+        auto *tab = new EditorTab(&window);
+        layout->addWidget(tab);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+        QString error;
+        QVERIFY2(tab->openLargeFileL2(path, &error, false,
+                                      L2Presentation::Hex,
+                                      L2ContentKind::Binary), qPrintable(error));
+        QVERIFY(tab->isL2Mode());
+        QVERIFY(!tab->windowedReadOnlyProvider()); // 32 MiB 以下走可编辑 B1。
+        QVERIFY(tab->l2View());
+        QTRY_VERIFY_WITH_TIMEOUT(tab->l2View()->isOpen(), 5000);
+
+        QsciScintilla *hex = tab->editor();
+        auto *ascii = tab->findChild<QPlainTextEdit *>(
+            QStringLiteral("HexAsciiPreview"));
+        QVERIFY(hex && ascii && ascii->isVisibleTo(&window));
+        const int bytesPerRow = tab->l2View()->hexBytesPerRow();
+        QVERIFY(bytesPerRow >= 8);
+        const int sciRowHeight = int(hex->SendScintilla(
+            QsciScintillaBase::SCI_TEXTHEIGHT, 0UL));
+        QVERIFY(sciRowHeight > 0);
+        for (int row = 0; row <= 1000; ++row) {
+            const QTextBlock block = ascii->document()->findBlockByNumber(row);
+            QVERIFY2(block.isValid(), qPrintable(QStringLiteral("row=%1").arg(row)));
+            const QRectF bounds = ascii->document()->documentLayout()
+                                      ->blockBoundingRect(block);
+            QCOMPARE(qRound(bounds.height()), sciRowHeight);
+        }
+
+        QFile source(path);
+        QVERIFY(source.open(QIODevice::ReadOnly));
+        constexpr qint64 copiedOffset = 0x416;
+        QVERIFY(source.seek(copiedOffset));
+        const QByteArray expectedBytes = source.read(3);
+        QCOMPARE(expectedBytes, QByteArray::fromHex("01E924"));
+        source.close();
+
+        // Physically drag the ASCII pane from the right boundary back to the
+        // left.  The mirror must not rewrite the native anchor during MouseMove.
+        const int row = int(copiedOffset / bytesPerRow);
+        const int column = int(copiedOffset % bytesPerRow);
+        const QTextBlock block = ascii->document()->findBlockByNumber(row);
+        QVERIFY(block.isValid());
+        tab->gotoByteOffset(copiedOffset, 0);
+        QCoreApplication::processEvents();
+        QTextCursor leftCursor(ascii->document());
+        leftCursor.setPosition(block.position() + column);
+        QTextCursor rightCursor(ascii->document());
+        rightCursor.setPosition(block.position() + column + 3);
+        const QPoint left = ascii->cursorRect(leftCursor).center();
+        const QPoint right = ascii->cursorRect(rightCursor).center();
+        QVERIFY(ascii->viewport()->rect().contains(left));
+        QVERIFY(ascii->viewport()->rect().contains(right));
+        QTest::mousePress(ascii->viewport(), Qt::LeftButton,
+                          Qt::NoModifier, right);
+        QTest::mouseMove(ascii->viewport(), left, 50);
+        QTest::mouseRelease(ascii->viewport(), Qt::LeftButton,
+                            Qt::NoModifier, left);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionStart(), copiedOffset, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionEnd(), copiedOffset + 3, 1000);
+        QCOMPARE(tab->l2View()->selectedBytes(), expectedBytes);
+        ascii->setFocus(Qt::OtherFocusReason);
+        QTRY_VERIFY(ascii->hasFocus());
+        QVERIFY(window.grab().save(
+            QDir(QCoreApplication::applicationDirPath()).filePath(
+                QStringLiteral("gui-tiny-hex-aligned-reverse-selection.png"))));
+        tab->copy();
+        const QMimeData *mime = QGuiApplication::clipboard()->mimeData();
+        QVERIFY(mime);
+        QCOMPARE(mime->data(QString::fromLatin1(ByteClipboard::RawBytesMime)),
+                 expectedBytes);
+        QCOMPARE(QGuiApplication::clipboard()->text(), QStringLiteral("01 E9 24"));
+
+        FindReplaceDialog dialog(&window);
+        dialog.setActiveTab(tab);
+        dialog.showFindMode();
+        QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+        auto *pattern = dialog.findChild<QLineEdit *>(
+            QStringLiteral("findPatternEdit"));
+        auto *hexMode = dialog.findChild<QCheckBox *>(QStringLiteral("hexBytesCheck"));
+        auto *findNext = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+        QVERIFY(pattern && hexMode && findNext);
+        pattern->setFocus(Qt::OtherFocusReason);
+        QTest::keyClick(pattern, Qt::Key_V, Qt::ControlModifier);
+        QCOMPARE(pattern->text(), QStringLiteral("01 E9 24"));
+        QVERIFY(hexMode->isChecked());
+        QTest::mouseClick(findNext, Qt::LeftButton);
+        QVERIFY(tab->l2View()->selectionStart() > copiedOffset);
+        QCOMPARE(tab->l2View()->selectedBytes(), expectedBytes);
+        tab->resetSearchPosition(true);
+        QTest::mouseClick(findNext, Qt::LeftButton);
+        QCOMPARE(tab->l2View()->selectionStart(), copiedOffset);
+        QCOMPARE(tab->l2View()->selectionEnd(), copiedOffset + 3);
+        dialog.close();
+
+        QVERIFY(window.grab().save(
+            QDir(QCoreApplication::applicationDirPath()).filePath(
+                QStringLiteral("gui-tiny-hex-raw-byte-search.png"))));
+
+        // Switch at a non-zero projected window. The gutter must be the real
+        // absolute decimal text line, not stale Hex addresses or local 1..N.
+        const qint64 textTarget = QFileInfo(path).size() * 3 / 4;
+        tab->gotoByteOffset(textTarget, 0);
+        const qint64 windowStart = tab->l2View()->activeWindowByteStart();
+        QFile prefix(path);
+        QVERIFY(prefix.open(QIODevice::ReadOnly));
+        qint64 expectedFirstLine = 0;
+        constexpr qint64 CountChunk = 4LL * 1024 * 1024;
+        for (qint64 offset = 0; offset < windowStart; offset += CountChunk) {
+            const QByteArray bytes = prefix.read(
+                qMin(CountChunk, windowStart - offset));
+            QVERIFY(!bytes.isEmpty());
+            expectedFirstLine += bytes.count('\n');
+        }
+        prefix.close();
+        tab->setViewModeL2(ViewMode::Text);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->viewModeL2(), ViewMode::Text, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(marginText(tab->editor(), 0),
+                                  QString::number(expectedFirstLine + 1), 3000);
+        bool decimalOk = false;
+        QCOMPARE(marginText(tab->editor(), 0).toLongLong(&decimalOk),
+                 qint64(expectedFirstLine + 1));
+        QVERIFY(decimalOk);
+        QCOMPARE(marginText(tab->editor(), 1),
+                 QString::number(expectedFirstLine + 2));
+        QVERIFY(window.grab().save(
+            QDir(QCoreApplication::applicationDirPath()).filePath(
+                QStringLiteral("gui-tiny-binary-text-absolute-lines.png"))));
+        window.close();
+    }
+
     void windowedHexUsesUnifiedThreeColumnByteContract()
     {
         QTemporaryDir temporary;
@@ -170,6 +323,14 @@ private slots:
         QVERIFY(hex->geometry().right() <= ascii->geometry().left());
         QVERIFY(!hex->verticalScrollBar()->isVisibleTo(provider));
         QVERIFY(!ascii->verticalScrollBar()->isVisibleTo(provider));
+        const int windowedRowHeight = int(hex->SendScintilla(
+            QsciScintillaBase::SCI_TEXTHEIGHT, 0UL));
+        for (QTextBlock block = ascii->document()->firstBlock();
+             block.isValid(); block = block.next()) {
+            QCOMPARE(qRound(ascii->document()->documentLayout()
+                                ->blockBoundingRect(block).height()),
+                     windowedRowHeight);
+        }
 
         // Hex selection [5, 7) mirrors the same two source bytes in ASCII.
         hex->setFocus(Qt::OtherFocusReason);
@@ -191,6 +352,22 @@ private slots:
                  hex->positionFromLineIndex(0, 3));
         QCOMPARE(hex->SendScintilla(QsciScintillaBase::SCI_GETSELECTIONEND),
                  hex->positionFromLineIndex(0, 9));
+
+        // Exercise the real reverse mouse gesture too. Programmatically
+        // assigning QTextCursor cannot expose anchor resets during MouseMove.
+        QTextCursor reverseLeft(ascii->document());
+        reverseLeft.setPosition(4);
+        QTextCursor reverseRight(ascii->document());
+        reverseRight.setPosition(7);
+        const QPoint reverseLeftPoint = ascii->cursorRect(reverseLeft).center();
+        const QPoint reverseRightPoint = ascii->cursorRect(reverseRight).center();
+        QTest::mousePress(ascii->viewport(), Qt::LeftButton,
+                          Qt::NoModifier, reverseRightPoint);
+        QTest::mouseMove(ascii->viewport(), reverseLeftPoint, 50);
+        QTest::mouseRelease(ascii->viewport(), Qt::LeftButton,
+                            Qt::NoModifier, reverseLeftPoint);
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(), qint64(4), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(), qint64(7), 1000);
 
         // Copy format follows the focused surface, matching editable B1.
         provider->goToOffset(65, 1); // ASCII 'A'
@@ -229,6 +406,125 @@ private slots:
         const QString screenshot = QDir(QCoreApplication::applicationDirPath())
             .filePath(QStringLiteral("gui-windowed-hex-unified.png"));
         QVERIFY(window.grab().save(screenshot));
+        window.close();
+    }
+
+    void windowedHexBothPanesWheelInLockstep()
+    {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        const QString path = temporary.filePath(QStringLiteral("hex-wheel-lockstep.bin"));
+        QByteArray block(1024 * 1024, '\0');
+        for (int i = 0; i < block.size(); ++i)
+            block[i] = char((i * 17 + 31) & 0xff);
+        {
+            QFile source(path);
+            QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            for (int i = 0; i < 4; ++i)
+                QCOMPARE(source.write(block), qint64(block.size()));
+        }
+
+        QWidget window;
+        window.resize(1100, 720);
+        auto *layout = new QVBoxLayout(&window);
+        layout->setContentsMargins(0, 0, 0, 0);
+        auto *provider = new WindowedReadOnlyProvider(&window);
+        layout->addWidget(provider);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        QString error;
+        QVERIFY2(provider->openFile(path,
+                                    WindowedReadOnlyProvider::Presentation::Hex,
+                                    &error), qPrintable(error));
+        auto *hex = provider->editor();
+        auto *ascii = provider->asciiPreview();
+        QVERIFY(hex && ascii && ascii->isVisibleTo(provider));
+        const auto hexFirst = [hex]() {
+            return int(hex->SendScintilla(
+                QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
+        };
+        const auto asciiFirst = [ascii]() {
+            return ascii->cursorForPosition(QPoint(2, 2)).blockNumber();
+        };
+        const auto assertLockstep = [&]() {
+            QCOMPARE(asciiFirst(), hexFirst());
+            const qint64 expected = provider->windowStart()
+                + qint64(hexFirst()) * provider->hexBytesPerRow();
+            QCOMPARE(provider->visibleTopOffset(), expected);
+        };
+
+        const int initial = hexFirst();
+        wheelLinesDown(hex->viewport());
+        QTRY_VERIFY_WITH_TIMEOUT(hexFirst() > initial, 1000);
+        assertLockstep();
+
+        const int afterHexWheel = hexFirst();
+        wheelLinesDown(ascii->viewport());
+        QTRY_VERIFY_WITH_TIMEOUT(hexFirst() > afterHexWheel, 1000);
+        assertLockstep();
+
+        const int afterAsciiWheel = hexFirst();
+        wheelPixelsDown(ascii->viewport(), hex->fontMetrics().lineSpacing() * 2);
+        QTRY_VERIFY_WITH_TIMEOUT(hexFirst() > afterAsciiWheel, 1000);
+        assertLockstep();
+
+        // Exercise a real projection-boundary transition from the ASCII pane.
+        // The first visible source row must advance continuously and both panes
+        // must repaint the same row after the bounded projection is replaced.
+        const int lines = int(hex->SendScintilla(QsciScintillaBase::SCI_GETLINECOUNT));
+        const int onScreen = qMax(1, int(hex->SendScintilla(
+            QsciScintillaBase::SCI_LINESONSCREEN)));
+        const int lastFirst = qMax(0, lines - onScreen);
+        hex->SendScintilla(QsciScintillaBase::SCI_SETFIRSTVISIBLELINE,
+                           static_cast<unsigned long>(lastFirst));
+        QCoreApplication::processEvents();
+        const qint64 boundaryTop = provider->visibleTopOffset();
+        const qint64 oldWindowStart = provider->windowStart();
+        wheelLinesDown(ascii->viewport());
+        QTRY_VERIFY_WITH_TIMEOUT(provider->windowStart() > oldWindowStart, 1000);
+        QVERIFY(provider->visibleTopOffset() > boundaryTop);
+        QVERIFY(provider->visibleTopOffset() - boundaryTop
+                <= qint64(QApplication::wheelScrollLines() + 1)
+                    * provider->hexBytesPerRow());
+        assertLockstep();
+
+        window.close();
+    }
+
+    void windowedBinaryTextPresentationUsesTextLineNumberGutter()
+    {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        const QString path = temporary.filePath(QStringLiteral("binary-as-text.bin"));
+        QFile source(path);
+        QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(source.write(QByteArrayLiteral("alpha\nbeta\ngamma\n")), qint64(17));
+        source.close();
+
+        QWidget window;
+        window.resize(800, 500);
+        auto *layout = new QVBoxLayout(&window);
+        auto *provider = new WindowedReadOnlyProvider(&window);
+        layout->addWidget(provider);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        QString error;
+        QVERIFY2(provider->openFile(path,
+                                    WindowedReadOnlyProvider::Presentation::Hex,
+                                    &error), qPrintable(error));
+        QCOMPARE(provider->editor()->marginType(0), QsciScintilla::TextMargin);
+        QVERIFY(provider->asciiPreview()->isVisibleTo(provider));
+
+        provider->setPresentation(WindowedReadOnlyProvider::Presentation::Text);
+        QCoreApplication::processEvents();
+        QCOMPARE(provider->editor()->marginType(0), QsciScintilla::NumberMargin);
+        QVERIFY(!provider->asciiPreview()->isVisibleTo(provider));
+        QVERIFY(provider->editor()->marginWidth(0) > 0);
+
+        provider->setPresentation(WindowedReadOnlyProvider::Presentation::Hex);
+        QCoreApplication::processEvents();
+        QCOMPARE(provider->editor()->marginType(0), QsciScintilla::TextMargin);
+        QVERIFY(provider->asciiPreview()->isVisibleTo(provider));
         window.close();
     }
 

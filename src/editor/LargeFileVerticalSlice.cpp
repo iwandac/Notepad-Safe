@@ -1,5 +1,6 @@
 #include "LargeFileVerticalSlice.h"
 #include "EditorSurfaceStyle.h"
+#include "ByteClipboard.h"
 
 #include <algorithm>
 #include <cstring>
@@ -15,10 +16,10 @@
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
+#include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QScrollBar>
-#include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QTextBlock>
 #include <QTextCursor>
@@ -97,6 +98,7 @@ WindowedReadOnlyProvider::WindowedReadOnlyProvider(QWidget *parent)
     m_asciiPreview->setToolTip(tr("字符栏（不可打印字节显示为 .；只读）"));
     m_asciiPreview->setFont(m_editor->font());
     m_asciiPreview->setReadOnly(true);
+    m_asciiPreview->setAttribute(Qt::WA_InputMethodEnabled, false);
     m_asciiPreview->setLineWrapMode(QPlainTextEdit::NoWrap);
     m_asciiPreview->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_asciiPreview->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -114,8 +116,8 @@ WindowedReadOnlyProvider::WindowedReadOnlyProvider(QWidget *parent)
     m_asciiPreview->hide();
     connect(m_editor, &QsciScintilla::SCN_UPDATEUI,
             this, [this]() {
-        syncAsciiScrollFromHex();
         syncAsciiSelectionFromHex();
+        syncAsciiScrollFromHex();
     });
     connect(m_editor, &QsciScintilla::selectionChanged,
             this, &WindowedReadOnlyProvider::syncAsciiSelectionFromHex);
@@ -203,6 +205,8 @@ bool WindowedReadOnlyProvider::openFile(const QString &path, Presentation presen
     // rename it while the projected text remains visible in Scintilla.
     m_file.close();
     m_presentation = presentation;
+    m_editor->setAttribute(Qt::WA_InputMethodEnabled,
+                           presentation == Presentation::Text);
     m_windowSpan = presentation == Presentation::Hex ? kHexWindowBytes : kTextWindowBytes;
     m_asciiPreview->setVisible(presentation == Presentation::Hex);
     m_editor->SendScintilla(QsciScintillaBase::SCI_SETHSCROLLBAR,
@@ -327,6 +331,8 @@ void WindowedReadOnlyProvider::setPresentation(Presentation presentation)
     if (m_presentation == presentation || m_path.isEmpty())
         return;
     m_presentation = presentation;
+    m_editor->setAttribute(Qt::WA_InputMethodEnabled,
+                           presentation == Presentation::Text);
     m_windowSpan = presentation == Presentation::Hex ? kHexWindowBytes : kTextWindowBytes;
     m_asciiPreview->setVisible(presentation == Presentation::Hex);
     m_editor->SendScintilla(QsciScintillaBase::SCI_SETHSCROLLBAR,
@@ -457,10 +463,9 @@ bool WindowedReadOnlyProvider::copySelection(QString *error) const
             || (m_asciiPreview->viewport()
                 && m_asciiPreview->viewport()->hasFocus()));
     if (m_presentation == Presentation::Hex && !asciiFocused) {
-        QGuiApplication::clipboard()->setText(
-            QString::fromLatin1(selected.toHex(' ').toUpper()));
+        ByteClipboard::setHexSelection(selected);
     } else if (m_presentation == Presentation::Hex) {
-        QGuiApplication::clipboard()->setText(QString::fromLatin1(selected));
+        ByteClipboard::setAsciiSelection(selected);
     } else {
         QGuiApplication::clipboard()->setText(QString::fromUtf8(selected));
     }
@@ -562,6 +567,19 @@ bool WindowedReadOnlyProvider::eventFilter(QObject *watched, QEvent *event)
     const bool asciiSurface = m_asciiPreview
         && (watched == m_asciiPreview || watched == m_asciiPreview->viewport());
     if ((providerSurface || editorSurface || asciiSurface) && m_fileSize > 0) {
+        if (m_presentation == Presentation::Hex && asciiSurface
+            && event->type() == QEvent::MouseButtonPress
+            && static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton) {
+            m_asciiMouseSelecting = true;
+        }
+        if (m_presentation == Presentation::Hex && asciiSurface
+            && event->type() == QEvent::MouseButtonRelease
+            && static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton) {
+            QTimer::singleShot(0, this, [this]() {
+                m_asciiMouseSelecting = false;
+                syncHexSelectionFromAscii();
+            });
+        }
         if ((providerSurface || editorSurface) && event->type() == QEvent::Resize
             && m_presentation == Presentation::Hex
             && !m_hexRelayoutPending) {
@@ -1042,28 +1060,19 @@ void WindowedReadOnlyProvider::configureProjectionMargin()
         return;
     }
 
-    // A windowed preview cannot claim local Scintilla line numbers are global
-    // file line numbers. Until a full LineIndex is available, show exact source
-    // byte offsets in the gutter instead of hiding the navigation landmark or
-    // restarting misleading line numbers at 1 after every remap.
-    const int addressDigits = std::max(
-        8, static_cast<int>(QString::number(
-                                std::max<qint64>(0, m_fileSize - 1), 16).size()));
-    m_editor->setMarginLineNumbers(0, false);
-    m_editor->setMarginType(0, QsciScintilla::TextMargin);
-    m_editor->setMarginWidth(0, QString(addressDigits + 2, QLatin1Char('0')));
-    const int lines = std::max(0, static_cast<int>(directScintilla(
+    // Text presentation follows the normal editor contract: the gutter is a
+    // decimal text-line landmark, never a hexadecimal byte address. Windowed
+    // projections may be replaced while browsing, so these are deliberately
+    // the lines currently represented by the editor; a future completed global
+    // LineIndex may supply an absolute base without changing the visual mode.
+    directScintilla(m_editor, QsciScintillaBase::SCI_MARGINTEXTCLEARALL);
+    m_editor->setMarginType(0, QsciScintilla::NumberMargin);
+    m_editor->setMarginLineNumbers(0, true);
+    const int lines = std::max(1, static_cast<int>(directScintilla(
         m_editor, QsciScintillaBase::SCI_GETLINECOUNT)));
-    for (int line = 0; line < lines; ++line) {
-        const qint64 local = directScintilla(
-            m_editor, QsciScintillaBase::SCI_POSITIONFROMLINE,
-            static_cast<ScintillaUnsigned>(line));
-        const QString address = QString::number(
-            std::clamp(m_windowStart + std::max<qint64>(0, local), 0LL, m_fileSize), 16)
-                                    .rightJustified(addressDigits, QLatin1Char('0'))
-                                    .toUpper();
-        m_editor->setMarginText(line, address, 0);
-    }
+    const int lineDigits = std::max(
+        4, static_cast<int>(QString::number(lines).size()) + 1);
+    m_editor->setMarginWidth(0, QString(lineDigits, QLatin1Char('9')));
 }
 
 qint64 WindowedReadOnlyProvider::sourceOffsetForProjectedLine(int line) const
@@ -1244,6 +1253,7 @@ void WindowedReadOnlyProvider::populateAsciiProjection(const QByteArray &source)
     }
     m_syncingAsciiSelection = true;
     m_asciiPreview->setPlainText(ascii);
+    alignPlainTextRowsToScintilla(m_asciiPreview, m_editor);
     m_syncingAsciiSelection = false;
 }
 
@@ -1291,7 +1301,8 @@ void WindowedReadOnlyProvider::syncAsciiScrollFromHex()
         return;
     const int first = static_cast<int>(directScintilla(
         m_editor, QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
-    QSignalBlocker blocker(m_asciiPreview->verticalScrollBar());
+    // Do not block this scrollbar: QPlainTextEdit consumes its own
+    // valueChanged signal to move the document viewport.
     m_asciiPreview->verticalScrollBar()->setValue(first);
 }
 
@@ -1312,17 +1323,31 @@ void WindowedReadOnlyProvider::syncAsciiSelectionFromHex()
     const qint64 caret = selected
         ? sourceBoundaryForHexPosition(caretPosition) : anchor;
     clearVirtualSelection();
+    // Mirroring an unselected Hex caret through setTextCursor() makes
+    // QPlainTextEdit ensure that caret is visible. During wheel scrolling that
+    // silently drags the ASCII pane back to the caret (often row 0). With no
+    // byte selection there is nothing to mirror, so preserve its cursor and
+    // synchronize only the visible row.
+    if (!selected && !m_asciiPreview->textCursor().hasSelection()) {
+        syncAsciiScrollFromHex();
+        return;
+    }
     QTextCursor cursor(m_asciiPreview->document());
     cursor.setPosition(asciiPositionForSourceOffset(anchor));
     cursor.setPosition(asciiPositionForSourceOffset(caret), QTextCursor::KeepAnchor);
     m_syncingAsciiSelection = true;
     m_asciiPreview->setTextCursor(cursor);
     m_syncingAsciiSelection = false;
+    // QPlainTextEdit scrolls a newly assigned cursor into view. Restore the
+    // Hex grid's first visible row after mirroring the selection so the two
+    // panes remain visually locked even when the caret is outside the viewport.
+    syncAsciiScrollFromHex();
 }
 
 void WindowedReadOnlyProvider::syncHexSelectionFromAscii()
 {
     if (m_presentation != Presentation::Hex || !m_asciiPreview
+        || m_asciiMouseSelecting
         || m_syncingAsciiSelection || m_syncingHexSelection) {
         return;
     }

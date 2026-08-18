@@ -262,6 +262,7 @@ L2 打开接口必须保持三个正交决策：`L2ContentKind::Text/Binary` 记
 - 位置、选择和文件大小一律使用 64 位字节偏移。
 - 三栏可视化：offset、hex bytes、ASCII/UTF-8 提示；每行字节数可配置但默认 16。
 - 编辑命令以原始字节为语义，不经过 `QString` 和编码转换。
+- 输入法事件不能成为显示投影的写入旁路：Hex/ASCII 字节面禁用 native preedit；平台仍投递的 commit 先整段校验，再作为单个 byte patch 事务执行。混合非法候选不得应用合法前缀，Text 呈现必须重新启用 IME。
 - “以文本重新打开”要求选择/确认显示编码，仅改变视图；发生文本编辑后，保存会按所选编码重建字节，因此状态栏必须显示编码。
 - “以十六进制重新打开”优先保持光标对应的原始 byte offset；存在未保存文本编辑时必须先保存、放弃或取消，不能静默丢失重编码后的内容。
 - 二进制搜索支持字节串、带空格的十六进制模式和 ASCII/UTF-8 文本；PCRE2 正则只用于文本解释，不对任意字节承诺 Unicode 语义。
@@ -626,6 +627,51 @@ indicator；窗口切换或搜索结果跳转后重新应用可见高亮。Patch
 - 全局替换完成后所有目标只进入普通 dirty 状态，保存仍由各文档原有 SaveRouter 保持 Plain/Secure/Text/Binary 类型；不得为了批量替换自动解密导出或覆盖磁盘文件。
 - 超过撤销/时间预算时只提供“预览差异 → 流式生成临时文件 → 备份 → 原子替换 → 重载”。
 - 替换语法规范化为 $1、${name}；UI 可接受 \1 并在提交前转换，避免不同引擎语义漂移。
+
+当前迁移实现（2026-08-17）已关闭一批会直接造成误操作的数据正确性缺陷：
+
+- `FindReplaceDialog::updateQueryUi()` 作为查询/能力状态机统一管理 Literal、Regex、Hex bytes、
+  current/all-open、空 query 和 busy；冲突选项先清空再禁用，Binary/锁定/只读替换能力独立判定。
+- L1 Replace 不再依赖 QScintilla 隐含的 `findFirst()` 会话，而以统一 PCRE2 cache 的当前
+  authoritative range 调用 `SCI_REPLACETARGET`；已选命中不会被 Replace 按钮跳过。
+- L2 Find Next/Previous 区分“当前命中选区、任意选区、无选区”，reset 在移动 caret 后重设
+  BOF/EOF sentinel，修复了 byte 0 命中被跳过和旧选区污染新 query 的问题。
+- `Pcre2Regex::expandReplacementAt()` 是 S1 与兼容 L2 patch 路径唯一模板展开器；所有命中先在
+  同一不可变 subject 上展开，模板错误在 mutation 前失败。Literal replacement 完全不展开。
+- 兼容 L2 patch 的 Replace All 完成后必须经 `VirtualFileView::notifyExternalPatchMutation()`
+  发布 dirty、revision、Undo/Redo、scroll range 与 repaint，不能只改 PatchList 而让标签仍显示 clean。
+- 全部打开文件 eligibility 只看 Text/可写/解锁 capability，不再把所有 `isL2Mode()` 文档
+  一律当只读；正式 S2 Preview/S3 仍由 `isReadOnlyByPolicy()` 排除。
+- 正式 S2/S3/B2/B3 可见 Provider 与隐藏 mmap 搜索后端分离。搜索源可用性按文档能力判定，
+  不再依赖 `QStackedWidget::currentWidget()`；首次查找按异步 mmap 的“已接受/映射就绪”两阶段
+  运行，准备期保持 busy/可取消，映射失败产生明确不完整结果，不能伪装成 0 命中。
+- Find Next/Previous 的当前位置读取可见 WindowedReadOnlyProvider 的全局选区；隐藏 mmap 只负责
+  扫描与有界结果，不能让重复 F3 永远重新选中同一命中。无缓存的首次导航等待映射就绪时保持
+  GUI 事件循环和 busy/cancel 状态，命中后重复导航直接复用缓存并正确执行 wrap 边界。
+- 隐藏搜索 mmap 禁止启动第二套完整 LineIndex；S3 Text 命中先以 64 位 byte range 和有界上下文
+  发布。PCRE2 取消/进度按 16 MiB offset window 检查，不再启用逐模式位置的 AUTO_CALLOUT；
+  ASCII UTF-8 校验按 8-byte 批量执行。同步 facade 的完成信号绑定等待循环线程，完成先于
+  `QEventLoop::exec()` 时直接返回，避免快速小文件永远等待第二个 finished 信号。
+
+可执行细粒度边界位于 `tests/gui_smoke/SEARCH_REPLACE_CONTRACT_MATRIX.md`。`tc_fr_019`–
+`tc_fr_032` 分别覆盖合法组合穷举/禁用点击、当前项替换、每个文本组合的 Find All 与双向导航、
+Hex 格式与错误、S1/L2 捕获替换、替换值等价类/原子失败和跨进度批次单 Undo。完整专项为
+30 个功能用例全部通过；其中 `tc_fr_027` 直接只读打开保留的 4,928,168,473-byte S3 样本，
+经正式 FindReplaceDialog 发起 Hex Find All，等待 mmap 准备后产生 Dock 结果，真实双击精确选中
+75% 位置的 32-byte range，并断言正文只有一条纵向滚动条；`tc_fr_028` 从全新 S3 标签发起
+Find Next，并验证首次准备、重复 forward/backward、非循环边界及 wrap；`tc_fr_029` 用 60,050
+个分行命中越过 50,000 条常驻上限，验证 spool 稀疏索引、虚拟尾行显示与真实双击跳转。本机两轮
+完整运行中真实 S3 两条链路约为 10.9–14.3 s；`tc_fr_030` 在 2 GiB 后放置有效 UTF-8 marker，
+证明 S3 Text 大小写不敏感 Regex、Dock、双击和只读替换边界，优化后为 59.2 s。Regex 必须先
+完整验证 UTF-8 再扫描，当前是安全优先的两遍读取，不能宣称与 Hex/Literal 同速。
+最终证据拆分为 `tc_fr_001`–`tc_fr_029` **31 passed / 0 failed**（含 init/cleanup）及
+`tc_fr_030` **3 passed / 0 failed**，底层 `test_pcre2_regex` 0 failures。
+`tc_fr_031` 另以真实 4.9 GB Binary S3 证明：界面默认仅勾选循环查找时，复制文本走原始字节
+Literal KMP（不区分大小写仅折叠 ASCII），不会因为文件含任意二进制字节而报告正则/UTF-8
+错误；`tc_fr_032` 用含非法 UTF-8 的小型 Binary 提供不依赖大文件样本的快速门禁。显式勾选
+正则才启用 UTF-8 PCRE2 语义。两个新用例及受影响的 `tc_fr_017/019/021/022`
+定向回归均通过，视觉证据为 `build/gui-s3-default-literal-copied-text.png`。
+这证明当前已登记切片，不替代百万级压力、编码 PositionMapper 和正式 exe 全菜单/F3 门禁。
 
 ### 9.6 “查找全部”是日志分析工作流
 
@@ -1870,8 +1916,10 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
    独立 ASCII pane”的可见契约；内部实现仍不相同。禁止重新引入地址/Hex/ASCII 拼接投影、
    外层与内核双滚动或靠双向同步两个 scrollbar 修补。后续抽取统一 HexEditorProvider 属于
    架构清债，任何迁移都必须先保持当前动态契约不退化。
-4. **预览期不能伪造行号**。完整 SparseLineIndex 未就绪时，Text gutter 显示精确全局 byte
-   offset；索引或完整 Scintilla 文档就绪后才能显示全局逻辑行号。窗口局部 1..N 永远不可见。
+4. **gutter 必须服从当前呈现语义**。Hex 呈现显示全局十六进制 byte address；Text 呈现
+   必须显示十进制文本行号，不能残留二进制地址。Windowed Provider 在完整 SparseLineIndex
+   未就绪时先显示当前有界文本投影的行号；索引就绪后可补上全局 line base，但不得在 Text
+   模式退回 Hex address，也不得为了计算全局行号阻塞文件首屏或随机跳转。
 5. **状态栏临时消息与文档元数据不能争夺布局**。`showMessage()` 独占左侧弹性区域；光标/
    offset、编码与 EOL、语法/呈现、大小与 tier、dirty 和 task chip 均为 permanent segment。
 6. **Save 的前置条件是 dirty，而不是“当前有文件”**。已命名未修改文档普通 Save 必须严格
@@ -1879,6 +1927,23 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
    旧代码无条件进入同路径保存并使用固定可见临时副本，才造成“先备份再保存”的观感。
    修改后的 B1 小文件仍使用 `QSaveFile` 同目录临时文件 + 原子 replace 来保证崩溃安全，
    但临时名由平台管理且正常 UI 不暴露；绝不能为了模仿“原地保存”而 truncate 原文件后写入。
+7. **输入法提交不是普通按键序列**。中文输入法通过 `QInputMethodEvent` 发送 preedit/commit，
+   旧实现只拦截 `QKeyEvent`，因此候选文本能绕过 byte model 直接污染 `00 01 ...` 投影。
+   Hex/ASCII 现在禁用 native preedit，仍收到的 commit 必须整段验证；合法多 nibble commit 在
+   OVR/INS 中作为一个原子 byte patch，非法或混合候选零修改。Text 模式和普通文本标签重新
+   启用 IME，不能用牺牲中文笔记输入来规避 Hex 数据完整性问题。
+8. **相同字体设置不等于相同行栅格**。QScintilla 与 `QPlainTextEdit` 即使共享 family/point size，
+   默认 leading、block height 和 Scintilla ascent/descent 仍可能不同，形成随行数累积的错位。
+   Hex/ASCII 投影必须以 `SCI_TEXTHEIGHT` 为共同像素栅格，同时固定 plain-text block height；
+   真实门禁逐行比较至少 1000 行，不能只看首屏。
+9. **ASCII 投影是有损显示，不是 byte 身份**。`00 10 00` 在右栏都显示为替代点，普通文本
+   剪贴板还会受 NUL/控制字符影响，因此“复制三个点再按文本搜索”没有唯一含义。应用内复制必须
+   额外携带 raw-byte MIME；查找框识别该 MIME 后以可见的 `00 10 00` 自动切到 Hex bytes，
+   用户仍能看懂并确认查询，跨应用则安全退化为可见 Hex 文本。
+10. **整词是 literal 的边界条件，不是 Regex 模式**。例如查询 `cat` 时匹配 `cat!`，不匹配
+    `catalog` 或 `_cat`；查询里的 `.`、`[]` 仍按普通字符。Text 使用 Unicode 字母/数字/下划线
+    边界，Binary raw-byte 路径使用 ASCII 边界并关闭 UTF 校验，因此文件中的无效 UTF-8 不得
+    冒充“正则表达式错误”。PCRE2 只是内部边界匹配实现，不能泄漏为用户语义。
 
 ### 18.2 当前 Provider 边界
 
@@ -1893,8 +1958,9 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 
 ### 18.3 本轮实现与证据
 
-- WindowedReadOnlyProvider 的 Text margin 改为全局十六进制 byte offset，保证 S2 早期预览
-  有稳定导航 landmark；正式截图 `build/gui-formal-s2-early-status.png` 可见。
+- WindowedReadOnlyProvider 的 gutter 现在按呈现切换：Hex 使用全局十六进制 byte address，
+  Text 使用 Scintilla NumberMargin 的十进制文本行号；Binary→Text、切回 Hex 与会话恢复均有
+  GUI 契约保护，不再把二进制地址残留在文本编辑界面。
 - scrollbar 最大值会把最后一个 window 固定到物理 EOF，并将最后一屏滚入 viewport；
   `build/gui-formal-s2-eof.png` 可见 `FINAL_FORMAL_S2_EOF_MARKER`，取得正文焦点后连续
   64 次 Down 仍保持 `value == maximum`。
@@ -1905,6 +1971,10 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 - 未修改 B1 保存动作禁用且 `EditorTab::saveFile` 为 no-op；GUI 回归同时检查文件 identity、
   mtime 不变且不存在 `.notepad-safe-save-tmp`。修改后的 B1 通过 QSaveFile 保存、重开和
   逐字节回读。
+- `tc_hex_ime_commit_preserves_byte_grid_contract` 使用真实 `QInputMethodEvent` 动态验证 preedit、
+  中文/非 Hex 混合 commit、Hex 与 ASCII 两个输入面、OVR/INS、Text↔Hex 往返和保存回读；
+  合法 `D8DB` 分别只覆盖或插入两个源字节，非法候选零修改，视觉证据为
+  `build/gui-hex-ime-safe.png`。相邻 nibble/非法键/ASCII/保存回读测试 6/6 入口通过。
 - B2/B3 Hex 已删除旧的“地址 + Hex + ASCII 拼接行”投影，改为 Scintilla 地址 margin、纯 Hex
   网格和独立 ASCII pane；两栏共用 source-byte 选区并随同一个全局 scrollbar 浏览。
   `windowedHexUsesUnifiedThreeColumnByteContract` 验证双向选区、nibble 导航、焦点 Copy、
@@ -1912,6 +1982,18 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
   Provider 邻接回归 9/9、B1 邻接回归 5/5、Hex 搜索邻接回归 4/4 通过；视觉证据为
   `build/gui-windowed-hex-unified.png`、`build/gui-production-b2-dynamic.png` 和
   `build/gui-production-s3-dynamic.png`。
+- Hex/ASCII 曾经只同步了 `QPlainTextEdit` 滚动条数值，却用 `QSignalBlocker` 同时屏蔽了控件
+  自己更新正文视口的内部连接，造成“数值正确、ASCII 画面仍停在旧行”。现已删除该阻断，
+  并把 B1 跨投影 wheel 从 120/250ms 旧防抖改为手势内即时切换 active window。
+  `windowedHexBothPanesWheelInLockstep` 同时检查两栏屏幕首行、angle/pixel wheel 与跨窗口连续性；
+  9MiB B1、228MB B2、4.9GB B3 邻接用例均通过。
+- `tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers` 直接使用保留的 `tinytestfile`：
+  Hex/ASCII 第 0–1000 行的实际像素高度严格一致；ASCII 右→左鼠标拖选 Hex 地址
+  `0x416–0x418`，得到 source `[0x416,0x419)`；原始 `01 E9 24` 经剪贴板粘贴后自动成为
+  Hex bytes 查询并精确回到同一范围。
+  同一标签跳到 75% 后切换 Text，首行 margin 为根据源前缀换行数计算的绝对十进制 64591，
+  不再显示窗口局部 1 或 Hex 地址。视觉证据为 `build/gui-tiny-hex-aligned-reverse-selection.png`、
+  `build/gui-tiny-hex-raw-byte-search.png` 和 `build/gui-tiny-binary-text-absolute-lines.png`。
 
 自动回归 `windowedTextWrapReachesPhysicalEofAndKeepsGutter` 和
 `tc_hex_binary_open_edit_save_as_reopen_roundtrip`、
