@@ -34,6 +34,7 @@ class QIODevice;
 class QKeyEvent;
 class QInputMethodEvent;
 class QPlainTextEdit;
+class QSplitter;
 
 // 语法类型
 enum class Syntax {
@@ -46,6 +47,20 @@ enum class Syntax {
     Sql,
     Yaml,
     Markdown,
+    JavaScript,
+    Java,
+    CSharp,
+    Css,
+    Bash,
+    Batch,
+    CMake,
+    Makefile,
+    Lua,
+    Ruby,
+    Perl,
+    Diff,
+    Properties,
+    Asm,
 };
 
 // ============================================================================
@@ -141,7 +156,7 @@ public:
 
     // 编辑器访问（L2 模式下仍返回有效 QsciScintilla 指针，但内容为空；
     // 优先使用下方统一分流的 selectAll/copy/paste/... 等接口，避免直接调 editor 方法）
-    QsciScintilla *editor() const { return m_editor; }
+    QsciScintilla *editor() const;
     qint64 currentByteOffset() const;
 
     // 语法
@@ -155,6 +170,23 @@ public:
     void moveLineDown();
     void sortLinesAsc();
     void sortLinesDesc();
+    void transposeLine();
+    void selectionToUpper();
+    void selectionToLower();
+    void joinSelectedLines();
+    void splitSelectedLines();
+
+    // Native Scintilla selection/navigation commands. They are deliberately
+    // exposed through EditorTab so callers cannot accidentally apply them to
+    // the Hex byte model or a bounded S2/S3 projection.
+    void selectNextOccurrence();
+    void selectAllOccurrences();
+    void moveToMatchingBrace();
+    void selectToMatchingBrace();
+    void foldCurrentLine();
+    void foldAll(bool expand);
+    bool supportsTextMutationCommands() const;
+    bool supportsLexerCommands() const;
 
     // 书签
     void toggleBookmark();
@@ -219,6 +251,27 @@ public:
     // 自动换行
     void setWordWrap(bool on);
     bool wordWrap() const;
+
+    // Shared text-surface preferences. Display-only preferences may also be
+    // applied to an S2/S3 text projection; mutation preferences only affect
+    // the editable S1/Secure Text surface.
+    void setWhitespaceVisible(bool visible);
+    bool whitespaceVisible() const { return m_whitespaceVisible; }
+    void setEolVisible(bool visible);
+    bool eolVisible() const { return m_eolVisible; }
+    bool convertEols(QsciScintilla::EolMode mode);
+    void setUseTabs(bool useTabs);
+    bool useTabs() const { return m_useTabs; }
+    void setTabWidth(int width);
+    int tabWidth() const { return m_tabWidth; }
+    void setBackspaceUnindents(bool enabled);
+    bool backspaceUnindents() const { return m_backspaceUnindents; }
+    void setWordCompletionEnabled(bool enabled);
+    bool wordCompletionEnabled() const { return m_wordCompletionEnabled; }
+    bool canSplitView() const;
+    bool splitViewEnabled() const { return m_splitEditor != nullptr; }
+    Qt::Orientation splitOrientation() const;
+    void setSplitView(bool enabled, Qt::Orientation orientation = Qt::Horizontal);
 
     // 编码重新加载（保持内容不变，仅改变编码解释方式）
     void reloadWithEncoding(TextEncoding enc);
@@ -361,6 +414,8 @@ signals:
 
 private:
     QsciScintilla *m_editor;
+    QsciScintilla *m_splitEditor = nullptr;
+    QSplitter *m_l1Splitter = nullptr;
     QStackedWidget *m_stack = nullptr;  // 0: m_editor (L1), 1: m_l2View (L2)
     QString m_filePath;       // 真实文件路径（空=未命名）
     QString m_autosavePath;   // 内部 autosave 临时路径（对用户透明）
@@ -381,10 +436,18 @@ private:
     int m_bookmarkMarker = -1;
     bool m_edgeVisible = true;
     int m_edgeColumn = 80;
+    bool m_whitespaceVisible = false;
+    bool m_eolVisible = false;
+    bool m_useTabs = false;
+    int m_tabWidth = 4;
+    bool m_backspaceUnindents = true;
+    bool m_wordCompletionEnabled = true;
 
     void setupEditor();
     void applySyntax(Syntax syntax);
-    QsciLexer *createLexer(Syntax syntax) const;
+    QsciLexer *createLexer(Syntax syntax, QObject *owner = nullptr) const;
+    QsciScintilla *activeTextEditor() const;
+    QWidget *l1Page() const;
     void clearMarkers();
     void applyEdgeSettings();
     void activateL2Overlay(VirtualFileView *view);

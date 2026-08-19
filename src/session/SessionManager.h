@@ -24,6 +24,8 @@ struct SessionTab {
     bool secureDocument = false;
     QString documentId;
     QString presentation;   // "text" / "hex"; empty means legacy auto routing
+    bool splitView = false;
+    QString splitOrientation; // "horizontal" / "vertical"
 };
 
 // 完整会话

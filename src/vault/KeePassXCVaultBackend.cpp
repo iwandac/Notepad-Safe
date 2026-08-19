@@ -4,6 +4,7 @@
 
 #include "core/Database.h"
 #include "core/Entry.h"
+#include "core/EntryAttributes.h"
 #include "core/Group.h"
 #include "core/Metadata.h"
 #include "core/PasswordGenerator.h"
@@ -30,6 +31,52 @@
 #endif
 
 namespace {
+
+SecureBuffer secureUtf8(const QString &text);
+
+QString accountGroupPath(const Entry *entry)
+{
+    if (!entry || !entry->group() || !entry->group()->parentGroup())
+        return {};
+    QStringList parts;
+    const Group *group = entry->group();
+    while (group && group->parentGroup()) {
+        if (!group->name().isEmpty())
+            parts.prepend(group->name());
+        group = group->parentGroup();
+    }
+    return parts.join(QLatin1Char('/'));
+}
+
+void readExtendedEntryFields(const Entry *entry, VaultEntryData *data,
+                             bool includeProtectedValues = true)
+{
+    if (!entry || !data)
+        return;
+    data->groupPath = accountGroupPath(entry);
+    data->expires = entry->timeInfo().expires();
+    data->expiryUtc = entry->timeInfo().expiryTime().toUTC();
+    const EntryAttributes *attributes = entry->attributes();
+    for (const QString &key : attributes->customKeys()) {
+        if (key.startsWith(EntryAttributes::AdditionalUrlAttribute)) {
+            data->additionalUrls.append(attributes->value(key));
+            continue;
+        }
+        if (key == Totp::ATTRIBUTE_OTP || key == Totp::ATTRIBUTE_SEED
+            || key == Totp::ATTRIBUTE_SETTINGS || key == Totp::KP2_TOTP_SECRET
+            || key == Totp::KP2_TOTP_ALGORITHM || key == Totp::KP2_TOTP_LENGTH
+            || key == Totp::KP2_TOTP_PERIOD || EntryAttributes::isPasskeyAttribute(key)
+            || key.startsWith(QStringLiteral("notepadsafe."))) {
+            continue;
+        }
+        VaultCustomField field;
+        field.name = key;
+        field.protectedValue = attributes->isProtected(key);
+        if (!field.protectedValue || includeProtectedValues)
+            field.valueUtf8 = secureUtf8(attributes->value(key));
+        data->customFields.push_back(std::move(field));
+    }
+}
 
 QString transientUtf8(const SecureBuffer &value)
 {
@@ -62,6 +109,29 @@ SecureBuffer secureUtf8(const QString &text)
     SecureBuffer result(utf8.constData(), utf8.size());
     scrubByteArray(utf8);
     return result;
+}
+
+Group *ensureAccountGroup(Database *database, const QString &requestedPath)
+{
+    Group *group = database ? database->rootGroup() : nullptr;
+    if (!group)
+        return nullptr;
+    QString normalized = requestedPath;
+    normalized.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    const QStringList parts = normalized.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    for (const QString &rawPart : parts) {
+        const QString part = rawPart.trimmed();
+        if (part.isEmpty() || part == QLatin1String(".") || part == QLatin1String(".."))
+            continue;
+        Group *child = group->findChildByName(part);
+        if (!child) {
+            child = new Group();
+            child->setName(part);
+            child->setParent(group);
+        }
+        group = child;
+    }
+    return group;
 }
 
 bool verifyDatabaseFile(const QString &path, const QSharedPointer<const CompositeKey> &key,
@@ -374,8 +444,13 @@ QSet<QUuid> KeePassXCVaultBackend::searchEntryIds(const QString &query,
 VaultEntrySummary KeePassXCVaultBackend::summarize(const Entry *entry)
 {
     const QStringList tags = entry->tagList();
-    return {entry->uuid(), entry->title(), entry->username(), entry->url(), tags,
-            tags.contains(VaultSecureNoteTag), !entry->password().isEmpty()};
+    VaultEntrySummary summary{entry->uuid(), entry->title(), entry->username(),
+                              entry->url(), tags, tags.contains(VaultSecureNoteTag),
+                              !entry->password().isEmpty()};
+    summary.groupPath = accountGroupPath(entry);
+    summary.expires = entry->timeInfo().expires();
+    summary.expiryUtc = entry->timeInfo().expiryTime().toUTC();
+    return summary;
 }
 
 std::unique_ptr<VaultEntryData> KeePassXCVaultBackend::readEntry(const QUuid &id,
@@ -405,6 +480,7 @@ std::unique_ptr<VaultEntryData> KeePassXCVaultBackend::readEntry(const QUuid &id
     data->passwordUtf8 = secureUtf8(entry->password());
     data->hasPassword = !entry->password().isEmpty();
     data->notesUtf8 = secureUtf8(entry->notes());
+    readExtendedEntryFields(entry, data.get());
     if (entry->attachments()->hasKey(VaultSecureDocumentPayloadAttachment)) {
         QByteArray payload = entry->attachments()->value(
             VaultSecureDocumentPayloadAttachment);
@@ -424,7 +500,8 @@ std::unique_ptr<VaultEntryData> KeePassXCVaultBackend::readEntry(const QUuid &id
         payload.clear();
     }
     if (const auto settings = entry->totpSettings()) {
-        data->totpSeedUtf8 = secureUtf8(settings->key);
+        data->totpSeedUtf8 = secureUtf8(Totp::writeSettings(
+            settings, entry->title(), entry->username(), true));
         data->hasTotp = !settings->key.isEmpty();
     }
     if (error)
@@ -459,6 +536,7 @@ std::unique_ptr<VaultEntryData> KeePassXCVaultBackend::readEntryMetadata(
     data->hasPassword = !entry->password().isEmpty();
     data->hasTotp = !entry->totpSettings().isNull();
     data->notesUtf8 = secureUtf8(entry->notes());
+    readExtendedEntryFields(entry, data.get(), false);
     if (error)
         *error = VaultError::success();
     return data;
@@ -482,7 +560,8 @@ VaultError KeePassXCVaultBackend::readEntrySecrets(
     }
     secrets->passwordUtf8 = secureUtf8(entry->password());
     if (const auto settings = entry->totpSettings())
-        secrets->totpSeedUtf8 = secureUtf8(settings->key);
+        secrets->totpSeedUtf8 = secureUtf8(Totp::writeSettings(
+            settings, entry->title(), entry->username(), true));
     return VaultError::success();
 }
 
@@ -524,23 +603,37 @@ VaultError KeePassXCVaultBackend::currentTotp(const QUuid &id,
 VaultError KeePassXCVaultBackend::generatePassword(int length,
                                                     SecureBuffer *passwordUtf8) const
 {
+    VaultPasswordGenerationOptions options;
+    options.length = length;
+    return generatePassword(options, passwordUtf8);
+}
+
+VaultError KeePassXCVaultBackend::generatePassword(
+    const VaultPasswordGenerationOptions &options, SecureBuffer *passwordUtf8) const
+{
     if (!database_)
         return lockedError();
-    if (!passwordUtf8 || length < 12 || length > 128) {
+    if (!passwordUtf8 || options.length < 8 || options.length > 128
+        || (!options.lower && !options.upper && !options.numbers && !options.special)) {
         return backendError(VaultErrorCode::InternalError,
                             QStringLiteral("密码生成参数无效。"),
                             QStringLiteral("vault.password.generate.arguments"));
     }
     PasswordGenerator generator;
-    generator.setLength(length);
+    generator.setLength(options.length);
     PasswordGenerator::CharClasses classes;
-    classes |= PasswordGenerator::LowerLetters;
-    classes |= PasswordGenerator::UpperLetters;
-    classes |= PasswordGenerator::Numbers;
-    classes |= PasswordGenerator::SpecialCharacters;
+    if (options.lower) classes |= PasswordGenerator::LowerLetters;
+    if (options.upper) classes |= PasswordGenerator::UpperLetters;
+    if (options.numbers) classes |= PasswordGenerator::Numbers;
+    if (options.special) classes |= PasswordGenerator::SpecialCharacters;
     generator.setCharClasses(classes);
-    generator.setFlags(PasswordGenerator::ExcludeLookAlike
-                       | PasswordGenerator::CharFromEveryGroup);
+    PasswordGenerator::GeneratorFlags flags;
+    if (options.excludeLookAlike)
+        flags |= PasswordGenerator::ExcludeLookAlike;
+    if (options.requireEverySelectedGroup)
+        flags |= PasswordGenerator::CharFromEveryGroup;
+    generator.setFlags(flags);
+    generator.setExcludedCharacterSet(options.excludedCharacters);
     if (!generator.isValid()) {
         return backendError(VaultErrorCode::InternalError,
                             QStringLiteral("密码生成器配置无效。"),
@@ -593,6 +686,68 @@ VaultError KeePassXCVaultBackend::assessPassword(
     return VaultError::success();
 }
 
+QList<VaultHealthFinding> KeePassXCVaultBackend::passwordHealthReport(
+    VaultError *error) const
+{
+    QList<VaultHealthFinding> findings;
+    if (!database_) {
+        if (error) *error = lockedError();
+        return findings;
+    }
+    QHash<QByteArray, QList<const Entry *>> reuseGroups;
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const auto entries = database_->rootGroup()->entriesRecursive(false);
+    for (const Entry *entry : entries) {
+        if (entry->isRecycled() || entry->tagList().contains(VaultSecureNoteTag))
+            continue;
+        if (entry->timeInfo().expires()
+            && entry->timeInfo().expiryTime().toUTC() <= now) {
+            findings.append({entry->uuid(), entry->title(),
+                             QStringLiteral("expired"),
+                             QStringLiteral("账号已到期")});
+        }
+        const QString password = entry->password();
+        if (password.isEmpty()) {
+            findings.append({entry->uuid(), entry->title(),
+                             QStringLiteral("missing"),
+                             QStringLiteral("未设置密码")});
+            continue;
+        }
+        const PasswordHealth health(password);
+        if (health.quality() == PasswordHealth::Quality::Bad
+            || health.quality() == PasswordHealth::Quality::Poor
+            || health.quality() == PasswordHealth::Quality::Weak) {
+            findings.append({entry->uuid(), entry->title(),
+                             QStringLiteral("weak"),
+                             QStringLiteral("密码强度不足（约 %1 bit）")
+                                 .arg(health.entropy(), 0, 'f', 1)});
+        }
+        QByteArray bytes = password.toUtf8();
+        QByteArray digest = CryptoHash::hash(bytes, CryptoHash::Sha256);
+        scrubByteArray(bytes);
+        reuseGroups[digest].append(entry);
+    }
+    for (auto it = reuseGroups.cbegin(); it != reuseGroups.cend(); ++it) {
+        if (it.value().size() < 2)
+            continue;
+        for (const Entry *entry : it.value()) {
+            findings.append({entry->uuid(), entry->title(),
+                             QStringLiteral("reused"),
+                             QStringLiteral("与另外 %1 个账号重复使用密码")
+                                 .arg(it.value().size() - 1)});
+        }
+    }
+    for (auto it = reuseGroups.begin(); it != reuseGroups.end(); ++it) {
+        if (!it.key().isEmpty()) {
+            QByteArray digest = it.key();
+            scrubByteArray(digest);
+        }
+    }
+    reuseGroups.clear();
+    if (error) *error = VaultError::success();
+    return findings;
+}
+
 QList<VaultEntryHistorySummary> KeePassXCVaultBackend::entryHistory(
     const QUuid &id, VaultError *error) const
 {
@@ -614,10 +769,30 @@ QList<VaultEntryHistorySummary> KeePassXCVaultBackend::entryHistory(
     result.reserve(history.size());
     for (int index = history.size() - 1; index >= 0; --index) {
         const Entry *item = history.at(index);
-        result.push_back({index,
-                          item->timeInfo().lastModificationTime().toUTC(),
-                          item->title(), item->username(),
-                          !item->password().isEmpty()});
+        VaultEntryHistorySummary summary;
+        summary.index = index;
+        summary.modifiedAtUtc = item->timeInfo().lastModificationTime().toUTC();
+        summary.title = item->title();
+        summary.username = item->username();
+        summary.url = item->url();
+        summary.hasPassword = !item->password().isEmpty();
+        if (item->title() != entry->title())
+            summary.changedFields.append(QStringLiteral("标题"));
+        if (item->username() != entry->username())
+            summary.changedFields.append(QStringLiteral("用户名"));
+        if (item->url() != entry->url())
+            summary.changedFields.append(QStringLiteral("网址"));
+        if (item->password() != entry->password())
+            summary.changedFields.append(QStringLiteral("密码"));
+        if (item->notes() != entry->notes())
+            summary.changedFields.append(QStringLiteral("备注"));
+        if (item->tags() != entry->tags())
+            summary.changedFields.append(QStringLiteral("标签"));
+        if (item->timeInfo().expires() != entry->timeInfo().expires()
+            || item->timeInfo().expiryTime() != entry->timeInfo().expiryTime()) {
+            summary.changedFields.append(QStringLiteral("到期时间"));
+        }
+        result.push_back(std::move(summary));
     }
     if (error) *error = VaultError::success();
     return result;
@@ -646,6 +821,37 @@ VaultError KeePassXCVaultBackend::restoreEntryHistory(const QUuid &id,
     return VaultError::success();
 }
 
+VaultError KeePassXCVaultBackend::removeEntryHistory(const QUuid &id, int historyIndex)
+{
+    if (!database_)
+        return lockedError();
+    Entry *entry = findEntry(id);
+    if (!entry)
+        return backendError(VaultErrorCode::InternalError,
+                            QStringLiteral("加密条目不存在。"),
+                            QStringLiteral("vault.entry.missing"));
+    const QList<Entry *> history = entry->historyItems();
+    if (historyIndex < 0 || historyIndex >= history.size())
+        return backendError(VaultErrorCode::InternalError,
+                            QStringLiteral("所选历史版本已经不可用。"),
+                            QStringLiteral("vault.history.index"));
+    entry->removeHistoryItems({history.at(historyIndex)});
+    return VaultError::success();
+}
+
+VaultError KeePassXCVaultBackend::clearEntryHistory(const QUuid &id)
+{
+    if (!database_)
+        return lockedError();
+    Entry *entry = findEntry(id);
+    if (!entry)
+        return backendError(VaultErrorCode::InternalError,
+                            QStringLiteral("加密条目不存在。"),
+                            QStringLiteral("vault.entry.missing"));
+    entry->removeHistoryItems(entry->historyItems());
+    return VaultError::success();
+}
+
 VaultError KeePassXCVaultBackend::upsertEntry(VaultEntryData &&data)
 {
     if (!database_)
@@ -663,10 +869,19 @@ VaultError KeePassXCVaultBackend::upsertEntry(VaultEntryData &&data)
 
     QSharedPointer<Totp::Settings> requestedTotp;
     if (!data.totpSeedUtf8.empty()) {
-        QString seed = transientUtf8(data.totpSeedUtf8);
-        requestedTotp = Totp::createSettings(seed);
-        seed.fill(QChar(0));
-        seed.clear();
+        QString rawSettings = transientUtf8(data.totpSeedUtf8).trimmed();
+        requestedTotp = rawSettings.startsWith(QStringLiteral("otpauth://"),
+                                               Qt::CaseInsensitive)
+                            ? Totp::parseSettings(rawSettings)
+                            : Totp::createSettings(rawSettings);
+        rawSettings.fill(QChar(0));
+        rawSettings.clear();
+        const QString validation = Totp::checkValidSettings(requestedTotp);
+        if (!validation.isEmpty()) {
+            return backendError(VaultErrorCode::InternalError,
+                                QStringLiteral("验证码配置无效：") + validation,
+                                QStringLiteral("vault.totp.invalid-settings"));
+        }
     }
     const QSharedPointer<Totp::Settings> previousTotp = entry->totpSettings();
     const bool totpChanged = requestedTotp.isNull() != previousTotp.isNull()
@@ -687,6 +902,51 @@ VaultError KeePassXCVaultBackend::upsertEntry(VaultEntryData &&data)
     entry->setUsername(data.username);
     entry->setUrl(data.url);
     entry->setTags(data.tags.join(QLatin1Char(',')));
+
+    if (data.synchronizeExtendedFields) {
+        if (Group *destination = ensureAccountGroup(database_.data(), data.groupPath)) {
+            if (entry->group() != destination)
+                entry->setGroup(destination);
+        }
+        entry->setExpires(data.expires);
+        if (data.expires && data.expiryUtc.isValid())
+            entry->setExpiryTime(data.expiryUtc.toUTC());
+
+        EntryAttributes *attributes = entry->attributes();
+        const QList<QString> customKeys = attributes->customKeys();
+        for (const QString &key : customKeys) {
+            const bool totpKey = key == Totp::ATTRIBUTE_OTP || key == Totp::ATTRIBUTE_SEED
+                || key == Totp::ATTRIBUTE_SETTINGS || key == Totp::KP2_TOTP_SECRET
+                || key == Totp::KP2_TOTP_ALGORITHM || key == Totp::KP2_TOTP_LENGTH
+                || key == Totp::KP2_TOTP_PERIOD;
+            if (!totpKey && !EntryAttributes::isPasskeyAttribute(key)
+                && !key.startsWith(QStringLiteral("notepadsafe."))) {
+                attributes->remove(key);
+            }
+        }
+        for (int i = 0; i < data.additionalUrls.size(); ++i) {
+            const QString key = i == 0
+                ? EntryAttributes::AdditionalUrlAttribute
+                : QStringLiteral("%1_%2").arg(EntryAttributes::AdditionalUrlAttribute)
+                                           .arg(i);
+            attributes->set(key, data.additionalUrls.at(i), false);
+        }
+        for (VaultCustomField &field : data.customFields) {
+            const QString key = field.name.trimmed();
+            if (key.isEmpty() || EntryAttributes::isDefaultAttribute(key)
+                || EntryAttributes::isPasskeyAttribute(key)
+                || key.startsWith(EntryAttributes::AdditionalUrlAttribute)
+                || key.startsWith(QStringLiteral("notepadsafe."))) {
+                field.valueUtf8.clear();
+                continue;
+            }
+            QString value = transientUtf8(field.valueUtf8);
+            attributes->set(key, value, field.protectedValue);
+            value.fill(QChar(0));
+            value.clear();
+            field.valueUtf8.clear();
+        }
+    }
 
     QString password = transientUtf8(data.passwordUtf8);
     entry->setPassword(password);

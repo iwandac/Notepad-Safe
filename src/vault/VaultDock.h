@@ -9,9 +9,12 @@
 struct SecurityIdentityParameters;
 
 class QCheckBox;
+class QComboBox;
+class QDateTimeEdit;
 class QFormLayout;
 class QLabel;
 class QLineEdit;
+class QPlainTextEdit;
 class QPushButton;
 class QStackedWidget;
 class QTextEdit;
@@ -104,8 +107,11 @@ private slots:
     void copyUsername();
     void openCurrentUrl();
     void refreshTotpCode();
+    void configureTotp();
     void copyTotpProtected();
     void clearProtectedClipboard();
+    void cloneCurrentEntry();
+    void showPasswordHealthReport();
 
 private:
     enum class EntryKind { Login, SecureNote };
@@ -146,6 +152,7 @@ private:
     QStackedWidget *detailPages_ = nullptr;
     QWidget *detailEditorPage_ = nullptr;
     QLineEdit *filterEdit_ = nullptr;
+    QComboBox *sortCombo_ = nullptr;
     QTreeWidget *entryTree_ = nullptr;
     QTreeWidgetItem *loginRoot_ = nullptr;
     QTreeWidgetItem *noteRoot_ = nullptr;
@@ -158,9 +165,17 @@ private:
     QLineEdit *urlEdit_ = nullptr;
     QWidget *urlRow_ = nullptr;
     QLineEdit *tagsEdit_ = nullptr;
+    QLineEdit *groupEdit_ = nullptr;
+    QPlainTextEdit *additionalUrlsEdit_ = nullptr;
+    QPlainTextEdit *customFieldsEdit_ = nullptr;
+    QCheckBox *expiryCheck_ = nullptr;
+    QDateTimeEdit *expiryEdit_ = nullptr;
+    QWidget *expiryRow_ = nullptr;
     QLineEdit *passwordEdit_ = nullptr;
     QWidget *passwordRow_ = nullptr;
     QLineEdit *totpEdit_ = nullptr;
+    QWidget *totpInputRow_ = nullptr;
+    QPushButton *totpConfigureButton_ = nullptr;
     QWidget *totpCodeRow_ = nullptr;
     QLabel *totpCodeCaption_ = nullptr;
     QLabel *totpCodeLabel_ = nullptr;
@@ -179,6 +194,8 @@ private:
     QPushButton *saveButton_ = nullptr;
     QPushButton *editButton_ = nullptr;
     QPushButton *historyButton_ = nullptr;
+    QPushButton *cloneButton_ = nullptr;
+    QPushButton *healthButton_ = nullptr;
     QPushButton *cancelButton_ = nullptr;
     QPushButton *copyUsernameButton_ = nullptr;
     QPushButton *openUrlButton_ = nullptr;

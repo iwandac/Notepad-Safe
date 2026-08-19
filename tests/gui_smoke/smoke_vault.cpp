@@ -5,7 +5,11 @@
 #include <QClipboard>
 #include <QApplication>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDesktopServices>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDateTimeEdit>
 #include <QGuiApplication>
 #include <QLabel>
 #include <QLineEdit>
@@ -13,6 +17,8 @@
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QPlainTextEdit>
+#include <QSpinBox>
 #include <QStackedWidget>
 #include <QTextEdit>
 #include <QTimer>
@@ -367,9 +373,21 @@ private slots:
         password->setFocus();
         QTest::keyClicks(password, QStringLiteral("abc"));
         QCOMPARE(passwordStrength->text(), QStringLiteral("一般 · 约 45 bit"));
+        QTimer::singleShot(0, &window, [&]() {
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            QVERIFY(dialog != nullptr);
+            QCOMPARE(dialog->objectName(), QStringLiteral("vaultPasswordGeneratorDialog"));
+            auto *length = dialog->findChild<QSpinBox *>(QStringLiteral("vaultPasswordLength"));
+            auto *special = dialog->findChild<QCheckBox *>(QStringLiteral("vaultPasswordSpecial"));
+            auto *buttons = dialog->findChild<QDialogButtonBox *>();
+            QVERIFY(length && special && buttons);
+            length->setValue(32);
+            special->setChecked(false);
+            QTest::mouseClick(buttons->button(QDialogButtonBox::Ok), Qt::LeftButton);
+        });
         QTest::mouseClick(generatePassword, Qt::LeftButton);
         const QString generatedPassword = password->text();
-        QCOMPARE(generatedPassword.size(), 24);
+        QCOMPARE(generatedPassword.size(), 32);
         QCOMPARE(passwordStrength->text(), QStringLiteral("很强 · 约 120 bit"));
         QVERIFY(window.grab().save(QStringLiteral("gui-account-generator.png")));
         totp->setText(QStringLiteral("JBSWY3DPEHPK3PXP"));
@@ -563,6 +581,119 @@ private slots:
     }
 
 #ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
+    void productionExtendedAccountWorkflow()
+    {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        const QString path = temporary.filePath(QStringLiteral("extended-account.kdbx"));
+        QMainWindow window;
+        window.resize(1100, 820);
+        auto *dock = new VaultDock(createProductionVaultBackend(), &window);
+        window.addDockWidget(Qt::RightDockWidgetArea, dock);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        SecureBuffer master("extended-account-master", 23);
+        QVERIFY(!dock->createVault(path, master).isError());
+
+        auto *newLogin = dock->findChild<QPushButton *>(QStringLiteral("vaultNewLoginButton"));
+        auto *title = dock->findChild<QLineEdit *>(QStringLiteral("vaultTitleEdit"));
+        auto *username = dock->findChild<QLineEdit *>(QStringLiteral("vaultUsernameEdit"));
+        auto *password = dock->findChild<QLineEdit *>(QStringLiteral("vaultPasswordEdit"));
+        auto *group = dock->findChild<QLineEdit *>(QStringLiteral("vaultGroupEdit"));
+        auto *urls = dock->findChild<QPlainTextEdit *>(QStringLiteral("vaultAdditionalUrlsEdit"));
+        auto *fields = dock->findChild<QPlainTextEdit *>(QStringLiteral("vaultCustomFieldsEdit"));
+        auto *expiry = dock->findChild<QCheckBox *>(QStringLiteral("vaultExpiryCheck"));
+        auto *expiryTime = dock->findChild<QDateTimeEdit *>(QStringLiteral("vaultExpiryEdit"));
+        auto *totpConfigure = dock->findChild<QPushButton *>(
+            QStringLiteral("vaultTotpConfigureButton"));
+        auto *save = dock->findChild<QPushButton *>(QStringLiteral("vaultSaveButton"));
+        auto *edit = dock->findChild<QPushButton *>(QStringLiteral("vaultEditButton"));
+        auto *cancel = dock->findChild<QPushButton *>(QStringLiteral("vaultCancelButton"));
+        auto *clone = dock->findChild<QPushButton *>(QStringLiteral("vaultCloneButton"));
+        auto *health = dock->findChild<QPushButton *>(QStringLiteral("vaultHealthButton"));
+        auto *sort = dock->findChild<QComboBox *>(QStringLiteral("vaultSortCombo"));
+        auto *tree = dock->findChild<QTreeWidget *>(QStringLiteral("vaultEntryTree"));
+        QVERIFY(newLogin && title && username && password && group && urls && fields
+                && expiry && expiryTime && totpConfigure && save && edit && cancel
+                && clone && health && sort && tree);
+
+        QTest::mouseClick(newLogin, Qt::LeftButton);
+        title->setText(QStringLiteral("Production API"));
+        username->setText(QStringLiteral("operator@example.test"));
+        password->setText(QStringLiteral("same-weak-password"));
+        group->setText(QStringLiteral("Work/Production"));
+        urls->setPlainText(QStringLiteral("https://backup.example.test\nhttps://dr.example.test"));
+        fields->setPlainText(QStringLiteral("API token=custom-secret\npublic:Region=us-west"));
+        expiry->setChecked(true);
+        expiryTime->setDateTime(QDateTime::currentDateTime().addDays(-1));
+
+        QTimer::singleShot(0, &window, [&]() {
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            QVERIFY(dialog != nullptr);
+            QCOMPARE(dialog->objectName(), QStringLiteral("vaultTotpSetupDialog"));
+            auto *seed = dialog->findChild<QLineEdit *>(QStringLiteral("vaultTotpSeed"));
+            auto *algorithm = dialog->findChild<QComboBox *>(QStringLiteral("vaultTotpAlgorithm"));
+            auto *digits = dialog->findChild<QSpinBox *>(QStringLiteral("vaultTotpDigits"));
+            auto *period = dialog->findChild<QSpinBox *>(QStringLiteral("vaultTotpPeriod"));
+            auto *buttons = dialog->findChild<QDialogButtonBox *>();
+            QVERIFY(seed && algorithm && digits && period && buttons);
+            seed->setText(QStringLiteral("JBSWY3DPEHPK3PXP"));
+            algorithm->setCurrentText(QStringLiteral("SHA256"));
+            digits->setValue(8);
+            period->setValue(45);
+            QTest::mouseClick(buttons->button(QDialogButtonBox::Ok), Qt::LeftButton);
+        });
+        QTest::mouseClick(totpConfigure, Qt::LeftButton);
+        QTest::mouseClick(save, Qt::LeftButton);
+        QTRY_VERIFY(edit->isVisible() && clone->isVisible());
+        QVERIFY(fields->toPlainText().contains(QStringLiteral("API token=••••••••")));
+        QVERIFY(fields->toPlainText().contains(QStringLiteral("public:Region=us-west")));
+        QVERIFY(health->text().contains(QStringLiteral("到期")));
+
+        QTreeWidgetItem *productionGroup = nullptr;
+        QList<QTreeWidgetItem *> pending;
+        for (int i = 0; i < tree->topLevelItemCount(); ++i)
+            pending.append(tree->topLevelItem(i));
+        while (!pending.isEmpty()) {
+            QTreeWidgetItem *item = pending.takeFirst();
+            if (item->text(0) == QStringLiteral("Production"))
+                productionGroup = item;
+            for (int i = 0; i < item->childCount(); ++i)
+                pending.append(item->child(i));
+        }
+        QVERIFY(productionGroup && productionGroup->childCount() == 1);
+        for (int mode = 0; mode < sort->count(); ++mode) {
+            sort->setCurrentIndex(mode);
+            QCoreApplication::processEvents();
+            QVERIFY(tree->topLevelItemCount() == 3);
+        }
+
+        QTest::mouseClick(edit, Qt::LeftButton);
+        QVERIFY(fields->toPlainText().contains(QStringLiteral("API token=custom-secret")));
+        QTest::mouseClick(cancel, Qt::LeftButton);
+        QVERIFY(fields->toPlainText().contains(QStringLiteral("API token=••••••••")));
+
+        QTest::mouseClick(clone, Qt::LeftButton);
+        QTRY_VERIFY(title->text().contains(QStringLiteral("副本")));
+        QVERIFY(fields->toPlainText().contains(QStringLiteral("API token=••••••••")));
+
+        bool healthInspected = false;
+        QTimer::singleShot(0, &window, [&]() {
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            QVERIFY(dialog != nullptr);
+            QCOMPARE(dialog->objectName(), QStringLiteral("vaultHealthDialog"));
+            auto *list = dialog->findChild<QListWidget *>(QStringLiteral("vaultHealthList"));
+            QVERIFY(list && list->count() >= 2);
+            healthInspected = dialog->grab().save(QStringLiteral("gui-account-health.png"));
+            dialog->reject();
+        });
+        QTest::mouseClick(health, Qt::LeftButton);
+        QVERIFY(healthInspected);
+        QVERIFY(window.grab().save(QStringLiteral("gui-account-extended-fields.png")));
+        dock->lockVault();
+        QVERIFY(title->text().isEmpty() && fields->toPlainText().isEmpty());
+    }
+
     void productionAccountHistoryCanRestorePassword()
     {
         QTemporaryDir temporary;

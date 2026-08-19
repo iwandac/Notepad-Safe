@@ -56,6 +56,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QShortcut>
+#include <QSignalBlocker>
 #include <QKeySequence>
 #include <QKeyEvent>
 #include <QDateTime>
@@ -413,6 +414,15 @@ static void restoreSessionPosition(EditorTab *tab, const SessionTab &state)
         return;
     }
     tab->setCursorPosition(state.cursorLine, state.cursorIndex);
+}
+
+static void restoreSessionSplit(EditorTab *tab, const SessionTab &state)
+{
+    if (!tab || !state.splitView || !tab->canSplitView())
+        return;
+    tab->setSplitView(
+        true, state.splitOrientation == QLatin1String("vertical")
+                  ? Qt::Vertical : Qt::Horizontal);
 }
 
 MainWindow::MainWindow(QWidget *parent)
@@ -1394,7 +1404,7 @@ void MainWindow::createMenus()
     dupLineAct->setObjectName(QStringLiteral("edit.line.duplicate"));
     m_documentOnlyActions.append(dupLineAct);
     m_textMutationActions.append(dupLineAct);
-    dupLineAct->setShortcut(QKeySequence("Ctrl+D"));
+    dupLineAct->setShortcut(QKeySequence("Ctrl+Shift+D"));
     connect(dupLineAct, &QAction::triggered, this, &MainWindow::duplicateLine);
 
     auto *delLineAct = editMenu->addAction(QStringLiteral("删除当前行(&L)"));
@@ -1418,6 +1428,53 @@ void MainWindow::createMenus()
     moveDownAct->setShortcut(QKeySequence("Alt+Down"));
     connect(moveDownAct, &QAction::triggered, this, &MainWindow::moveLineDown);
 
+    auto addNativeTextAction = [this, editMenu](const QString &text,
+                                                 const QString &objectName,
+                                                 const QKeySequence &shortcut,
+                                                 auto callback) {
+        auto *action = editMenu->addAction(text);
+        action->setObjectName(objectName);
+        if (!shortcut.isEmpty())
+            action->setShortcut(shortcut);
+        m_documentOnlyActions.append(action);
+        m_textMutationActions.append(action);
+        connect(action, &QAction::triggered, this, callback);
+        return action;
+    };
+
+    addNativeTextAction(QStringLiteral("转置当前行"),
+                        QStringLiteral("edit.line.transpose"), {}, [this]() {
+        if (auto *tab = currentTab()) tab->transposeLine();
+    });
+
+    editMenu->addSeparator();
+    addNativeTextAction(QStringLiteral("选择下一个相同内容"),
+                        QStringLiteral("edit.multiSelect.next"),
+                        QKeySequence(QStringLiteral("Ctrl+D")), [this]() {
+        if (auto *tab = currentTab()) tab->selectNextOccurrence();
+    });
+    addNativeTextAction(QStringLiteral("选择所有相同内容"),
+                        QStringLiteral("edit.multiSelect.all"),
+                        QKeySequence(QStringLiteral("Ctrl+Shift+Alt+D")), [this]() {
+        if (auto *tab = currentTab()) tab->selectAllOccurrences();
+    });
+    addNativeTextAction(QStringLiteral("选区转换为大写"),
+                        QStringLiteral("edit.selection.upper"), {}, [this]() {
+        if (auto *tab = currentTab()) tab->selectionToUpper();
+    });
+    addNativeTextAction(QStringLiteral("选区转换为小写"),
+                        QStringLiteral("edit.selection.lower"), {}, [this]() {
+        if (auto *tab = currentTab()) tab->selectionToLower();
+    });
+    addNativeTextAction(QStringLiteral("合并选中行"),
+                        QStringLiteral("edit.lines.join"), {}, [this]() {
+        if (auto *tab = currentTab()) tab->joinSelectedLines();
+    });
+    addNativeTextAction(QStringLiteral("按窗口宽度拆分选中行"),
+                        QStringLiteral("edit.lines.split"), {}, [this]() {
+        if (auto *tab = currentTab()) tab->splitSelectedLines();
+    });
+
     editMenu->addSeparator();
 
     auto *sortAscAct = editMenu->addAction(QStringLiteral("行升序排序"));
@@ -1431,6 +1488,72 @@ void MainWindow::createMenus()
     sortDescAct->setObjectName(QStringLiteral("edit.lines.sortDescending"));
     m_documentOnlyActions.append(sortDescAct);
     connect(sortDescAct, &QAction::triggered, this, &MainWindow::sortLinesDesc);
+
+    editMenu->addSeparator();
+    auto *indentMenu = editMenu->addMenu(QStringLiteral("缩进与补全"));
+    indentMenu->setObjectName(QStringLiteral("edit.indentation"));
+    m_documentOnlyActions.append(indentMenu->menuAction());
+
+    m_actUseTabs = indentMenu->addAction(QStringLiteral("使用 Tab 缩进"));
+    m_actUseTabs->setObjectName(QStringLiteral("edit.indentation.useTabs"));
+    m_actUseTabs->setCheckable(true);
+    m_documentOnlyActions.append(m_actUseTabs);
+    connect(m_actUseTabs, &QAction::toggled, this, [this](bool enabled) {
+        m_useTabs = enabled;
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            if (auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i)))
+                tab->setUseTabs(enabled);
+        }
+        saveSettings();
+    });
+
+    auto *tabWidthMenu = indentMenu->addMenu(QStringLiteral("Tab 宽度"));
+    tabWidthMenu->setObjectName(QStringLiteral("edit.indentation.tabWidth"));
+    m_tabWidthGroup = new QActionGroup(this);
+    m_tabWidthGroup->setExclusive(true);
+    for (const int width : {2, 4, 8}) {
+        auto *action = tabWidthMenu->addAction(QStringLiteral("%1 个字符").arg(width));
+        action->setObjectName(QStringLiteral("edit.indentation.tabWidth.%1").arg(width));
+        action->setCheckable(true);
+        action->setData(width);
+        m_tabWidthGroup->addAction(action);
+        m_documentOnlyActions.append(action);
+    }
+    connect(m_tabWidthGroup, &QActionGroup::triggered, this, [this](QAction *action) {
+        m_tabWidth = action->data().toInt();
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            if (auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i)))
+                tab->setTabWidth(m_tabWidth);
+        }
+        saveSettings();
+    });
+
+    m_actBackspaceUnindents = indentMenu->addAction(QStringLiteral("Backspace 回退缩进"));
+    m_actBackspaceUnindents->setObjectName(
+        QStringLiteral("edit.indentation.backspaceUnindents"));
+    m_actBackspaceUnindents->setCheckable(true);
+    m_documentOnlyActions.append(m_actBackspaceUnindents);
+    connect(m_actBackspaceUnindents, &QAction::toggled, this, [this](bool enabled) {
+        m_backspaceUnindents = enabled;
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            if (auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i)))
+                tab->setBackspaceUnindents(enabled);
+        }
+        saveSettings();
+    });
+
+    m_actWordCompletion = indentMenu->addAction(QStringLiteral("文档词语自动补全"));
+    m_actWordCompletion->setObjectName(QStringLiteral("edit.completion.words"));
+    m_actWordCompletion->setCheckable(true);
+    m_documentOnlyActions.append(m_actWordCompletion);
+    connect(m_actWordCompletion, &QAction::toggled, this, [this](bool enabled) {
+        m_wordCompletion = enabled;
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            if (auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i)))
+                tab->setWordCompletionEnabled(enabled);
+        }
+        saveSettings();
+    });
 
     // 搜索菜单
     auto *searchMenu = menuBar()->addMenu(QStringLiteral("搜索(&S)"));
@@ -1463,24 +1586,56 @@ void MainWindow::createMenus()
     findPrevAct->setShortcut(QKeySequence("Shift+F3"));
     connect(findPrevAct, &QAction::triggered, this, &MainWindow::findPrev);
 
+    searchMenu->addSeparator();
+    auto *matchingBraceAct = searchMenu->addAction(QStringLiteral("跳转到匹配括号"));
+    matchingBraceAct->setObjectName(QStringLiteral("search.brace.match"));
+    matchingBraceAct->setShortcut(QKeySequence(QStringLiteral("Ctrl+]")));
+    m_documentOnlyActions.append(matchingBraceAct);
+    m_nativeTextActions.append(matchingBraceAct);
+    connect(matchingBraceAct, &QAction::triggered, this, [this]() {
+        if (auto *tab = currentTab()) tab->moveToMatchingBrace();
+    });
+    auto *selectBraceAct = searchMenu->addAction(QStringLiteral("选择到匹配括号"));
+    selectBraceAct->setObjectName(QStringLiteral("search.brace.select"));
+    selectBraceAct->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+]")));
+    m_documentOnlyActions.append(selectBraceAct);
+    m_nativeTextActions.append(selectBraceAct);
+    connect(selectBraceAct, &QAction::triggered, this, [this]() {
+        if (auto *tab = currentTab()) tab->selectToMatchingBrace();
+    });
+
     // 语言菜单
     auto *syntaxMenu = menuBar()->addMenu(QStringLiteral("语言(&L)"));
     syntaxMenu->menuAction()->setObjectName(QStringLiteral("menu.language"));
     m_languageActions.append(syntaxMenu->menuAction());
     auto *syntaxGroup = new QActionGroup(this);
-    QStringList syntaxNames = {
+    const QStringList syntaxNames = {
         QStringLiteral("纯文本"), QStringLiteral("C/C++"),
         QStringLiteral("Python"), QStringLiteral("JSON"),
         QStringLiteral("HTML"), QStringLiteral("XML"),
         QStringLiteral("SQL"), QStringLiteral("YAML"),
-        QStringLiteral("Markdown"),
+        QStringLiteral("Markdown"), QStringLiteral("JavaScript"),
+        QStringLiteral("Java"), QStringLiteral("C#"),
+        QStringLiteral("CSS"), QStringLiteral("Shell"),
+        QStringLiteral("Batch"), QStringLiteral("CMake"),
+        QStringLiteral("Makefile"), QStringLiteral("Lua"),
+        QStringLiteral("Ruby"), QStringLiteral("Perl"),
+        QStringLiteral("Diff/Patch"), QStringLiteral("Properties/INI"),
+        QStringLiteral("Assembly"),
     };
     const QStringList syntaxIds = {
         QStringLiteral("plain"), QStringLiteral("cpp"),
         QStringLiteral("python"), QStringLiteral("json"),
         QStringLiteral("html"), QStringLiteral("xml"),
         QStringLiteral("sql"), QStringLiteral("yaml"),
-        QStringLiteral("markdown"),
+        QStringLiteral("markdown"), QStringLiteral("javascript"),
+        QStringLiteral("java"), QStringLiteral("csharp"),
+        QStringLiteral("css"), QStringLiteral("bash"),
+        QStringLiteral("batch"), QStringLiteral("cmake"),
+        QStringLiteral("makefile"), QStringLiteral("lua"),
+        QStringLiteral("ruby"), QStringLiteral("perl"),
+        QStringLiteral("diff"), QStringLiteral("properties"),
+        QStringLiteral("asm"),
     };
     for (int i = 0; i < syntaxNames.size(); ++i) {
         auto *act = syntaxMenu->addAction(syntaxNames[i]);
@@ -1557,6 +1712,100 @@ void MainWindow::createMenus()
     m_actWordWrap->setCheckable(true);
     m_actWordWrap->setChecked(m_wordWrap);
     connect(m_actWordWrap, &QAction::triggered, this, &MainWindow::toggleWordWrap);
+
+    auto *splitMenu = viewMenu->addMenu(QStringLiteral("分屏"));
+    splitMenu->setObjectName(QStringLiteral("view.split"));
+    m_documentOnlyActions.append(splitMenu->menuAction());
+    m_actSplitHorizontal = splitMenu->addAction(QStringLiteral("左右分屏"));
+    m_actSplitHorizontal->setObjectName(QStringLiteral("view.split.horizontal"));
+    m_actSplitHorizontal->setCheckable(true);
+    m_documentOnlyActions.append(m_actSplitHorizontal);
+    m_actSplitVertical = splitMenu->addAction(QStringLiteral("上下分屏"));
+    m_actSplitVertical->setObjectName(QStringLiteral("view.split.vertical"));
+    m_actSplitVertical->setCheckable(true);
+    m_documentOnlyActions.append(m_actSplitVertical);
+    connect(m_actSplitHorizontal, &QAction::toggled, this, [this](bool enabled) {
+        EditorTab *tab = currentTab();
+        if (!tab)
+            return;
+        if (enabled) {
+            QSignalBlocker blocker(m_actSplitVertical);
+            m_actSplitVertical->setChecked(false);
+            tab->setSplitView(true, Qt::Horizontal);
+        } else if (tab->splitViewEnabled()
+                   && tab->splitOrientation() == Qt::Horizontal) {
+            tab->setSplitView(false);
+        }
+        syncCommandStates(tab);
+    });
+    connect(m_actSplitVertical, &QAction::toggled, this, [this](bool enabled) {
+        EditorTab *tab = currentTab();
+        if (!tab)
+            return;
+        if (enabled) {
+            QSignalBlocker blocker(m_actSplitHorizontal);
+            m_actSplitHorizontal->setChecked(false);
+            tab->setSplitView(true, Qt::Vertical);
+        } else if (tab->splitViewEnabled()
+                   && tab->splitOrientation() == Qt::Vertical) {
+            tab->setSplitView(false);
+        }
+        syncCommandStates(tab);
+    });
+
+    auto *symbolsMenu = viewMenu->addMenu(QStringLiteral("显示符号"));
+    symbolsMenu->setObjectName(QStringLiteral("view.symbols"));
+    m_documentOnlyActions.append(symbolsMenu->menuAction());
+    m_actWhitespaceVisible = symbolsMenu->addAction(QStringLiteral("显示空格与制表符"));
+    m_actWhitespaceVisible->setObjectName(QStringLiteral("view.symbols.whitespace"));
+    m_actWhitespaceVisible->setCheckable(true);
+    m_documentOnlyActions.append(m_actWhitespaceVisible);
+    connect(m_actWhitespaceVisible, &QAction::toggled, this, [this](bool visible) {
+        m_whitespaceVisible = visible;
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            if (auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i)))
+                tab->setWhitespaceVisible(visible);
+        }
+        saveSettings();
+    });
+    m_actEolVisible = symbolsMenu->addAction(QStringLiteral("显示行尾符"));
+    m_actEolVisible->setObjectName(QStringLiteral("view.symbols.eol"));
+    m_actEolVisible->setCheckable(true);
+    m_documentOnlyActions.append(m_actEolVisible);
+    connect(m_actEolVisible, &QAction::toggled, this, [this](bool visible) {
+        m_eolVisible = visible;
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            if (auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i)))
+                tab->setEolVisible(visible);
+        }
+        saveSettings();
+    });
+
+    auto *foldMenu = viewMenu->addMenu(QStringLiteral("代码折叠"));
+    foldMenu->setObjectName(QStringLiteral("view.folding"));
+    m_documentOnlyActions.append(foldMenu->menuAction());
+    m_lexerActions.append(foldMenu->menuAction());
+    auto addFoldAction = [this, foldMenu](const QString &text,
+                                          const QString &name,
+                                          auto callback) {
+        auto *action = foldMenu->addAction(text);
+        action->setObjectName(name);
+        m_documentOnlyActions.append(action);
+        m_lexerActions.append(action);
+        connect(action, &QAction::triggered, this, callback);
+    };
+    addFoldAction(QStringLiteral("折叠/展开当前块"),
+                  QStringLiteral("view.folding.toggleCurrent"), [this]() {
+        if (auto *tab = currentTab()) tab->foldCurrentLine();
+    });
+    addFoldAction(QStringLiteral("全部折叠"),
+                  QStringLiteral("view.folding.collapseAll"), [this]() {
+        if (auto *tab = currentTab()) tab->foldAll(false);
+    });
+    addFoldAction(QStringLiteral("全部展开"),
+                  QStringLiteral("view.folding.expandAll"), [this]() {
+        if (auto *tab = currentTab()) tab->foldAll(true);
+    });
 
     viewMenu->addSeparator();
 
@@ -1713,6 +1962,33 @@ void MainWindow::createMenus()
         m_convertEncodingActions.append(a);
         m_documentOnlyActions.append(a);
         connect(a, &QAction::triggered, this, &MainWindow::convertEncodingFromAction);
+    }
+
+    m_encodingMenu->addSeparator();
+    auto *eolMenu = m_encodingMenu->addMenu(QStringLiteral("换行符转换"));
+    eolMenu->setObjectName(QStringLiteral("encoding.eol"));
+    m_documentOnlyActions.append(eolMenu->menuAction());
+    m_textMutationActions.append(eolMenu->menuAction());
+    const QList<QPair<QString, QsciScintilla::EolMode>> eolModes = {
+        {QStringLiteral("Windows (CRLF)"), QsciScintilla::EolWindows},
+        {QStringLiteral("Unix (LF)"), QsciScintilla::EolUnix},
+        {QStringLiteral("Mac (CR)"), QsciScintilla::EolMac},
+    };
+    const QStringList eolIds = {
+        QStringLiteral("crlf"), QStringLiteral("lf"), QStringLiteral("cr")
+    };
+    for (int i = 0; i < eolModes.size(); ++i) {
+        auto *action = eolMenu->addAction(eolModes.at(i).first);
+        action->setObjectName(QStringLiteral("encoding.eol.%1").arg(eolIds.at(i)));
+        m_documentOnlyActions.append(action);
+        m_textMutationActions.append(action);
+        const auto mode = eolModes.at(i).second;
+        connect(action, &QAction::triggered, this, [this, mode]() {
+            if (auto *tab = currentTab()) {
+                if (tab->convertEols(mode))
+                    updateStatusBar();
+            }
+        });
     }
 
     // "以编码重新打开"：重新解释原始字节，不把它误解为编码转换。
@@ -2104,6 +2380,7 @@ EditorTab *MainWindow::addNewTab()
     tab->setEdgeVisible(m_edgeVisible);
     tab->setEdgeColumn(m_edgeColumn);
     tab->setWordWrap(m_wordWrap);
+    applyEditorPreferences(tab);
     // QScintilla keeps its own colors outside the QWidget palette. Apply the
     // resolved appearance to newly created/restored tabs as well as existing ones.
     applyDarkMode(m_darkMode);
@@ -2240,6 +2517,18 @@ EditorTab *MainWindow::addNewTab()
     // 新建后立刻同步一次 L2 敏感动作（覆盖新 tab 还没收到任何信号的早期空状态）
     syncCommandStates(tab);
     return tab;
+}
+
+void MainWindow::applyEditorPreferences(EditorTab *tab)
+{
+    if (!tab)
+        return;
+    tab->setWhitespaceVisible(m_whitespaceVisible);
+    tab->setEolVisible(m_eolVisible);
+    tab->setUseTabs(m_useTabs);
+    tab->setTabWidth(m_tabWidth);
+    tab->setBackspaceUnindents(m_backspaceUnindents);
+    tab->setWordCompletionEnabled(m_wordCompletion);
 }
 
 QString MainWindow::secureTitleFrom(EditorTab *tab)
@@ -3502,6 +3791,7 @@ void MainWindow::setSyntaxFromAction()
     if (!tab)
         return;
     tab->setSyntax(static_cast<Syntax>(syntax));
+    syncCommandStates(tab);
     updateStatusBar();
 }
 
@@ -3631,6 +3921,16 @@ void MainWindow::syncGlobalMenuCheckStates()
     if (m_actDarkMode)
         m_actDarkMode->setChecked(m_appearanceMode == AppearanceMode::Dark);
     if (m_actWordWrap)  m_actWordWrap->setChecked(m_wordWrap);
+    if (m_actWhitespaceVisible)
+        m_actWhitespaceVisible->setChecked(m_whitespaceVisible);
+    if (m_actEolVisible)
+        m_actEolVisible->setChecked(m_eolVisible);
+    if (m_actUseTabs)
+        m_actUseTabs->setChecked(m_useTabs);
+    if (m_actBackspaceUnindents)
+        m_actBackspaceUnindents->setChecked(m_backspaceUnindents);
+    if (m_actWordCompletion)
+        m_actWordCompletion->setChecked(m_wordCompletion);
     if (m_actEdgeVisible) m_actEdgeVisible->setChecked(m_edgeVisible);
     if (m_actTextViewMode || m_actHexViewMode) {
         auto *tab = currentTab();
@@ -3649,6 +3949,10 @@ void MainWindow::syncGlobalMenuCheckStates()
         for (QAction *a : m_edgeColGroup->actions()) {
             a->setChecked(a->data().toInt() == m_edgeColumn);
         }
+    }
+    if (m_tabWidthGroup) {
+        for (QAction *action : m_tabWidthGroup->actions())
+            action->setChecked(action->data().toInt() == m_tabWidth);
     }
 }
 
@@ -3964,11 +4268,37 @@ void MainWindow::syncCommandStates(EditorTab *tab)
     }
     for (QAction *action : m_textMutationActions) {
         if (action)
-            action->setEnabled(canModify && !tab->isL2Active());
+            action->setEnabled(hasDocument && tab->supportsTextMutationCommands());
+    }
+    const bool nativeTextSurface = hasDocument && !tab->isL2Active()
+                                   && !tab->isBinaryDocument()
+                                   && !tab->isSecureDocumentMasked();
+    for (QAction *action : m_nativeTextActions) {
+        if (action)
+            action->setEnabled(nativeTextSurface);
+    }
+    for (QAction *action : m_lexerActions) {
+        if (action)
+            action->setEnabled(hasDocument && tab->supportsLexerCommands());
     }
     for (QAction *action : m_languageActions) {
         if (action)
-            action->setEnabled(hasDocument && !tab->isL2Active());
+            action->setEnabled(nativeTextSurface);
+    }
+    const bool splitAvailable = hasDocument && tab->canSplitView();
+    if (m_actSplitHorizontal) {
+        QSignalBlocker blocker(m_actSplitHorizontal);
+        m_actSplitHorizontal->setEnabled(splitAvailable);
+        m_actSplitHorizontal->setChecked(
+            hasDocument && tab->splitViewEnabled()
+            && tab->splitOrientation() == Qt::Horizontal);
+    }
+    if (m_actSplitVertical) {
+        QSignalBlocker blocker(m_actSplitVertical);
+        m_actSplitVertical->setEnabled(splitAvailable);
+        m_actSplitVertical->setChecked(
+            hasDocument && tab->splitViewEnabled()
+            && tab->splitOrientation() == Qt::Vertical);
     }
     const bool accountsWorkspace = m_workspaceStack && m_accountsPage
                                    && m_workspaceStack->currentWidget() == m_accountsPage;
@@ -4050,6 +4380,7 @@ void MainWindow::onTabChanged(int index)
     tab->setEdgeVisible(m_edgeVisible);
     tab->setEdgeColumn(m_edgeColumn);
     tab->setWordWrap(m_wordWrap);
+    applyEditorPreferences(tab);
     updateStatusBar();
 }
 
@@ -4440,12 +4771,19 @@ void MainWindow::updateStatusBar()
                                            .arg(encodingName(tab->encoding()),
                                                 tab->lineEndingName()));
 
-    QStringList syntaxNames = {
+    const QStringList syntaxNames = {
         QStringLiteral("纯文本"), QStringLiteral("C/C++"),
         QStringLiteral("Python"), QStringLiteral("JSON"),
         QStringLiteral("HTML"), QStringLiteral("XML"),
         QStringLiteral("SQL"), QStringLiteral("YAML"),
-        QStringLiteral("Markdown"),
+        QStringLiteral("Markdown"), QStringLiteral("JavaScript"),
+        QStringLiteral("Java"), QStringLiteral("C#"),
+        QStringLiteral("CSS"), QStringLiteral("Shell"),
+        QStringLiteral("Batch"), QStringLiteral("CMake"),
+        QStringLiteral("Makefile"), QStringLiteral("Lua"),
+        QStringLiteral("Ruby"), QStringLiteral("Perl"),
+        QStringLiteral("Diff/Patch"), QStringLiteral("Properties/INI"),
+        QStringLiteral("Assembly"),
     };
     int s = static_cast<int>(tab->syntax());
     if (hexMode)
@@ -4731,6 +5069,7 @@ void MainWindow::restoreSession()
             tab->setSyntax(static_cast<Syntax>(st.syntax));
         } else {
             restoreSessionPosition(tab, st);
+            restoreSessionSplit(tab, st);
         }
         m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
     }
@@ -4929,6 +5268,7 @@ void MainWindow::restoreNextSessionTab()
         tab = nullptr;
     } else {
         restoreSessionPosition(tab, st);
+        restoreSessionSplit(tab, st);
         m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
     }
 
@@ -5013,6 +5353,13 @@ void MainWindow::loadSettings()
     m_edgeColumn = settings->value("edgeColumn", 80).toInt();
     if (m_edgeColumn < 1) m_edgeColumn = 80;
     m_wordWrap = settings->value("wordWrap", false).toBool();
+    m_whitespaceVisible = settings->value("editor/showWhitespace", false).toBool();
+    m_eolVisible = settings->value("editor/showEol", false).toBool();
+    m_useTabs = settings->value("editor/useTabs", false).toBool();
+    m_tabWidth = qBound(1, settings->value("editor/tabWidth", 4).toInt(), 16);
+    m_backspaceUnindents = settings->value(
+        "editor/backspaceUnindents", true).toBool();
+    m_wordCompletion = settings->value("editor/wordCompletion", true).toBool();
 
     QSize winSize = settings->value("windowSize", QSize(1200, 800)).toSize();
     if (winSize.isValid())
@@ -5053,6 +5400,12 @@ void MainWindow::saveSettings()
     settings->setValue("edgeVisible", m_edgeVisible);
     settings->setValue("edgeColumn", m_edgeColumn);
     settings->setValue("wordWrap", m_wordWrap);
+    settings->setValue("editor/showWhitespace", m_whitespaceVisible);
+    settings->setValue("editor/showEol", m_eolVisible);
+    settings->setValue("editor/useTabs", m_useTabs);
+    settings->setValue("editor/tabWidth", m_tabWidth);
+    settings->setValue("editor/backspaceUnindents", m_backspaceUnindents);
+    settings->setValue("editor/wordCompletion", m_wordCompletion);
     settings->setValue("windowSize", size());
     settings->setValue("windowGeometry", saveGeometry());
     settings->setValue("windowState", saveState());

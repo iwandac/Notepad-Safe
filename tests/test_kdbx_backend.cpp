@@ -111,6 +111,21 @@ int main(int argc, char **argv)
         entry.username = QStringLiteral("alice@example.test");
         entry.url = QStringLiteral("https://example.test");
         entry.tags = {QStringLiteral("integration"), QStringLiteral("notepadsafe/secure-note")};
+        entry.synchronizeExtendedFields = true;
+        entry.groupPath = QStringLiteral("Work/Production");
+        entry.additionalUrls = {QStringLiteral("https://backup.example.test")};
+        VaultCustomField protectedField;
+        protectedField.name = QStringLiteral("API token");
+        protectedField.valueUtf8 = password("custom-secret");
+        protectedField.protectedValue = true;
+        entry.customFields.push_back(std::move(protectedField));
+        VaultCustomField publicField;
+        publicField.name = QStringLiteral("Region");
+        publicField.valueUtf8 = password("us-west");
+        publicField.protectedValue = false;
+        entry.customFields.push_back(std::move(publicField));
+        entry.expires = true;
+        entry.expiryUtc = QDateTime::currentDateTimeUtc().addDays(30);
         entry.passwordUtf8 = password("fixture-entry-password");
         entry.notesUtf8 = password("encrypted note body");
         entry.totpSeedUtf8 = password("JBSWY3DPEHPK3PXP");
@@ -129,6 +144,21 @@ int main(int argc, char **argv)
         updatedEntry.url = QStringLiteral("https://example.test");
         updatedEntry.tags = {QStringLiteral("integration"),
                              QStringLiteral("notepadsafe/secure-note")};
+        updatedEntry.synchronizeExtendedFields = true;
+        updatedEntry.groupPath = QStringLiteral("Work/Production");
+        updatedEntry.additionalUrls = {QStringLiteral("https://backup.example.test")};
+        VaultCustomField updatedProtectedField;
+        updatedProtectedField.name = QStringLiteral("API token");
+        updatedProtectedField.valueUtf8 = password("custom-secret");
+        updatedProtectedField.protectedValue = true;
+        updatedEntry.customFields.push_back(std::move(updatedProtectedField));
+        VaultCustomField updatedPublicField;
+        updatedPublicField.name = QStringLiteral("Region");
+        updatedPublicField.valueUtf8 = password("us-west");
+        updatedPublicField.protectedValue = false;
+        updatedEntry.customFields.push_back(std::move(updatedPublicField));
+        updatedEntry.expires = true;
+        updatedEntry.expiryUtc = QDateTime::currentDateTimeUtc().addDays(30);
         updatedEntry.passwordUtf8 = password("updated-entry-password");
         updatedEntry.notesUtf8 = password("encrypted note body");
         updatedEntry.totpSeedUtf8 = password("JBSWY3DPEHPK3PXP");
@@ -149,6 +179,38 @@ int main(int argc, char **argv)
             restoredSecrets.passwordUtf8.clear();
             restoredSecrets.totpSeedUtf8.clear();
         }
+        check(!service.clearEntryHistory(insertedId).isError(),
+              "entry history cleanup succeeds");
+        const auto clearedHistory = service.entryHistory(insertedId, &historyError);
+        check(!historyError.isError() && clearedHistory.isEmpty(),
+              "entry history cleanup removes every old version");
+
+        VaultPasswordGenerationOptions generatorOptions;
+        generatorOptions.length = 32;
+        generatorOptions.special = false;
+        generatorOptions.excludeLookAlike = true;
+        SecureBuffer generated;
+        check(!service.generatePassword(generatorOptions, &generated).isError(),
+              "configurable KeePassXC password generator succeeds");
+        check(generated.size() == 32, "configurable generator honors length");
+        generated.clear();
+
+        const QUuid weakOne = QUuid::createUuid();
+        const QUuid weakTwo = QUuid::createUuid();
+        for (const QUuid &id : {weakOne, weakTwo}) {
+            VaultEntryData weak;
+            weak.id = id;
+            weak.title = id == weakOne ? QStringLiteral("Weak one")
+                                       : QStringLiteral("Weak two");
+            weak.passwordUtf8 = password("same");
+            check(!service.upsertEntry(std::move(weak)).isError(),
+                  "health fixture account inserts");
+        }
+        VaultError healthError;
+        const auto health = service.passwordHealthReport(&healthError);
+        check(!healthError.isError(), "offline password health scan succeeds");
+        check(health.size() >= 4,
+              "health scan reports weak and reused findings for both accounts");
         check(!service.save().isError(), "restored history state saves atomically");
     }
 
@@ -177,8 +239,20 @@ int main(int argc, char **argv)
                   "password survives encrypted roundtrip");
             check(entry->notesUtf8.equals("encrypted note body", 19),
                   "secure note survives encrypted roundtrip");
-            check(entry->totpSeedUtf8.equals("JBSWY3DPEHPK3PXP", 16),
-                  "TOTP seed survives encrypted roundtrip");
+            const QString totpSettings = QString::fromUtf8(
+                reinterpret_cast<const char *>(entry->totpSeedUtf8.data()),
+                entry->totpSeedUtf8.size());
+            check(totpSettings.startsWith(QStringLiteral("otpauth://"))
+                      && totpSettings.contains(QStringLiteral("JBSWY3DPEHPK3PXP")),
+                  "complete TOTP settings survive encrypted roundtrip");
+            check(entry->groupPath == QStringLiteral("Work/Production"),
+                  "nested group survives encrypted roundtrip");
+            check(entry->additionalUrls.contains(QStringLiteral("https://backup.example.test")),
+                  "additional URL survives encrypted roundtrip");
+            check(entry->customFields.size() == 2,
+                  "protected and public custom fields survive encrypted roundtrip");
+            check(entry->expires && entry->expiryUtc.isValid(),
+                  "expiry metadata survives encrypted roundtrip");
         }
         auto metadata = service.readEntryMetadata(insertedId, &readError);
         check(metadata && !readError.isError(), "entry metadata is readable");
@@ -187,14 +261,30 @@ int main(int argc, char **argv)
                   "metadata reports secret presence without returning values");
             check(metadata->passwordUtf8.empty() && metadata->totpSeedUtf8.empty(),
                   "metadata does not retain password or TOTP seed");
+            bool protectedValueLeaked = false;
+            bool publicValuePresent = false;
+            for (const auto &field : metadata->customFields) {
+                if (field.protectedValue && !field.valueUtf8.empty())
+                    protectedValueLeaked = true;
+                if (!field.protectedValue && !field.valueUtf8.empty())
+                    publicValuePresent = true;
+            }
+            check(!protectedValueLeaked,
+                  "metadata does not retain protected custom-field values");
+            check(publicValuePresent,
+                  "metadata keeps explicitly public custom-field values");
         }
         VaultEntrySecrets secrets;
         check(!service.readEntrySecrets(insertedId, &secrets).isError(),
               "short-lived entry secrets are readable on demand");
         check(secrets.passwordUtf8.equals("fixture-entry-password", 22),
               "secret lease returns the password");
-        check(secrets.totpSeedUtf8.equals("JBSWY3DPEHPK3PXP", 16),
-              "secret lease returns the TOTP seed");
+        const QString leasedTotp = QString::fromUtf8(
+            reinterpret_cast<const char *>(secrets.totpSeedUtf8.data()),
+            secrets.totpSeedUtf8.size());
+        check(leasedTotp.startsWith(QStringLiteral("otpauth://"))
+                  && leasedTotp.contains(QStringLiteral("JBSWY3DPEHPK3PXP")),
+              "secret lease returns complete TOTP settings");
         secrets.passwordUtf8.clear();
         secrets.totpSeedUtf8.clear();
     }

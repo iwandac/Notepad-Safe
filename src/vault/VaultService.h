@@ -37,11 +37,16 @@ public:
     VaultError readEntrySecrets(const QUuid &id, VaultEntrySecrets *secrets) const;
     VaultError currentTotp(const QUuid &id, VaultTotpSnapshot *snapshot) const;
     VaultError generatePassword(int length, SecureBuffer *passwordUtf8) const;
+    VaultError generatePassword(const VaultPasswordGenerationOptions &options,
+                                SecureBuffer *passwordUtf8) const;
     VaultError assessPassword(const SecureBuffer &passwordUtf8,
                               VaultPasswordAssessment *assessment) const;
+    QList<VaultHealthFinding> passwordHealthReport(VaultError *error = nullptr) const;
     QList<VaultEntryHistorySummary> entryHistory(
         const QUuid &id, VaultError *error = nullptr) const;
     VaultError restoreEntryHistory(const QUuid &id, int historyIndex);
+    VaultError removeEntryHistory(const QUuid &id, int historyIndex);
+    VaultError clearEntryHistory(const QUuid &id);
     VaultError upsertEntry(VaultEntryData &&entry);
     VaultError recycleEntry(const QUuid &id);
     VaultError restoreEntry(const QUuid &id);

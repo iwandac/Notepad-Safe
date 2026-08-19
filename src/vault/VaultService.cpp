@@ -165,12 +165,29 @@ VaultError VaultService::generatePassword(int length, SecureBuffer *passwordUtf8
     return backend_->generatePassword(length, passwordUtf8);
 }
 
+VaultError VaultService::generatePassword(
+    const VaultPasswordGenerationOptions &options, SecureBuffer *passwordUtf8) const
+{
+    if (state_ != VaultState::Open || !backend_)
+        return lockedError();
+    return backend_->generatePassword(options, passwordUtf8);
+}
+
 VaultError VaultService::assessPassword(const SecureBuffer &passwordUtf8,
                                         VaultPasswordAssessment *assessment) const
 {
     if (state_ != VaultState::Open || !backend_)
         return lockedError();
     return backend_->assessPassword(passwordUtf8, assessment);
+}
+
+QList<VaultHealthFinding> VaultService::passwordHealthReport(VaultError *error) const
+{
+    if (state_ != VaultState::Open || !backend_) {
+        if (error) *error = lockedError();
+        return {};
+    }
+    return backend_->passwordHealthReport(error);
 }
 
 QList<VaultEntryHistorySummary> VaultService::entryHistory(
@@ -191,6 +208,26 @@ VaultError VaultService::restoreEntryHistory(const QUuid &id, int historyIndex)
     if (unchanged.isError())
         return unchanged;
     return backend_->restoreEntryHistory(id, historyIndex);
+}
+
+VaultError VaultService::removeEntryHistory(const QUuid &id, int historyIndex)
+{
+    if (state_ != VaultState::Open || !backend_)
+        return lockedError();
+    const VaultError unchanged = ensureDiskUnchanged();
+    if (unchanged.isError())
+        return unchanged;
+    return backend_->removeEntryHistory(id, historyIndex);
+}
+
+VaultError VaultService::clearEntryHistory(const QUuid &id)
+{
+    if (state_ != VaultState::Open || !backend_)
+        return lockedError();
+    const VaultError unchanged = ensureDiskUnchanged();
+    if (unchanged.isError())
+        return unchanged;
+    return backend_->clearEntryHistory(id);
 }
 
 VaultError VaultService::upsertEntry(VaultEntryData &&entry)

@@ -7,6 +7,7 @@
 #include <QString>
 #include <QStringList>
 #include <QUuid>
+#include <vector>
 
 inline const QString VaultSecureNoteTag = QStringLiteral("notepadsafe/secure-note");
 inline const QString VaultSecureDocumentPayloadAttachment =
@@ -53,6 +54,9 @@ struct VaultEntrySummary {
     QStringList tags;
     bool secureNote = false;
     bool hasPassword = false;
+    QString groupPath;
+    bool expires = false;
+    QDateTime expiryUtc;
 };
 
 struct VaultEntryHistorySummary {
@@ -60,6 +64,8 @@ struct VaultEntryHistorySummary {
     QDateTime modifiedAtUtc;
     QString title;
     QString username;
+    QString url;
+    QStringList changedFields;
     bool hasPassword = false;
 };
 
@@ -83,6 +89,30 @@ struct VaultPasswordAssessment {
     double entropyBits = 0.0;
 };
 
+struct VaultPasswordGenerationOptions {
+    int length = 24;
+    bool lower = true;
+    bool upper = true;
+    bool numbers = true;
+    bool special = true;
+    bool excludeLookAlike = true;
+    bool requireEverySelectedGroup = true;
+    QString excludedCharacters;
+};
+
+struct VaultHealthFinding {
+    QUuid entryId;
+    QString title;
+    QString issue;
+    QString detail;
+};
+
+struct VaultCustomField {
+    QString name;
+    SecureBuffer valueUtf8;
+    bool protectedValue = true;
+};
+
 // Full entry data is move-only because it can own secret fields.
 struct VaultEntryData {
     QUuid id;
@@ -90,6 +120,12 @@ struct VaultEntryData {
     QString username;
     QString url;
     QStringList tags;
+    QString groupPath;
+    QStringList additionalUrls;
+    std::vector<VaultCustomField> customFields;
+    bool synchronizeExtendedFields = false;
+    bool expires = false;
+    QDateTime expiryUtc;
     SecureBuffer passwordUtf8;
     SecureBuffer notesUtf8;
     // Reserved raw payload used by a standalone Notepad Safe binary document.

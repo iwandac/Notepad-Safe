@@ -43,6 +43,7 @@
 #include <QScrollBar>
 #include <QSignalBlocker>
 #include <QScopeGuard>
+#include <QSplitter>
 
 #include "Sci_Position.h"
 #include <QBuffer>
@@ -72,6 +73,20 @@
 #include <Qsci/qscilexersql.h>
 #include <Qsci/qscilexeryaml.h>
 #include <Qsci/qscilexermarkdown.h>
+#include <Qsci/qscilexerjavascript.h>
+#include <Qsci/qscilexerjava.h>
+#include <Qsci/qscilexercsharp.h>
+#include <Qsci/qscilexercss.h>
+#include <Qsci/qscilexerbash.h>
+#include <Qsci/qscilexerbatch.h>
+#include <Qsci/qscilexercmake.h>
+#include <Qsci/qscilexermakefile.h>
+#include <Qsci/qscilexerlua.h>
+#include <Qsci/qscilexerruby.h>
+#include <Qsci/qscilexerperl.h>
+#include <Qsci/qscilexerdiff.h>
+#include <Qsci/qscilexerproperties.h>
+#include <Qsci/qscilexermasm.h>
 
 namespace {
 
@@ -358,6 +373,10 @@ EditorTab::~EditorTab() {
     //
     //  此处析构体里仅做 dtor-safe 兜底：如果 MainWindow 路径没执行到（如异常析构），
     //  手动调 closeFile(false)—— 禁止 processEvents，保守等待 500ms 让 worker 自退出。
+    if (m_l1Splitter) {
+        QSignalBlocker blocker(this);
+        setSplitView(false);
+    }
     bridgeReparentEditorToStack();
     clearL2BridgeBaseline();
     if (m_windowedReadOnlyProvider)
@@ -441,6 +460,14 @@ void EditorTab::setupEditor()
     // 自动补全
     m_editor->setAutoCompletionSource(QsciScintilla::AcsAll);
     m_editor->setAutoCompletionThreshold(3);
+    m_editor->setBackspaceUnindents(m_backspaceUnindents);
+
+    // Enable Scintilla's native multi-selection editing.  These options make
+    // typing and paste operate on every selection instead of only the main one.
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETMULTIPLESELECTION, 1UL);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETADDITIONALSELECTIONTYPING, 1UL);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETMULTIPASTE,
+                            QsciScintillaBase::SC_MULTIPASTE_EACH);
 
     // 信号
     connect(m_editor, &QsciScintilla::SCN_MODIFYATTEMPTRO, this, [this]() {
@@ -474,8 +501,15 @@ void EditorTab::setupEditor()
                    int, int, int, int, int) {
         constexpr int contentChanges = QsciScintillaBase::SC_MOD_INSERTTEXT
                                        | QsciScintillaBase::SC_MOD_DELETETEXT;
-        if (!m_bridge.applying && (modificationType & contentChanges))
+        const bool userEdit = modificationType & QsciScintillaBase::SC_PERFORMED_USER;
+        // A projection rebuild holds m_bridge.applying through one queued
+        // paint turn. Keyboard input can legitimately arrive in that narrow
+        // interval; never classify an explicit Scintilla user edit as part of
+        // the projection or search-result invalidation will be missed.
+        if ((modificationType & contentChanges)
+            && (!m_bridge.applying || userEdit)) {
             advanceContentRevision();
+        }
     });
 }
 
@@ -546,7 +580,7 @@ bool EditorTab::loadFile(const QString &path)
         m_windowedReadOnlyProvider->closeFile();
     m_l2Mode = false;
     emit l2ModeStatusChanged();
-    if (m_stack) m_stack->setCurrentWidget(m_editor);
+    if (m_stack) m_stack->setCurrentWidget(l1Page());
 
     // 根据后缀猜测语法
     Syntax s = guessSyntaxFromExtension(path);
@@ -813,7 +847,7 @@ void EditorTab::initializeSecureDocument(const QUuid &id, const QString &title,
     m_editor->setModified(false);
     m_secureDocumentTransitioning = false;
     if (m_stack)
-        m_stack->setCurrentWidget(m_editor);
+        m_stack->setCurrentWidget(l1Page());
     setSyntax(Syntax::Markdown);
     emit l2ModeStatusChanged();
     emit encodingChanged(m_encoding);
@@ -908,6 +942,7 @@ void EditorTab::maskSecureDocument()
 {
     if (!isSecureDocument() || m_secureDocumentMasked)
         return;
+    setSplitView(false);
     m_secureDocumentTransitioning = true;
     m_secureDocumentMasked = true;
     // A note title is commonly derived from its first plaintext line. Do not
@@ -923,7 +958,7 @@ void EditorTab::maskSecureDocument()
             m_l2View->closeFile(true);
         m_l2Mode = false;
         if (m_stack)
-            m_stack->setCurrentWidget(m_editor);
+            m_stack->setCurrentWidget(l1Page());
         clearL2BridgeBaseline();
         emit l2ModeStatusChanged();
     }
@@ -1013,7 +1048,9 @@ void EditorTab::setSyntax(Syntax syntax)
 
 Syntax EditorTab::guessSyntaxFromExtension(const QString &fileName)
 {
-    QString ext = QFileInfo(fileName).suffix().toLower();
+    const QFileInfo info(fileName);
+    const QString ext = info.suffix().toLower();
+    const QString baseName = info.fileName().toLower();
     if (ext == "cpp" || ext == "cc" || ext == "cxx" || ext == "h" || ext == "hpp" ||
         ext == "hh" || ext == "hxx" || ext == "c" || ext == "inl")
         return Syntax::Cpp;
@@ -1031,20 +1068,64 @@ Syntax EditorTab::guessSyntaxFromExtension(const QString &fileName)
         return Syntax::Yaml;
     if (ext == "md" || ext == "markdown")
         return Syntax::Markdown;
+    if (ext == "js" || ext == "mjs" || ext == "cjs" || ext == "jsx")
+        return Syntax::JavaScript;
+    if (ext == "java")
+        return Syntax::Java;
+    if (ext == "cs")
+        return Syntax::CSharp;
+    if (ext == "css" || ext == "scss" || ext == "less")
+        return Syntax::Css;
+    if (ext == "sh" || ext == "bash" || ext == "zsh")
+        return Syntax::Bash;
+    if (ext == "bat" || ext == "cmd")
+        return Syntax::Batch;
+    if (ext == "cmake" || baseName == "cmakelists.txt")
+        return Syntax::CMake;
+    if (ext == "mk" || ext == "mak" || baseName == "makefile")
+        return Syntax::Makefile;
+    if (ext == "lua")
+        return Syntax::Lua;
+    if (ext == "rb" || ext == "rake" || baseName == "rakefile")
+        return Syntax::Ruby;
+    if (ext == "pl" || ext == "pm")
+        return Syntax::Perl;
+    if (ext == "diff" || ext == "patch")
+        return Syntax::Diff;
+    if (ext == "properties" || ext == "ini" || ext == "cfg" || ext == "conf")
+        return Syntax::Properties;
+    if (ext == "asm" || ext == "s")
+        return Syntax::Asm;
     return Syntax::Plain;
 }
 
-QsciLexer *EditorTab::createLexer(Syntax syntax) const
+QsciLexer *EditorTab::createLexer(Syntax syntax, QObject *owner) const
 {
+    if (!owner)
+        owner = m_editor;
     switch (syntax) {
-    case Syntax::Cpp:      return new QsciLexerCPP(m_editor);
-    case Syntax::Python:   return new QsciLexerPython(m_editor);
-    case Syntax::Json:     return new QsciLexerJSON(m_editor);
-    case Syntax::Html:     return new QsciLexerHTML(m_editor);
-    case Syntax::Xml:      return new QsciLexerXML(m_editor);
-    case Syntax::Sql:      return new QsciLexerSQL(m_editor);
-    case Syntax::Yaml:     return new QsciLexerYAML(m_editor);
-    case Syntax::Markdown: return new QsciLexerMarkdown(m_editor);
+    case Syntax::Cpp:      return new QsciLexerCPP(owner);
+    case Syntax::Python:   return new QsciLexerPython(owner);
+    case Syntax::Json:     return new QsciLexerJSON(owner);
+    case Syntax::Html:     return new QsciLexerHTML(owner);
+    case Syntax::Xml:      return new QsciLexerXML(owner);
+    case Syntax::Sql:      return new QsciLexerSQL(owner);
+    case Syntax::Yaml:     return new QsciLexerYAML(owner);
+    case Syntax::Markdown: return new QsciLexerMarkdown(owner);
+    case Syntax::JavaScript: return new QsciLexerJavaScript(owner);
+    case Syntax::Java:       return new QsciLexerJava(owner);
+    case Syntax::CSharp:     return new QsciLexerCSharp(owner);
+    case Syntax::Css:        return new QsciLexerCSS(owner);
+    case Syntax::Bash:       return new QsciLexerBash(owner);
+    case Syntax::Batch:      return new QsciLexerBatch(owner);
+    case Syntax::CMake:      return new QsciLexerCMake(owner);
+    case Syntax::Makefile:   return new QsciLexerMakefile(owner);
+    case Syntax::Lua:        return new QsciLexerLua(owner);
+    case Syntax::Ruby:       return new QsciLexerRuby(owner);
+    case Syntax::Perl:       return new QsciLexerPerl(owner);
+    case Syntax::Diff:       return new QsciLexerDiff(owner);
+    case Syntax::Properties: return new QsciLexerProperties(owner);
+    case Syntax::Asm:        return new QsciLexerMASM(owner);
     case Syntax::Plain:    return nullptr;
     }
     return nullptr;
@@ -1058,6 +1139,12 @@ void EditorTab::applySyntax(Syntax syntax)
         lexer->setDefaultFont(font);
     }
     m_editor->setLexer(lexer);
+    if (m_splitEditor) {
+        QsciLexer *splitLexer = createLexer(syntax, m_splitEditor);
+        if (splitLexer)
+            splitLexer->setDefaultFont(m_splitEditor->font());
+        m_splitEditor->setLexer(splitLexer);
+    }
     // setLexer 接管 ownership，旧 lexer 自动删除
 
     // 大文件启用 idle styling：只对可见区域着色，剩余部分在空闲时逐步完成，
@@ -1076,55 +1163,190 @@ void EditorTab::applySyntax(Syntax syntax)
 
 void EditorTab::duplicateLine()
 {
-    int line, index;
-    m_editor->getCursorPosition(&line, &index);
-    QString lineText = m_editor->text(line);
-    m_editor->insertAt(lineText + "\n", line, 0);
-    m_editor->setCursorPosition(line + 1, index);
+    if (!supportsTextMutationCommands())
+        return;
+    activeTextEditor()->SendScintilla(QsciScintillaBase::SCI_LINEDUPLICATE);
 }
 
 void EditorTab::deleteLine()
 {
-    int line, index;
-    m_editor->getCursorPosition(&line, &index);
-    m_editor->setSelection(line, 0, line + 1, 0);
-    m_editor->removeSelectedText();
+    if (!supportsTextMutationCommands())
+        return;
+    activeTextEditor()->SendScintilla(QsciScintillaBase::SCI_LINEDELETE);
 }
 
 void EditorTab::moveLineUp()
 {
-    int line, index;
-    m_editor->getCursorPosition(&line, &index);
-    if (line == 0)
+    if (!supportsTextMutationCommands())
         return;
-    QString current = m_editor->text(line);
-    QString above = m_editor->text(line - 1);
-    // 替换上一行
-    m_editor->setSelection(line - 1, 0, line, 0);
-    m_editor->removeSelectedText();
-    m_editor->insertAt(current + "\n", line - 1, 0);
-    m_editor->setSelection(line, 0, line + 1, 0);
-    m_editor->removeSelectedText();
-    m_editor->insertAt(above + "\n", line, 0);
-    m_editor->setCursorPosition(line - 1, index);
+    activeTextEditor()->SendScintilla(QsciScintillaBase::SCI_MOVESELECTEDLINESUP);
 }
 
 void EditorTab::moveLineDown()
 {
-    int line, index;
-    m_editor->getCursorPosition(&line, &index);
-    int lines = m_editor->lines();
-    if (line >= lines - 1)
+    if (!supportsTextMutationCommands())
         return;
-    QString current = m_editor->text(line);
-    QString below = m_editor->text(line + 1);
-    m_editor->setSelection(line + 1, 0, line + 2, 0);
-    m_editor->removeSelectedText();
-    m_editor->insertAt(below + "\n", line, 0);
-    m_editor->setSelection(line + 1, 0, line + 2, 0);
-    m_editor->removeSelectedText();
-    m_editor->insertAt(current + "\n", line + 1, 0);
-    m_editor->setCursorPosition(line + 1, index);
+    activeTextEditor()->SendScintilla(QsciScintillaBase::SCI_MOVESELECTEDLINESDOWN);
+}
+
+void EditorTab::transposeLine()
+{
+    if (!supportsTextMutationCommands())
+        return;
+    activeTextEditor()->SendScintilla(QsciScintillaBase::SCI_LINETRANSPOSE);
+}
+
+void EditorTab::selectionToUpper()
+{
+    QsciScintilla *editor = activeTextEditor();
+    if (!supportsTextMutationCommands() || !editor->hasSelectedText())
+        return;
+    editor->SendScintilla(QsciScintillaBase::SCI_UPPERCASE);
+}
+
+void EditorTab::selectionToLower()
+{
+    QsciScintilla *editor = activeTextEditor();
+    if (!supportsTextMutationCommands() || !editor->hasSelectedText())
+        return;
+    editor->SendScintilla(QsciScintillaBase::SCI_LOWERCASE);
+}
+
+void EditorTab::joinSelectedLines()
+{
+    if (!supportsTextMutationCommands())
+        return;
+    QsciScintilla *editor = activeTextEditor();
+    const auto start = editor->SendScintilla(QsciScintillaBase::SCI_GETSELECTIONSTART);
+    const auto end = editor->SendScintilla(QsciScintillaBase::SCI_GETSELECTIONEND);
+    if (end <= start)
+        return;
+    editor->beginUndoAction();
+    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETSTART, start);
+    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETEND, end);
+    editor->SendScintilla(QsciScintillaBase::SCI_LINESJOIN);
+    editor->endUndoAction();
+}
+
+void EditorTab::splitSelectedLines()
+{
+    if (!supportsTextMutationCommands())
+        return;
+    QsciScintilla *editor = activeTextEditor();
+    const auto start = editor->SendScintilla(QsciScintillaBase::SCI_GETSELECTIONSTART);
+    const auto end = editor->SendScintilla(QsciScintillaBase::SCI_GETSELECTIONEND);
+    if (end <= start)
+        return;
+    const int pixelWidth = qMax(80, editor->viewport()->width() - 24);
+    editor->beginUndoAction();
+    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETSTART, start);
+    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETEND, end);
+    editor->SendScintilla(QsciScintillaBase::SCI_LINESSPLIT, pixelWidth);
+    editor->endUndoAction();
+}
+
+void EditorTab::selectNextOccurrence()
+{
+    if (!supportsTextMutationCommands())
+        return;
+    QsciScintilla *editor = activeTextEditor();
+    if (!editor->hasSelectedText()) {
+        const auto position = editor->SendScintilla(QsciScintillaBase::SCI_GETCURRENTPOS);
+        const auto start = editor->SendScintilla(QsciScintillaBase::SCI_WORDSTARTPOSITION,
+                                                   position, 1L);
+        const auto end = editor->SendScintilla(QsciScintillaBase::SCI_WORDENDPOSITION,
+                                                 position, 1L);
+        if (end <= start)
+            return;
+        editor->SendScintilla(QsciScintillaBase::SCI_SETSEL, start, end);
+    }
+    const long oldTargetStart = editor->SendScintilla(
+        QsciScintillaBase::SCI_GETTARGETSTART);
+    const long oldTargetEnd = editor->SendScintilla(
+        QsciScintillaBase::SCI_GETTARGETEND);
+    const long oldSearchFlags = editor->SendScintilla(
+        QsciScintillaBase::SCI_GETSEARCHFLAGS);
+    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETSTART, 0UL);
+    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETEND,
+                          static_cast<unsigned long>(editor->length()));
+    editor->SendScintilla(QsciScintillaBase::SCI_SETSEARCHFLAGS,
+                          QsciScintillaBase::SCFIND_MATCHCASE);
+    editor->SendScintilla(QsciScintillaBase::SCI_MULTIPLESELECTADDNEXT);
+    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETSTART,
+                          static_cast<unsigned long>(oldTargetStart));
+    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETEND,
+                          static_cast<unsigned long>(oldTargetEnd));
+    editor->SendScintilla(QsciScintillaBase::SCI_SETSEARCHFLAGS,
+                          static_cast<unsigned long>(oldSearchFlags));
+}
+
+void EditorTab::selectAllOccurrences()
+{
+    if (!supportsTextMutationCommands())
+        return;
+    QsciScintilla *editor = activeTextEditor();
+    if (!editor->hasSelectedText()) {
+        const auto position = editor->SendScintilla(QsciScintillaBase::SCI_GETCURRENTPOS);
+        const auto start = editor->SendScintilla(QsciScintillaBase::SCI_WORDSTARTPOSITION,
+                                                   position, 1L);
+        const auto end = editor->SendScintilla(QsciScintillaBase::SCI_WORDENDPOSITION,
+                                                 position, 1L);
+        if (end <= start)
+            return;
+        editor->SendScintilla(QsciScintillaBase::SCI_SETSEL, start, end);
+    }
+    const long oldTargetStart = editor->SendScintilla(
+        QsciScintillaBase::SCI_GETTARGETSTART);
+    const long oldTargetEnd = editor->SendScintilla(
+        QsciScintillaBase::SCI_GETTARGETEND);
+    const long oldSearchFlags = editor->SendScintilla(
+        QsciScintillaBase::SCI_GETSEARCHFLAGS);
+    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETSTART, 0UL);
+    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETEND,
+                          static_cast<unsigned long>(editor->length()));
+    editor->SendScintilla(QsciScintillaBase::SCI_SETSEARCHFLAGS,
+                          QsciScintillaBase::SCFIND_MATCHCASE);
+    editor->SendScintilla(QsciScintillaBase::SCI_MULTIPLESELECTADDEACH);
+    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETSTART,
+                          static_cast<unsigned long>(oldTargetStart));
+    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETEND,
+                          static_cast<unsigned long>(oldTargetEnd));
+    editor->SendScintilla(QsciScintillaBase::SCI_SETSEARCHFLAGS,
+                          static_cast<unsigned long>(oldSearchFlags));
+}
+
+void EditorTab::moveToMatchingBrace()
+{
+    if (isBinaryDocument() || isSecureDocumentMasked())
+        return;
+    activeTextEditor()->moveToMatchingBrace();
+}
+
+void EditorTab::selectToMatchingBrace()
+{
+    if (isBinaryDocument() || isSecureDocumentMasked())
+        return;
+    activeTextEditor()->selectToMatchingBrace();
+}
+
+void EditorTab::foldCurrentLine()
+{
+    if (!supportsLexerCommands())
+        return;
+    int line = 0;
+    int index = 0;
+    QsciScintilla *editor = activeTextEditor();
+    editor->getCursorPosition(&line, &index);
+    editor->foldLine(line);
+}
+
+void EditorTab::foldAll(bool expand)
+{
+    if (!supportsLexerCommands())
+        return;
+    activeTextEditor()->SendScintilla(QsciScintillaBase::SCI_FOLDALL,
+                            expand ? QsciScintillaBase::SC_FOLDACTION_EXPAND
+                                   : QsciScintillaBase::SC_FOLDACTION_CONTRACT);
 }
 
 void EditorTab::sortLinesAsc()
@@ -1355,7 +1577,7 @@ void EditorTab::getCursorPosition(int *line, int *index) const
         if (index) *index = m_lastL2Col;
         return;
     }
-    m_editor->getCursorPosition(line, index);
+    activeTextEditor()->getCursorPosition(line, index);
 }
 
 void EditorTab::setCursorPosition(int line, int index)
@@ -1369,19 +1591,22 @@ void EditorTab::setCursorPosition(int line, int index)
         }
         return;
     }
-    m_editor->setCursorPosition(line, index);
-    m_editor->ensureLineVisible(line);
+    QsciScintilla *editor = activeTextEditor();
+    editor->setCursorPosition(line, index);
+    editor->ensureLineVisible(line);
 }
 
 // ============ 长行标尺 ============
 
 void EditorTab::applyEdgeSettings()
 {
-    m_editor->setEdgeColumn(m_edgeColumn);
-    if (m_edgeVisible)
-        m_editor->setEdgeMode(QsciScintilla::EdgeLine);
-    else
-        m_editor->setEdgeMode(QsciScintilla::EdgeNone);
+    for (QsciScintilla *view : {m_editor, m_splitEditor}) {
+        if (!view)
+            continue;
+        view->setEdgeColumn(m_edgeColumn);
+        view->setEdgeMode(m_edgeVisible ? QsciScintilla::EdgeLine
+                                        : QsciScintilla::EdgeNone);
+    }
 }
 
 void EditorTab::setEdgeColumn(int column)
@@ -1558,6 +1783,12 @@ void EditorTab::setWordWrap(bool on)
     } else {
         m_editor->setWrapMode(QsciScintilla::WrapNone);
     }
+    if (m_splitEditor) {
+        m_splitEditor->setWrapMode(on ? QsciScintilla::WrapWord
+                                      : QsciScintilla::WrapNone);
+        m_splitEditor->setWrapVisualFlags(QsciScintilla::WrapFlagByText);
+        m_splitEditor->setWrapIndentMode(QsciScintilla::WrapIndentSame);
+    }
 }
 
 bool EditorTab::wordWrap() const
@@ -1565,6 +1796,225 @@ bool EditorTab::wordWrap() const
     if (isL2Mode() && m_l2View)
         return m_l2View->wordWrap();
     return m_editor->wrapMode() != QsciScintilla::WrapNone;
+}
+
+void EditorTab::setWhitespaceVisible(bool on)
+{
+    m_whitespaceVisible = on;
+    if (m_editor) {
+        m_editor->setWhitespaceVisibility(on ? QsciScintilla::WsVisible
+                                             : QsciScintilla::WsInvisible);
+    }
+    if (m_splitEditor)
+        m_splitEditor->setWhitespaceVisibility(on ? QsciScintilla::WsVisible
+                                                   : QsciScintilla::WsInvisible);
+    if (m_windowedReadOnlyProvider && m_windowedReadOnlyProvider->editor())
+        m_windowedReadOnlyProvider->editor()->setWhitespaceVisibility(
+            on ? QsciScintilla::WsVisible : QsciScintilla::WsInvisible);
+}
+
+void EditorTab::setEolVisible(bool on)
+{
+    m_eolVisible = on;
+    if (m_editor)
+        m_editor->setEolVisibility(on);
+    if (m_splitEditor)
+        m_splitEditor->setEolVisibility(on);
+    if (m_windowedReadOnlyProvider && m_windowedReadOnlyProvider->editor())
+        m_windowedReadOnlyProvider->editor()->setEolVisibility(on);
+}
+
+bool EditorTab::convertEols(QsciScintilla::EolMode mode)
+{
+    if (!supportsTextMutationCommands())
+        return false;
+    m_editor->beginUndoAction();
+    m_editor->convertEols(mode);
+    m_editor->setEolMode(mode);
+    m_editor->endUndoAction();
+    emit encodingChanged(m_encoding);
+    return true;
+}
+
+void EditorTab::setUseTabs(bool on)
+{
+    m_useTabs = on;
+    if (m_editor)
+        m_editor->setIndentationsUseTabs(on);
+    if (m_splitEditor)
+        m_splitEditor->setIndentationsUseTabs(on);
+}
+
+void EditorTab::setTabWidth(int columns)
+{
+    m_tabWidth = qBound(1, columns, 16);
+    if (m_editor)
+        m_editor->setTabWidth(m_tabWidth);
+    if (m_splitEditor)
+        m_splitEditor->setTabWidth(m_tabWidth);
+}
+
+void EditorTab::setBackspaceUnindents(bool on)
+{
+    m_backspaceUnindents = on;
+    if (m_editor)
+        m_editor->setBackspaceUnindents(on);
+    if (m_splitEditor)
+        m_splitEditor->setBackspaceUnindents(on);
+}
+
+void EditorTab::setWordCompletionEnabled(bool on)
+{
+    m_wordCompletionEnabled = on;
+    if (!m_editor)
+        return;
+    m_editor->setAutoCompletionSource(on ? QsciScintilla::AcsAll
+                                         : QsciScintilla::AcsNone);
+    m_editor->setAutoCompletionThreshold(on ? 3 : -1);
+    if (m_splitEditor) {
+        m_splitEditor->setAutoCompletionSource(on ? QsciScintilla::AcsAll
+                                                   : QsciScintilla::AcsNone);
+        m_splitEditor->setAutoCompletionThreshold(on ? 3 : -1);
+    }
+}
+
+QsciScintilla *EditorTab::activeTextEditor() const
+{
+    if (m_splitEditor && (m_splitEditor->hasFocus()
+                          || (m_splitEditor->viewport()
+                              && m_splitEditor->viewport()->hasFocus()))) {
+        return m_splitEditor;
+    }
+    return m_editor;
+}
+
+QWidget *EditorTab::l1Page() const
+{
+    return m_l1Splitter ? static_cast<QWidget *>(m_l1Splitter)
+                        : static_cast<QWidget *>(m_editor);
+}
+
+bool EditorTab::canSplitView() const
+{
+    return m_editor && !isL2Mode() && !isBinaryDocument()
+           && !isSecureDocumentMasked() && !isSecureDocumentTransitioning();
+}
+
+Qt::Orientation EditorTab::splitOrientation() const
+{
+    return m_l1Splitter ? m_l1Splitter->orientation() : Qt::Horizontal;
+}
+
+void EditorTab::setSplitView(bool enabled, Qt::Orientation orientation)
+{
+    if (enabled && !canSplitView())
+        return;
+    if (!enabled) {
+        if (!m_l1Splitter)
+            return;
+        const bool wasCurrent = m_stack && m_stack->currentWidget() == m_l1Splitter;
+        if (m_splitEditor) {
+            m_splitEditor->setDocument(QsciDocument());
+            delete m_splitEditor;
+            m_splitEditor = nullptr;
+        }
+        QSplitter *splitter = m_l1Splitter;
+        m_l1Splitter = nullptr;
+        if (m_stack)
+            m_stack->removeWidget(splitter);
+        m_editor->setParent(m_stack);
+        if (m_stack && m_stack->indexOf(m_editor) < 0)
+            m_stack->insertWidget(0, m_editor);
+        if (wasCurrent && m_stack)
+            m_stack->setCurrentWidget(m_editor);
+        delete splitter;
+        emit commandCapabilitiesChanged();
+        return;
+    }
+
+    if (m_l1Splitter) {
+        m_l1Splitter->setOrientation(orientation);
+        m_editor->show();
+        if (m_splitEditor)
+            m_splitEditor->show();
+        // QSplitter preserves pixel sizes when its orientation changes.  A
+        // width that was valid for a side-by-side split can become a zero
+        // height after switching to a stacked split, leaving the second view
+        // logically alive but invisible.  Rebalance both visible views.
+        const int extent = orientation == Qt::Horizontal
+            ? m_l1Splitter->width() : m_l1Splitter->height();
+        const int half = qMax(1, extent / 2);
+        m_l1Splitter->setSizes({half, half});
+        emit commandCapabilitiesChanged();
+        return;
+    }
+
+    const bool wasCurrent = m_stack && m_stack->currentWidget() == m_editor;
+    const int oldIndex = m_stack ? m_stack->indexOf(m_editor) : 0;
+    m_l1Splitter = new QSplitter(orientation, m_stack);
+    m_l1Splitter->setObjectName(QStringLiteral("editorSplitView"));
+    m_l1Splitter->setChildrenCollapsible(false);
+    m_l1Splitter->addWidget(m_editor);
+    if (m_stack)
+        m_stack->insertWidget(qMax(0, oldIndex), m_l1Splitter);
+
+    m_splitEditor = new QsciScintilla(m_l1Splitter);
+    m_splitEditor->setObjectName(QStringLiteral("secondaryScintillaEditor"));
+    applySharedEditorSurfaceStyle(m_splitEditor);
+    m_splitEditor->setDocument(m_editor->document());
+    m_splitEditor->setMarginType(0, QsciScintilla::NumberMargin);
+    m_splitEditor->setMarginLineNumbers(0, true);
+    m_splitEditor->setMarginWidth(0, "99999");
+    m_splitEditor->setMarginWidth(1, 0);
+    m_splitEditor->setFolding(QsciScintilla::BoxedTreeFoldStyle);
+    m_splitEditor->setEolMode(m_editor->eolMode());
+    m_splitEditor->setReadOnly(m_editor->isReadOnly());
+    m_splitEditor->setScrollWidth(1);
+    m_splitEditor->setScrollWidthTracking(true);
+    m_splitEditor->setIndentationsUseTabs(m_useTabs);
+    m_splitEditor->setTabWidth(m_tabWidth);
+    m_splitEditor->setBackspaceUnindents(m_backspaceUnindents);
+    m_splitEditor->setWhitespaceVisibility(m_whitespaceVisible
+                                               ? QsciScintilla::WsVisible
+                                               : QsciScintilla::WsInvisible);
+    m_splitEditor->setEolVisibility(m_eolVisible);
+    m_splitEditor->setWrapMode(wordWrap() ? QsciScintilla::WrapWord
+                                           : QsciScintilla::WrapNone);
+    m_splitEditor->setWrapVisualFlags(QsciScintilla::WrapFlagByText);
+    m_splitEditor->setWrapIndentMode(QsciScintilla::WrapIndentSame);
+    m_splitEditor->setAutoCompletionSource(m_wordCompletionEnabled
+                                               ? QsciScintilla::AcsAll
+                                               : QsciScintilla::AcsNone);
+    m_splitEditor->setAutoCompletionThreshold(m_wordCompletionEnabled ? 3 : -1);
+    m_splitEditor->SendScintilla(QsciScintillaBase::SCI_SETMULTIPLESELECTION, 1UL);
+    m_splitEditor->SendScintilla(QsciScintillaBase::SCI_SETADDITIONALSELECTIONTYPING, 1UL);
+    m_splitEditor->SendScintilla(QsciScintillaBase::SCI_SETMULTIPASTE,
+                                 QsciScintillaBase::SC_MULTIPASTE_EACH);
+    QsciLexer *lexer = createLexer(m_syntax, m_splitEditor);
+    if (lexer)
+        lexer->setDefaultFont(m_splitEditor->font());
+    m_splitEditor->setLexer(lexer);
+    applyEdgeSettings();
+    m_l1Splitter->addWidget(m_splitEditor);
+    // Reparenting the current page out of QStackedWidget can preserve its
+    // hidden state.  Both editor surfaces must become visible members of the
+    // splitter; otherwise one logical view consumes zero pixels.
+    m_editor->show();
+    m_splitEditor->show();
+    const int extent = orientation == Qt::Horizontal
+        ? m_l1Splitter->width() : m_l1Splitter->height();
+    const int half = qMax(1, extent / 2);
+    m_l1Splitter->setSizes({half, half});
+    connect(m_splitEditor, &QsciScintilla::cursorPositionChanged,
+            this, &EditorTab::cursorPositionChanged);
+    connect(m_splitEditor, &QsciScintilla::selectionChanged,
+            this, &EditorTab::commandCapabilitiesChanged);
+    connect(m_splitEditor, &QsciScintilla::textChanged,
+            this, &EditorTab::commandCapabilitiesChanged);
+    if (wasCurrent && m_stack)
+        m_stack->setCurrentWidget(m_l1Splitter);
+    m_splitEditor->setFocus();
+    emit commandCapabilitiesChanged();
 }
 
 void EditorTab::setDisplayEncoding(TextEncoding enc)
@@ -1665,6 +2115,15 @@ void EditorTab::setViewModeL2(ViewMode mode)
         m_windowedReadOnlyProvider->setPresentation(
             mode == ViewMode::Hex ? WindowedReadOnlyProvider::Presentation::Hex
                                   : WindowedReadOnlyProvider::Presentation::Text);
+        // editor() remains the compatibility surface queried by commands,
+        // session tests and accessibility tooling even while the windowed
+        // provider owns the visible projection. Keep its gutter semantics in
+        // sync so Binary->Text never reports hexadecimal addresses as lines.
+        m_editor->SendScintilla(QsciScintillaBase::SCI_MARGINTEXTCLEARALL);
+        m_editor->setMarginLineNumbers(0, mode == ViewMode::Text);
+        m_editor->setMarginType(0, mode == ViewMode::Text
+                                      ? QsciScintilla::NumberMargin
+                                      : QsciScintilla::TextMargin);
         return;
     }
     // The overlay representation changes between decoded text and a reversible
@@ -1777,6 +2236,10 @@ WindowedReadOnlyProvider *EditorTab::ensureWindowedReadOnlyProvider()
         m_windowedReadOnlyProvider = new WindowedReadOnlyProvider(this);
         m_windowedReadOnlyProvider->setObjectName(
             QStringLiteral("productionWindowedReadOnlyProvider"));
+        m_windowedReadOnlyProvider->editor()->setWhitespaceVisibility(
+            m_whitespaceVisible ? QsciScintilla::WsVisible
+                                : QsciScintilla::WsInvisible);
+        m_windowedReadOnlyProvider->editor()->setEolVisibility(m_eolVisible);
         if (m_stack && m_stack->indexOf(m_windowedReadOnlyProvider) < 0)
             m_stack->addWidget(m_windowedReadOnlyProvider);
         connect(m_windowedReadOnlyProvider->editor(),
@@ -1823,6 +2286,16 @@ bool EditorTab::windowedReadOnlyActive() const
 {
     return m_l2Mode && m_stack && m_windowedReadOnlyProvider
         && m_stack->currentWidget() == m_windowedReadOnlyProvider;
+}
+
+QsciScintilla *EditorTab::editor() const
+{
+    // Expose the actual user-visible Scintilla surface. Returning the dormant
+    // compatibility editor in S2/S3 made menu, accessibility and GUI checks
+    // observe stale Hex margins and scroll state unrelated to the screen.
+    if (windowedReadOnlyActive() && m_windowedReadOnlyProvider)
+        return m_windowedReadOnlyProvider->editor();
+    return m_editor;
 }
 
 EditorTab::LargeDocumentRuntimeState EditorTab::largeDocumentRuntimeState() const
@@ -2176,6 +2649,18 @@ void EditorTab::refreshTextProjectionMargin()
     }
 
     m_editor->SendScintilla(QsciScintillaBase::SCI_MARGINTEXTCLEARALL);
+    const bool wholeDocumentProjection = m_bridge.windowStart == 0
+        && m_bridge.windowLen >= m_l2View->virtualFileSize();
+    if (wholeDocumentProjection) {
+        // A complete byte-preserving Text projection has the same line-number
+        // semantics as an ordinary S1 document. Use Scintilla's native gutter
+        // so Binary -> Text does not retain the visual contract of Hex mode.
+        m_editor->setMarginLineNumbers(0, true);
+        m_editor->setMarginType(0, QsciScintilla::NumberMargin);
+        const int digits = qMax(4, QString::number(qMax(1, m_editor->lines())).size());
+        m_editor->setMarginWidth(0, QString(digits + 2, QLatin1Char('9')));
+        return;
+    }
     m_editor->setMarginLineNumbers(0, false);
     m_editor->setMarginType(0, QsciScintilla::TextMargin);
     const int lines = qMax(1, m_editor->lines());
@@ -3937,6 +4422,7 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
                                 L2Presentation presentation,
                                 L2ContentKind contentKind)
 {
+    setSplitView(false);
     // S2 promotion is deliberately disabled: all mapped documents >= 32 MiB
     // use the same read-only provider as S3.
     const bool inheritedWordWrap = m_editor
@@ -4495,7 +4981,7 @@ void EditorTab::selectAll()
         m_editor->selectAll();
         return;
     }
-    m_editor->selectAll();
+    activeTextEditor()->selectAll();
 }
 
 bool EditorTab::canModifyCommand() const
@@ -4504,7 +4990,21 @@ bool EditorTab::canModifyCommand() const
         || windowedReadOnlyActive() || isReadOnlyByPolicy() || !m_editor) {
         return false;
     }
-    return !m_editor->isReadOnly();
+    return !activeTextEditor()->isReadOnly();
+}
+
+bool EditorTab::supportsTextMutationCommands() const
+{
+    // Native Scintilla mutation commands operate on character positions.  Raw
+    // byte editing and windowed mmap views use different coordinate systems.
+    return canModifyCommand() && !isL2Active() && !isBinaryDocument()
+           && !isSecureDocumentMasked();
+}
+
+bool EditorTab::supportsLexerCommands() const
+{
+    return m_editor && !isL2Active() && !isBinaryDocument()
+           && !isSecureDocumentMasked() && m_syntax != Syntax::Plain;
 }
 
 bool EditorTab::canUndoCommand() const
@@ -4513,7 +5013,7 @@ bool EditorTab::canUndoCommand() const
         return false;
     if (isL2Mode() && m_l2View)
         return m_editor->isUndoAvailable() || m_l2View->canUndo();
-    return m_editor->isUndoAvailable();
+    return activeTextEditor()->isUndoAvailable();
 }
 
 bool EditorTab::canRedoCommand() const
@@ -4522,7 +5022,7 @@ bool EditorTab::canRedoCommand() const
         return false;
     if (isL2Mode() && m_l2View)
         return m_editor->isRedoAvailable() || m_l2View->canRedo();
-    return m_editor->isRedoAvailable();
+    return activeTextEditor()->isRedoAvailable();
 }
 
 bool EditorTab::hasSelectionCommand() const
@@ -4540,7 +5040,7 @@ bool EditorTab::hasSelectionCommand() const
         qint64 end = 0;
         return hexSelectionByteRange(&start, &end) && end > start;
     }
-    return m_editor->hasSelectedText();
+    return activeTextEditor()->hasSelectedText();
 }
 
 void EditorTab::undo()
@@ -4563,7 +5063,7 @@ void EditorTab::undo()
         }
         return;
     }
-    m_editor->undo();
+    activeTextEditor()->undo();
 }
 
 void EditorTab::redo()
@@ -4586,7 +5086,7 @@ void EditorTab::redo()
         }
         return;
     }
-    m_editor->redo();
+    activeTextEditor()->redo();
 }
 
 void EditorTab::cut()
@@ -4607,7 +5107,7 @@ void EditorTab::cut()
         m_editor->cut();
         return;
     }
-    m_editor->cut();
+    activeTextEditor()->cut();
 }
 
 void EditorTab::copy()
@@ -4644,7 +5144,7 @@ void EditorTab::copy()
         m_editor->copy();
         return;
     }
-    m_editor->copy();
+    activeTextEditor()->copy();
 }
 
 void EditorTab::paste()
@@ -4665,7 +5165,7 @@ void EditorTab::paste()
         m_editor->paste();
         return;
     }
-    m_editor->paste();
+    activeTextEditor()->paste();
 }
 
 void EditorTab::setFocusEditor()
@@ -4678,7 +5178,7 @@ void EditorTab::setFocusEditor()
         m_editor->setFocus();
         return;
     }
-    m_editor->setFocus();
+    activeTextEditor()->setFocus();
 }
 
 void EditorTab::gotoByteOffset(qint64 byteOffset, int selectLength)

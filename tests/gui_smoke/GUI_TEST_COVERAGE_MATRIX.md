@@ -116,6 +116,10 @@
 | K20 | 查询状态产生非法组合 | Regex+整词、Regex+Hex、Hex+大小写/整词仍可同时勾选，或 Binary/只读/锁定文档仍启用替换 |
 | K21 | Replace 跳过当前命中 | 用户已选中命中后点击 Replace 却先跳到下一处；或 L1 依赖另一套 Scintilla 查找会话导致无修改 |
 | K22 | L2 批量替换显示 clean | PatchList 已改变但标签 dirty、revision、Undo/Redo、scroll range 或正文 repaint 未更新 |
+| K23 | 快速真实输入未使结果失效 | 投影 guard 尚未退出时用户键入被当成程序化刷新，旧搜索结果仍可跳转或高亮错位 |
+| K24 | 后台统计阻止外部替换文件 | 字符数/索引/搜索长期持有 Windows 源句柄，导致编辑器或外部工具的原子 replace 失败 |
+| K25 | 语言变化但命令状态滞后 | Lexer 已切换而折叠、括号或语言 QAction 仍按旧语法 enabled/checked |
+| K26 | 多选相同文本受旧 target 限制 | “选择全部相同文本”只选择当前/上次查找区间，未覆盖整个文档或误沿用旧搜索 flags |
 
 ## 5. 参数契约展开规则
 
@@ -161,6 +165,13 @@ Delete/Backspace、无选择/正向选择/反向选择、起点/中间/EOF；每
 同时验证 raw bytes、Hex 投影、ASCII 投影、dirty、Undo/Redo 和单滚动条约束。
 Hex 的完整有限边界、操作原语及自动化强度由 `HEX_EDITOR_CONTRACT_MATRIX.md` 管理；专项修复不得
 只补一条复现步骤，必须选择对应 `HX-*` 契约并展开相关状态组合。
+
+上游原生能力批次以 `tc_native_editor_commands_and_capability_routing` 贯穿显示符号、Lexer/fold、
+大小写、全篇同词多选、EOL、缩进和 Text→Hex capability；
+`tc_s1_split_view_shares_document_and_keeps_independent_viewports` 验证共享文档、独立 viewport、
+方向切换、会话序列化和关闭分屏。K23 由 `tc_fr_006_live_overlay_search_snapshot_highlight_and_invalidation`
+守护，K24 由 `productionWindowedPathDoesNotHoldLegacyMmap` 守护；账户扩展用正式 KDBX 的
+`productionExtendedAccountWorkflow` 与 `productionAccountHistoryCanRestorePassword` 守护。
 
 ## 6. 实际工作记录格式
 

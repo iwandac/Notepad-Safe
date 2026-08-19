@@ -193,6 +193,11 @@ bool SessionManager::saveSession(const QVector<EditorTab *> &tabs, int activeInd
             st.presentation = QStringLiteral("text");
         }
         st.modified = tab->isModified();
+        st.splitView = tab->splitViewEnabled();
+        if (st.splitView) {
+            st.splitOrientation = tab->splitOrientation() == Qt::Vertical
+                ? QStringLiteral("vertical") : QStringLiteral("horizontal");
+        }
         st.secureDocument = tab->isSecureDocument();
         if (st.secureDocument) {
             st.documentId = tab->secureDocumentId().toString(QUuid::WithoutBraces);
@@ -301,6 +306,8 @@ bool SessionManager::saveSession(const QVector<EditorTab *> &tabs, int activeInd
         obj["secureDocument"] = st.secureDocument;
         obj["documentId"] = st.documentId;
         obj["presentation"] = st.presentation;
+        obj["splitView"] = st.splitView;
+        obj["splitOrientation"] = st.splitOrientation;
         tabsArray.append(obj);
     }
 
@@ -378,6 +385,8 @@ SessionData SessionManager::loadSession() const
         st.modified = obj["modified"].toBool(false);
         st.autosavePath = obj["autosavePath"].toString();
         st.secureDocument = obj["secureDocument"].toBool(false);
+        st.splitView = obj["splitView"].toBool(false);
+        st.splitOrientation = obj["splitOrientation"].toString();
         st.documentId = obj["documentId"].toString();
         st.presentation = obj["presentation"].toString();
         data.tabs.append(st);

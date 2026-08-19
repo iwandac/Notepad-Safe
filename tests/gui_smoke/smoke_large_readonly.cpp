@@ -174,6 +174,20 @@ class LargeReadOnlySmokeTest final : public QObject {
         return count;
     }
 
+    static int nonCharacterCountTasks(const QSignalSpy &spy)
+    {
+        int count = 0;
+        for (const QList<QVariant> &arguments : spy) {
+            if (arguments.isEmpty())
+                continue;
+            const AsyncTask task = AsyncTaskManager::instance().taskById(
+                arguments.constFirst().toLongLong());
+            if (task.categoryTag != QStringLiteral("CharacterCount"))
+                ++count;
+        }
+        return count;
+    }
+
     static QByteArray scintillaBytes(QsciScintilla *editor)
     {
         const long length = editor->SendScintilla(
@@ -239,6 +253,9 @@ private slots:
         layout->addWidget(tab);
         window.show();
         QVERIFY(QTest::qWaitForWindowExposed(&window));
+        window.raise();
+        window.activateWindow();
+        QTRY_VERIFY_WITH_TIMEOUT(window.isActiveWindow(), 1000);
 
         QString error;
         QVERIFY2(tab->openLargeFileL2(path, &error,
@@ -272,6 +289,9 @@ private slots:
         QVERIFY(source.seek(copiedOffset));
         const QByteArray expectedBytes = source.read(3);
         QCOMPARE(expectedBytes.size(), 3);
+        QVERIFY(source.seek(0));
+        const qint64 expectedFirstOffset = source.readAll().indexOf(expectedBytes);
+        QVERIFY(expectedFirstOffset >= 0);
         const QString expectedHexText = QString::fromLatin1(
             expectedBytes.toHex(' ').toUpper());
         source.close();
@@ -330,8 +350,8 @@ private slots:
         QCOMPARE(tab->l2View()->selectedBytes(), expectedBytes);
         tab->resetSearchPosition(true);
         QTest::mouseClick(findNext, Qt::LeftButton);
-        QCOMPARE(tab->l2View()->selectionStart(), copiedOffset);
-        QCOMPARE(tab->l2View()->selectionEnd(), copiedOffset + 3);
+        QCOMPARE(tab->l2View()->selectionStart(), expectedFirstOffset);
+        QCOMPARE(tab->l2View()->selectionEnd(), expectedFirstOffset + 3);
         dialog.close();
 
         QVERIFY(window.grab().save(
@@ -390,6 +410,9 @@ private slots:
         layout->addWidget(tab);
         window.show();
         QVERIFY(QTest::qWaitForWindowExposed(&window));
+        window.raise();
+        window.activateWindow();
+        QTRY_VERIFY_WITH_TIMEOUT(window.isActiveWindow(), 1000);
 
         QString error;
         QVERIFY2(tab->openLargeFileL2(path, &error,
@@ -487,7 +510,7 @@ private slots:
         // ASCII pane must support both conventional Hex-editor modes. Insert
         // grows the byte stream; overwrite keeps its size. Every key must move
         // the caret and update both projections without touching the disk file.
-        const auto placeAsciiCaret = [tab, ascii](qint64 byteOffset) {
+        const auto placeAsciiCaret = [tab, ascii, &window](qint64 byteOffset) {
             tab->gotoByteOffset(byteOffset, 0);
             QCoreApplication::processEvents();
             const qint64 local = byteOffset
@@ -499,6 +522,8 @@ private slots:
                 return false;
             QTextCursor cursor(ascii->document());
             cursor.setPosition(block.position() + int(local % bytesPerRow));
+            window.raise();
+            window.activateWindow();
             ascii->setFocus(Qt::OtherFocusReason);
             ascii->setTextCursor(cursor);
             QCoreApplication::processEvents();
@@ -987,7 +1012,7 @@ private slots:
         QVERIFY(tab->isL2Mode());
         tab->gotoByteOffset(dragged);
         QTest::qWait(500);
-        QCOMPARE(tasksAdded.count(), 0);
+        QCOMPARE(nonCharacterCountTasks(tasksAdded), 0);
         QVERIFY(tab->isReadOnlyByPolicy());
         QCOMPARE(tab->largeDocumentRuntimeState(),
                  EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis);
@@ -1209,7 +1234,6 @@ private slots:
         QVERIFY2(!tab->l2View()->isOpen(),
                  "the hidden legacy VirtualFileView must not mmap a windowed document");
         QCOMPARE(tab->l2View()->mmapSize(), qint64(0));
-
         QByteArray replacement = QByteArrayLiteral(
             "PRODUCTION_REPLACED marker=NO_HIDDEN_MMAP\n");
         replacement += QByteArray(1024 * 1024, 'r');
@@ -1282,7 +1306,7 @@ private slots:
         QString error;
         QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
         QTest::qWait(500);
-        QCOMPARE(added.count(), 0);
+        QCOMPARE(nonCharacterCountTasks(added), 0);
         QCOMPARE(tab->largeDocumentRuntimeState(),
                  EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis);
         QVERIFY(tab->isL2Mode());
@@ -1528,7 +1552,7 @@ private slots:
         QVERIFY(provider->editor()->geometry().right()
                 <= ascii->geometry().left());
         QTest::qWait(1000);
-        QCOMPARE(tasksAdded.count(), 0);
+        QCOMPARE(nonCharacterCountTasks(tasksAdded), 0);
         QCOMPARE(provider->globalOffset(), dragged);
         QCOMPARE(provider->editor()->text(0), firstLine);
 
@@ -1596,7 +1620,7 @@ private slots:
         QCOMPARE(tab->largeDocumentRuntimeState(),
                  EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis);
         QTest::qWait(500);
-        QCOMPARE(tasksAdded.count(), 0);
+        QCOMPARE(nonCharacterCountTasks(tasksAdded), 0);
         auto *provider = tab->windowedReadOnlyProvider();
         QVERIFY(provider);
         const QByteArray before = provider->sourceBytes(0, 32);

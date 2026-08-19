@@ -282,3 +282,26 @@
 - `test_session` 68/68（含跨 8 MiB UTF-8 分块边界）；聚焦 GUI 用例
   `tc_background_task_center_lifecycle` 与
   `tc_status_bar_reports_unicode_characters_and_hex_bytes` 通过，并人工检查截图无状态栏重叠。
+
+## 11. 2026-08-18 — 上游原生能力与账户体验收敛
+
+- 按 `DESIGN.md` 第 19 章把 QScintilla 原生编辑能力和 KeePassXC Core 可复用能力收敛为 15 个
+  FeatureId；Steam Guard、打印/宏、Auto-Type、浏览器集成、硬件挑战响应和破坏性组级 CRUD
+  保持明确排除，不用半实现扩大产品表面积。
+- 编辑器新增显示符号、EOL 转换、原生行/选择变换、多重选择、括号/折叠、缩进/当前文档补全、
+  14 类常用 Lexer 及共享 `QsciDocument` 分屏。命令在 S1/Secure Text 可用，在 Hex/S2/S3
+  依据 capability 禁用；分屏方向进入会话数据并在恢复后重建。
+- 账户工作区新增可配置密码生成器、标准 TOTP URI/算法/位数/周期、附加 URL、保护/公开自定义
+  字段、过期状态、历史差异/删除/清理、离线弱密码/复用/过期检查，以及路径式分组、克隆和排序。
+  KDBX 元数据序列化断言继续禁止密码、TOTP secret 与受保护字段明文。
+- 失败优先验证发现并修复七个邻接问题：Lexer 切换后动作状态滞后；多选同词沿用旧 target range；
+  快速真实输入被投影 guard 吞掉 revision；S2/S3 字符统计长期持有源句柄阻止外部原子替换；
+  B1 Binary→Text 完整投影错误显示绝对 byte margin；分屏重挂后主视图保持 hidden 且错误地用
+  `{1,1}` 像素分配尺寸；健康检查把内部英文 issue code 直接展示给中文用户。
+- 大文件完整套件首次连续运行还发现 Qt 测试第二个顶层窗口未获得前台焦点，键盘事件没有送达
+  ASCII pane；测试现在显式激活顶层窗口再设置输入焦点，聚焦与完整套件均通过。这是测试注入
+  稳定性修正，不以单次焦点偶然成功替代产品数据断言。
+- 最终动态结果：smallfixes 41/41、find/replace 34/34、S2/S3/Hex 22/22、vault 8/8、secure
+  documents 8/8、核心单元/安全/KDBX/供应链 10/10。正式 `build-slice/notepad-safe.exe`
+  与测试从同一源码和依赖重新链接。本记录只关闭第 19 章范围，第 18 章三批全产品成熟度门槛
+  仍保持有效。

@@ -1969,3 +1969,109 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 
 以上三批未完成前，不得把成熟度标记为 50% 以上，不得生成新发布候选。每批只运行受影响
 测试和少量邻接回归；阶段门才运行全矩阵，以控制剩余资源。
+
+## 19. 上游原生能力收敛批次（2026-08-18）
+
+本章把已静态核对、已经进入当前供应链与编译闭包、且符合产品哲学的 QScintilla 与
+KeePassXC Core 能力列为一个完整纵向批次。目标不是把上游所有 API 平铺为菜单，而是补齐
+用户可理解、可在当前 Provider 能力矩阵中稳定工作的功能。每项实现必须复用统一命令状态、
+会话、安全剪贴板、保存和 GUI 验收路径；禁止为安全文档或 Hex 再建立一套平行菜单。
+
+### 19.1 本批次实施清单
+
+| FeatureId | 功能 | 产品入口 | 允许范围 | 本轮状态与完成门槛 |
+|---|---|---|---|---|
+| `NATIVE-EDIT-001` | 显示空格/Tab、显示行尾符 | 视图 → 显示符号 | S1/Secure Text；S2/S3 Text 只读显示 | 切换、标签同步、重启持久化；不改变正文或 dirty |
+| `NATIVE-EDIT-002` | CRLF/LF/CR 真正转换 | 编辑 → 行尾转换 | 仅可编辑 Text | 全文转换为一次 Undo；保存重开字节正确；只读/Hex 禁用 |
+| `NATIVE-EDIT-003` | 多光标、矩形选择、选择下一个/全部相同文本 | 编辑 → 多重选择 | 仅 S1/Secure Text | Ctrl+鼠标、键盘列选、多处输入/删除/粘贴、一次 Undo；其它 Provider 禁用 |
+| `NATIVE-EDIT-004` | 原生行与选择变换 | 编辑 → 行操作/大小写 | 仅可编辑 Text | 复制/删除/移动所选行、转置、大小写、合并/拆分均保持选择与 EOL，Undo 原子化 |
+| `NATIVE-EDIT-005` | 折叠与括号导航 | 搜索/视图 | 有 Lexer 的 S1/Secure Text | 当前层/全部折叠展开、跳转/选择匹配括号；Plain/Hex/只读投影不出现空功能 |
+| `NATIVE-EDIT-006` | 缩进与文档单词补全设置 | 设置型子菜单 | S1/Secure Text | Tab/空格、宽度、退格反缩进、补全开关即时生效并持久化 |
+| `NATIVE-EDIT-007` | 常用 Lexer 扩充与扩展名识别 | 语言菜单 | S1/Secure Text | 在现有 8 种上增加 JS、Java、C#、CSS、Bash、Batch、CMake、Makefile、Lua、Ruby、Perl、Diff、Properties、ASM；手选/自动识别/会话恢复一致 |
+| `NATIVE-EDIT-008` | 同一 S1 文档上下/左右分屏 | 视图 → 分屏 | 仅 S1/Secure Text | 两视图共享一个 QsciDocument/Undo/dirty，光标状态以焦点视图为准；锁定时两视图同时清除明文 |
+| `NATIVE-ACCOUNT-001` | 可配置密码生成器 | 账户密码字段“生成” | Accounts | 长度、字符组、排除易混、自定义/排除字符经过 KeePassXC PasswordGenerator；结果强度和保存正确 |
+| `NATIVE-ACCOUNT-002` | 标准 TOTP 配置 | 账户验证码设置 | Accounts | 已完成：支持 Base32 与 `otpauth://`、SHA-1/256/512、6–8 位、周期、issuer/account 与移除；非法输入禁止保存，代码与剩余秒数正确 |
+| `NATIVE-ACCOUNT-003` | 受保护自定义字段与附加 URL | 账户“更多字段” | Accounts | 增删改、保护显示/复制、搜索非秘密字段、KDBX 往返不丢未知字段 |
+| `NATIVE-ACCOUNT-004` | 过期时间与本地提醒 | 账户详情/列表 | Accounts | 不过期/指定时间/立即过期、即将过期状态、离线计算、时区和重开一致 |
+| `NATIVE-ACCOUNT-005` | 历史差异、单项删除与清理 | 账户历史 | Accounts | 只读差异、恢复、删除所选/全部、历史上限；当前版本始终可恢复且保存原子化 |
+| `NATIVE-ACCOUNT-006` | 本地安全检查 | 账户工作区 | Accounts | 弱密码、重复密码、过期账号离线汇总；不泄漏密码，不联网，不持久化秘密报告 |
+| `NATIVE-ACCOUNT-007` | 分组、克隆账号与排序 | 账户树/上下文动作 | Accounts | 已完成本轮范围：斜杠路径创建/移动分组、克隆账号、树排序/过滤与 KDBX 层级保留；账号回收恢复、搜索与标签不受层级限制 |
+
+### 19.2 明确不纳入本批次
+
+- QScintilla 打印和持久化宏会把安全正文交给打印队列或宏存储；在建立独立泄漏模型前不开放。
+- QsciAPIs 只提供补全展示/索引框架，没有语言语义；不把它包装成伪语言服务器。
+- Annotation、Indicator、Hotspot 是搜索/诊断的实现原语，不单独成为用户功能。
+- KeePassXC 普通附件会与一等安全文件入口重复，并可能产生明文临时文件；继续只允许产品保留的
+  内部 Text/Binary payload 附件。
+- PassphraseGenerator、Auto-Type、浏览器集成、Passkey、SSH Agent、KeeShare、数据库合并和
+  外部格式导入没有进入当前无界面编译闭包；不得通过局部复制上游 GUI 绕过供应链审查。
+- Cipher/KDF/Argon2 参数继续使用审计后的产品默认；普通用户界面不提供危险的密码学旋钮。
+- 当前 YubiKey 链接的是 Stub，界面不得声称支持硬件挑战响应。
+- Steam Guard 不是 RFC 6238 标准 TOTP，本轮不以近似算法伪装支持；待引入上游可验证实现和
+  golden vectors 后再评估。
+- 空组重命名/删除、拖拽整组和组级回收并非账户核心路径，本轮只提供账号的路径式创建/移动、
+  克隆和排序；不得把缺失的破坏性组操作宣传为已经完成。
+
+### 19.3 Provider 与安全约束
+
+1. `NATIVE-EDIT-*` 的完整修改语义只属于 `<32 MiB` 的 TextEditorProvider，包括解锁后的
+   Secure Text。B1 Hex 继续由 byte model 决定输入；S2/S3/B2/B3 继续永久只读。
+2. S2/S3 Text 可以复用“显示空白/行尾”视觉设置，但不得把折叠、多光标、行尾转换或分屏
+   偷渡到有界投影；这些命令在能力控制器中必须禁用或隐藏。
+3. 分屏不得复制正文。两个 Scintilla view 共享一个 `QsciDocument`；安全锁定先停止补全/宏等
+   transient state，再清空共享文档和 Undo。关闭第二视图不能改变保存点或 revision。
+4. 文档单词补全只使用当前内存文档，不生成 `.api/.pap` 或安全内容索引文件。安全标签关闭或
+   锁定后不得留下补全缓存；S2/S3 不扫描窗口外内容建立补全词表。
+5. 账户新字段通过 `AccountService/IVaultBackend` 的值对象传递，UI 不直接持有 KeePassXC
+   `Entry/Group/Metadata` 指针。未知 KDBX 自定义字段、附件、图标和组数据必须在普通编辑后保留。
+6. 健康检查在内存中比较经短期 lease 取得的秘密；结果只包含 EntryId 和问题类型，结束后清零
+   所有密码字节，不写 session、日志、截图或搜索 spool。
+
+### 19.4 GUI 验收矩阵
+
+编辑器每个 FeatureId 至少覆盖 Plain S1、Secure Text、B1 Hex、S2/S3 Text、B2/B3 Hex 的
+enabled/visible/checked、快捷键、真实鼠标与键盘触发、Undo、保存重开和标签切换。显示类设置还要
+覆盖 wrap、深浅主题和 150%/200% DPI；多重选择必须覆盖中文 IME、反向选择、矩形粘贴和多个
+不同长度选区。分屏必须覆盖搜索高亮、两视图不同滚动位置、关闭一侧、会话恢复与立即锁定。
+
+账户每个 FeatureId 使用正式 KDBX=ON 程序执行新建、编辑、取消、保存、重开、历史、回收站、
+外部 KeePassXC 兼容文件和锁定/七天会话邻接轨迹；秘密字段截图只允许遮罩值。TOTP 使用固定
+时钟 golden 验证算法/位数/周期，健康检查使用确定性测试条目，分组迁移还必须证明未知属性和
+非产品附件的 hash 未变化。
+
+### 19.5 实施状态与动态证据（2026-08-18）
+
+本章 15 个 FeatureId 已按 19.2 的排除项与上表收紧后的范围完成，不代表第 18 章的全产品
+成熟度门槛已经关闭。编辑器实现复用同一 `EditorTab/MainWindow` 命令与 capability 路由：
+空白/行尾显示不改 dirty，EOL/行/选择/多重选择均走 Scintilla 原生命令，新增 14 类常用 Lexer，
+S1 与解锁后的 Secure Text 可以建立共享 `QsciDocument` 的左右/上下分屏并保存会话方向；
+Hex 与 S2/S3 不显示可执行的伪入口。账户实现通过 `VaultService/IVaultBackend` 值对象往返
+标准 TOTP、附加 URL、保护/公开自定义字段、过期时间、历史、离线健康结果和分组路径，元数据
+不保存密码、TOTP secret 或受保护字段明文。
+
+本轮失败优先验证额外关闭了七个跨功能缺陷：
+
+1. 语言切换后立即同步折叠与括号动作状态，避免 Lexer 已变化而菜单仍是旧 capability。
+2. “选择全部相同文本”先把 Scintilla target 设为整个文档，避免只在上一次查找区间内增加选择。
+3. 搜索投影的真实快速键入通过 `SC_PERFORMED_USER` 立即增加 revision，避免误当成内部刷新而保留
+   可跳转的过期结果。
+4. S2/S3 Unicode 总字符数改为短期开/读/关的 1 MiB 分块，并提供启动宽限和块间取消点；后台
+   统计不再长期占用 Windows 源文件句柄、阻止 `QSaveFile`/外部工具原子替换。
+5. B1 Binary→Text 完整投影使用原生行号 margin；只有有界窗口投影显示绝对文本行，消除切换
+   后把 byte 地址误当文本行号的回退。
+6. 编辑器从 `QStackedWidget` 重挂到分屏后显式显示两个视图，并按当前方向的真实像素 50/50
+   分配；GUI 门禁要求两个窗格同时可见，不能只凭隐藏 widget 的共享文档断言通过。
+7. 账户健康检查只在内部保留稳定 issue code，用户界面显示“已到期/弱密码/重复使用/未设置
+   密码”，避免中英文内部协议混排。
+
+动态证据：`gui_smoke_smallfixes` 41/41、`gui_smoke_findreplace` 34/34、
+`gui_smoke_large_readonly` 22/22、`gui_smoke_vault` 8/8、
+`gui_smoke_secure_documents` 8/8；核心单元/契约/供应链锁定 10/10。关键真实 GUI 用例包括
+`tc_native_editor_commands_and_capability_routing`、
+`tc_s1_split_view_shares_document_and_keeps_independent_viewports`、
+`tc_fr_006_live_overlay_search_snapshot_highlight_and_invalidation`、
+`productionWindowedPathDoesNotHoldLegacyMmap` 与 `productionExtendedAccountWorkflow`。
+最终应用与这些用例从同一源码和锁定依赖重新链接；截图证据包括
+`build-slice/gui-native-editor-commands.png`、`build-slice/gui-s1-shared-split-view.png`、
+`gui-account-extended-fields.png` 和 `gui-account-health.png`。

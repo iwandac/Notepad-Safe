@@ -60,8 +60,22 @@ public:
     }
     virtual VaultError currentTotp(const QUuid &id, VaultTotpSnapshot *snapshot) const = 0;
     virtual VaultError generatePassword(int length, SecureBuffer *passwordUtf8) const = 0;
+    virtual VaultError generatePassword(const VaultPasswordGenerationOptions &options,
+                                        SecureBuffer *passwordUtf8) const
+    {
+        return generatePassword(options.length, passwordUtf8);
+    }
     virtual VaultError assessPassword(const SecureBuffer &passwordUtf8,
                                       VaultPasswordAssessment *assessment) const = 0;
+    virtual QList<VaultHealthFinding> passwordHealthReport(VaultError *error) const
+    {
+        if (error) {
+            *error = {VaultErrorCode::UnsupportedFormat,
+                      QStringLiteral("当前后端不支持密码健康检查。"),
+                      QStringLiteral("vault.health.unsupported")};
+        }
+        return {};
+    }
     virtual QList<VaultEntryHistorySummary> entryHistory(
         const QUuid &, VaultError *error) const
     {
@@ -77,6 +91,18 @@ public:
         return {VaultErrorCode::UnsupportedFormat,
                 QStringLiteral("当前后端不支持账号历史恢复。"),
                 QStringLiteral("vault.history.restore.unsupported")};
+    }
+    virtual VaultError removeEntryHistory(const QUuid &, int)
+    {
+        return {VaultErrorCode::UnsupportedFormat,
+                QStringLiteral("不支持删除条目历史。"),
+                QStringLiteral("vault.history.remove.unsupported")};
+    }
+    virtual VaultError clearEntryHistory(const QUuid &)
+    {
+        return {VaultErrorCode::UnsupportedFormat,
+                QStringLiteral("不支持清理条目历史。"),
+                QStringLiteral("vault.history.clear.unsupported")};
     }
     virtual VaultError upsertEntry(VaultEntryData &&entry) = 0;
     virtual VaultError recycleEntry(const QUuid &id) = 0;

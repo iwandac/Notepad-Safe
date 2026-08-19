@@ -157,6 +157,13 @@ private:
     QAction *m_actAppearanceSystem = nullptr;
     QAction *m_actAppearanceLight = nullptr;
     QAction *m_actWordWrap = nullptr;
+    QAction *m_actSplitHorizontal = nullptr;
+    QAction *m_actSplitVertical = nullptr;
+    QAction *m_actWhitespaceVisible = nullptr;
+    QAction *m_actEolVisible = nullptr;
+    QAction *m_actUseTabs = nullptr;
+    QAction *m_actBackspaceUnindents = nullptr;
+    QAction *m_actWordCompletion = nullptr;
     QAction *m_actEdgeVisible = nullptr;
     QAction *m_actTextViewMode = nullptr;
     QAction *m_actHexViewMode = nullptr;
@@ -184,8 +191,11 @@ private:
     QLabel *m_securitySessionStatus = nullptr;
     QLabel *m_securityRecoveryStatus = nullptr;
     QActionGroup *m_edgeColGroup = nullptr;   // 长行标尺列数组，遍历其 action 同步勾选
+    QActionGroup *m_tabWidthGroup = nullptr;
     QVector<QAction *> m_documentOnlyActions;
     QVector<QAction *> m_textMutationActions;
+    QVector<QAction *> m_nativeTextActions;
+    QVector<QAction *> m_lexerActions;
     QVector<QAction *> m_languageActions;
     QVector<QAction *> m_displayEncodingActions;
 
@@ -202,6 +212,12 @@ private:
 
     // 自动换行
     bool m_wordWrap = false;
+    bool m_whitespaceVisible = false;
+    bool m_eolVisible = false;
+    bool m_useTabs = false;
+    int m_tabWidth = 4;
+    bool m_backspaceUnindents = true;
+    bool m_wordCompletion = true;
     bool m_searchDockWasVisibleBeforeWorkspace = false;
 
     // 查找历史
@@ -244,6 +260,7 @@ private:
     void updateStatusBar();
     void showWorkspaceStatus(const QString &workspaceName);
     void updateRecentFiles(const QString &path);
+    void applyEditorPreferences(EditorTab *tab);
     void rebuildRecentFilesMenu();
     void applyDarkMode(bool dark);
     void applyAppearanceMode();

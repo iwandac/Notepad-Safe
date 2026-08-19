@@ -417,24 +417,19 @@ void WindowedReadOnlyProvider::startCharacterCount()
         (qint64, AsyncCancelPtr cancel,
          std::function<void(qint64, qint64)> reportProgress,
          std::function<void(const AsyncErrorInfo &)> reportError) {
-            SharedReadOnlyFile reader;
             QString openError;
-            if (!openSharedReadOnlyFile(reader, path, &openError)) {
-                AsyncErrorInfo error;
-                error.message = QObject::tr("无法统计字符数：%1").arg(openError);
-                if (reportError)
-                    reportError(error);
-                QMetaObject::invokeMethod(guard, [guard, generation]() {
-                    if (!guard || guard->m_characterCountGeneration != generation)
-                        return;
-                    guard->m_characterCountPending = false;
-                    guard->m_characterCountTaskId = -1;
-                    emit guard->characterCountChanged(-1, false);
-                }, Qt::QueuedConnection);
-                return;
+            // Leave a short edit/save grace period and never retain a source
+            // handle for the duration of a multi-GiB scan. On Windows even a
+            // share-delete reader can make QSaveFile's atomic rename fail.
+            // Brief per-chunk handles preserve exact counting while leaving
+            // regular gaps for editors and log rotators to replace the path.
+            for (int wait = 0; wait < 25; ++wait) {
+                if (cancel && cancel->load(std::memory_order_acquire))
+                    return;
+                QThread::msleep(10);
             }
 
-            constexpr qint64 chunkBytes = 8LL * 1024 * 1024;
+            constexpr qint64 chunkBytes = 1LL * 1024 * 1024;
             QStringDecoder decoder("UTF-8");
             qint64 totalCharacters = 0;
             qint64 offset = 0;
@@ -443,8 +438,24 @@ void WindowedReadOnlyProvider::startCharacterCount()
                 if (cancel && cancel->load(std::memory_order_acquire))
                     return;
                 const qint64 wanted = qMin(chunkBytes, size - offset);
+                SharedReadOnlyFile reader;
+                if (!openSharedReadOnlyFile(reader, path, &openError)) {
+                    AsyncErrorInfo error;
+                    error.message = QObject::tr("无法统计字符数：%1").arg(openError);
+                    if (reportError)
+                        reportError(error);
+                    QMetaObject::invokeMethod(guard, [guard, generation]() {
+                        if (!guard || guard->m_characterCountGeneration != generation)
+                            return;
+                        guard->m_characterCountPending = false;
+                        guard->m_characterCountTaskId = -1;
+                        emit guard->characterCountChanged(-1, false);
+                    }, Qt::QueuedConnection);
+                    return;
+                }
                 const QByteArray chunk = reader.readAt(
                     offset, static_cast<qsizetype>(wanted), &openError);
+                reader.close();
                 if (chunk.isEmpty() && wanted > 0) {
                     AsyncErrorInfo error;
                     error.message = QObject::tr("统计字符数时读取失败：%1").arg(openError);
@@ -470,8 +481,8 @@ void WindowedReadOnlyProvider::startCharacterCount()
                 offset += chunk.size();
                 if (reportProgress)
                     reportProgress(offset, size);
+                QThread::msleep(2);
             }
-            reader.close();
             if (cancel && cancel->load(std::memory_order_acquire))
                 return;
             QMetaObject::invokeMethod(
@@ -1254,8 +1265,11 @@ void WindowedReadOnlyProvider::configureProjectionMargin()
     // the lines currently represented by the editor; a future completed global
     // LineIndex may supply an absolute base without changing the visual mode.
     directScintilla(m_editor, QsciScintillaBase::SCI_MARGINTEXTCLEARALL);
-    m_editor->setMarginType(0, QsciScintilla::NumberMargin);
+    // QScintilla's setMarginLineNumbers() also selects its own margin type.
+    // Apply the explicit contract last so a Hex -> Text transition cannot
+    // leave margin 0 reported (or rendered) as a TextMargin.
     m_editor->setMarginLineNumbers(0, true);
+    m_editor->setMarginType(0, QsciScintilla::NumberMargin);
     const int lines = std::max(1, static_cast<int>(directScintilla(
         m_editor, QsciScintillaBase::SCI_GETLINECOUNT)));
     const int lineDigits = std::max(

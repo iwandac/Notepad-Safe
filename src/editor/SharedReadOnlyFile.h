@@ -47,7 +47,7 @@ public:
             reinterpret_cast<LPCWSTR>(m_path.utf16()), GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr, OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
             nullptr);
         if (m_fileHandle == INVALID_HANDLE_VALUE) {
             setWindowsError(QStringLiteral("CreateFile"));
@@ -99,26 +99,20 @@ public:
         while (completed < wanted) {
             const DWORD piece = static_cast<DWORD>(std::min<quint64>(
                 wanted - completed, std::numeric_limits<DWORD>::max()));
-            OVERLAPPED operation{};
             const quint64 absolute = static_cast<quint64>(offset) + completed;
-            operation.Offset = static_cast<DWORD>(absolute & 0xffffffffULL);
-            operation.OffsetHigh = static_cast<DWORD>(absolute >> 32);
-            operation.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            if (!operation.hEvent) {
+            LARGE_INTEGER position{};
+            position.QuadPart = static_cast<LONGLONG>(absolute);
+            if (!::SetFilePointerEx(m_fileHandle, position, nullptr, FILE_BEGIN)) {
                 if (error)
-                    *error = QStringLiteral("CreateEvent failed with Windows error %1")
+                    *error = QStringLiteral("SetFilePointerEx failed with Windows error %1")
                                  .arg(static_cast<qulonglong>(::GetLastError()));
                 return {};
             }
             DWORD received = 0;
-            const BOOL immediate = ::ReadFile(
+            const BOOL ok = ::ReadFile(
                 m_fileHandle, result.data() + static_cast<qsizetype>(completed),
-                piece, &received, &operation);
-            bool ok = immediate != FALSE;
-            if (!ok && ::GetLastError() == ERROR_IO_PENDING)
-                ok = ::GetOverlappedResult(m_fileHandle, &operation, &received, TRUE) != FALSE;
+                piece, &received, nullptr);
             const DWORD nativeError = ok ? ERROR_SUCCESS : ::GetLastError();
-            ::CloseHandle(operation.hEvent);
             if (!ok) {
                 if (error) {
                     *error = QStringLiteral("ReadFile failed with Windows error %1")

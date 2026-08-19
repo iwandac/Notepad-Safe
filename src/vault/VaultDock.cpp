@@ -6,10 +6,13 @@
 #endif
 
 #include <QCheckBox>
+#include <QComboBox>
 #include <QClipboard>
 #include <QApplication>
 #include <QCryptographicHash>
+#include <QColor>
 #include <QDesktopServices>
+#include <QDateTimeEdit>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFileDialog>
@@ -18,6 +21,7 @@
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QHash>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -29,9 +33,11 @@
 #include <QSignalBlocker>
 #include <QSplitter>
 #include <QStackedWidget>
+#include <QSpinBox>
 #include <QTextEdit>
 #include <QTimer>
 #include <QUrl>
+#include <QUrlQuery>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 #include <QSettings>
@@ -43,6 +49,7 @@
 #include <QRegularExpression>
 
 #include <algorithm>
+#include <functional>
 
 #ifdef Q_OS_WIN
 #include <Windows.h>
@@ -263,10 +270,20 @@ void VaultDock::buildUi()
     filterEdit_->setClearButtonEnabled(true);
     filterEdit_->setPlaceholderText(tr("搜索标题、用户名、网址、标签或备注"));
     filterEdit_->setMinimumHeight(34);
+    sortCombo_ = new QComboBox(openPage_);
+    sortCombo_->setObjectName(QStringLiteral("vaultSortCombo"));
+    sortCombo_->addItem(tr("标题排序"), QStringLiteral("title"));
+    sortCombo_->addItem(tr("用户名排序"), QStringLiteral("username"));
+    sortCombo_->addItem(tr("分组排序"), QStringLiteral("group"));
+    healthButton_ = new QPushButton(tr("健康检查"), openPage_);
+    healthButton_->setObjectName(QStringLiteral("vaultHealthButton"));
+    healthButton_->setMinimumHeight(34);
     newLoginButton_->setParent(openPage_);
     newLoginButton_->setText(tr("+ 新建账号"));
     newLoginButton_->setMinimumHeight(34);
     searchRow->addWidget(filterEdit_, 1);
+    searchRow->addWidget(sortCombo_);
+    searchRow->addWidget(healthButton_);
     searchRow->addWidget(newLoginButton_);
     openLayout->addWidget(searchRowWidget_);
 
@@ -395,6 +412,9 @@ void VaultDock::buildUi()
     historyButton_ = new QPushButton(tr("历史"), detailHeader);
     historyButton_->setObjectName(QStringLiteral("vaultHistoryButton"));
     historyButton_->setToolTip(tr("查看并恢复 KeePassXC 条目历史"));
+    cloneButton_ = new QPushButton(tr("克隆"), detailHeader);
+    cloneButton_->setObjectName(QStringLiteral("vaultCloneButton"));
+    cloneButton_->setToolTip(tr("复制此账号及其扩展字段，在当前分组中创建新条目"));
     saveButton_ = new QPushButton(tr("保存"), detailHeader);
     saveButton_->setObjectName(QStringLiteral("vaultSaveButton"));
     cancelButton_ = new QPushButton(tr("取消"), detailHeader);
@@ -408,6 +428,7 @@ void VaultDock::buildUi()
     detailHeaderLayout->addWidget(cancelButton_);
     detailHeaderLayout->addWidget(editButton_);
     detailHeaderLayout->addWidget(historyButton_);
+    detailHeaderLayout->addWidget(cloneButton_);
     detailHeaderLayout->addWidget(restoreButton_);
     detailHeaderLayout->addWidget(deleteButton_);
     editorLayout->addWidget(detailHeader);
@@ -437,6 +458,30 @@ void VaultDock::buildUi()
     tagsEdit_ = new QLineEdit(editor);
     tagsEdit_->setObjectName(QStringLiteral("vaultTagsEdit"));
     tagsEdit_->setPlaceholderText(tr("多个标签用逗号分隔"));
+    groupEdit_ = new QLineEdit(editor);
+    groupEdit_->setObjectName(QStringLiteral("vaultGroupEdit"));
+    groupEdit_->setPlaceholderText(tr("例如：工作/生产环境"));
+    additionalUrlsEdit_ = new QPlainTextEdit(editor);
+    additionalUrlsEdit_->setObjectName(QStringLiteral("vaultAdditionalUrlsEdit"));
+    additionalUrlsEdit_->setPlaceholderText(tr("每行一个备用网址"));
+    additionalUrlsEdit_->setMaximumHeight(72);
+    customFieldsEdit_ = new QPlainTextEdit(editor);
+    customFieldsEdit_->setObjectName(QStringLiteral("vaultCustomFieldsEdit"));
+    customFieldsEdit_->setPlaceholderText(
+        tr("每行 name=value；默认加密保护，public:name=value 表示公开字段"));
+    customFieldsEdit_->setMaximumHeight(92);
+    expiryCheck_ = new QCheckBox(tr("此账号会过期"), editor);
+    expiryCheck_->setObjectName(QStringLiteral("vaultExpiryCheck"));
+    expiryEdit_ = new QDateTimeEdit(editor);
+    expiryEdit_->setObjectName(QStringLiteral("vaultExpiryEdit"));
+    expiryEdit_->setCalendarPopup(true);
+    expiryEdit_->setDisplayFormat(QStringLiteral("yyyy-MM-dd HH:mm"));
+    expiryEdit_->setDateTime(QDateTime::currentDateTime().addMonths(3));
+    expiryRow_ = new QWidget(editor);
+    auto *expiryLayout = new QHBoxLayout(expiryRow_);
+    expiryLayout->setContentsMargins(0, 0, 0, 0);
+    expiryLayout->addWidget(expiryCheck_);
+    expiryLayout->addWidget(expiryEdit_, 1);
     passwordEdit_ = new QLineEdit(editor);
     passwordEdit_->setObjectName(QStringLiteral("vaultPasswordEdit"));
     passwordEdit_->setEchoMode(QLineEdit::Password);
@@ -445,10 +490,17 @@ void VaultDock::buildUi()
     copyPasswordButton_->setToolTip(tr("复制密码；30 秒后自动清除剪贴板"));
     generatePasswordButton_ = new QPushButton(tr("生成"), editor);
     generatePasswordButton_->setObjectName(QStringLiteral("vaultGeneratePasswordButton"));
-    generatePasswordButton_->setToolTip(tr("使用 KeePassXC 密码生成器创建 24 位强密码"));
+    generatePasswordButton_->setToolTip(tr("配置并使用 KeePassXC 密码生成器"));
     totpEdit_ = new QLineEdit(editor);
     totpEdit_->setObjectName(QStringLiteral("vaultTotpEdit"));
     totpEdit_->setEchoMode(QLineEdit::Password);
+    totpInputRow_ = new QWidget(editor);
+    auto *totpInputLayout = new QHBoxLayout(totpInputRow_);
+    totpInputLayout->setContentsMargins(0, 0, 0, 0);
+    totpInputLayout->addWidget(totpEdit_, 1);
+    totpConfigureButton_ = new QPushButton(tr("设置…"), totpInputRow_);
+    totpConfigureButton_->setObjectName(QStringLiteral("vaultTotpConfigureButton"));
+    totpInputLayout->addWidget(totpConfigureButton_);
     showPasswordCheck_ = new QCheckBox(tr("显示密码"), editor);
     showPasswordCheck_->setObjectName(QStringLiteral("vaultShowPasswordCheck"));
     notesEdit_ = new QTextEdit(editor);
@@ -462,6 +514,10 @@ void VaultDock::buildUi()
     formLayout_->addRow(urlLabel_, urlRow_);
     tagsLabel_ = new QLabel(tr("标签"), editor);
     formLayout_->addRow(tagsLabel_, tagsEdit_);
+    formLayout_->addRow(tr("分组"), groupEdit_);
+    formLayout_->addRow(tr("备用网址"), additionalUrlsEdit_);
+    formLayout_->addRow(tr("自定义字段"), customFieldsEdit_);
+    formLayout_->addRow(tr("到期"), expiryRow_);
     passwordLabel_ = new QLabel(tr("密码"), editor);
     passwordRow_ = new QWidget(editor);
     auto *passwordLayout = new QHBoxLayout(passwordRow_);
@@ -476,7 +532,7 @@ void VaultDock::buildUi()
     passwordStrengthLabel_->setObjectName(QStringLiteral("vaultPasswordStrengthLabel"));
     formLayout_->addRow(passwordStrengthCaption_, passwordStrengthLabel_);
     totpLabel_ = new QLabel(tr("验证码密钥"), editor);
-    formLayout_->addRow(totpLabel_, totpEdit_);
+    formLayout_->addRow(totpLabel_, totpInputRow_);
     totpCodeRow_ = new QWidget(editor);
     auto *totpCodeLayout = new QHBoxLayout(totpCodeRow_);
     totpCodeLayout->setContentsMargins(0, 0, 0, 0);
@@ -535,6 +591,11 @@ void VaultDock::buildUi()
     connect(emptyCreateButton_, &QPushButton::clicked, this, &VaultDock::createLogin);
     connect(newNoteButton_, &QPushButton::clicked, this, &VaultDock::createSecureNote);
     connect(filterEdit_, &QLineEdit::textChanged, this, &VaultDock::applyFilter);
+    connect(sortCombo_, &QComboBox::currentIndexChanged, this, [this](int) {
+        refreshEntries(currentEntryId_);
+    });
+    connect(healthButton_, &QPushButton::clicked,
+            this, &VaultDock::showPasswordHealthReport);
     connect(entryTree_, &QTreeWidget::currentItemChanged,
             this, &VaultDock::onCurrentItemChanged);
     connect(entryTree_, &QTreeWidget::itemDoubleClicked, this,
@@ -553,6 +614,8 @@ void VaultDock::buildUi()
     connect(editButton_, &QPushButton::clicked, this, &VaultDock::editCurrentEntry);
     connect(historyButton_, &QPushButton::clicked,
             this, &VaultDock::showEntryHistory);
+    connect(cloneButton_, &QPushButton::clicked,
+            this, &VaultDock::cloneCurrentEntry);
     connect(cancelButton_, &QPushButton::clicked, this, &VaultDock::cancelCurrentEdit);
     connect(copyUsernameButton_, &QPushButton::clicked, this, &VaultDock::copyUsername);
     connect(openUrlButton_, &QPushButton::clicked, this, &VaultDock::openCurrentUrl);
@@ -566,6 +629,8 @@ void VaultDock::buildUi()
             this, &VaultDock::generatePassword);
     connect(copyTotpButton_, &QPushButton::clicked,
             this, &VaultDock::copyTotpProtected);
+    connect(totpConfigureButton_, &QPushButton::clicked,
+            this, &VaultDock::configureTotp);
     connect(clipboardClearTimer_, &QTimer::timeout,
             this, &VaultDock::clearProtectedClipboard);
     connect(passwordRevealTimer_, &QTimer::timeout, this, &VaultDock::hidePassword);
@@ -587,6 +652,15 @@ void VaultDock::buildUi()
     connect(usernameEdit_, &QLineEdit::textChanged, this, markDirty);
     connect(urlEdit_, &QLineEdit::textChanged, this, markDirty);
     connect(tagsEdit_, &QLineEdit::textChanged, this, markDirty);
+    connect(groupEdit_, &QLineEdit::textChanged, this, markDirty);
+    connect(additionalUrlsEdit_, &QPlainTextEdit::textChanged, this, markDirty);
+    connect(customFieldsEdit_, &QPlainTextEdit::textChanged, this, markDirty);
+    connect(expiryCheck_, &QCheckBox::toggled, this, [this, markDirty](bool enabled) {
+        expiryEdit_->setEnabled(enabled && editorEditing_);
+        markDirty();
+    });
+    connect(expiryEdit_, &QDateTimeEdit::dateTimeChanged, this,
+            [markDirty](const QDateTime &) { markDirty(); });
     connect(passwordEdit_, &QLineEdit::textChanged, this, markDirty);
     connect(passwordEdit_, &QLineEdit::textEdited, this, [this] {
         updatePasswordStrength();
@@ -1312,21 +1386,73 @@ void VaultDock::refreshEntries(const QUuid &selectId)
         return;
     }
 
-    const auto byTitle = [](const VaultEntrySummary &left, const VaultEntrySummary &right) {
-        return QString::localeAwareCompare(left.title, right.title) < 0;
+    const QString sortMode = sortCombo_ ? sortCombo_->currentData().toString()
+                                        : QStringLiteral("title");
+    const auto compareEntries = [sortMode](const VaultEntrySummary &left,
+                                           const VaultEntrySummary &right) {
+        QString leftKey = left.title;
+        QString rightKey = right.title;
+        if (sortMode == QStringLiteral("username")) {
+            leftKey = left.username;
+            rightKey = right.username;
+        } else if (sortMode == QStringLiteral("group")) {
+            leftKey = left.groupPath;
+            rightKey = right.groupPath;
+        }
+        const int primary = QString::localeAwareCompare(leftKey, rightKey);
+        return primary == 0
+            ? QString::localeAwareCompare(left.title, right.title) < 0
+            : primary < 0;
     };
-    std::sort(entries.begin(), entries.end(), byTitle);
+    std::sort(entries.begin(), entries.end(), compareEntries);
+    QHash<QString, QTreeWidgetItem *> groupItems;
+    const auto loginParentFor = [&](const QString &groupPath) {
+        QTreeWidgetItem *parent = loginRoot_;
+        QString cumulative;
+        const QStringList parts = groupPath.split(
+            QRegularExpression(QStringLiteral("[/\\\\]+")), Qt::SkipEmptyParts);
+        for (const QString &rawPart : parts) {
+            const QString part = rawPart.trimmed();
+            if (part.isEmpty())
+                continue;
+            cumulative += (cumulative.isEmpty() ? QString() : QStringLiteral("/")) + part;
+            QTreeWidgetItem *groupItem = groupItems.value(cumulative, nullptr);
+            if (!groupItem) {
+                groupItem = new QTreeWidgetItem(parent, {part, tr("分组")});
+                groupItem->setFlags(groupItem->flags() & ~Qt::ItemIsSelectable);
+                groupItem->setExpanded(true);
+                groupItem->setToolTip(0, cumulative);
+                groupItems.insert(cumulative, groupItem);
+            }
+            parent = groupItem;
+        }
+        return parent;
+    };
     QTreeWidgetItem *toSelect = nullptr;
+    int expiredCount = 0;
     for (const auto &entry : entries) {
-        auto *parent = entry.secureNote ? noteRoot_ : loginRoot_;
+        auto *parent = entry.secureNote ? noteRoot_ : loginParentFor(entry.groupPath);
         QString detail = entry.secureNote ? tr("安全笔记") : entry.username;
         if (detail.isEmpty())
             detail = entry.url;
+        const bool expired = entry.expires && entry.expiryUtc.isValid()
+                             && entry.expiryUtc <= QDateTime::currentDateTimeUtc();
+        if (expired) {
+            detail = detail.isEmpty() ? tr("已到期") : tr("已到期 · %1").arg(detail);
+            ++expiredCount;
+        }
         auto *item = new QTreeWidgetItem(parent, {entry.title, detail});
         item->setData(0, EntryIdRole, entry.id.toString(QUuid::WithoutBraces));
         item->setData(0, EntryRecycledRole, false);
         item->setToolTip(0, entry.title);
-        item->setToolTip(1, detail);
+        item->setToolTip(1, expired
+            ? tr("已于 %1 到期").arg(entry.expiryUtc.toLocalTime().toString(
+                  QStringLiteral("yyyy-MM-dd HH:mm")))
+            : detail);
+        if (expired) {
+            item->setForeground(0, QColor(Qt::darkRed));
+            item->setForeground(1, QColor(Qt::darkRed));
+        }
         if (entry.id == selectId)
             toSelect = item;
     }
@@ -1335,7 +1461,7 @@ void VaultDock::refreshEntries(const QUuid &selectId)
         showError(error, tr("无法读取回收站"));
         return;
     }
-    std::sort(recycledEntries.begin(), recycledEntries.end(), byTitle);
+    std::sort(recycledEntries.begin(), recycledEntries.end(), compareEntries);
     for (const auto &entry : recycledEntries) {
         QString detail = entry.secureNote ? tr("安全笔记") : entry.username;
         if (detail.isEmpty())
@@ -1350,6 +1476,14 @@ void VaultDock::refreshEntries(const QUuid &selectId)
     }
     noteRoot_->setHidden(noteRoot_->childCount() == 0);
     recycleRoot_->setHidden(recycleRoot_->childCount() == 0);
+    if (healthButton_) {
+        healthButton_->setText(expiredCount > 0
+            ? tr("健康检查（%1 到期）").arg(expiredCount)
+            : tr("健康检查"));
+        healthButton_->setToolTip(expiredCount > 0
+            ? tr("有 %1 个账号已到期；点击查看完整离线检查报告").arg(expiredCount)
+            : tr("离线检查弱密码、重复密码、空密码和到期账号"));
+    }
     applyFilter(filterEdit_->text());
     if (toSelect)
         entryTree_->setCurrentItem(toSelect);
@@ -1393,6 +1527,26 @@ void VaultDock::loadEntry(const QUuid &id)
     QStringList visibleTags = entry->tags;
     visibleTags.removeAll(VaultSecureNoteTag);
     tagsEdit_->setText(visibleTags.join(QStringLiteral(", ")));
+    groupEdit_->setText(entry->groupPath);
+    additionalUrlsEdit_->setPlainText(entry->additionalUrls.join(QLatin1Char('\n')));
+    QStringList customLines;
+    for (VaultCustomField &field : entry->customFields) {
+        QString value = field.protectedValue
+            ? QStringLiteral("••••••••")
+            : transientText(field.valueUtf8);
+        customLines.append((field.protectedValue ? QString() : QStringLiteral("public:"))
+                           + field.name + QLatin1Char('=') + value);
+        wipeQString(value);
+        field.valueUtf8.clear();
+    }
+    customFieldsEdit_->setPlainText(customLines.join(QLatin1Char('\n')));
+    for (QString &line : customLines)
+        wipeQString(line);
+    customLines.clear();
+    expiryCheck_->setChecked(entry->expires);
+    expiryEdit_->setDateTime(entry->expiryUtc.isValid()
+                                 ? entry->expiryUtc.toLocalTime()
+                                 : QDateTime::currentDateTime().addMonths(3));
     clearSensitiveLineEdit(passwordEdit_);
     clearSensitiveLineEdit(totpEdit_);
     currentEntryHasPassword_ = entry->hasPassword;
@@ -1466,21 +1620,33 @@ void VaultDock::editCurrentEntry()
         || currentEntryRecycled_ || !currentEntryPersisted_) {
         return;
     }
-    VaultEntrySecrets secrets;
-    const VaultError error = service_.readEntrySecrets(currentEntryId_, &secrets);
-    if (error.isError()) {
+    VaultError error;
+    auto entry = service_.readEntry(currentEntryId_, &error);
+    if (!entry) {
         showError(error, tr("无法读取账号秘密"));
         return;
     }
     loading_ = true;
-    QString password = transientText(secrets.passwordUtf8);
-    secrets.passwordUtf8.clear();
+    QString password = transientText(entry->passwordUtf8);
+    entry->passwordUtf8.clear();
     passwordEdit_->setText(password);
     wipeQString(password);
-    QString totpSeed = transientText(secrets.totpSeedUtf8);
-    secrets.totpSeedUtf8.clear();
+    QString totpSeed = transientText(entry->totpSeedUtf8);
+    entry->totpSeedUtf8.clear();
     totpEdit_->setText(totpSeed);
     wipeQString(totpSeed);
+    QStringList customLines;
+    for (VaultCustomField &field : entry->customFields) {
+        QString value = transientText(field.valueUtf8);
+        customLines.append((field.protectedValue ? QString() : QStringLiteral("public:"))
+                           + field.name + QLatin1Char('=') + value);
+        wipeQString(value);
+        field.valueUtf8.clear();
+    }
+    customFieldsEdit_->setPlainText(customLines.join(QLatin1Char('\n')));
+    for (QString &line : customLines)
+        wipeQString(line);
+    customLines.clear();
     loading_ = false;
     setEditingState(true);
     titleEdit_->setFocus();
@@ -1528,6 +1694,45 @@ bool VaultDock::saveCurrentEntryImpl(bool showSuccess)
     if (currentKind_ == EntryKind::SecureNote)
         data.tags.push_back(VaultSecureNoteTag);
     if (currentKind_ == EntryKind::Login) {
+        data.synchronizeExtendedFields = true;
+        data.groupPath = groupEdit_->text().trimmed();
+        const QStringList rawUrls = additionalUrlsEdit_->toPlainText().split(
+            QRegularExpression(QStringLiteral("[\\r\\n]+")), Qt::SkipEmptyParts);
+        for (const QString &rawUrl : rawUrls) {
+            const QString url = rawUrl.trimmed();
+            if (!url.isEmpty() && !data.additionalUrls.contains(url, Qt::CaseInsensitive))
+                data.additionalUrls.append(url);
+        }
+        const QStringList rawFields = customFieldsEdit_->toPlainText().split(
+            QRegularExpression(QStringLiteral("[\\r\\n]+")), Qt::SkipEmptyParts);
+        QSet<QString> fieldNames;
+        for (const QString &rawLine : rawFields) {
+            QString line = rawLine.trimmed();
+            bool protectedValue = true;
+            if (line.startsWith(QStringLiteral("public:"), Qt::CaseInsensitive)) {
+                line.remove(0, 7);
+                protectedValue = false;
+            }
+            const int separator = line.indexOf(QLatin1Char('='));
+            const QString name = separator > 0 ? line.left(separator).trimmed() : QString();
+            if (name.isEmpty() || fieldNames.contains(name.toCaseFolded())) {
+                if (showSuccess) {
+                    QMessageBox::warning(
+                        this, tr("自定义字段无效"),
+                        tr("每个自定义字段必须使用唯一的 name=value 格式。"));
+                }
+                customFieldsEdit_->setFocus();
+                return false;
+            }
+            fieldNames.insert(name.toCaseFolded());
+            VaultCustomField field;
+            field.name = name;
+            field.protectedValue = protectedValue;
+            field.valueUtf8 = secureUtf8From(line.mid(separator + 1));
+            data.customFields.push_back(std::move(field));
+        }
+        data.expires = expiryCheck_->isChecked();
+        data.expiryUtc = expiryEdit_->dateTime().toUTC();
         data.passwordUtf8 = secureUtf8From(passwordEdit_->text());
         data.totpSeedUtf8 = secureUtf8From(totpEdit_->text().trimmed());
         currentEntryHasPassword_ = !data.passwordUtf8.empty();
@@ -1550,11 +1755,9 @@ bool VaultDock::saveCurrentEntryImpl(bool showSuccess)
     currentEntryPersisted_ = true;
     deleteButton_->setEnabled(true);
     refreshEntries(currentEntryId_);
-    setEditingState(false);
-    if (showSuccess)
-        kindLabel_->setText(currentKind_ == EntryKind::SecureNote ? tr("旧版笔记")
-                                                                  : tr("账号"));
-    refreshTotpCode();
+    // Re-read presentation metadata after saving so password/TOTP and protected
+    // custom-field values do not remain in ordinary view widgets.
+    loadEntry(currentEntryId_);
     return true;
 }
 
@@ -1650,10 +1853,14 @@ void VaultDock::showEntryHistory()
         const QString summary = item.username.trimmed().isEmpty()
             ? QStringLiteral("%1  ·  %2").arg(when, item.title)
             : QStringLiteral("%1  ·  %2  ·  %3").arg(when, item.title, item.username);
-        auto *row = new QListWidgetItem(summary, list);
+        const QString changed = item.changedFields.isEmpty()
+            ? tr("与当前版本差异未知")
+            : tr("变更：%1").arg(item.changedFields.join(tr("、")));
+        auto *row = new QListWidgetItem(summary + QLatin1Char('\n') + changed, list);
         row->setData(Qt::UserRole, item.index);
-        row->setToolTip(item.hasPassword ? tr("此版本包含密码（不会在列表中显示）")
-                                         : tr("此版本没有密码"));
+        row->setToolTip((item.hasPassword ? tr("此版本包含密码（不会在列表中显示）")
+                                         : tr("此版本没有密码"))
+                        + QStringLiteral("\n") + changed);
     }
     list->setCurrentRow(0);
     layout->addWidget(list, 1);
@@ -1661,12 +1868,19 @@ void VaultDock::showEntryHistory()
     auto *restore = buttons->addButton(tr("恢复所选版本"),
                                        QDialogButtonBox::AcceptRole);
     restore->setObjectName(QStringLiteral("vaultHistoryRestoreButton"));
+    auto *remove = buttons->addButton(tr("删除所选版本"),
+                                      QDialogButtonBox::DestructiveRole);
+    remove->setObjectName(QStringLiteral("vaultHistoryRemoveButton"));
+    auto *clear = buttons->addButton(tr("清空历史"),
+                                     QDialogButtonBox::DestructiveRole);
+    clear->setObjectName(QStringLiteral("vaultHistoryClearButton"));
     buttons->button(QDialogButtonBox::Close)->setText(tr("关闭"));
     layout->addWidget(buttons);
     connect(buttons->button(QDialogButtonBox::Close), &QPushButton::clicked,
             &dialog, &QDialog::reject);
     connect(list, &QListWidget::itemDoubleClicked, restore,
             [restore](QListWidgetItem *) { restore->click(); });
+    bool restored = false;
     connect(restore, &QPushButton::clicked, &dialog, [&]() {
         QListWidgetItem *selected = list->currentItem();
         if (!selected)
@@ -1687,6 +1901,47 @@ void VaultDock::showEntryHistory()
                 showError(restoreError, tr("恢复账号历史失败"));
             return;
         }
+        restored = true;
+        dialog.accept();
+    });
+    connect(remove, &QPushButton::clicked, &dialog, [&]() {
+        QListWidgetItem *selected = list->currentItem();
+        if (!selected)
+            return;
+        if (QMessageBox::question(
+                &dialog, tr("删除历史版本"),
+                tr("永久删除所选历史版本？此操作无法撤销。"),
+                QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::No) != QMessageBox::Yes) {
+            return;
+        }
+        VaultError removeError = service_.removeEntryHistory(
+            currentEntryId_, selected->data(Qt::UserRole).toInt());
+        if (!removeError.isError())
+            removeError = service_.save();
+        if (removeError.isError()) {
+            if (!handleExternalChangeError(removeError))
+                showError(removeError, tr("删除历史版本失败"));
+            return;
+        }
+        dialog.accept();
+    });
+    connect(clear, &QPushButton::clicked, &dialog, [&]() {
+        if (QMessageBox::question(
+                &dialog, tr("清空账号历史"),
+                tr("永久删除此账号的全部历史版本？当前版本不会被删除。"),
+                QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::No) != QMessageBox::Yes) {
+            return;
+        }
+        VaultError clearError = service_.clearEntryHistory(currentEntryId_);
+        if (!clearError.isError())
+            clearError = service_.save();
+        if (clearError.isError()) {
+            if (!handleExternalChangeError(clearError))
+                showError(clearError, tr("清空账号历史失败"));
+            return;
+        }
         dialog.accept();
     });
     if (dialog.exec() != QDialog::Accepted)
@@ -1694,7 +1949,109 @@ void VaultDock::showEntryHistory()
     const QUuid id = currentEntryId_;
     refreshEntries(id);
     loadEntry(id);
-    emit userNotificationRequested(tr("已恢复账号历史版本"), 4000);
+    emit userNotificationRequested(restored ? tr("已恢复账号历史版本")
+                                             : tr("已清理账号历史"), 4000);
+}
+
+void VaultDock::cloneCurrentEntry()
+{
+    if (service_.state() != VaultState::Open || currentEntryId_.isNull()
+        || editorEditing_ || currentEntryRecycled_ || !currentEntryPersisted_
+        || currentKind_ != EntryKind::Login) {
+        return;
+    }
+    VaultError error;
+    auto copy = service_.readEntry(currentEntryId_, &error);
+    if (!copy) {
+        showError(error, tr("无法读取待克隆账号"));
+        return;
+    }
+    const QUuid cloneId = QUuid::createUuid();
+    copy->id = cloneId;
+    copy->title = tr("%1 - 副本").arg(copy->title);
+    copy->synchronizeExtendedFields = true;
+    copy->recordHistory = false;
+    error = service_.upsertEntry(std::move(*copy));
+    if (!error.isError())
+        error = service_.save();
+    if (error.isError()) {
+        if (!handleExternalChangeError(error))
+            showError(error, tr("克隆账号失败"));
+        return;
+    }
+    refreshEntries(cloneId);
+    loadEntry(cloneId);
+    emit userNotificationRequested(tr("已克隆账号；可继续编辑副本"), 4000);
+}
+
+void VaultDock::showPasswordHealthReport()
+{
+    if (service_.state() != VaultState::Open)
+        return;
+    VaultError error;
+    const QList<VaultHealthFinding> findings = service_.passwordHealthReport(&error);
+    if (error.isError()) {
+        showError(error, tr("无法执行密码健康检查"));
+        return;
+    }
+    if (findings.isEmpty()) {
+        QMessageBox::information(
+            this, tr("密码健康检查"),
+            tr("未发现空密码、弱密码、重复密码或已到期账号。检查完全在本机进行。"));
+        return;
+    }
+
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("vaultHealthDialog"));
+    dialog.setWindowTitle(tr("密码健康检查"));
+    dialog.resize(720, 440);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *message = new QLabel(
+        tr("发现 %1 项需要处理的问题。检查完全在本机完成，不上传密码；列表也不显示密码。")
+            .arg(findings.size()),
+        &dialog);
+    message->setWordWrap(true);
+    layout->addWidget(message);
+    auto *list = new QListWidget(&dialog);
+    list->setObjectName(QStringLiteral("vaultHealthList"));
+    for (const VaultHealthFinding &finding : findings) {
+        QString issueLabel = finding.issue;
+        if (finding.issue == QLatin1String("expired"))
+            issueLabel = tr("已到期");
+        else if (finding.issue == QLatin1String("missing"))
+            issueLabel = tr("未设置密码");
+        else if (finding.issue == QLatin1String("weak"))
+            issueLabel = tr("弱密码");
+        else if (finding.issue == QLatin1String("reused"))
+            issueLabel = tr("重复使用");
+        auto *row = new QListWidgetItem(
+            QStringLiteral("%1  ·  %2\n%3")
+                .arg(finding.title, issueLabel, finding.detail), list);
+        row->setData(Qt::UserRole, finding.entryId.toString(QUuid::WithoutBraces));
+        row->setToolTip(tr("双击打开此账号"));
+    }
+    list->setCurrentRow(0);
+    layout->addWidget(list, 1);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    auto *open = buttons->addButton(tr("打开所选账号"), QDialogButtonBox::AcceptRole);
+    open->setObjectName(QStringLiteral("vaultHealthOpenButton"));
+    buttons->button(QDialogButtonBox::Close)->setText(tr("关闭"));
+    layout->addWidget(buttons);
+    connect(buttons->button(QDialogButtonBox::Close), &QPushButton::clicked,
+            &dialog, &QDialog::reject);
+    connect(list, &QListWidget::itemDoubleClicked, open,
+            [open](QListWidgetItem *) { open->click(); });
+    connect(open, &QPushButton::clicked, &dialog, [&dialog, list]() {
+        if (list->currentItem())
+            dialog.accept();
+    });
+    if (dialog.exec() != QDialog::Accepted || !list->currentItem())
+        return;
+    const QUuid id(list->currentItem()->data(Qt::UserRole).toString());
+    if (id.isNull())
+        return;
+    refreshEntries(id);
+    loadEntry(id);
 }
 
 void VaultDock::setEntryKind(EntryKind kind)
@@ -1705,7 +2062,7 @@ void VaultDock::setEntryKind(EntryKind kind)
     const QList<QWidget *> loginWidgets = {
         usernameLabel_, usernameEdit_, urlLabel_, urlEdit_, passwordLabel_,
         passwordRow_, passwordStrengthCaption_, passwordStrengthLabel_,
-        totpLabel_, totpEdit_, totpCodeCaption_, totpCodeRow_};
+        totpLabel_, totpInputRow_, totpCodeCaption_, totpCodeRow_};
     for (QWidget *widget : loginWidgets) {
         widget->setVisible(login);
     }
@@ -1724,13 +2081,19 @@ void VaultDock::setEditingState(bool editing, bool newEntry)
         hidePassword();
         clearSensitiveLineEdit(totpEdit_);
     }
-    for (QLineEdit *field : {titleEdit_, usernameEdit_, urlEdit_, tagsEdit_, passwordEdit_, totpEdit_})
+    for (QLineEdit *field : {titleEdit_, usernameEdit_, urlEdit_, tagsEdit_, groupEdit_,
+                             passwordEdit_, totpEdit_})
         field->setReadOnly(!editable);
     notesEdit_->setReadOnly(!editable);
+    additionalUrlsEdit_->setReadOnly(!editable);
+    customFieldsEdit_->setReadOnly(!editable);
+    expiryCheck_->setEnabled(editable);
+    expiryEdit_->setEnabled(editable && expiryCheck_->isChecked());
     const QString detailLineStyle = editable
         ? QString()
         : QStringLiteral("QLineEdit { border: none; background: transparent; padding-left: 0px; }");
-    for (QLineEdit *field : {titleEdit_, usernameEdit_, urlEdit_, tagsEdit_, passwordEdit_})
+    for (QLineEdit *field : {titleEdit_, usernameEdit_, urlEdit_, tagsEdit_, groupEdit_,
+                             passwordEdit_})
         field->setStyleSheet(detailLineStyle);
     QFont titleFont = QApplication::font();
     if (!editable) {
@@ -1752,6 +2115,10 @@ void VaultDock::setEditingState(bool editing, bool newEntry)
     historyButton_->setVisible(available && !currentEntryRecycled_
                                && currentEntryPersisted_ && !editorEditing_);
     historyButton_->setEnabled(historyButton_->isVisible());
+    cloneButton_->setVisible(available && currentKind_ == EntryKind::Login
+                             && !currentEntryRecycled_ && currentEntryPersisted_
+                             && !editorEditing_);
+    cloneButton_->setEnabled(cloneButton_->isVisible());
     restoreButton_->setVisible(available && currentEntryRecycled_ && !editorEditing_);
     restoreButton_->setEnabled(restoreButton_->isVisible());
     deleteButton_->setVisible(available && !editorEditing_);
@@ -1766,12 +2133,18 @@ void VaultDock::setEditingState(bool editing, bool newEntry)
     formLayout_->setRowVisible(usernameRow_, available && login);
     formLayout_->setRowVisible(urlRow_, available && login);
     formLayout_->setRowVisible(passwordRow_, available && login);
+    formLayout_->setRowVisible(groupEdit_, available && login);
+    formLayout_->setRowVisible(additionalUrlsEdit_, available && login);
+    formLayout_->setRowVisible(customFieldsEdit_, available && login);
+    formLayout_->setRowVisible(expiryRow_, available && login);
     formLayout_->setRowVisible(totpCodeRow_, available && login);
     formLayout_->setRowVisible(notesEdit_, available);
     // The seed is configuration, not daily account information.
-    formLayout_->setRowVisible(totpEdit_, login && editable);
+    formLayout_->setRowVisible(totpInputRow_, login && editable);
     formLayout_->setRowVisible(passwordStrengthLabel_, login && editable);
     generatePasswordButton_->setVisible(login && editable);
+    totpConfigureButton_->setVisible(login && editable);
+    totpConfigureButton_->setEnabled(login && editable);
     passwordEdit_->setPlaceholderText(login && !editable && currentEntryHasPassword_
                                           ? QStringLiteral("••••••••••••")
                                           : QString());
@@ -1813,10 +2186,11 @@ void VaultDock::setEditingState(bool editing, bool newEntry)
 void VaultDock::setEditorEnabled(bool enabled)
 {
     const QList<QWidget *> editorWidgets = {
-        titleEdit_, usernameEdit_, urlEdit_, tagsEdit_, passwordEdit_, totpEdit_,
-        notesEdit_, showPasswordCheck_, copyPasswordButton_, copyTotpButton_, saveButton_,
-        generatePasswordButton_, editButton_, historyButton_, cancelButton_,
-        copyUsernameButton_, openUrlButton_};
+        titleEdit_, usernameEdit_, urlEdit_, tagsEdit_, groupEdit_, passwordEdit_, totpEdit_,
+        additionalUrlsEdit_, customFieldsEdit_, expiryCheck_, expiryEdit_, notesEdit_,
+        showPasswordCheck_, copyPasswordButton_, copyTotpButton_, saveButton_,
+        generatePasswordButton_, totpConfigureButton_, editButton_, historyButton_, cancelButton_,
+        cloneButton_, copyUsernameButton_, openUrlButton_};
     for (QWidget *widget : editorWidgets) {
         widget->setEnabled(enabled);
     }
@@ -1840,6 +2214,11 @@ void VaultDock::clearEditor()
     usernameEdit_->clear();
     urlEdit_->clear();
     tagsEdit_->clear();
+    groupEdit_->clear();
+    additionalUrlsEdit_->clear();
+    customFieldsEdit_->clear();
+    expiryCheck_->setChecked(false);
+    expiryEdit_->setDateTime(QDateTime::currentDateTime().addMonths(3));
     clearSensitiveLineEdit(passwordEdit_);
     passwordStrengthLabel_->setText(tr("未输入"));
     passwordStrengthLabel_->setStyleSheet(QString());
@@ -1863,6 +2242,7 @@ void VaultDock::clearEditor()
     saveButton_->setVisible(false);
     editButton_->setVisible(false);
     historyButton_->setVisible(false);
+    cloneButton_->setVisible(false);
     cancelButton_->setVisible(false);
     copyUsernameButton_->setVisible(false);
     openUrlButton_->setVisible(false);
@@ -1872,8 +2252,9 @@ void VaultDock::clearEditor()
     deleteButton_->setToolTip(tr("先移到回收站；可在永久删除前恢复"));
     titleEdit_->hide();
     const QList<QWidget *> formFields = {
-        usernameRow_, urlRow_, tagsEdit_, passwordRow_,
-        passwordStrengthLabel_, totpEdit_, totpCodeRow_, notesEdit_};
+        usernameRow_, urlRow_, tagsEdit_, groupEdit_, additionalUrlsEdit_,
+        customFieldsEdit_, expiryRow_, passwordRow_,
+        passwordStrengthLabel_, totpInputRow_, totpCodeRow_, notesEdit_};
     for (QWidget *field : formFields) {
         formLayout_->setRowVisible(field, false);
     }
@@ -1945,23 +2326,27 @@ void VaultDock::applyFilter(const QString &text)
             return;
     }
     int visibleEntries = 0;
-    for (QTreeWidgetItem *root : {loginRoot_, noteRoot_, recycleRoot_}) {
-        bool anyVisible = false;
-        for (int i = 0; i < root->childCount(); ++i) {
-            auto *item = root->child(i);
-            const QUuid id(item->data(0, EntryIdRole).toString());
-            const bool itemMatches = needle.isEmpty() || matches.contains(id);
-            item->setHidden(!itemMatches);
-            anyVisible |= itemMatches;
-            if (itemMatches)
+    const std::function<bool(QTreeWidgetItem *)> updateBranch =
+        [&](QTreeWidgetItem *item) -> bool {
+        const QUuid id(item->data(0, EntryIdRole).toString());
+        if (!id.isNull()) {
+            const bool visible = needle.isEmpty() || matches.contains(id);
+            item->setHidden(!visible);
+            if (visible)
                 ++visibleEntries;
+            return visible;
         }
-        const bool emptyMigrationGroup = root == noteRoot_ && root->childCount() == 0;
-        const bool emptyRecycleBin = root == recycleRoot_ && root->childCount() == 0;
-        root->setHidden(emptyMigrationGroup || emptyRecycleBin
-                        || (!needle.isEmpty() && !anyVisible));
+        bool anyVisible = false;
+        for (int i = 0; i < item->childCount(); ++i)
+            anyVisible |= updateBranch(item->child(i));
+        item->setHidden(!anyVisible);
         if (!needle.isEmpty() && anyVisible)
-            root->setExpanded(true);
+            item->setExpanded(true);
+        return anyVisible;
+    };
+    for (QTreeWidgetItem *root : {loginRoot_, noteRoot_, recycleRoot_}) {
+        const bool anyVisible = updateBranch(root);
+        root->setHidden(!anyVisible);
     }
     if (listPages_) {
         if (listEmptyLabel_) {
@@ -1972,8 +2357,7 @@ void VaultDock::applyFilter(const QString &text)
         }
         listPages_->setCurrentIndex(visibleEntries > 0 ? 0 : 1);
     }
-    const int totalEntries = loginRoot_->childCount() + noteRoot_->childCount()
-                             + recycleRoot_->childCount();
+    const int totalEntries = visibleEntries;
     const bool firstUse = totalEntries == 0 && needle.isEmpty();
     if (contentPages_)
         contentPages_->setCurrentIndex(firstUse ? 0 : 1);
@@ -2054,8 +2438,86 @@ void VaultDock::generatePassword()
 {
     if (!editorEditing_ || currentKind_ != EntryKind::Login || currentEntryRecycled_)
         return;
+
+    const auto settings = createSecuritySettings();
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("vaultPasswordGeneratorDialog"));
+    dialog.setWindowTitle(tr("生成密码"));
+    auto *layout = new QFormLayout(&dialog);
+    auto *length = new QSpinBox(&dialog);
+    length->setObjectName(QStringLiteral("vaultPasswordLength"));
+    length->setRange(8, 128);
+    length->setValue(settings->value("passwordGenerator/length", 24).toInt());
+    layout->addRow(tr("长度"), length);
+    auto *lower = new QCheckBox(tr("小写字母"), &dialog);
+    auto *upper = new QCheckBox(tr("大写字母"), &dialog);
+    auto *numbers = new QCheckBox(tr("数字"), &dialog);
+    auto *special = new QCheckBox(tr("特殊字符"), &dialog);
+    lower->setObjectName(QStringLiteral("vaultPasswordLower"));
+    upper->setObjectName(QStringLiteral("vaultPasswordUpper"));
+    numbers->setObjectName(QStringLiteral("vaultPasswordNumbers"));
+    special->setObjectName(QStringLiteral("vaultPasswordSpecial"));
+    lower->setChecked(settings->value("passwordGenerator/lower", true).toBool());
+    upper->setChecked(settings->value("passwordGenerator/upper", true).toBool());
+    numbers->setChecked(settings->value("passwordGenerator/numbers", true).toBool());
+    special->setChecked(settings->value("passwordGenerator/special", true).toBool());
+    auto *classes = new QWidget(&dialog);
+    auto *classesLayout = new QHBoxLayout(classes);
+    classesLayout->setContentsMargins(0, 0, 0, 0);
+    classesLayout->addWidget(lower);
+    classesLayout->addWidget(upper);
+    classesLayout->addWidget(numbers);
+    classesLayout->addWidget(special);
+    layout->addRow(tr("字符集"), classes);
+    auto *excludeLookAlike = new QCheckBox(tr("排除易混淆字符"), &dialog);
+    excludeLookAlike->setObjectName(QStringLiteral("vaultPasswordExcludeLookAlike"));
+    excludeLookAlike->setChecked(
+        settings->value("passwordGenerator/excludeLookAlike", true).toBool());
+    layout->addRow(QString(), excludeLookAlike);
+    auto *everyGroup = new QCheckBox(tr("每组选中的字符至少出现一次"), &dialog);
+    everyGroup->setObjectName(QStringLiteral("vaultPasswordEveryGroup"));
+    everyGroup->setChecked(
+        settings->value("passwordGenerator/everyGroup", true).toBool());
+    layout->addRow(QString(), everyGroup);
+    auto *excluded = new QLineEdit(&dialog);
+    excluded->setObjectName(QStringLiteral("vaultPasswordExcludedCharacters"));
+    excluded->setText(settings->value("passwordGenerator/excluded").toString());
+    layout->addRow(tr("额外排除"), excluded);
+    auto *buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("生成"));
+    buttons->button(QDialogButtonBox::Cancel)->setText(tr("取消"));
+    layout->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    VaultPasswordGenerationOptions options;
+    options.length = length->value();
+    options.lower = lower->isChecked();
+    options.upper = upper->isChecked();
+    options.numbers = numbers->isChecked();
+    options.special = special->isChecked();
+    options.excludeLookAlike = excludeLookAlike->isChecked();
+    options.requireEverySelectedGroup = everyGroup->isChecked();
+    options.excludedCharacters = excluded->text();
+    if (!options.lower && !options.upper && !options.numbers && !options.special) {
+        QMessageBox::warning(this, tr("无法生成密码"), tr("请至少选择一个字符集。"));
+        return;
+    }
+    settings->setValue("passwordGenerator/length", options.length);
+    settings->setValue("passwordGenerator/lower", options.lower);
+    settings->setValue("passwordGenerator/upper", options.upper);
+    settings->setValue("passwordGenerator/numbers", options.numbers);
+    settings->setValue("passwordGenerator/special", options.special);
+    settings->setValue("passwordGenerator/excludeLookAlike", options.excludeLookAlike);
+    settings->setValue("passwordGenerator/everyGroup", options.requireEverySelectedGroup);
+    settings->setValue("passwordGenerator/excluded", options.excludedCharacters);
     SecureBuffer generated;
-    const VaultError error = service_.generatePassword(24, &generated);
+    const VaultError error = service_.generatePassword(options, &generated);
+    options.excludedCharacters.fill(QChar(0));
+    options.excludedCharacters.clear();
     if (error.isError()) {
         showError(error, tr("无法生成密码"));
         return;
@@ -2069,6 +2531,114 @@ void VaultDock::generatePassword()
     showPasswordCheck_->setChecked(true);
     passwordEdit_->setFocus();
     passwordEdit_->selectAll();
+}
+
+void VaultDock::configureTotp()
+{
+    if (!editorEditing_ || currentKind_ != EntryKind::Login || currentEntryRecycled_)
+        return;
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("vaultTotpSetupDialog"));
+    dialog.setWindowTitle(tr("设置动态验证码 (TOTP)"));
+    auto *layout = new QFormLayout(&dialog);
+    auto *seed = new QLineEdit(&dialog);
+    seed->setObjectName(QStringLiteral("vaultTotpSeed"));
+    seed->setEchoMode(QLineEdit::Password);
+    seed->setPlaceholderText(tr("Base32 密钥，或粘贴 otpauth:// URI"));
+    auto *issuer = new QLineEdit(&dialog);
+    issuer->setObjectName(QStringLiteral("vaultTotpIssuer"));
+    issuer->setText(titleEdit_->text().trimmed());
+    auto *account = new QLineEdit(&dialog);
+    account->setObjectName(QStringLiteral("vaultTotpAccount"));
+    account->setText(usernameEdit_->text().trimmed());
+    auto *algorithm = new QComboBox(&dialog);
+    algorithm->setObjectName(QStringLiteral("vaultTotpAlgorithm"));
+    algorithm->addItems({QStringLiteral("SHA1"), QStringLiteral("SHA256"),
+                         QStringLiteral("SHA512")});
+    auto *digits = new QSpinBox(&dialog);
+    digits->setObjectName(QStringLiteral("vaultTotpDigits"));
+    digits->setRange(6, 8);
+    digits->setValue(6);
+    auto *period = new QSpinBox(&dialog);
+    period->setObjectName(QStringLiteral("vaultTotpPeriod"));
+    period->setRange(5, 300);
+    period->setSuffix(tr(" 秒"));
+    period->setValue(30);
+
+    const QString current = totpEdit_->text().trimmed();
+    if (current.startsWith(QStringLiteral("otpauth://"), Qt::CaseInsensitive)) {
+        const QUrl uri(current);
+        const QUrlQuery query(uri);
+        seed->setText(query.queryItemValue(QStringLiteral("secret")));
+        issuer->setText(query.queryItemValue(QStringLiteral("issuer")));
+        const QString label = QUrl::fromPercentEncoding(uri.path().mid(1).toUtf8());
+        const int colon = label.indexOf(QLatin1Char(':'));
+        account->setText(colon >= 0 ? label.mid(colon + 1) : label);
+        const QString alg = query.queryItemValue(QStringLiteral("algorithm")).toUpper();
+        const int algIndex = algorithm->findText(alg);
+        if (algIndex >= 0) algorithm->setCurrentIndex(algIndex);
+        bool ok = false;
+        const int parsedDigits = query.queryItemValue(QStringLiteral("digits")).toInt(&ok);
+        if (ok) digits->setValue(parsedDigits);
+        const int parsedPeriod = query.queryItemValue(QStringLiteral("period")).toInt(&ok);
+        if (ok) period->setValue(parsedPeriod);
+    } else {
+        seed->setText(current);
+    }
+    layout->addRow(tr("密钥"), seed);
+    layout->addRow(tr("服务商"), issuer);
+    layout->addRow(tr("账户名"), account);
+    layout->addRow(tr("算法"), algorithm);
+    layout->addRow(tr("位数"), digits);
+    layout->addRow(tr("周期"), period);
+    auto *buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("应用"));
+    buttons->button(QDialogButtonBox::Cancel)->setText(tr("取消"));
+    auto *remove = buttons->addButton(tr("移除验证码"), QDialogButtonBox::DestructiveRole);
+    remove->setObjectName(QStringLiteral("vaultTotpRemoveButton"));
+    layout->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    connect(remove, &QPushButton::clicked, &dialog, [&dialog]() { dialog.done(2); });
+    const int result = dialog.exec();
+    if (result == 2) {
+        clearSensitiveLineEdit(totpEdit_);
+        setDirty(true);
+        return;
+    }
+    if (result != QDialog::Accepted)
+        return;
+    QString rawSecret = takeSensitiveLineEdit(seed);
+    QString secret = rawSecret.trimmed();
+    wipeQString(rawSecret);
+    if (secret.isEmpty()) {
+        wipeQString(secret);
+        QMessageBox::warning(this, tr("验证码配置无效"), tr("密钥不能为空。"));
+        return;
+    }
+    if (secret.startsWith(QStringLiteral("otpauth://"), Qt::CaseInsensitive)) {
+        totpEdit_->setText(secret);
+    } else {
+        QUrl uri;
+        uri.setScheme(QStringLiteral("otpauth"));
+        uri.setHost(QStringLiteral("totp"));
+        QString label = account->text().trimmed();
+        if (!issuer->text().trimmed().isEmpty())
+            label.prepend(issuer->text().trimmed() + QLatin1Char(':'));
+        uri.setPath(QLatin1Char('/') + label);
+        QUrlQuery query;
+        query.addQueryItem(QStringLiteral("secret"), secret);
+        if (!issuer->text().trimmed().isEmpty())
+            query.addQueryItem(QStringLiteral("issuer"), issuer->text().trimmed());
+        query.addQueryItem(QStringLiteral("algorithm"), algorithm->currentText());
+        query.addQueryItem(QStringLiteral("digits"), QString::number(digits->value()));
+        query.addQueryItem(QStringLiteral("period"), QString::number(period->value()));
+        uri.setQuery(query);
+        totpEdit_->setText(uri.toString(QUrl::FullyEncoded));
+    }
+    wipeQString(secret);
+    setDirty(true);
 }
 
 void VaultDock::updatePasswordStrength()

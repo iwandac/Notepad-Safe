@@ -690,8 +690,10 @@ VaultError SecureDocumentService::saveAsSecure(
     Handle *handle = nullptr;
     VaultError error = createHandle(QFileInfo(targetPath).absoluteFilePath(), false, &handle);
     if (!error.isError())
+    {
         error = persist(handle, SecureDocumentPayloadKind::Text, text, {},
                         title, targetPath);
+    }
     if (error.isError()) {
         if (handle)
             close(handle->documentId);

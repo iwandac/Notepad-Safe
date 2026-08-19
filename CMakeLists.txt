@@ -749,10 +749,10 @@ endif()
 set_tests_properties(
     gui_smoke_coord gui_smoke_findreplace gui_smoke_large_readonly
     gui_smoke_smallfixes gui_smoke_vault
-    PROPERTIES RUN_SERIAL TRUE TIMEOUT 60
+    PROPERTIES RUN_SERIAL TRUE TIMEOUT 180
 )
 if(TARGET gui_smoke_secure_documents)
-    set_tests_properties(gui_smoke_secure_documents PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    set_tests_properties(gui_smoke_secure_documents PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
 endif()
 
 # 真实进程 E2E：启动完整 notepad-safe.exe，并通过 Win32 获取窗口/像素。

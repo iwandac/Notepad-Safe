@@ -53,12 +53,27 @@ static QByteArray trunc64(const QByteArray& b) {
     return b.left(64) + QByteArrayLiteral("...[total=") + QByteArray::number(b.size()) + ']';
 }
 
+static QByteArray makeCoordinateFixture(int lineCount = 320) {
+    QByteArray data;
+    for (int i = 0; i < lineCount; ++i) {
+        QByteArray line = QByteArrayLiteral("line-")
+            + QByteArray::number(i).rightJustified(4, '0')
+            + QByteArrayLiteral(":");
+        while (line.size() < 79)
+            line.append(static_cast<char>('A' + (i % 26)));
+        line.append('\n');
+        data.append(line);
+    }
+    return data;
+}
+
 void SmokeCoordEditops::tc_coord_001_goto_and_read_consistency() {
     QString err;
-    const QString clone = cloneToTemp(defaultLargeFilePath());
-    QVERIFY2(!clone.isEmpty(), "clone smalltestfile failed");
-    QVERIFY2(openL2(clone, &err), qPrintable(QStringLiteral("openL2 failed: %1").arg(err)));
-    // smalltestfile 打开后 LineIndex 可能是 incomplete 状态，等 300ms 让后台构建完成（totalLines 用真实值）
+    const QString path = createSmallTestFile(makeCoordinateFixture(),
+                                             "coord001-lines.txt");
+    QVERIFY2(!path.isEmpty(), "create coordinate fixture failed");
+    QVERIFY2(openL2(path, &err), qPrintable(QStringLiteral("openL2 failed: %1").arg(err)));
+    // LineIndex 可能短暂处于 incomplete 状态，等待后台构建完成。
     for (int i = 0; i < 8 && totalLines() < 50; ++i) {
         QTest::qWait(80);
     }
@@ -213,9 +228,10 @@ void SmokeCoordEditops::tc_coord_002_below_then_above_insert_no_horizontal_offse
 
 void SmokeCoordEditops::tc_coord_003_drag_select_byte_match() {
     QString err;
-    const QString clone = cloneToTemp(defaultLargeFilePath());
-    QVERIFY2(!clone.isEmpty(), "clone smalltestfile failed");
-    QVERIFY2(openL2(clone, &err), qPrintable(QStringLiteral("openL2 failed: %1").arg(err)));
+    const QString path = createSmallTestFile(makeCoordinateFixture(),
+                                             "coord003-lines.txt");
+    QVERIFY2(!path.isEmpty(), "create coordinate fixture failed");
+    QVERIFY2(openL2(path, &err), qPrintable(QStringLiteral("openL2 failed: %1").arg(err)));
     QVERIFY(totalLines() > 220);
 
     const int L1 = 200, L2 = 210;
