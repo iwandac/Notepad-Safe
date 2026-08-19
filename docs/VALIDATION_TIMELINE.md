@@ -261,3 +261,24 @@
   点击远处屏幕中部右栏并立即 OVR；同位置立即提交 `SAFE` IME 字符串；校验模型 offset、caret、
   byte content、单次 Undo；再执行 INS/OVR、Hex→Text、连续中段拖动、Wrap ON 中段/EOF 拖动及
   磁盘 hash 守护。最终 tiny 邻接集合 4/4、完整 MainWindow Hex 邻接集合 6/6 通过。
+
+## 10. 2026-08-18 静态代码与默认构建图收敛
+
+- 将与现行只读边界冲突的旧 S2 编辑综合测试、三个 PatchList/L2 编辑诊断和旧 GUI 矩阵移至
+  `archive/disabled/`；删除 CMake/CTest/脚本入口，但保留源码供架构复盘。
+- 默认产品构建新增 tests/diagnostics 双重 OFF 开关，`build.bat` 只构建 `notepad-safe`；测试与
+  GUI smoke 脚本显式选择所需目标。默认 target help 已确认不存在 test/diag/gui/e2e 目标。
+- 删除 VirtualFileView 无赋值的旧 QFuture watcher、同步全量索引/模态进度入口和预留但无调用者
+  的异步加密/解密/大文件保存任务类型；活动 B1 Hex 的 PatchList/VirtualFileView 保留。
+- 修复异步池伪优先级/永久增长排队计数，以及任务仍在 QThreadPool 排队却提前显示 Running、
+  取消走错分支的问题。KDBX=ON 产品成功链接；定向回归为 search 32/32、session 59/59、
+  filetierpolicy exit 0。详细边界见 `docs/STATIC_CODE_AUDIT.md`。
+## 2026-08-18 — 线程预算、任务 UI 与状态栏字符数
+
+- 应用自有 worker 上限固定为 10；`LineIndex` 私有池纳入同一容量预算和真实活跃计数。
+- 旧 `LargeFileSearch::findAll` 与窗口化字节搜索不再使用不可见的全局 QtConcurrent worker。
+- 状态栏新增 `status.characters`：文本按 Unicode scalar 计数，Hex 按权威原始字节计数；
+  S2/S3 文本以低优先级后台任务分块统计，不阻塞首屏浏览。
+- `test_session` 68/68（含跨 8 MiB UTF-8 分块边界）；聚焦 GUI 用例
+  `tc_background_task_center_lifecycle` 与
+  `tc_status_bar_reports_unicode_characters_and_hex_bytes` 通过，并人工检查截图无状态栏重叠。

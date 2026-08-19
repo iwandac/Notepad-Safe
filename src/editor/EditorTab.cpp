@@ -1812,6 +1812,9 @@ WindowedReadOnlyProvider *EditorTab::ensureWindowedReadOnlyProvider()
             if (auto *window = qobject_cast<QMainWindow *>(this->window()))
                 window->statusBar()->showMessage(message, 8000);
         });
+        connect(m_windowedReadOnlyProvider,
+                &WindowedReadOnlyProvider::characterCountChanged,
+                this, [this](qint64, bool) { emit characterCountChanged(); });
     }
     return m_windowedReadOnlyProvider;
 }
@@ -1841,6 +1844,37 @@ qint64 EditorTab::contentSizeBytes() const
     if (m_l2Mode && m_l2View && m_l2View->isOpen())
         return m_l2View->virtualFileSize();
     return m_editor ? static_cast<qint64>(m_editor->length()) : 0;
+}
+
+qint64 EditorTab::contentCharacterCount() const
+{
+    const bool hexMode = isL2Active() && viewModeL2() == ViewMode::Hex;
+    if (hexMode)
+        return contentSizeBytes();
+    if (windowedReadOnlyActive() && m_windowedReadOnlyProvider)
+        return m_windowedReadOnlyProvider->characterCount();
+
+    if (m_characterCountRevision == m_contentRevision
+        && m_cachedCharacterCountHex == hexMode) {
+        return m_cachedCharacterCount;
+    }
+
+    qint64 count = 0;
+    if (m_l2Mode && m_l2View && m_l2View->isOpen()) {
+        // The remaining editable mmap path is bounded to B1 (<32 MiB), so one
+        // exact decode is acceptable and is cached until the byte model changes.
+        const QByteArray bytes = m_l2View->readByteRange(
+            0, m_l2View->virtualFileSize());
+        count = QString::fromUtf8(bytes).toUcs4().size();
+    } else if (m_editor) {
+        count = static_cast<qint64>(m_editor->SendScintilla(
+            QsciScintillaBase::SCI_COUNTCHARACTERS, 0,
+            m_editor->length()));
+    }
+    m_characterCountRevision = m_contentRevision;
+    m_cachedCharacterCountHex = hexMode;
+    m_cachedCharacterCount = count;
+    return count;
 }
 
 bool EditorTab::ensureWindowedSearchSource(QString *error)
@@ -1881,7 +1915,7 @@ bool EditorTab::ensureWindowedSearchSource(QString *error)
                           == WindowedReadOnlyProvider::Presentation::Hex
                       ? ViewMode::Hex : ViewMode::Text);
     QString openError;
-    if (!view->openFile(m_filePath, &openError, this->window())) {
+    if (!view->openFile(m_filePath, &openError)) {
         if (error)
             *error = openError;
         return false;
@@ -3929,7 +3963,7 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
     v->setViewMode(binaryHex ? ViewMode::Hex : ViewMode::Text);
     // 确保 VirtualFileView 已加入 stack（ensureL2View 会 addWidget 到 index=1）
     QString localErr;
-    if (!useWindowedReadOnly && !v->openFile(path, &localErr, this->window())) {
+    if (!useWindowedReadOnly && !v->openFile(path, &localErr)) {
         if (errMsg) *errMsg = localErr;
         return false;
     }
@@ -4059,7 +4093,7 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
             const QString commitError = output.errorString();
             QString reopenError;
             m_l2View->setViewMode(presentation);
-            m_l2View->openFile(path, &reopenError, this->window());
+            m_l2View->openFile(path, &reopenError);
             if (errMsg)
                 *errMsg = QObject::tr("B1 原子保存失败：%1").arg(commitError);
             if (!snapshot.isEmpty()) snapshot.fill(0);
@@ -4068,7 +4102,7 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
         if (!snapshot.isEmpty()) snapshot.fill(0);
         QString reopenError;
         m_l2View->setViewMode(presentation);
-        if (!m_l2View->openFile(path, &reopenError, this->window())) {
+        if (!m_l2View->openFile(path, &reopenError)) {
             if (errMsg)
                 *errMsg = QObject::tr("保存成功但重新打开失败：%1").arg(reopenError);
             return false;
@@ -4116,7 +4150,7 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
         }
         m_l2View->closeFile();
         QString reopenErr;
-        ok = m_l2View->openFile(path, &reopenErr, this->window());
+        ok = m_l2View->openFile(path, &reopenErr);
         if (!ok) {
             if (errMsg)
                 *errMsg = QObject::tr("文件已另存为，但无法切换到新文件：%1").arg(reopenErr);

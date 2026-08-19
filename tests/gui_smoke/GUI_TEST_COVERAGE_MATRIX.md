@@ -65,7 +65,7 @@
 | A04 | 历史/回收站 | 多次轮换、恢复旧版、反向恢复、删除/恢复/永久删除 | KeePass 历史完整；误删可恢复；永久删除明确确认且数据库持久化正确 |
 | A05 | 外来 KDBX | 密码/key file、七天重开、外部冲突、保存失败 | 兼容打开；不创建空库；原子保存；错误/冲突保留旧库与当前修改 |
 | U01 | QAction/capability | Empty/Text/Hex/S2 ReadOnly/S3 ReadOnly/Accounts/Security | 菜单/工具栏/快捷键同一动作；enabled/checked/visible 与实际可执行能力一致 |
-| U02 | 状态栏 | 各 Provider、无标签/Accounts、最长文案、临时消息、任务 chip | 位置/编码/语言/大小/tier/dirty 准确；文字不重叠、裁切或残留旧标签信息 |
+| U02 | 状态栏 | 各 Provider、无标签/Accounts、最长文案、临时消息、任务 chip | 位置/编码/语言/大小/Unicode 总字符数（Hex 为字节数）/tier/dirty 准确；文字不重叠、裁切或残留旧标签信息 |
 | U03 | 后台任务 | 索引/搜索/保存、排队/运行/取消/失败/完成；S2/S3 打开 | 阶段与真实状态一致；取消及时；S2/S3 打开不产生编辑装载任务；0 任务无线程噪音；详情脱敏且可清理 |
 | U04 | Dock/工具栏/状态栏 | 显隐、关闭重开、中央工作区切换、重启恢复 | 布局和动作勾选一致；Accounts/Security 不显示无关 Dock；返回文档恢复合理 |
 | U05 | 主题/DPI/无障碍 | System/Light/Dark/高对比、900–1800px、100–200% DPI | 正文/菜单/焦点/禁用态可读；核心动作可达；Tab 顺序、accessible name 正确 |

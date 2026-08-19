@@ -48,6 +48,7 @@ public:
     int failedCount() const;    // 状态==Failed 的最近 100 条内（取消不算错误）
     int cancellableCount() const; // 当前 Queued + Running
     int activeThreadCount();    // 池内活跃线程
+    int maximumThreadCount() const;
 
     // ========= 提交 / 管理 =========
     using WorkerFn = std::function<void(

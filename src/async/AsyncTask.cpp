@@ -51,9 +51,6 @@ QString AsyncTask::typeText() const
     switch (type) {
     case AsyncTaskType::LineIndexBuild: return QObject::tr("行索引构建");
     case AsyncTaskType::LargeFileSearch:return QObject::tr("大文件搜索");
-    case AsyncTaskType::FileEncrypt:    return QObject::tr("文件加密");
-    case AsyncTaskType::FileDecrypt:    return QObject::tr("文件解密");
-    case AsyncTaskType::LargeFileSave:  return QObject::tr("大文件保存");
     default: return QObject::tr("其他");
     }
 }

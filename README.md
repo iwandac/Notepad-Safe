@@ -20,8 +20,11 @@ build.bat
 :: 3. 运行
 build\notepad-safe.exe
 
-:: 4. 运行所有测试（可选）
+:: 4. 运行非 GUI 回归（可选；测试目标不进入默认产品构建）
 run_tests.bat
+
+:: 5. 构建并运行 GUI smoke（可选）
+run_all_gui_smoke.bat
 ```
 
 `build.bat` 默认构建生产 KDBX 后端。只验证编辑器、且不希望准备密码学依赖时，可先执行 `set NOTEPADSAFE_WITH_KDBX=OFF`。依赖身份及摘要来自 `third_party/dependencies.lock.json`；独立准备命令为：

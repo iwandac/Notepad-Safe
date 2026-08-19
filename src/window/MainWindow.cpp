@@ -67,6 +67,7 @@
 #include <QCryptographicHash>
 #include <QDesktopServices>
 #include <QProcess>
+#include <QLocale>
 
 #include <memory>
 #include <utility>
@@ -1858,6 +1859,17 @@ void MainWindow::createStatusBar()
     m_statusSize->setMinimumWidth(80);
     statusBar()->addPermanentWidget(m_statusSize);
 
+    m_statusCharacters = new QLabel(QStringLiteral("字符数: 0"));
+    m_statusCharacters->setObjectName(QStringLiteral("status.characters"));
+    m_statusCharacters->setAccessibleName(QStringLiteral("文档总字符数"));
+    m_statusCharacters->setMinimumWidth(100);
+    statusBar()->addPermanentWidget(m_statusCharacters);
+
+    m_characterStatusTimer.setSingleShot(true);
+    m_characterStatusTimer.setInterval(120);
+    connect(&m_characterStatusTimer, &QTimer::timeout,
+            this, &MainWindow::updateStatusBar);
+
     m_hexEditModeButton = new QToolButton;
     m_hexEditModeButton->setObjectName(QStringLiteral("status.hexEditMode"));
     m_hexEditModeButton->setAccessibleName(QStringLiteral("十六进制编辑模式"));
@@ -2120,6 +2132,14 @@ EditorTab *MainWindow::addNewTab()
             return;
         syncCommandStates(tab);
         updateStatusBar();
+    });
+    connect(tab, &EditorTab::contentChanged, this, [this, tab](quint64) {
+        if (currentTab() == tab)
+            m_characterStatusTimer.start();
+    });
+    connect(tab, &EditorTab::characterCountChanged, this, [this, tab]() {
+        if (currentTab() == tab)
+            updateStatusBar();
     });
 #ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
     connect(tab, &EditorTab::contentChanged, this, [this, tab](quint64) {
@@ -4377,6 +4397,7 @@ void MainWindow::updateStatusBar()
         if (m_statusEncoding) m_statusEncoding->hide();
         if (m_statusSyntax) m_statusSyntax->hide();
         if (m_statusSize) m_statusSize->hide();
+        if (m_statusCharacters) m_statusCharacters->hide();
         if (m_hexEditModeButton) m_hexEditModeButton->hide();
         if (m_statusModified) m_statusModified->hide();
         return;
@@ -4385,6 +4406,7 @@ void MainWindow::updateStatusBar()
     if (m_statusEncoding) m_statusEncoding->show();
     if (m_statusSyntax) m_statusSyntax->show();
     if (m_statusSize) m_statusSize->show();
+    if (m_statusCharacters) m_statusCharacters->show();
     if (m_statusModified) m_statusModified->show();
 
     int line, index;
@@ -4475,6 +4497,21 @@ void MainWindow::updateStatusBar()
     m_statusSize->setToolTip(
         QStringLiteral("当前文档内容大小；S1 直接编辑，S2/S3 均为 mmap 只读分析"));
 
+    const qint64 characters = tab->contentCharacterCount();
+    if (hexMode) {
+        m_statusCharacters->setText(
+            QStringLiteral("字节数: %1").arg(QLocale().toString(characters)));
+        m_statusCharacters->setToolTip(QStringLiteral("十六进制文档的原始字节总数"));
+    } else if (characters >= 0) {
+        m_statusCharacters->setText(
+            QStringLiteral("字符数: %1").arg(QLocale().toString(characters)));
+        m_statusCharacters->setToolTip(QStringLiteral("当前文本的 Unicode 字符总数"));
+    } else {
+        m_statusCharacters->setText(QStringLiteral("字符数: 统计中…"));
+        m_statusCharacters->setToolTip(
+            QStringLiteral("正在后台扫描窗口化只读文档，不阻塞浏览"));
+    }
+
     m_statusModified->setText(tab->isModified() ? QStringLiteral("● 已修改") : QStringLiteral(""));
 }
 
@@ -4483,6 +4520,7 @@ void MainWindow::showWorkspaceStatus(const QString &workspaceName)
     if (m_statusPos) m_statusPos->hide();
     if (m_statusEncoding) m_statusEncoding->hide();
     if (m_statusSize) m_statusSize->hide();
+    if (m_statusCharacters) m_statusCharacters->hide();
     if (m_hexEditModeButton) m_hexEditModeButton->hide();
     if (m_statusModified) m_statusModified->hide();
     if (m_statusSyntax) {

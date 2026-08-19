@@ -3614,10 +3614,17 @@ private slots:
             QStringLiteral("clearTaskHistoryButton"));
         auto *failedSummary = panel->findChild<QLabel *>(
             QStringLiteral("taskSummaryFailed"));
-        QVERIFY(cancelAll && clearHistory && failedSummary);
+        auto *threadSummary = panel->findChild<QLabel *>(
+            QStringLiteral("taskSummaryThreads"));
+        QVERIFY(cancelAll && clearHistory && failedSummary && threadSummary);
         QVERIFY(cancelAll->isEnabled());
         QVERIFY(clearHistory->isEnabled());
         QCOMPARE(failedSummary->text(), QStringLiteral("失败: 1"));
+        QTRY_VERIFY_WITH_TIMEOUT(threadSummary->text().endsWith(QStringLiteral("/10")),
+                                 2000);
+        QVERIFY(manager.activeThreadCount() >= 1);
+        QVERIFY(manager.activeThreadCount() <= 10);
+        QVERIFY(chip->toolTip().contains(QStringLiteral("/10")));
 
         const QString runningShot = QCoreApplication::applicationDirPath()
                                     + QStringLiteral("/gui-background-tasks-running.png");
@@ -3631,22 +3638,6 @@ private slots:
         QCOMPARE(chip->text(), QStringLiteral("任务失败 1"));
         QVERIFY(!cancelAll->isEnabled());
 
-        // FileEncrypt/FileDecrypt rows are always opaque even if a caller
-        // accidentally supplies a protected path or account name.
-        const qint64 cryptoId = manager.submit(
-            AsyncTaskType::FileEncrypt, AsyncTaskPriority::High,
-            QStringLiteral("C:/secret/Alice.nsafe"),
-            QStringLiteral("password=do-not-show"),
-            [](qint64, AsyncCancelPtr,
-               const std::function<void(qint64, qint64)> &,
-               const std::function<void(const AsyncErrorInfo &)> &) {});
-        QTRY_VERIFY_WITH_TIMEOUT(manager.taskById(cryptoId).state
-                                 == AsyncTaskState::Finished, 3000);
-        const AsyncTask cryptoTask = manager.taskById(cryptoId);
-        QCOMPARE(cryptoTask.title, QStringLiteral("保存安全文档"));
-        QVERIFY(!cryptoTask.description.contains(QStringLiteral("Alice")));
-        QVERIFY(!cryptoTask.description.contains(QStringLiteral("password")));
-
         const QString failedShot = QCoreApplication::applicationDirPath()
                                    + QStringLiteral("/gui-background-tasks-failed.png");
         QVERIFY2(panel->grab().save(failedShot), qPrintable(failedShot));
@@ -3655,6 +3646,47 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(manager.rowCount(), 0, 2000);
         QTRY_VERIFY_WITH_TIMEOUT(!chip->isVisible(), 2000);
         panel->hide();
+    }
+
+    void tc_status_bar_reports_unicode_characters_and_hex_bytes() {
+        closeAllEditorTabs(mw_);
+        auto *statusCharacters = mw_->findChild<QLabel *>(
+            QStringLiteral("status.characters"));
+        QVERIFY(statusCharacters != nullptr);
+
+        const QString textPath = tmpDir_.filePath(QStringLiteral("character-count.txt"));
+        QFile textFile(textPath);
+        QVERIFY(textFile.open(QIODevice::WriteOnly));
+        QCOMPARE(textFile.write(QStringLiteral("A中😀\n").toUtf8()), qint64(9));
+        textFile.close();
+
+        mw_->openFilesFromExternal({textPath});
+        auto *tabs = mw_->findChild<QTabWidget *>();
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 1, 2000);
+        auto *textTab = qobject_cast<EditorTab *>(tabs->currentWidget());
+        QVERIFY(textTab != nullptr);
+        QTRY_COMPARE_WITH_TIMEOUT(statusCharacters->text(),
+                                  QStringLiteral("字符数: 4"), 2000);
+        textTab->editor()->append(QStringLiteral("Z"));
+        QTRY_COMPARE_WITH_TIMEOUT(statusCharacters->text(),
+                                  QStringLiteral("字符数: 5"), 2000);
+
+        closeAllEditorTabs(mw_);
+        const QString binaryPath = tmpDir_.filePath(QStringLiteral("character-count.bin"));
+        QFile binaryFile(binaryPath);
+        QVERIFY(binaryFile.open(QIODevice::WriteOnly));
+        const QByteArray binary = QByteArray::fromHex("000102FF");
+        QCOMPARE(binaryFile.write(binary), qint64(binary.size()));
+        binaryFile.close();
+
+        mw_->openFilesFromExternal({binaryPath});
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 1, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(statusCharacters->text(),
+                                  QStringLiteral("字节数: 4"), 2000);
+        const QString screenshot = QCoreApplication::applicationDirPath()
+                                   + QStringLiteral("/gui-status-character-count.png");
+        QVERIFY2(mw_->grab().save(screenshot), qPrintable(screenshot));
+        closeAllEditorTabs(mw_);
     }
 };
 

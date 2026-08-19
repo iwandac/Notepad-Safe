@@ -24,12 +24,13 @@
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWheelEvent>
-#include <QtConcurrent/QtConcurrentRun>
+#include <QStringConverter>
 
 #include <Qsci/qsciscintilla.h>
 #include <Qsci/qsciscintillabase.h>
 
 #include "Sci_Position.h"
+#include "AsyncTaskManager.h"
 #include "SharedReadOnlyFile.h"
 
 namespace {
@@ -63,6 +64,20 @@ qint64 clampOffset(qint64 offset, qint64 size)
     if (size <= 0)
         return 0;
     return std::clamp(offset, 0LL, size - 1);
+}
+
+qint64 unicodeScalarCount(QStringView text)
+{
+    qint64 count = 0;
+    for (qsizetype i = 0; i < text.size(); ++i) {
+        const QChar current = text.at(i);
+        if (current.isHighSurrogate() && i + 1 < text.size()
+            && text.at(i + 1).isLowSurrogate()) {
+            ++i;
+        }
+        ++count;
+    }
+    return count;
 }
 
 } // namespace
@@ -233,6 +248,8 @@ bool WindowedReadOnlyProvider::openFile(const QString &path, Presentation presen
     m_observedSize = observed.size();
     m_observedModified = observed.lastModified();
     m_filePoll->start();
+    if (presentation == Presentation::Text)
+        startCharacterCount();
     return true;
 }
 
@@ -246,10 +263,12 @@ void WindowedReadOnlyProvider::closeFile()
         m_fileWatcher->removePaths(m_fileWatcher->files());
     if (m_fileWatcher && !m_fileWatcher->directories().isEmpty())
         m_fileWatcher->removePaths(m_fileWatcher->directories());
-    m_cancelSearch.storeRelease(true);
-    if (m_searchWatcher.isRunning())
-        m_searchWatcher.waitForFinished();
+    ++m_searchGeneration;
+    if (m_searchTaskId >= 0)
+        AsyncTaskManager::instance().cancel(m_searchTaskId);
+    m_searchTaskId = -1;
     m_searchResultPending = false;
+    cancelCharacterCount();
     m_file.close();
     m_fileSize = 0;
     m_globalOffset = 0;
@@ -261,6 +280,8 @@ void WindowedReadOnlyProvider::closeFile()
         m_asciiPreview->clear();
     m_observedSize = -1;
     m_observedModified = {};
+    m_characterCount = -1;
+    m_characterCountPending = false;
 }
 
 bool WindowedReadOnlyProvider::refreshFileMapping(QString *error)
@@ -287,9 +308,10 @@ bool WindowedReadOnlyProvider::refreshFileMapping(QString *error)
     const int preservedHorizontal = static_cast<int>(directScintilla(
         m_editor, QsciScintillaBase::SCI_GETXOFFSET));
 
-    m_cancelSearch.storeRelease(true);
-    if (m_searchWatcher.isRunning())
-        m_searchWatcher.waitForFinished();
+    ++m_searchGeneration;
+    if (m_searchTaskId >= 0)
+        AsyncTaskManager::instance().cancel(m_searchTaskId);
+    m_searchTaskId = -1;
     m_searchResultPending = false;
     m_file.close();
     QString openError;
@@ -333,6 +355,8 @@ bool WindowedReadOnlyProvider::refreshFileMapping(QString *error)
         m_updatingScrollBar = false;
     }
     emit sourceFileChanged(previousSize, m_fileSize);
+    if (m_presentation == Presentation::Text)
+        startCharacterCount();
     return true;
 }
 
@@ -355,6 +379,111 @@ void WindowedReadOnlyProvider::setPresentation(Presentation presentation)
     m_globalScrollBar->setPageStep(std::max(
         1, int((static_cast<long double>(m_windowSpan) * kSliderMaximum) / m_fileSize)));
     reloadWindow(m_globalOffset, 0);
+    if (presentation == Presentation::Text && m_characterCount < 0
+        && !m_characterCountPending) {
+        startCharacterCount();
+    }
+}
+
+void WindowedReadOnlyProvider::cancelCharacterCount()
+{
+    ++m_characterCountGeneration;
+    if (m_characterCountTaskId >= 0)
+        AsyncTaskManager::instance().cancel(m_characterCountTaskId);
+    m_characterCountTaskId = -1;
+    m_characterCountPending = false;
+}
+
+void WindowedReadOnlyProvider::startCharacterCount()
+{
+    cancelCharacterCount();
+    if (m_path.isEmpty() || m_fileSize <= 0)
+        return;
+
+    m_characterCount = -1;
+    m_characterCountPending = true;
+    emit characterCountChanged(-1, true);
+
+    const QString path = m_path;
+    const qint64 size = m_fileSize;
+    const quint64 generation = ++m_characterCountGeneration;
+    QPointer<WindowedReadOnlyProvider> guard(this);
+    m_characterCountTaskId = AsyncTaskManager::instance().submit(
+        AsyncTaskType::Other,
+        AsyncTaskPriority::Low,
+        tr("统计文档字符数"),
+        tr("后台扫描只读大文件并统计 Unicode 字符。"),
+        [guard, generation, path, size]
+        (qint64, AsyncCancelPtr cancel,
+         std::function<void(qint64, qint64)> reportProgress,
+         std::function<void(const AsyncErrorInfo &)> reportError) {
+            SharedReadOnlyFile reader;
+            QString openError;
+            if (!openSharedReadOnlyFile(reader, path, &openError)) {
+                AsyncErrorInfo error;
+                error.message = QObject::tr("无法统计字符数：%1").arg(openError);
+                if (reportError)
+                    reportError(error);
+                QMetaObject::invokeMethod(guard, [guard, generation]() {
+                    if (!guard || guard->m_characterCountGeneration != generation)
+                        return;
+                    guard->m_characterCountPending = false;
+                    guard->m_characterCountTaskId = -1;
+                    emit guard->characterCountChanged(-1, false);
+                }, Qt::QueuedConnection);
+                return;
+            }
+
+            constexpr qint64 chunkBytes = 8LL * 1024 * 1024;
+            QStringDecoder decoder("UTF-8");
+            qint64 totalCharacters = 0;
+            qint64 offset = 0;
+            bool firstDecodedChunk = true;
+            while (offset < size) {
+                if (cancel && cancel->load(std::memory_order_acquire))
+                    return;
+                const qint64 wanted = qMin(chunkBytes, size - offset);
+                const QByteArray chunk = reader.readAt(
+                    offset, static_cast<qsizetype>(wanted), &openError);
+                if (chunk.isEmpty() && wanted > 0) {
+                    AsyncErrorInfo error;
+                    error.message = QObject::tr("统计字符数时读取失败：%1").arg(openError);
+                    if (reportError)
+                        reportError(error);
+                    QMetaObject::invokeMethod(guard, [guard, generation]() {
+                        if (!guard || guard->m_characterCountGeneration != generation)
+                            return;
+                        guard->m_characterCountPending = false;
+                        guard->m_characterCountTaskId = -1;
+                        emit guard->characterCountChanged(-1, false);
+                    }, Qt::QueuedConnection);
+                    return;
+                }
+                QString decoded = decoder(chunk);
+                qint64 decodedCount = unicodeScalarCount(decoded);
+                if (firstDecodedChunk && !decoded.isEmpty()
+                    && decoded.front() == QChar::ByteOrderMark) {
+                    --decodedCount;
+                }
+                firstDecodedChunk = false;
+                totalCharacters += qMax<qint64>(0, decodedCount);
+                offset += chunk.size();
+                if (reportProgress)
+                    reportProgress(offset, size);
+            }
+            reader.close();
+            if (cancel && cancel->load(std::memory_order_acquire))
+                return;
+            QMetaObject::invokeMethod(
+                guard, [guard, generation, totalCharacters]() {
+                    if (!guard || guard->m_characterCountGeneration != generation)
+                        return;
+                    guard->m_characterCount = totalCharacters;
+                    guard->m_characterCountPending = false;
+                    guard->m_characterCountTaskId = -1;
+                    emit guard->characterCountChanged(totalCharacters, false);
+                }, Qt::QueuedConnection);
+        }, 0, QLatin1String("CharacterCount"), size);
 }
 
 void WindowedReadOnlyProvider::setWordWrap(bool enabled)
@@ -528,7 +657,6 @@ void WindowedReadOnlyProvider::findBytesAsync(const QByteArray &needle, qint64 f
 {
     if (m_path.isEmpty() || needle.isEmpty() || m_searchResultPending)
         return;
-    m_cancelSearch.storeRelease(false);
     m_searchResultPending = true;
     m_lastSearchResult = -1;
     m_searchNeedle = needle;
@@ -536,25 +664,35 @@ void WindowedReadOnlyProvider::findBytesAsync(const QByteArray &needle, qint64 f
     const QString path = m_path;
     const qint64 begin = std::clamp(fromOffset, 0LL, size);
     QPointer<WindowedReadOnlyProvider> guard(this);
-
-    disconnect(&m_searchWatcher, nullptr, this, nullptr);
-    connect(&m_searchWatcher, &QFutureWatcher<qint64>::finished, this, [this]() {
-        m_lastSearchResult = m_searchWatcher.result();
-        if (m_lastSearchResult >= 0)
-            goToOffset(m_lastSearchResult, m_searchNeedle.size());
-        m_searchResultPending = false;
-        emit searchFinished(m_lastSearchResult);
-    });
-    m_searchWatcher.setFuture(QtConcurrent::run([this, guard, path, size, begin, needle]() {
+    const quint64 generation = ++m_searchGeneration;
+    m_searchTaskId = AsyncTaskManager::instance().submit(
+        AsyncTaskType::LargeFileSearch,
+        AsyncTaskPriority::High,
+        tr("搜索当前大文件"),
+        tr("在只读窗口源中查找下一处字节序列。"),
+        [guard, generation, path, size, begin, needle]
+        (qint64, AsyncCancelPtr cancel,
+         std::function<void(qint64, qint64)> reportProgress,
+         std::function<void(const AsyncErrorInfo &)>) {
         const qint64 last = size - needle.size();
-        if (begin > last)
-            return qint64(-1);
+        qint64 result = -1;
+        if (begin > last) {
+            QMetaObject::invokeMethod(guard, [guard, generation, result]() {
+                if (!guard || guard->m_searchGeneration != generation)
+                    return;
+                guard->m_lastSearchResult = result;
+                guard->m_searchResultPending = false;
+                guard->m_searchTaskId = -1;
+                emit guard->searchFinished(result);
+            }, Qt::QueuedConnection);
+            return;
+        }
         constexpr qint64 chunkSize = 4LL * 1024 * 1024;
         const qint64 overlap = std::max<qint64>(0, qint64(needle.size()) - 1);
         qint64 chunkStart = begin;
         while (chunkStart <= last) {
-            if (m_cancelSearch.loadAcquire())
-                return qint64(-1);
+            if (cancel && cancel->load(std::memory_order_acquire))
+                return;
             const qint64 wanted = std::min<qint64>(
                 size - chunkStart, chunkSize + overlap);
             SharedReadOnlyFile reader;
@@ -566,19 +704,32 @@ void WindowedReadOnlyProvider::findBytesAsync(const QByteArray &needle, qint64 f
             if (chunk.isEmpty())
                 break;
             const qsizetype local = chunk.indexOf(needle);
-            if (local >= 0)
-                return chunkStart + local;
-            chunkStart += std::min<qint64>(chunkSize, qint64(chunk.size()));
-            if (guard) {
-                const qint64 scanned = std::min(chunkStart, size);
-                QMetaObject::invokeMethod(guard, [guard, scanned, size]() {
-                    if (guard)
-                        emit guard->searchProgress(scanned, size);
-                }, Qt::QueuedConnection);
+            if (local >= 0) {
+                result = chunkStart + local;
+                break;
             }
+            chunkStart += std::min<qint64>(chunkSize, qint64(chunk.size()));
+            const qint64 scanned = std::min(chunkStart, size);
+            if (reportProgress)
+                reportProgress(scanned, size);
+            QMetaObject::invokeMethod(guard, [guard, generation, scanned, size]() {
+                if (guard && guard->m_searchGeneration == generation)
+                    emit guard->searchProgress(scanned, size);
+            }, Qt::QueuedConnection);
         }
-        return qint64(-1);
-    }));
+        if (cancel && cancel->load(std::memory_order_acquire))
+            return;
+        QMetaObject::invokeMethod(guard, [guard, generation, result, needle]() {
+            if (!guard || guard->m_searchGeneration != generation)
+                return;
+            guard->m_lastSearchResult = result;
+            if (result >= 0)
+                guard->goToOffset(result, needle.size());
+            guard->m_searchResultPending = false;
+            guard->m_searchTaskId = -1;
+            emit guard->searchFinished(result);
+        }, Qt::QueuedConnection);
+    }, 0, QLatin1String("WindowedSearch"), size);
 }
 
 bool WindowedReadOnlyProvider::searchRunning() const

@@ -9,6 +9,18 @@ option(NOTEPADSAFE_ENABLE_ASAN
     "Instrument Notepad Safe targets with MSVC AddressSanitizer"
     OFF
 )
+option(NOTEPADSAFE_BUILD_TESTS
+    "Build unit, integration, E2E, and GUI smoke test targets"
+    OFF
+)
+option(NOTEPADSAFE_BUILD_DIAGNOSTICS
+    "Build developer-only diagnostics (requires NOTEPADSAFE_BUILD_TESTS)"
+    OFF
+)
+if(NOTEPADSAFE_BUILD_DIAGNOSTICS AND NOT NOTEPADSAFE_BUILD_TESTS)
+    message(FATAL_ERROR
+        "NOTEPADSAFE_BUILD_DIAGNOSTICS requires NOTEPADSAFE_BUILD_TESTS=ON")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -34,7 +46,7 @@ elseif(NOT NOTEPADSAFE_QT6_DIR)
 endif()
 set(CMAKE_PREFIX_PATH "${NOTEPADSAFE_QT6_DIR}")
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network PrintSupport Svg SvgWidgets Concurrent TaskTree Test)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network PrintSupport Svg SvgWidgets Concurrent TaskTree)
 include(cmake/PCRE2.cmake)
 
 # QScintilla 静态库（相对于产品根，clone 后即可构建）
@@ -82,7 +94,7 @@ target_include_directories(notepadsafe_search_runtime PUBLIC
 )
 target_link_libraries(notepadsafe_search_runtime PUBLIC Qt6::Core notepadsafe_pcre2)
 
-# Stable product-domain policies. Keep file tiers and resource admission free of
+# Stable product-domain policies. Keep file-tier and draft-storage rules free of
 # QWidget/QScintilla dependencies so they can be tested at exact byte boundaries.
 add_library(notepadsafe_domain STATIC
     src/domain/FileTierPolicy.cpp
@@ -294,6 +306,12 @@ add_custom_target(portable_package
 
 # ============ 测试 ============
 
+# Product builds intentionally stop above this line. Tests are explicit opt-in
+# targets so build.bat cannot accidentally compile stale experiments or GUI
+# harnesses into the default developer/release build graph.
+if(NOTEPADSAFE_BUILD_TESTS)
+find_package(Qt6 REQUIRED COMPONENTS Test)
+
 # Windows 静态 Qt 需要的系统库（复用于测试）
 set(WIN_SYSTEM_LIBS
     winmm imm32 ws2_32 ole32 oleaut32 advapi32 shell32
@@ -380,40 +398,7 @@ if(WIN32)
     target_link_libraries(test_settings_ui PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
 
-# 测试 5: 大文件分块加载回归测试
-# 防回归："打开大文件时进度对话框正常显示，但加载完成后编辑框无内容"
-# 使用 QApplication（非 QCoreApplication），与 notepad-safe.exe 主程序相同的初始化方式。
-add_executable(test_largefile
-    tests/test_largefile.cpp
-    src/editor/DynamicThresholds.cpp
-    src/editor/LineIndex.cpp
-    src/editor/PatchList.cpp
-    src/search/LargeFileSearch.cpp
-    src/search/SearchResultsModel.cpp
-    src/async/AsyncTask.cpp
-    src/async/AsyncThreadPool.cpp
-    src/async/AsyncTaskManager.cpp
-    src/editor/VirtualFileView.cpp
-)
-target_include_directories(test_largefile PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
-target_link_libraries(test_largefile PRIVATE
-    notepadsafe_domain
-    notepadsafe_search_runtime
-    Qt6::Core
-    Qt6::Gui
-    Qt6::Widgets
-    Qt6::Concurrent
-    Qt6::TaskTree
-    ${QSCINTILLA_LIB}
-)
-if(WIN32)
-    target_link_libraries(test_largefile PRIVATE ${WIN_SYSTEM_LIBS})
-endif()
-qt_import_plugins(test_largefile
-    INCLUDE Qt6::QWindowsIntegrationPlugin
-)
-
-# Test 6: exact S1/S2/S3 boundaries and permanent large-file read-only policy.
+# Test 5: exact S1/S2/S3 boundaries and permanent large-file read-only policy.
 add_executable(test_filetierpolicy
     tests/test_filetierpolicy.cpp
 )
@@ -423,7 +408,7 @@ if(WIN32)
     target_link_libraries(test_filetierpolicy PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
 
-# Test 7: secret-memory/service-state contract plus pinned KeePassXC fixtures.
+# Test 6: secret-memory/service-state contract plus pinned KeePassXC fixtures.
 add_executable(test_vault_contract
     tests/test_vault_contract.cpp
 )
@@ -454,6 +439,25 @@ if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
         target_link_libraries(test_security_identity PRIVATE ${WIN_SYSTEM_LIBS})
     endif()
 endif()
+
+set(NOTEPADSAFE_NON_GUI_TEST_TARGETS
+    test_textencoding
+    test_search
+    test_pcre2_regex
+    test_session
+    test_settings_ui
+    test_filetierpolicy
+    test_vault_contract
+)
+if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
+    list(APPEND NOTEPADSAFE_NON_GUI_TEST_TARGETS
+        test_kdbx_backend
+        test_security_identity
+    )
+endif()
+add_custom_target(notepadsafe_non_gui_tests
+    DEPENDS ${NOTEPADSAFE_NON_GUI_TEST_TARGETS}
+)
 
 # 测试 6: 端到端启动秒开验证（100MB 会话恢复 → 主窗口 < 1500ms 可见）
 #  方式：QProcess 启动 notepad-safe.exe + Win32 EnumWindows 检测窗口可见时间
@@ -492,7 +496,6 @@ add_test(NAME search       COMMAND test_search)
 add_test(NAME pcre2_regex  COMMAND test_pcre2_regex)
 add_test(NAME session      COMMAND test_session)
 add_test(NAME settings_ui  COMMAND test_settings_ui)
-add_test(NAME largefile    COMMAND test_largefile)
 add_test(NAME filetierpolicy COMMAND test_filetierpolicy)
 add_test(NAME vault_contract COMMAND test_vault_contract)
 if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
@@ -512,6 +515,8 @@ endif()
 
 # ============ 诊断工具 ============
 
+if(NOTEPADSAFE_BUILD_DIAGNOSTICS)
+
 add_executable(diag_lineindex
     tests/diag_lineindex.cpp
     src/editor/DynamicThresholds.cpp
@@ -519,18 +524,6 @@ add_executable(diag_lineindex
 )
 target_include_directories(diag_lineindex PRIVATE ${APP_INCLUDE_DIRS})
 target_link_libraries(diag_lineindex PRIVATE
-    Qt6::Core
-    Qt6::Concurrent
-)
-
-add_executable(diag_editops
-    tests/diag_editops.cpp
-    src/editor/DynamicThresholds.cpp
-    src/editor/LineIndex.cpp
-    src/editor/PatchList.cpp
-)
-target_include_directories(diag_editops PRIVATE ${APP_INCLUDE_DIRS})
-target_link_libraries(diag_editops PRIVATE
     Qt6::Core
     Qt6::Concurrent
 )
@@ -546,39 +539,7 @@ target_link_libraries(diag_scroll_lines PRIVATE
     Qt6::Concurrent
 )
 
-add_executable(diag_gui_l2_editops
-    tests/diag_gui_l2_editops.cpp
-    src/editor/VirtualFileView.cpp
-    src/editor/PatchList.cpp
-    src/editor/LineIndex.cpp
-    src/search/LargeFileSearch.cpp
-    src/async/AsyncTaskManager.cpp
-    src/async/AsyncTask.cpp
-    src/async/AsyncThreadPool.cpp
-    src/editor/DynamicThresholds.cpp
-)
-target_include_directories(diag_gui_l2_editops PRIVATE ${APP_INCLUDE_DIRS})
-target_link_libraries(diag_gui_l2_editops PRIVATE
-    notepadsafe_search_runtime
-    Qt6::Core
-    Qt6::Gui
-    Qt6::Widgets
-    Qt6::Concurrent
-    Qt6::PrintSupport
-    Qt6::Svg
-)
-
-add_executable(diag_save_l2_chain
-    tests/diag_save_l2_chain.cpp
-    src/editor/PatchList.cpp
-    src/editor/LineIndex.cpp
-    src/editor/DynamicThresholds.cpp
-)
-target_include_directories(diag_save_l2_chain PRIVATE ${APP_INCLUDE_DIRS})
-target_link_libraries(diag_save_l2_chain PRIVATE
-    Qt6::Core
-    Qt6::Concurrent
-)
+endif()
 
 # ============================================================================
 #  GUI 冒烟测试组件（tests/gui_smoke/）
@@ -805,3 +766,5 @@ if(WIN32)
         LABELS "gui;e2e"
     )
 endif()
+
+endif() # NOTEPADSAFE_BUILD_TESTS

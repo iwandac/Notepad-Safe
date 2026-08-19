@@ -8,17 +8,9 @@
 #include <QMouseEvent>
 #include <QKeyEvent>
 #include <QWheelEvent>
-#include <QProgressDialog>
 #include <QApplication>
 #include <QThread>
-#include <QMessageBox>
 #include <QScrollBar>
-#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-#include <QtConcurrentRun>
-#else
-#include <QtConcurrent>
-#endif
-#include <QSaveFile>
 #include <QClipboard>
 #include <QGuiApplication>
 #include <QInputMethodEvent>
@@ -26,7 +18,6 @@
 #include <QPointer>
 #include <QElapsedTimer>
 #include <QFile>
-#include <QTextStream>
 #include <QDir>
 #include <QFileInfo>
 
@@ -147,14 +138,12 @@ VirtualFileView::~VirtualFileView() {
     closeFile(/*allowProcessEvents=*/false);
 
     if (search_) { delete search_; search_ = nullptr; }
-    if (lineBuildWatcher_) { delete lineBuildWatcher_; lineBuildWatcher_ = nullptr; }
 }
 
 // ============================================================================
 //  打开/关闭文件
 // ============================================================================
-bool VirtualFileView::openFile(const QString& filePath, QString* errMsg,
-                               QWidget* /*progressParent — 秒开不再用模态进度对话框*/)
+bool VirtualFileView::openFile(const QString& filePath, QString* errMsg)
 {
     closeFile();
     QString openError;
@@ -414,89 +403,7 @@ bool VirtualFileView::remapFile(QString* errMsg) {
     }
     QString path = file_.fileName();
     closeFile();
-    return openFile(path, errMsg, nullptr);
-}
-
-bool VirtualFileView::openFileSync(const QString& filePath, QString* errMsg) {
-    // 诊断/单测专用：同步完成 mmap + quickBuild + 全量 buildFromMmap，
-    // 不走 AsyncTaskManager，不依赖 QEventLoop。
-    closeFile();
-    file_.setFileName(filePath);
-    if (!file_.open(QIODevice::ReadOnly)) {
-        if (errMsg) *errMsg = QObject::tr("openFileSync: 无法打开文件：%1").arg(file_.errorString());
-        return false;
-    }
-    qint64 size = file_.size();
-    if (size < 0) { if (errMsg) *errMsg = QObject::tr("文件大小无效"); return false; }
-    if (size == 0) {
-        mmapSize_ = 0;
-        lineIndex_.clear();
-        bookmarks_.clear();
-        cursorByte_ = 0;
-        selStartByte_ = selEndByte_ = 0;
-        patches_.resetAfterSave();
-        lastL2Count_ = 0;
-        if (search_) search_->setSource(nullptr, 0, &lineIndex_, &patches_);
-        updateMetrics();
-        updateScrollBarsFromContent();
-        viewport()->update();
-        emit fileOpenedChanged(true);
-        emit saveNeededChanged(false);
-        emit lineBuildProgress(0, 0);
-        emit lineBuildFinished(true);
-        return true;
-    }
-    uchar* p = file_.map(0, size);
-    if (!p) {
-        if (errMsg) *errMsg = QObject::tr("openFileSync: QFile::map 失败：%1").arg(file_.errorString());
-        return false;
-    }
-    // quickBuild 首屏锚点
-    LineIndex quickIndex;
-    quickIndex.setIncompleteWithFileSize(size);
-    quickIndex.quickBuildFirstRange(p, size, 1024 * 1024);
-
-    // 写入 quickIndex 状态（等同 onMmapReady）
-    m_loading = false;
-    mmapBase_ = p;
-    mmapSize_ = size;
-    lineIndex_ = quickIndex;
-    bookmarks_.clear();
-    m_buildProgressBytes = 1024 * 1024;
-    cursorByte_ = 0;
-    selStartByte_ = selEndByte_ = 0;
-    patches_.resetAfterSave();
-    lastL2Count_ = 0;
-    if (search_) search_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
-    updateMetrics();
-    updateScrollBarsFromContent();
-    viewport()->update();
-    emit fileOpenedChanged(true);
-    emit saveNeededChanged(false);
-    emit lineBuildProgress(1024 * 1024, size);
-
-    // 同步 full buildFromMmap（不走 AsyncTaskManager）
-    LineIndex fullIndex;
-    std::atomic<bool> cancel{false};
-    auto progress = [&](qint64 done, qint64 total) {
-        m_buildProgressBytes = done;
-        emit lineBuildProgress(done, total);
-    };
-    bool buildOk = fullIndex.buildFromMmap(p, size, progress, &cancel, 0);
-    if (buildOk) {
-        lineIndex_ = fullIndex;
-        m_buildProgressBytes = size;
-        emit lineBuildProgress(size, size);
-        emit lineBuildFinished(true);
-    } else {
-        if (errMsg) *errMsg = QObject::tr("openFileSync: LineIndex 构建失败");
-        file_.unmap(p); mmapBase_ = nullptr; mmapSize_ = 0;
-        lineIndex_.clear();
-        file_.close();
-        return false;
-    }
-    viewport()->update();
-    return true;
+    return openFile(path, errMsg);
 }
 
 void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
@@ -517,7 +424,7 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
 
     // ========================================================================
     //  关键修复（WM_CLOSE 0xC0000005 崩溃根因）：
-    //   现在后台 LineIndex 构建走 AsyncTaskManager，不再是 lineBuildFuture_。
+    //   后台 LineIndex 构建由 AsyncTaskManager worker 持有。
     //   如果 cancel 之后直接 unmap mmapBase_，worker 线程仍在
     //   buildLineIndexOnWorker(mmapBase_, ...) 读内存 → 访问违例 0xC0000005。
     //   所以必须：1) cancel  2) 忙等 worker 真正进入终态 (Finished/Canceled/Failed)
@@ -579,10 +486,8 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
         m_lineBuildTaskId = -1;
         m_lineBuildWorkerDone.reset();
     }
-    // 下面是 legacy 取消（防止还有旧的 QtConcurrent 路径残留）
+    // The current AsyncTaskManager task owns the only line-index worker.
     if (lineBuildCancel_) lineBuildCancel_->store(true, std::memory_order_relaxed);
-    if (lineBuildWatcher_) { lineBuildWatcher_->cancel(); lineBuildWatcher_->disconnect(); }
-    if (lineBuildFuture_.isRunning()) lineBuildFuture_.waitForFinished();
 
     // Prefetch workers also hold the raw mapping pointer. Cancel and wait for
     // every generation still in flight before unmapping or scrubbing memory.
@@ -668,26 +573,6 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
         emit saveNeededChanged(false);
     }
     m_closingFile = false;
-}
-
-// ============================================================================
-//  LineIndex 构建：已废弃（L2 秒开统一由 startAsyncLineBuild → AsyncTaskManager 处理）
-//  保留此函数仅为二进制兼容；若被误调用则警告并返回 true（避免调用方误以为失败）。
-// ============================================================================
-bool VirtualFileView::buildLineIndexWithProgress(QWidget* /*progressParent*/, QString* errMsg) {
-    qWarning("[VirtualFileView::buildLineIndexWithProgress] DEPRECATED: use startAsyncLineBuild via AsyncTaskManager instead.");
-    // 如果当前仍处于 incomplete 状态，仅在 errMsg 给出提示但不阻塞失败
-    if (lineIndex_.isIncomplete() && errMsg && errMsg->isEmpty()) {
-        *errMsg = QObject::tr("buildLineIndexWithProgress 已废弃；后台正在通过 AsyncTaskManager 增量构建行索引。");
-    }
-    return true;
-}
-
-QWidget* VirtualFileView::pickProgressParent(QWidget* progressParent) {
-    if (progressParent) return progressParent;
-    QWidget* p = this;
-    while (p && p->parentWidget()) p = p->parentWidget();
-    return p ? p : this;
 }
 
 // ============================================================================

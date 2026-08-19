@@ -20,7 +20,7 @@
 - ✅ **深色模式**（跟随系统 + 手动切换）
 - ✅ **mmap 大文件快速查看基础**（目标三档方案见 docs/DESIGN.md §6–§9）
 - ✅ **产品图标**（根目录 `notepad_safe.png` → EXE 图标 + 窗口运行时图标）
-- ✅ **全自动化测试**：CTest 10 个测试套件覆盖编码、搜索、会话、设置、大文件、GUI 交互与真实进程截图
+- ✅ **测试与产品构建隔离**：非 GUI、GUI smoke、E2E 按脚本显式构建，不进入默认产品 compile/link 图
 
 ## 2. 构建
 
@@ -56,17 +56,18 @@ build.bat
 脚本内部流程：
 1. 调用 `vcvars64.bat`（若未在 VS x64 Native Tools 环境）
 2. `cmake -G Ninja -S . -B build`（QScintilla 相对路径；Qt 路径从环境变量/缓存）
-3. `cmake --build build -j`
+3. `cmake --build build --target notepad-safe -j`
 4. 产出：`build\notepad-safe.exe`（单文件 ~24MB）
 
-### 2.4 运行所有测试
+### 2.4 运行测试
 
 ```bat
 run_tests.bat
 ```
 
-10 个 CTest 目标：5 个逻辑/组件测试、3 个 Qt GUI 冒烟测试，以及 2 个启动完整应用并检查窗口与像素的 E2E 测试。
-全部通过即视为构建与行为合格。
+该脚本显式开启测试构建并运行非 GUI 回归。GUI smoke 使用 `run_all_gui_smoke.bat`；真实进程
+E2E 由发布门禁按需运行。默认 `build.bat` 不生成任何测试或诊断目标。构建边界与归档清单见
+`docs/STATIC_CODE_AUDIT.md`。
 
 ## 3. 使用
 
@@ -83,8 +84,8 @@ build\notepad-safe.exe a.txt      :: 启动并打开指定文件（支持多文�
 
 **数据目录**：
 - 会话 + 自动恢复：`%LOCALAPPDATA%\NotepadSafe\session.json` / `autosave\*.ndraft`
-  （S1 使用 Windows DPAPI 当前用户密封；S2 使用加密编辑日志及分块检查点；
-  旧版 `.tmp` 仅保留迁移读取）
+  （普通 S1/B1 恢复数据使用 Windows DPAPI 当前用户密封；S2/S3/B2/B3 只读，不生成编辑日志；
+  旧版大文件编辑恢复格式只会被明确拒绝）
 - 设置：`HKEY_CURRENT_USER\Software\NotepadSafe\NotepadSafe`（或等效 ini，由 Qt QSettings 决定）
 
 > 为与原 Credential Vault 产品隔离，独立后 Notepad Safe 不读取/写入任何
@@ -94,14 +95,12 @@ build\notepad-safe.exe a.txt      :: 启动并打开指定文件（支持多文�
 
 ```
 notepad-safe/
-├── CMakeLists.txt              # 主目标 notepad-safe + 10 个 CTest
-├── build.bat / run_tests.bat   # 构建 & 测试脚本（相对脚本自身路径）
-├── main.cpp / MainWindow.*     # 主程序入口 & 主窗口
-├── EditorTab.*                 # 单个编辑器标签（QsciScintilla）
-├── TextEncoding.*              # 编码检测 / 转换
-├── FindReplaceDialog.*         # 查找替换对话框
-├── SearchResultsDock.*         # 搜索结果 Dock
-├── SessionManager.*            # 会话 & 自动保存
+├── CMakeLists.txt              # 默认产品目标；测试/诊断显式 opt-in
+├── build.bat / run_tests.bat   # 产品构建与非 GUI 测试脚本
+├── run_all_gui_smoke.bat       # GUI smoke 显式构建/执行
+├── src/                        # window/editor/search/session/async/vault/domain
+├── tests/                      # 活动单元、集成、GUI 与 E2E 测试
+├── archive/disabled/           # 不参与 CMake/CTest 的历史实现
 ├── notepad_safe.png            # 原始图标（1254×1254，产品根）
 ├── resources/
 │   ├── notepad_safe.png        # 运行时 PNG（app_resources.qrc 引用）

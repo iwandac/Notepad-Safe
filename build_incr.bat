@@ -15,6 +15,15 @@ if defined NOTEPADSAFE_BUILD_JOBS (
     REM environment variable to 1 when diagnosing an individual command.
     set "BUILD_JOBS=4"
 )
+if not defined NOTEPADSAFE_BUILD_TESTS (
+    set "NOTEPADSAFE_BUILD_TESTS=OFF"
+)
+if not defined NOTEPADSAFE_BUILD_DIAGNOSTICS (
+    set "NOTEPADSAFE_BUILD_DIAGNOSTICS=OFF"
+)
+if not defined NOTEPADSAFE_WITH_KDBX (
+    set "NOTEPADSAFE_WITH_KDBX=ON"
+)
 
 REM Match build.bat: stable English /showIncludes output and UTF-8 diagnostics.
 set "VSLANG=1033"
@@ -38,16 +47,28 @@ pushd "%BUILD_DIR%"
 "%VS_CMAKE%" -G Ninja ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DCMAKE_MAKE_PROGRAM="%VS_NINJA%" ^
+    -DNOTEPADSAFE_BUILD_TESTS="%NOTEPADSAFE_BUILD_TESTS%" ^
+    -DNOTEPADSAFE_BUILD_DIAGNOSTICS="%NOTEPADSAFE_BUILD_DIAGNOSTICS%" ^
+    -DNOTEPADSAFE_ENABLE_KDBX_BACKEND="%NOTEPADSAFE_WITH_KDBX%" ^
     "%SOURCE_DIR%"
-if errorlevel 1 (popd & exit /b 1)
+set "CONFIGURE_RC=!errorlevel!"
+if not "!CONFIGURE_RC!"=="0" (
+    popd
+    exit /b !CONFIGURE_RC!
+)
 
 echo === [3/3] Building target(s): %* ===
 if "%~1"=="" (
     "%VS_CMAKE%" --build . --config Release -j %BUILD_JOBS%
+    set "BUILD_RC=!errorlevel!"
 ) else (
     "%VS_CMAKE%" --build . --config Release -j %BUILD_JOBS% --target %*
+    set "BUILD_RC=!errorlevel!"
 )
-if errorlevel 1 (popd & exit /b 1)
+if not "!BUILD_RC!"=="0" (
+    popd
+    exit /b !BUILD_RC!
+)
 
 echo.
 echo === INCREMENTAL BUILD SUCCESS ===

@@ -4,7 +4,7 @@ REM  notepad-safe GUI 冒烟测试一键脚本（Windows / PowerShell 环境）
 REM  按 QUALITY_ASSURANCE_AND_GUI_TESTING.md §2 强制管理。
 REM
 REM  用法：
-REM    cd F:\projects\credentials\notepad-safe
+REM    cd ^<repository^>\notepad-safe
 REM    .\run_all_gui_smoke.bat          构建+运行全部 GUI smoke，输出汇总 PASS/FAIL
 REM    .\run_all_gui_smoke.bat build    只构建，不运行
 REM    .\run_all_gui_smoke.bat coord    只跑 gui_smoke_coord
@@ -13,10 +13,16 @@ REM ============================================================================
 setlocal enabledelayedexpansion
 
 set ROOT=%~dp0
-set BUILD=%ROOT%build
+if defined NOTEPADSAFE_BUILD_DIR (
+    set "BUILD=%NOTEPADSAFE_BUILD_DIR%"
+) else (
+    set "BUILD=%ROOT%build"
+)
 
-set TARGETS=gui_smoke_coord gui_smoke_findreplace
-set TARGET_NAMES=COORD_EDITOPS FIND_REPLACE
+set "NOTEPADSAFE_BUILD_TESTS=ON"
+set "NOTEPADSAFE_BUILD_DIAGNOSTICS=OFF"
+set "NOTEPADSAFE_WITH_KDBX=ON"
+set TARGETS=gui_smoke_coord gui_smoke_findreplace gui_smoke_large_readonly gui_smoke_smallfixes gui_smoke_vault gui_smoke_secure_documents
 
 echo.
 echo === notepad-safe GUI Smoke Suite ===
@@ -25,7 +31,7 @@ echo.
 REM -------- Step 1. build --------
 pushd "%ROOT%"
 if /I "%1"=="build" (
-    call "%ROOT%build_incr.bat" gui_smoke_coord gui_smoke_findreplace 2>&1
+    call "%ROOT%build_incr.bat" %TARGETS% 2>&1
     if errorlevel 1 (
         echo. & echo [FATAL] Build failed. & exit /b 1
     )
@@ -43,7 +49,7 @@ if /I "%1"=="fr" (
 )
 
 REM 默认：构建全部 + 运行全部
-call "%ROOT%build_incr.bat" gui_smoke_coord gui_smoke_findreplace 2>&1
+call "%ROOT%build_incr.bat" %TARGETS% 2>&1
 if errorlevel 1 (
     echo. & echo [FATAL] Build failed (see build log above). & exit /b 1
 )
@@ -51,13 +57,10 @@ if errorlevel 1 (
 :RUN_ALL
 set PASS=0
 set FAIL=0
-set I=0
 for %%T in (%TARGETS%) do (
-    set /a I+=1
-    call set NAME=%%TARGET_NAMES: =&REM %%% // hack: pick I-th
     echo.
     echo ------------------------------------------------------------
-    call echo [Step !I!] Running %%T%% ...
+    echo Running %%T ...
     echo ------------------------------------------------------------
     pushd "%BUILD%"
     ".\%%T.exe" -o txt,%TEMP%\%%T.txt -xml,%TEMP%\%%T.junit.xml

@@ -28,6 +28,7 @@ StatusBarTaskWidget::StatusBarTaskWidget(QWidget *parent)
     connect(&mgr, &AsyncTaskManager::threadCountChanged, this, &StatusBarTaskWidget::onThreadCountChanged);
     connect(&mgr, &AsyncTaskManager::summaryChanged, this, &StatusBarTaskWidget::onSummaryChanged);
 
+    onThreadCountChanged(mgr.activeThreadCount(), mgr.maximumThreadCount());
     onSummaryChanged(mgr.queuedCount(), mgr.runningCount(), 0);
 }
 

@@ -5,6 +5,7 @@
 #include <QByteArray>
 #include <QVector>
 #include <QUuid>
+#include <limits>
 #include <Qsci/qsciscintilla.h>
 #include "TextEncoding.h"
 #include "LargeFileSearch.h"   // 先入 LargeFileSearchMatch 定义
@@ -12,8 +13,9 @@
 
 enum class ViewMode : int;  // 前置声明（定义在 VirtualFileView.h）
 
-// L2 的呈现方式与“是否在后台提升为完整 Scintilla 编辑器”是两个独立决策。
-// Text + false 用于强制保持 mmap 文本视图；Hex 永不构建文本行索引。
+// Historical L2 names are retained in session/API data for compatibility.
+// They select text versus binary presentation only: S2/S3/B2/B3 always use
+// WindowedReadOnlyProvider and are never promoted to an editable document.
 enum class L2Presentation {
     Text,
     Hex,
@@ -255,6 +257,10 @@ public:
     // owns the authoritative 64-bit size for S2/S3 read-only analysis;
     // Scintilla owns it only for sub-32-MiB ordinary/secure documents.
     qint64 contentSizeBytes() const;
+    // Unicode scalar count for text presentations; Hex presentations return
+    // their authoritative byte count. -1 means a large-file count is pending
+    // or unavailable.
+    qint64 contentCharacterCount() const;
 
     // 焦点设置（跳转后对用户可见）
     void setFocusEditor();
@@ -325,6 +331,7 @@ signals:
     void syntaxChanged(Syntax syntax);
     void titleChanged(const QString &title);
     void contentChanged(quint64 revision);
+    void characterCountChanged();
     void commandCapabilitiesChanged();
 
     // 当前 EditorTab 内部 L2<->L1 模式切换（从 L1 切换到 L2 或反向）——MainWindow 用它同步"不适配 L2 的菜单项 enabled"
@@ -359,6 +366,9 @@ private:
     QString m_autosavePath;   // 内部 autosave 临时路径（对用户透明）
     QUuid m_sessionInstanceId = QUuid::createUuid();
     quint64 m_contentRevision = 0;
+    mutable quint64 m_characterCountRevision = std::numeric_limits<quint64>::max();
+    mutable qint64 m_cachedCharacterCount = 0;
+    mutable bool m_cachedCharacterCountHex = false;
     QUuid m_secureDocumentId;
     QString m_secureDocumentTitle;
     bool m_secureDocumentMasked = false;

@@ -1,103 +1,37 @@
 @echo off
-setlocal enabledelayedexpansion
+setlocal
 
-REM ============================================================================
-REM  Notepad Safe - run all tests (direct exe + CTest double check)
-REM  Paths are relative to the script dir (%~dp0)
-REM ============================================================================
-
+REM Build and run the non-GUI regression suite. Product build.bat deliberately
+REM excludes these targets; this script opts in and builds only this suite.
 set "SCRIPT_DIR=%~dp0"
-set "BUILD_DIR=%SCRIPT_DIR%build"
+if defined NOTEPADSAFE_BUILD_DIR (
+    set "BUILD_DIR=%NOTEPADSAFE_BUILD_DIR%"
+) else (
+    set "BUILD_DIR=%SCRIPT_DIR%build"
+)
+set "NOTEPADSAFE_BUILD_TESTS=ON"
+set "NOTEPADSAFE_BUILD_DIAGNOSTICS=OFF"
 
 if not defined NOTEPADSAFE_VS_ROOT (
     set "NOTEPADSAFE_VS_ROOT=C:\Program Files\Microsoft Visual Studio\18\Insiders"
 )
 set "VS_CTEST=%NOTEPADSAFE_VS_ROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\ctest.exe"
 
-if not exist "%BUILD_DIR%\test_textencoding.exe" (
-    echo ERROR: Tests not built. Run build.bat first.
+call "%SCRIPT_DIR%build_incr.bat" notepadsafe_non_gui_tests
+if errorlevel 1 (
+    echo ERROR: Non-GUI test build failed.
     exit /b 1
 )
 
-set PASS=0
-set FAIL=0
-
-echo.
-echo ============ Running Exe Tests Directly ============
-echo.
-
-echo --- TextEncoding Tests ---
-"%BUILD_DIR%\test_textencoding.exe"
-if !errorlevel! == 0 (
-    set /a PASS+=1
-    echo [PASS] test_textencoding
-) else (
-    set /a FAIL+=1
-    echo [FAIL] test_textencoding
-)
-echo.
-
-echo --- Search Logic Tests ---
-"%BUILD_DIR%\test_search.exe"
-if !errorlevel! == 0 (
-    set /a PASS+=1
-    echo [PASS] test_search
-) else (
-    set /a FAIL+=1
-    echo [FAIL] test_search
-)
-echo.
-
-echo --- SessionManager Tests ---
-"%BUILD_DIR%\test_session.exe"
-if !errorlevel! == 0 (
-    set /a PASS+=1
-    echo [PASS] test_session
-) else (
-    set /a FAIL+=1
-    echo [FAIL] test_session
-)
-echo.
-
-echo --- Settings / UI Sync Tests ---
-"%BUILD_DIR%\test_settings_ui.exe"
-if !errorlevel! == 0 (
-    set /a PASS+=1
-    echo [PASS] test_settings_ui
-) else (
-    set /a FAIL+=1
-    echo [FAIL] test_settings_ui
-)
-echo.
-
-echo --- LargeFile Tests ---
-"%BUILD_DIR%\test_largefile.exe"
-if !errorlevel! == 0 (
-    set /a PASS+=1
-    echo [PASS] test_largefile
-) else (
-    set /a FAIL+=1
-    echo [FAIL] test_largefile
-)
-echo.
-
-echo ============ Running CTest ============
 pushd "%BUILD_DIR%"
 if exist "%VS_CTEST%" (
-    "%VS_CTEST%" --output-on-failure
-    set CTEST_RC=!errorlevel!
+    "%VS_CTEST%" --output-on-failure -E "^(gui_smoke_|e2e_)"
 ) else (
-    ctest --output-on-failure
-    set CTEST_RC=!errorlevel!
+    ctest --output-on-failure -E "^(gui_smoke_|e2e_)"
 )
+set "TEST_RC=%errorlevel%"
 popd
 
-echo.
-echo ============ Summary ============
-echo   Direct exe : %PASS% passed, %FAIL% failed
-echo   CTest      : rc=%CTEST_RC%
-echo.
-
-if %FAIL% gtr 0 exit /b 1
-if not "%CTEST_RC%"=="0" exit /b %CTEST_RC%
+if not "%TEST_RC%"=="0" exit /b %TEST_RC%
+echo === NON-GUI TESTS PASSED ===
 exit /b 0

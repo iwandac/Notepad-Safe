@@ -186,6 +186,11 @@ int AsyncTaskManager::activeThreadCount()
     return AsyncThreadPool::instance().totalActiveThreadCount();
 }
 
+int AsyncTaskManager::maximumThreadCount() const
+{
+    return AsyncThreadPool::instance().maxThreads();
+}
+
 static inline int findTaskIndex(QList<AsyncTask> &list, qint64 id)
 {
     for (int i = 0; i < list.size(); ++i) if (list[i].id == id) return i;
@@ -200,19 +205,8 @@ qint64 AsyncTaskManager::submit(AsyncTaskType type, AsyncTaskPriority priority, 
     t.batchId = batchId;
     t.type = type;
     t.priority = priority;
-    // Crypto operations deliberately remain opaque in the global task UI.
-    // A caller must never make a password, account name or protected path part
-    // of a long-lived task-history row.
-    if (type == AsyncTaskType::FileEncrypt) {
-        t.title = tr("保存安全文档");
-        t.description = tr("正在以原子方式写入加密数据。");
-    } else if (type == AsyncTaskType::FileDecrypt) {
-        t.title = tr("打开安全文档");
-        t.description = tr("正在验证并解密文档。");
-    } else {
-        t.title = title;
-        t.description = description;
-    }
+    t.title = title;
+    t.description = description;
     t.progressDone = 0;
     t.progressTotal = progressTotalInit;
     t.createdAt = QDateTime::currentDateTime();
@@ -244,9 +238,6 @@ qint64 AsyncTaskManager::submit(AsyncTaskType type, AsyncTaskPriority priority, 
     auto cancelPtr = t.cancel;
     auto mgr = this;
 
-    // 立即在主线程标记 Running（QueuedConnection 自身保证线程安全，同步发也没大问题）
-    QMetaObject::invokeMethod(mgr, "markTaskRunningImpl", Qt::QueuedConnection, Q_ARG(qint64, weakTaskId));
-
     auto reportProgress = [mgr, weakTaskId](qint64 done, qint64 total) {
         QMetaObject::invokeMethod(mgr, "updateTaskProgressImpl", Qt::QueuedConnection,
                                   Q_ARG(qint64, weakTaskId), Q_ARG(qint64, done), Q_ARG(qint64, total));
@@ -259,7 +250,14 @@ qint64 AsyncTaskManager::submit(AsyncTaskType type, AsyncTaskPriority priority, 
                                   Q_ARG(AsyncErrorInfo, copy));
     };
 
-    AsyncThreadPool::instance().tryStartWorker([mgr, workerFn, weakTaskId, cancelPtr, reportProgress, reportError]() {
+    AsyncThreadPool::instance().startWorker([mgr, workerFn, weakTaskId, cancelPtr, reportProgress, reportError]() {
+        // Keep tasks Queued while they are actually waiting in QThreadPool.
+        // Besides making the task panel truthful, this lets cancel() remove a
+        // not-yet-started task immediately. Queued invocations from this worker
+        // are delivered in order, so Running is observed before its terminal
+        // finish callback.
+        QMetaObject::invokeMethod(mgr, "markTaskRunningImpl", Qt::QueuedConnection,
+                                  Q_ARG(qint64, weakTaskId));
         AsyncErrorInfo err;
         AsyncTaskState finalState = AsyncTaskState::Finished;
         try {

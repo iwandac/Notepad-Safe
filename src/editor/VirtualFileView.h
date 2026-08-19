@@ -7,7 +7,6 @@
 #include <QColor>
 #include <QFont>
 #include <QFontMetrics>
-#include <QFuture>
 #include <QFutureWatcher>
 #include <QPointer>
 #include <QElapsedTimer>
@@ -22,18 +21,19 @@
 #include "TextEncoding.h"
 #include "SharedReadOnlyFile.h"
 
-class QEventLoop;
-class QProgressDialog;
-
 // ============================================================================
-//  VirtualFileView — L2 虚拟视图（P1 基础视图）
+//  VirtualFileView — bounded B1 byte editor compatibility provider
 //
-//  职责（P1）：
-//   · QFile::map() 打开大文件 mmap（Windows 下 FileMapping + MapViewOfFile）
-//   · 后台线程构建 LineIndex（QProgressDialog + 取消原子）
-//   · paintEvent 自绘「可见行 50~100 行」≥ 55fps（不画全文件）
-//   · 垂直/水平滚动条同步 LineIndex 的总行数/最长行
-//   · 光标 byte 位置（P1 简化为整行浏览级光标：鼠标单击某行 → 定位到行首）
+//  Production boundary:
+//   · used by B1 (< 32 MiB) binary/Hex editing and bounded secure binary data;
+//   · NOT the S2/S3/B2/B3 surface; those tiers use WindowedReadOnlyProvider;
+//   · PatchList and saveAs here do not imply editable large-file support.
+//
+//  Responsibilities:
+//   · mmap a bounded file, or own a bounded in-memory secure payload
+//   · 后台任务构建 LineIndex（状态栏任务进度 + 取消原子）
+//   · provide global byte/line coordinates to the EditorTab Scintilla overlays
+//   · keep Hex and ASCII panes synchronized with the byte model
 //   · 书签集合（QSet<行号>），点击行号区切换，上/下一个书签跳转
 //   · 对外提供「按 byte 范围读文本」→ 委托 PatchList::renderRange
 //   · 对外提供 gotoLine / gotoByteOffset / saveAs（用 renderRange 分块写）
@@ -42,16 +42,8 @@ class QProgressDialog;
 //
 //  16 进制视图模式：
 //   · 每行 16 字节：[ 地址列(8 位 16 进制) ][ 16×(2 位 16 进制 + 空格) ][ ASCII 列（16 字）]
-//   · 大文件下不使用 LineIndex（按固定 16B/行分页），避免二进制文件 LineIndex 行数爆炸。
+//   · Hex 下不使用 LineIndex（按固定 16B/行分页）。
 //   · 字节导航用 gotoByteOffset（仍然有效）；书签切换为 16 进制行的偏移。
-//
-//  不做的（P2/P3/P4 分别落地）：
-//   - 光标逐字节导航 + 文本选择 + 键盘输入编辑（P3）
-//   - 语法高亮词法器（P1 仅黑白纯文本，等宽字体）
-//   - 大文件搜索 / 替换（P2/P4）
-//   - 粘贴、删除、Ctrl+Z/Y（P3）
-//
-//  行高 & 字号：使用系统等宽字体（Courier New/Consolas），字号跟随全局 DPI
 // ============================================================================
 
 enum class ViewMode {
@@ -66,11 +58,9 @@ public:
     ~VirtualFileView() override;
 
     // ---- 打开 / 关闭 ----
-    // filePath：本地文件路径（绝对）。parentWidget 仅用于 QProgressDialog 的父窗口，
-    // 可以传 nullptr（用 this 当父）。
+    // filePath：本地文件路径（绝对）。
     // 返回 false 时 errMsg 有可读原因。
-    bool openFile(const QString& filePath, QString* errMsg = nullptr,
-                  QWidget* parentWidgetForProgress = nullptr);
+    bool openFile(const QString& filePath, QString* errMsg = nullptr);
     // Decrypted secure binary payloads must never be written to a temporary
     // file. They use the same byte/patch/Hex provider directly from a bounded
     // in-memory backing store.
@@ -79,10 +69,6 @@ public:
 
     // 重新 map 同一个文件（保存成功后调用：旧 unmap → map → 重建 LineIndex → patch reset）
     bool remapFile(QString* errMsg = nullptr);
-
-    // 同步打开（诊断/测试专用）：主线程同步完成 mmap + quickBuild + 全量 LineIndex 构建，
-    // 返回时 isOpen() == true, lineIndex 完整。不依赖 AsyncTaskManager/QEventLoop。
-    bool openFileSync(const QString& filePath, QString* errMsg = nullptr);
 
     // 关闭并释放 mmap
     //  allowProcessEvents=false：析构上下文必须传 false！此时对象半析构，
@@ -374,13 +360,8 @@ private:
     // col 为 qint64：二进制长行单行列号可超 INT_MAX（P0 截断根因）
     void computeCursorLineCol(int* line, qint64* col) const;
 
-    // LineIndex 后台构建（runBlockingBuildInBackground：用 QtConcurrent::run + 信号等待）
+    // LineIndex 后台构建由 AsyncTaskManager 统一派发和统计。
     // 失败填 errMsg、返回 false；cancel 设 true 也返回 false
-    bool buildLineIndexWithProgress(QWidget* progressParent, QString* errMsg);
-
-    // 给 QProgressDialog 的父窗口定位：优先 progressParent，其次 this
-    QWidget* pickProgressParent(QWidget* progressParent);
-
     // 从 (viewX, viewY) 像素点 → (line, virtCol)：
     //   line: 0-based 行号，virtCol: 虚拟坐标下的行内字节偏移（qint64，长行不溢出）
     // 全程虚拟坐标，编辑后点击定位正确（P2 行末换行修复）
@@ -417,10 +398,6 @@ private:
     // 后台全量构建状态
     qint64                                   m_lineBuildTaskId = -1;  // AsyncTaskManager::submit 返回的 id
     AsyncCancelPtr                           lineBuildCancel_;        // 跨线程取消原子
-    // 已废弃：QFuture / QFutureWatcher 不再使用（统一走 AsyncTaskManager 调度）
-    // 保留字段避免修改过多代码：置空即可
-    QFuture<LineIndex>                       lineBuildFuture_;
-    QFutureWatcher<LineIndex>*               lineBuildWatcher_ = nullptr;
 
     // 字体 & 度量
     QFont          font_;

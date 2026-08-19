@@ -47,7 +47,7 @@ DynamicThresholds computeFrom(qint64 ramBytes, int cpuCores) {
                                     10LL * 1024 * 1024,
                                     200LL * 1024 * 1024);
 
-    t.SEARCH_THREADS   = qBound(1, cpuCores, 8);
+    t.SEARCH_THREADS   = qBound(1, cpuCores, 10);
     return t;
 }
 

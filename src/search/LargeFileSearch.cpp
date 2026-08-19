@@ -3,16 +3,17 @@
 #include "PatchList.h"
 #include "DynamicThresholds.h"
 #include "AsyncTaskManager.h"
+#include "AsyncThreadPool.h"
 #include "Pcre2Regex.h"
 
 #include <QFile>
 #include <QDir>
 #include <QDataStream>
-#include <QtConcurrent>
 #include <QScopeGuard>
 #include <QTemporaryFile>
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QPointer>
 #include <QUuid>
 #include <cstring>
 #include <algorithm>
@@ -685,7 +686,11 @@ void LargeFileSearch::findAll(const QString& pattern, const Options& opts) {
         emit finished(qint64(memMatches_.size()) + overrunCount_);
     };
 
-    QtConcurrent::run(worker);
+    // This compatibility path still blocks its caller with a nested event
+    // loop, but its worker belongs to the same capped/observable pool as all
+    // other application background work.
+    AsyncThreadPool::instance().startWorker(std::move(worker),
+                                            AsyncTaskPriority::High);
 }
 
 // ============================================================================

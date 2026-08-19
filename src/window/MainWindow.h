@@ -133,6 +133,7 @@ private:
     QLabel *m_statusPos = nullptr;
     QLabel *m_statusEncoding = nullptr;
     QLabel *m_statusSize = nullptr;
+    QLabel *m_statusCharacters = nullptr;
     QLabel *m_statusSyntax = nullptr;
     QLabel *m_statusModified = nullptr;
     QToolButton *m_hexEditModeButton = nullptr;
@@ -283,6 +284,7 @@ private:
     QTimer m_autosaveTimer;
     QTimer m_secureAutosaveTimer;
     QTimer m_securityExpiryTimer;
+    QTimer m_characterStatusTimer;
     bool m_systemProtectionActive = false;
     bool m_sessionNotificationsRegistered = false;
     bool m_restoreAccountsAfterSystemUnlock = false;

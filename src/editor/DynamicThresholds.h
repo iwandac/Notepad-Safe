@@ -15,7 +15,7 @@
 //          8GB RAM        16GB RAM       32GB RAM
 //  PATCH_L1   400MB            800MB           2GB (顶)
 //  MAX_MATCH  10M条           21M条          42M条
-//  SEARCH_THR   4核              8核             8核 (顶)
+//  SEARCH_THR   4核              10核            10核 (顶)
 //  PASTE       250MB           250MB           250MB? 不，按公式
 // ============================================================================
 
@@ -40,7 +40,7 @@ struct DynamicThresholds {
     // 单次粘贴大小上限（超过需要中间保存提示）= min(RAM_BYTES/32, 200MB)
     qint64 PASTE_LIMIT = 0;
 
-    // 大文件多线程搜索线程数 = min(CPU_CORES, 8)
+    // 大文件多线程扫描期望线程数 = min(CPU_CORES, 10)；实际还受全局 10 worker 预算约束
     int    SEARCH_THREADS = 1;
 
     // 每块扫描字节 = 16MB（4KB overlap 边界去重）

@@ -5,6 +5,8 @@
 #include "TextEncoding.h"
 #include "EditorTab.h"
 #include "VirtualFileView.h"
+#include "WindowedReadOnlyProvider.h"
+#include "AsyncThreadPool.h"
 
 #include <QApplication>
 #include <QFile>
@@ -405,6 +407,59 @@ void test_binary_hex_patch_recovery_is_encrypted_and_restorable()
     cleanupTestData(dir);
 }
 
+void test_worker_limit_and_unicode_character_count()
+{
+    TEST("全局 worker 上限与 Unicode 字符计数");
+    CHECK(AsyncThreadPool::instance().maxThreads() == 10,
+          "应用后台 worker 最大数量固定为 10");
+    const int reserved = AsyncThreadPool::instance().reserveExternalCapacity(2);
+    CHECK(reserved == 2, "空闲时 LineIndex 私有池可从统一预算预留 worker");
+    AsyncThreadPool::instance().externalWorkerStarted();
+    AsyncThreadPool::instance().externalWorkerStarted();
+    CHECK(AsyncThreadPool::instance().totalActiveThreadCount() == 2,
+          "任务 UI 统计包含私有池的真实活跃 worker");
+    AsyncThreadPool::instance().externalWorkerFinished();
+    AsyncThreadPool::instance().externalWorkerFinished();
+    AsyncThreadPool::instance().releaseExternalCapacity(reserved);
+    CHECK(AsyncThreadPool::instance().totalActiveThreadCount() == 0,
+          "私有池结束后活跃线程统计归零");
+
+    auto tab = std::make_unique<EditorTab>();
+    tab->editor()->setText(QStringLiteral("A中😀\n"));
+    QApplication::processEvents(QEventLoop::AllEvents, 50);
+    CHECK(tab->contentCharacterCount() == 4,
+          "ASCII、中文、非 BMP 字符和换行各计为一个 Unicode 字符");
+    tab->editor()->append(QStringLiteral("Z"));
+    QApplication::processEvents(QEventLoop::AllEvents, 50);
+    CHECK(tab->contentCharacterCount() == 5,
+          "编辑后字符总数缓存按内容 revision 失效并更新");
+
+    QString countDir = testDataDir() + "_character_count";
+    QDir().mkpath(countDir);
+    const QString countPath = QDir(countDir).filePath("chunk-boundary.txt");
+    QByteArray countBytes(8 * 1024 * 1024 - 2, 'a');
+    countBytes += QStringLiteral("😀B").toUtf8();
+    QFile countFile(countPath);
+    CHECK(countFile.open(QIODevice::WriteOnly)
+              && countFile.write(countBytes) == countBytes.size(),
+          "创建跨 8 MiB UTF-8 边界的字符统计 fixture");
+    countFile.close();
+    WindowedReadOnlyProvider provider;
+    QString countError;
+    CHECK(provider.openFile(countPath, WindowedReadOnlyProvider::Presentation::Text,
+                            &countError),
+          "窗口化文本启动后台字符统计");
+    QElapsedTimer countTimer;
+    countTimer.start();
+    while (provider.characterCountPending() && countTimer.elapsed() < 5000)
+        QApplication::processEvents(QEventLoop::AllEvents, 25);
+    CHECK(!provider.characterCountPending()
+              && provider.characterCount() == 8LL * 1024 * 1024,
+          "分块 UTF-8 解码跨边界仍得到精确 Unicode 字符总数");
+    provider.closeFile();
+    cleanupTestData(countDir);
+}
+
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
@@ -418,6 +473,7 @@ int main(int argc, char *argv[])
     }
 
     test_load_empty_session();
+    test_worker_limit_and_unicode_character_count();
     test_load_valid_session();
     test_load_corrupted_session();
     test_clear_session();

@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "DynamicThresholds.h"
+#include "AsyncThreadPool.h"
 
 namespace {
 
@@ -240,13 +241,22 @@ bool LineIndex::buildFromMmap(const uchar* data, qint64 size,
     deltaEncoded_.reserve(int(qMin(qint64(256 * 1024 * 1024), size / 40 + 1024)));
     blockIndex_.reserve(int(size / (BLOCK_LINES * 40LL) + 64));
 
-    const int numThreads = DynamicThresholds::instance().SEARCH_THREADS;
-    const qint64 parallelThreshold = qint64(16) * 1024 * 1024 * numThreads;
+    const int desiredThreads = DynamicThresholds::instance().SEARCH_THREADS;
+    const qint64 parallelThreshold = qint64(16) * 1024 * 1024 * desiredThreads;
+    int reservedThreads = 0;
+    int numThreads = desiredThreads;
+    if (desiredThreads > 1 && size >= parallelThreshold) {
+        reservedThreads = AsyncThreadPool::instance()
+                              .reserveExternalCapacity(desiredThreads);
+        numThreads = reservedThreads;
+    }
 
     // -------------------------------------------------------------------
     //  小文件或单线程：保持原单线程串行逻辑（扫描 + 编码同步进行）
     // -------------------------------------------------------------------
     if (numThreads <= 1 || size < parallelThreshold) {
+        if (reservedThreads > 0)
+            AsyncThreadPool::instance().releaseExternalCapacity(reservedThreads);
         qint64 lines = 0;
         qint64 lastLineStart = 0;
 
@@ -333,6 +343,13 @@ bool LineIndex::buildFromMmap(const uchar* data, qint64 size,
     // -------------------------------------------------------------------
     //  大文件：多线程并行扫描 newline 位置，单线程合并 + varint 编码
     // -------------------------------------------------------------------
+    struct ExternalCapacityGuard {
+        int count = 0;
+        ~ExternalCapacityGuard() {
+            AsyncThreadPool::instance().releaseExternalCapacity(count);
+        }
+    } capacityGuard{reservedThreads};
+
     std::atomic<qint64> bytesScanned(0);
     std::atomic<qint64> linesFound(0);
 
@@ -371,6 +388,14 @@ bool LineIndex::buildFromMmap(const uchar* data, qint64 size,
         const auto seg = segments[segIdx];
         sync.addFuture(QtConcurrent::run(&pool,
             [seg, segIdx, extras, data, cancel, &bytesScanned, &linesFound, step]() -> QVector<qint64> {
+                struct ExternalActivityGuard {
+                    ExternalActivityGuard() {
+                        AsyncThreadPool::instance().externalWorkerStarted();
+                    }
+                    ~ExternalActivityGuard() {
+                        AsyncThreadPool::instance().externalWorkerFinished();
+                    }
+                } activityGuard;
                 QVector<qint64> positions;
                 if (seg.end <= seg.start) return positions;
                 positions.reserve(int(qMin<qint64>(qint64(8) * 1024 * 1024,

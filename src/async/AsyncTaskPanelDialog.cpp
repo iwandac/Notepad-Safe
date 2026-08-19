@@ -263,7 +263,7 @@ AsyncTaskPanelDialog::AsyncTaskPanelDialog(QWidget *parent)
             this, &AsyncTaskPanelDialog::updateActionStates);
     // 初始同步一次
     refreshHeaderSummary(mgr.queuedCount(), mgr.runningCount(), 0);
-    refreshThreadOccupancy(mgr.activeThreadCount(), 0);
+    refreshThreadOccupancy(mgr.activeThreadCount(), mgr.maximumThreadCount());
     updateActionStates();
 }
 

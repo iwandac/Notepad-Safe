@@ -2,9 +2,7 @@
 
 // Bounded mmap-backed read-only provider shared by S2 and S3.
 
-#include <QAtomicInteger>
 #include <QDateTime>
-#include <QFutureWatcher>
 #include <QWidget>
 
 #include "SharedReadOnlyFile.h"
@@ -33,6 +31,8 @@ public:
     Presentation presentation() const { return m_presentation; }
 
     qint64 fileSize() const { return m_fileSize; }
+    qint64 characterCount() const { return m_characterCount; }
+    bool characterCountPending() const { return m_characterCountPending; }
     qint64 globalOffset() const { return m_globalOffset; }
     qint64 windowStart() const { return m_windowStart; }
     qint64 windowEnd() const { return m_windowEnd; }
@@ -62,6 +62,7 @@ signals:
     void searchFinished(qint64 matchOffset);
     void sourceFileChanged(qint64 previousSize, qint64 currentSize);
     void sourceReloadFailed(const QString &message);
+    void characterCountChanged(qint64 count, bool pending);
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -96,6 +97,8 @@ private:
     int sliderForOffset(qint64 offset) const;
     QByteArray formatHexWindow(const uchar *data, qsizetype length, qint64 absoluteStart) const;
     void selectProjectedBytes(qint64 absoluteOffset, qint64 selectionBytes);
+    void startCharacterCount();
+    void cancelCharacterCount();
 
     SharedReadOnlyFile m_file;
     QString m_path;
@@ -126,9 +129,13 @@ private:
     QDateTime m_observedModified;
     qint64 m_observedSize = -1;
 
-    QFutureWatcher<qint64> m_searchWatcher;
-    QAtomicInteger<bool> m_cancelSearch = false;
+    qint64 m_searchTaskId = -1;
+    quint64 m_searchGeneration = 0;
     bool m_searchResultPending = false;
     qint64 m_lastSearchResult = -1;
     QByteArray m_searchNeedle;
+    qint64 m_characterCount = -1;
+    qint64 m_characterCountTaskId = -1;
+    quint64 m_characterCountGeneration = 0;
+    bool m_characterCountPending = false;
 };

@@ -561,7 +561,9 @@ PatchList，再以 flush 后的 revision 启动任务。有编辑发生时取消
 - 大小写敏感和 ASCII 不区分大小写可以多线程分块。
 - overlap 精确等于 needleBytes - 1；结果只归属“起点位于本块核心区”的 worker，避免漏报和重复。
 - Unicode 大小写折叠或复杂整词规则无法保证按原始字节独立分块时，自动转入 PCRE2 顺序路径。
-- 线程数默认 min(逻辑核心数, 8, 实际块数)，I/O 慢时允许自适应降低。
+- 应用自有后台 worker 总预算固定为 10；分块扫描期望值为
+  `min(逻辑核心数, 10, 实际块数)`。`LineIndex` 私有池必须从统一预算预留容量并上报真实活跃
+  worker，任务中心显示“实际活跃/10”，禁止独立线程池绕过上限或只显示协调池数字。
 
 ### 9.3 正则搜索
 
@@ -1289,7 +1291,11 @@ Hex 和 Accounts 禁用整个编码菜单；S2/S3 只读视图允许“以编码
 
 `AsyncTaskPanelDialog` 保留非模态，改名“后台任务”，包含：排队、运行、最近完成、活跃线程/上限；任务行展示类型、状态、耗时、进度和阶段性取消；详情经过脱敏。增加“取消所有可取消任务”，保留“清空历史”和“关闭”。完成历史只在进程内保留最近 100 条，不写磁盘；安全任务不显示标题、搜索词、账号名或敏感路径。
 
-任务类型至少覆盖：FileProbe、Kdf/KeyResolve、SecureOpen、SecureSave、DraftSave、Text/Hex Load、EditorPromotion、LineIndex、Text/Byte Search、Snapshot、LargeFileSave、Migration、AccountSave。`FileEncrypt/FileDecrypt` 预留枚举改为真实领域名称，避免把整个流程错误描述为单一“加密线程”。
+目标任务类型按真实领域划分：FileProbe、Kdf/KeyResolve、SecureOpen、SecureSave、DraftSave、
+Text/Hex Load、LineIndex、Text/Byte Search、Snapshot、Migration、AccountSave。当前编译实现只有
+LineIndex、LargeFileSearch 和通用 Other；没有调用者的 `FileEncrypt/FileDecrypt/LargeFileSave`
+预留枚举已归档。新增任务类型必须与真实提交者、取消语义、阶段和脱敏合同一起落地，不能
+用预留名称伪装尚未实现的异步能力。
 
 ### 11.10 设置与持久化
 
@@ -1734,10 +1740,10 @@ S1 的“查找全部”、F3/Shift+F3 和批量替换已共用同一 PCRE2 prov
 直到用户在任务中心清空历史。线程占用只存在于 chip tooltip 和任务中心，不再永久挤占
 编辑状态栏。任务中心提供真实可聚焦的“取消所选”“取消所有”“清空历史”和“关闭”
 按钮，列表内取消按钮的绘制与命中使用同一矩形，已结束任务不显示伪取消控件；排队、
-运行、最近完成、失败和线程占用会在任务状态改变时立即收敛。`FileEncrypt/FileDecrypt`
-历史强制使用不含调用方标题、账号、密码或路径的 opaque 文案。原子提交阶段从可取消
-切换为不可取消的 phase API 仍随异步 SaveRouter 落地，在此之前不得把同步原子替换包装
-成虚假的可取消任务。
+运行、最近完成、失败和线程占用会在任务状态改变时立即收敛。当前安全打开/保存是同步
+Security service 调用，不创建全局任务历史；未来 SecureOpen/SecureSave 任务必须强制使用
+不含调用方标题、账号、密码或路径的 opaque 文案。原子提交阶段从可取消切换为不可取消的
+phase API 仍随异步 SaveRouter 落地，在此之前不得把同步原子替换包装成虚假的可取消任务。
 
 状态栏已按中央工作区收敛：Documents 显示实时正文/字节视图大小与 S1/S2/S3/B1/B2/B3 能力，
 未保存编辑会即时更新；安全文档显示 payload 大小而不是外层 KDBX 容器大小。Accounts 与

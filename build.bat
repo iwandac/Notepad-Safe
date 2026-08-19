@@ -81,6 +81,8 @@ if defined NOTEPADSAFE_QT6_DIR (
         -DCMAKE_BUILD_TYPE=Release ^
         -DCMAKE_MAKE_PROGRAM="%VS_NINJA%" ^
         -DNOTEPADSAFE_ENABLE_KDBX_BACKEND="%NOTEPADSAFE_WITH_KDBX%" ^
+        -DNOTEPADSAFE_BUILD_TESTS=OFF ^
+        -DNOTEPADSAFE_BUILD_DIAGNOSTICS=OFF ^
         -DNOTEPADSAFE_QT6_DIR="%NOTEPADSAFE_QT6_DIR%" ^
         "%SOURCE_DIR%"
 ) else (
@@ -88,6 +90,8 @@ if defined NOTEPADSAFE_QT6_DIR (
         -DCMAKE_BUILD_TYPE=Release ^
         -DCMAKE_MAKE_PROGRAM="%VS_NINJA%" ^
         -DNOTEPADSAFE_ENABLE_KDBX_BACKEND="%NOTEPADSAFE_WITH_KDBX%" ^
+        -DNOTEPADSAFE_BUILD_TESTS=OFF ^
+        -DNOTEPADSAFE_BUILD_DIAGNOSTICS=OFF ^
         "%SOURCE_DIR%"
 )
 
@@ -98,7 +102,7 @@ if errorlevel 1 (
 )
 
 echo === [4/4] Building ===
-"%VS_CMAKE%" --build . --config Release -j
+"%VS_CMAKE%" --build . --config Release -j --target notepad-safe
 if errorlevel 1 (
     echo ERROR: Build failed
     popd

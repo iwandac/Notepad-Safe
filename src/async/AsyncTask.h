@@ -10,8 +10,8 @@
 #include <functional>
 
 enum class AsyncTaskPriority : int {
-    Highest = 0,  // 用户交互型：打开加密文件立即解密、点击跳转后的紧急补扫
-    High    = 1,  // 搜索、主动点保存、另存加密文件
+    Highest = 0,  // 用户交互型：点击跳转后的紧急补扫等
+    High    = 1,  // 用户主动发起的搜索等
     Normal  = 2,  // LineIndex 按需补扫（滚到哪扫到哪）
     Low     = 3,  // LineIndex 后台预扫、空闲打包
     Lowest  = 4   // 最低优先级：后台校验、统计、索引归档
@@ -29,9 +29,6 @@ enum class AsyncTaskType : int {
     Unknown = 0,
     LineIndexBuild = 1,   // L2 行索引构建（全量/增量/补扫）
     LargeFileSearch = 2,  // 大文件分块搜索
-    FileEncrypt     = 3,  // 大文件加密保存（为后续加密功能预留）
-    FileDecrypt     = 4,  // 加密文件打开解密（为后续加密功能预留）
-    LargeFileSave   = 5,  // 流式保存
     Other           = 99
 };
 
