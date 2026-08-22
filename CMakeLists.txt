@@ -46,15 +46,23 @@ elseif(NOT NOTEPADSAFE_QT6_DIR)
 endif()
 set(CMAKE_PREFIX_PATH "${NOTEPADSAFE_QT6_DIR}")
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network PrintSupport Svg SvgWidgets Concurrent TaskTree)
+find_package(Qt6 6.11.1 EXACT REQUIRED COMPONENTS Core Gui Widgets Network PrintSupport Svg SvgWidgets Concurrent TaskTree)
 include(cmake/PCRE2.cmake)
+include(cmake/BoostRegex.cmake)
 
-# QScintilla 静态库（相对于产品根，clone 后即可构建）
+# QScintilla is always built from the vendored source tree by
+# tools/bootstrap_qscintilla.ps1. No binary is allowed in third_party/src.
 set(QSCINTILLA_INCLUDE_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/QScintilla_src-2.14.1/src"
-    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/QScintilla_src-2.14.1/scintilla/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/src/qscintilla-2.14.1/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/src/qscintilla-2.14.1/scintilla/include"
 )
-set(QSCINTILLA_LIB "${CMAKE_CURRENT_SOURCE_DIR}/third_party/QScintilla_src-2.14.1/src/release/qscintilla2_qt6.lib")
+set(QSCINTILLA_LIB
+    "${CMAKE_CURRENT_SOURCE_DIR}/.deps/install/qscintilla-2.14.1-qt6.11.1-msvc/lib/qscintilla2_qt6.lib")
+if(NOT EXISTS "${QSCINTILLA_LIB}")
+    message(FATAL_ERROR
+        "Source-built QScintilla library is missing: ${QSCINTILLA_LIB}. "
+        "Run prepare_dependencies.bat from an x64 Visual Studio environment.")
+endif()
 
 # 应用资源：EXE 图标/版本 RC + 窗口/任务栏 QRC。RC 与 About、ZIP 共用
 # project(VERSION)，避免发布时出现三个版本号各自更新。
@@ -88,11 +96,17 @@ set(APP_INCLUDE_DIRS
 
 add_library(notepadsafe_search_runtime STATIC
     src/search/Pcre2Regex.cpp
+    src/search/RawCodePageRegex.cpp
 )
 target_include_directories(notepadsafe_search_runtime PUBLIC
     ${CMAKE_SOURCE_DIR}/src/search
+    ${CMAKE_SOURCE_DIR}/src/editor
 )
-target_link_libraries(notepadsafe_search_runtime PUBLIC Qt6::Core notepadsafe_pcre2)
+target_link_libraries(notepadsafe_search_runtime PUBLIC
+    Qt6::Core
+    notepadsafe_pcre2
+    notepadsafe_boost_regex
+)
 
 # Stable product-domain policies. Keep file-tier and draft-storage rules free of
 # QWidget/QScintilla dependencies so they can be tested at exact byte boundaries.
@@ -149,6 +163,13 @@ if(WIN32)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         VERBATIM
     )
+    add_custom_target(verify_async_threading
+        COMMAND ${NOTEPADSAFE_POWERSHELL_EXECUTABLE}
+            -NoProfile -ExecutionPolicy Bypass
+            -File ${CMAKE_SOURCE_DIR}/tools/check_async_threading.ps1
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        VERBATIM
+    )
     set(NOTEPADSAFE_SBOM "${CMAKE_CURRENT_BINARY_DIR}/notepad-safe.spdx.json")
     add_custom_command(
         OUTPUT "${NOTEPADSAFE_SBOM}"
@@ -187,6 +208,7 @@ add_executable(notepad-safe WIN32
     src/async/AsyncTask.cpp
     src/async/AsyncThreadPool.cpp
     src/async/AsyncTaskManager.cpp
+    src/async/AsyncSerialQueue.cpp
     src/async/StatusBarTaskWidget.cpp
     src/async/AsyncTaskPanelDialog.cpp
     src/vault/VaultDock.cpp
@@ -195,7 +217,7 @@ add_executable(notepad-safe WIN32
 )
 
 if(WIN32)
-    add_dependencies(notepad-safe generate_sbom)
+    add_dependencies(notepad-safe generate_sbom verify_async_threading)
 endif()
 
 target_include_directories(notepad-safe PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
@@ -262,7 +284,8 @@ install(TARGETS notepad-safe RUNTIME DESTINATION .)
 install(FILES
     README.md
     THIRD_PARTY_NOTICES.md
-    third_party/QScintilla_src-2.14.1/LICENSE
+    third_party/src/qscintilla-2.14.1/LICENSE
+    third_party/src/boost-regex-1.90.0/LICENSE_1_0.txt
     DESTINATION .
 )
 install(FILES
@@ -282,7 +305,7 @@ set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_PACKAGE_FILE_NAME "NotepadSafe-${PROJECT_VERSION}-windows-x64")
 set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
 set(CPACK_RESOURCE_FILE_LICENSE
-    "${CMAKE_SOURCE_DIR}/third_party/QScintilla_src-2.14.1/LICENSE")
+    "${CMAKE_SOURCE_DIR}/third_party/src/qscintilla-2.14.1/LICENSE")
 set(CMAKE_SKIP_INSTALL_ALL_DEPENDENCY TRUE)
 include(CPack)
 if(TARGET package)

@@ -75,8 +75,10 @@ QHash<int, QByteArray> AsyncTaskManager::roleNames() const
     rn[TaskStartedAtRole]         = "startedAt";
     rn[TaskFinishedAtRole]        = "finishedAt";
     rn[TaskElapsedMsRole]         = "elapsedMs";
+    rn[TaskEstimatedRemainingMsRole] = "estimatedRemainingMs";
     rn[TaskErrorRole]             = "error";
     rn[TaskCategoryTagRole]       = "categoryTag";
+    rn[TaskCancellableRole]       = "cancellable";
     rn[TaskStateTextRole]         = "stateText";
     rn[TaskPriorityTextRole]      = "priorityText";
     rn[TaskTypeTextRole]          = "typeText";
@@ -116,8 +118,11 @@ QVariant AsyncTaskManager::data(const QModelIndex &index, int role) const
     case TaskStartedAtRole:         return t.startedAt;
     case TaskFinishedAtRole:        return t.finishedAt;
     case TaskElapsedMsRole:         return QVariant::fromValue(t.elapsedMs());
+    case TaskEstimatedRemainingMsRole:
+        return QVariant::fromValue(t.estimatedRemainingMs());
     case TaskErrorRole:             return t.error.isNull() ? QString() : t.error.toString();
     case TaskCategoryTagRole:       return t.categoryTag;
+    case TaskCancellableRole:       return t.cancellable;
     case TaskStateTextRole:         return t.stateText();
     case TaskPriorityTextRole:      return t.priorityText();
     case TaskTypeTextRole:          return t.typeText();
@@ -173,8 +178,9 @@ int AsyncTaskManager::cancellableCount() const
     QMutexLocker lk(&mu_);
     int count = 0;
     for (const auto &task : tasks_) {
-        if (task.state == AsyncTaskState::Queued
-            || task.state == AsyncTaskState::Running) {
+        if (task.cancellable
+            && (task.state == AsyncTaskState::Queued
+                || task.state == AsyncTaskState::Running)) {
             ++count;
         }
     }
@@ -198,7 +204,8 @@ static inline int findTaskIndex(QList<AsyncTask> &list, qint64 id)
 }
 
 qint64 AsyncTaskManager::submit(AsyncTaskType type, AsyncTaskPriority priority, const QString &title, const QString &description,
-                                WorkerFn workerFn, qint64 batchId, const QString &categoryTag, qint64 progressTotalInit)
+                                WorkerFn workerFn, qint64 batchId, const QString &categoryTag,
+                                qint64 progressTotalInit, bool cancellable)
 {
     AsyncTask t;
     t.id = nextId();
@@ -213,6 +220,7 @@ qint64 AsyncTaskManager::submit(AsyncTaskType type, AsyncTaskPriority priority, 
     t.categoryTag = categoryTag;
     t.cancel = AsyncCancelPtr::create();
     t.cancel->store(false, std::memory_order_release);
+    t.cancellable = cancellable;
 
     int rowInsert;
     {
@@ -308,6 +316,8 @@ void AsyncTaskManager::cancel(qint64 taskId)
         QMutexLocker lk(&mu_);
         int idx = findTaskIndex(tasks_, taskId);
         if (idx >= 0) {
+            if (!tasks_[idx].cancellable)
+                return;
             if (tasks_[idx].cancel) {
                 tasks_[idx].cancel->store(true, std::memory_order_release);
                 cancelRef = tasks_[idx].cancel;
@@ -348,6 +358,20 @@ void AsyncTaskManager::cancel(qint64 taskId)
         // Running 状态：置 cancel 原子后交给 worker 自己在下次检查时退出并回调 finishTaskImpl(Canceled)
         Q_UNUSED(cancelRef);
     }
+}
+
+void AsyncTaskManager::setTaskCancellable(qint64 taskId, bool cancellable)
+{
+    int row = -1;
+    {
+        QMutexLocker lk(&mu_);
+        row = findTaskIndex(tasks_, taskId);
+        if (row < 0 || tasks_[row].cancellable == cancellable)
+            return;
+        tasks_[row].cancellable = cancellable;
+    }
+    const QModelIndex changed = index(row, 0);
+    emit dataChanged(changed, changed, {TaskCancellableRole});
 }
 
 void AsyncTaskManager::cancelAllByType(AsyncTaskType type)

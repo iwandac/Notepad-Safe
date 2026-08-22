@@ -1,4 +1,5 @@
 #include "VaultDock.h"
+#include "AsyncUiOperation.h"
 
 #include "VaultBackendFactory.h"
 #ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
@@ -685,7 +686,12 @@ VaultError VaultDock::createVault(const QString &filePath,
     if (!maybeSaveChanges())
         return {VaultErrorCode::Cancelled, tr("操作已取消。"), QStringLiteral("vault.ui.cancelled")};
 
-    VaultError error = service_.create(filePath, masterPasswordUtf8, keyFilePath);
+    VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        tr("正在创建账户数据库"),
+        [this, filePath, &masterPasswordUtf8, keyFilePath] {
+            return service_.create(filePath, masterPasswordUtf8, keyFilePath);
+        });
     if (error.isError()) {
         pages_->setCurrentWidget(lockedPage_);
         setVaultOpenControls(false);
@@ -703,7 +709,12 @@ VaultError VaultDock::unlockVault(const QString &filePath,
     if (!maybeSaveChanges())
         return {VaultErrorCode::Cancelled, tr("操作已取消。"), QStringLiteral("vault.ui.cancelled")};
 
-    VaultError error = service_.unlock(filePath, masterPasswordUtf8, keyFilePath);
+    VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        tr("正在解锁账户数据库"),
+        [this, filePath, &masterPasswordUtf8, keyFilePath] {
+            return service_.unlock(filePath, masterPasswordUtf8, keyFilePath);
+        });
     if (error.isError()) {
         pages_->setCurrentWidget(lockedPage_);
         setVaultOpenControls(false);
@@ -733,11 +744,18 @@ VaultError VaultDock::createManagedStore(const QString &filePath,
 
     SecureBuffer databaseCredential;
     QVariantMap publicCustomData;
-    VaultError error = SecurityIdentity::create(securityPassphraseUtf8,
-                                                 &databaseCredential, recoveryKey,
-                                                 &publicCustomData);
-    if (!error.isError())
-        error = service_.create(filePath, databaseCredential, {}, publicCustomData);
+    VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        tr("正在创建受保护账户数据库"),
+        [this, filePath, &securityPassphraseUtf8, &databaseCredential,
+         recoveryKey, &publicCustomData] {
+            VaultError result = SecurityIdentity::create(
+                securityPassphraseUtf8, &databaseCredential, recoveryKey,
+                &publicCustomData);
+            if (!result.isError())
+                result = service_.create(filePath, databaseCredential, {}, publicCustomData);
+            return result;
+        });
     databaseCredential.clear();
     if (error.isError()) {
         recoveryKey->fill(QChar(0));
@@ -762,11 +780,19 @@ VaultError VaultDock::unlockManagedStore(const QString &filePath,
             QStringLiteral("identity.backend.unavailable")};
 #else
     QVariantMap publicCustomData;
-    VaultError error = service_.readPublicCustomData(filePath, &publicCustomData);
     SecureBuffer databaseCredential;
-    if (!error.isError())
-        error = SecurityIdentity::unlock(publicCustomData, securityPassphraseUtf8,
-                                         &databaseCredential);
+    VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        tr("正在解析账户数据库密钥"),
+        [this, filePath, &publicCustomData, &securityPassphraseUtf8,
+         &databaseCredential] {
+            VaultError result = service_.readPublicCustomData(filePath, &publicCustomData);
+            if (!result.isError())
+                result = SecurityIdentity::unlock(publicCustomData,
+                                                   securityPassphraseUtf8,
+                                                   &databaseCredential);
+            return result;
+        });
     if (!error.isError())
         error = unlockVault(filePath, databaseCredential);
     databaseCredential.clear();
@@ -794,11 +820,18 @@ VaultError VaultDock::createManagedStoreForIdentity(
         return {VaultErrorCode::Cancelled, tr("操作已取消。"), QStringLiteral("vault.ui.cancelled")};
     SecureBuffer databaseCredential;
     QVariantMap publicCustomData;
-    VaultError error = SecurityIdentity::createForIdentity(
-        parameters, masterUnlockKey, recoverySecret, &databaseCredential,
-        &publicCustomData, QStringLiteral("Accounts"));
-    if (!error.isError())
-        error = service_.create(filePath, databaseCredential, {}, publicCustomData);
+    VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        tr("正在创建账户数据库"),
+        [this, filePath, &parameters, &masterUnlockKey, &recoverySecret,
+         &databaseCredential, &publicCustomData] {
+            VaultError result = SecurityIdentity::createForIdentity(
+                parameters, masterUnlockKey, recoverySecret, &databaseCredential,
+                &publicCustomData, QStringLiteral("Accounts"));
+            if (!result.isError())
+                result = service_.create(filePath, databaseCredential, {}, publicCustomData);
+            return result;
+        });
     databaseCredential.clear();
     if (error.isError()) {
         pages_->setCurrentWidget(lockedPage_);
@@ -821,11 +854,18 @@ VaultError VaultDock::unlockManagedStoreWithMasterKey(
             QStringLiteral("identity.backend.unavailable")};
 #else
     QVariantMap publicCustomData;
-    VaultError error = service_.readPublicCustomData(filePath, &publicCustomData);
     SecureBuffer databaseCredential;
-    if (!error.isError())
-        error = SecurityIdentity::unlockWithMasterKey(publicCustomData, masterUnlockKey,
-                                                       &databaseCredential);
+    VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        tr("正在解析账户数据库密钥"),
+        [this, filePath, &publicCustomData, &masterUnlockKey,
+         &databaseCredential] {
+            VaultError result = service_.readPublicCustomData(filePath, &publicCustomData);
+            if (!result.isError())
+                result = SecurityIdentity::unlockWithMasterKey(
+                    publicCustomData, masterUnlockKey, &databaseCredential);
+            return result;
+        });
     if (!error.isError())
         error = unlockVault(filePath, databaseCredential);
     databaseCredential.clear();
@@ -845,12 +885,18 @@ VaultError VaultDock::unlockManagedStoreWithRecoverySecret(
             QStringLiteral("identity.backend.unavailable")};
 #else
     QVariantMap publicCustomData;
-    VaultError error = service_.readPublicCustomData(filePath, &publicCustomData);
     SecureBuffer databaseCredential;
-    if (!error.isError()) {
-        error = SecurityIdentity::recoverWithSecret(
-            publicCustomData, recoverySecret, &databaseCredential);
-    }
+    VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        tr("正在恢复账户数据库密钥"),
+        [this, filePath, &publicCustomData, &recoverySecret,
+         &databaseCredential] {
+            VaultError result = service_.readPublicCustomData(filePath, &publicCustomData);
+            if (!result.isError())
+                result = SecurityIdentity::recoverWithSecret(
+                    publicCustomData, recoverySecret, &databaseCredential);
+            return result;
+        });
     if (!error.isError())
         error = unlockVault(filePath, databaseCredential);
     databaseCredential.clear();
@@ -884,10 +930,17 @@ VaultError VaultDock::recoverManagedStore(const QString &filePath,
             QStringLiteral("identity.backend.unavailable")};
 #else
     QVariantMap publicCustomData;
-    VaultError error = service_.readPublicCustomData(filePath, &publicCustomData);
     SecureBuffer databaseCredential;
-    if (!error.isError())
-        error = SecurityIdentity::recover(publicCustomData, recoveryKey, &databaseCredential);
+    VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        tr("正在恢复账户数据库"),
+        [this, filePath, &publicCustomData, &recoveryKey, &databaseCredential] {
+            VaultError result = service_.readPublicCustomData(filePath, &publicCustomData);
+            if (!result.isError())
+                result = SecurityIdentity::recover(publicCustomData, recoveryKey,
+                                                   &databaseCredential);
+            return result;
+        });
     if (!error.isError())
         error = unlockVault(filePath, databaseCredential);
     databaseCredential.clear();
@@ -922,9 +975,16 @@ VaultError VaultDock::saveSecureDocument(const QUuid &id, const QString &title,
     data.tags = {VaultSecureNoteTag};
     data.notesUtf8.assign(body.constData(), body.size());
     scrubByteArray(body);
-    VaultError error = service_.upsertEntry(std::move(data));
-    if (!error.isError())
-        error = service_.save();
+    auto pendingData = std::make_shared<VaultEntryData>(std::move(data));
+    VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::SecureSave, AsyncTaskPriority::High,
+        tr("正在保存加密笔记"),
+        [this, pendingData]() mutable {
+            VaultError result = service_.upsertEntry(std::move(*pendingData));
+            if (!result.isError())
+                result = service_.save();
+            return result;
+        });
     if (!error.isError())
         refreshEntries(id);
     return error;
@@ -1742,9 +1802,16 @@ bool VaultDock::saveCurrentEntryImpl(bool showSuccess)
     }
     data.notesUtf8 = secureUtf8From(notesEdit_->toPlainText());
 
-    VaultError error = service_.upsertEntry(std::move(data));
-    if (!error.isError())
-        error = service_.save();
+    auto pendingData = std::make_shared<VaultEntryData>(std::move(data));
+    VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        tr("正在保存账户"),
+        [this, pendingData]() mutable {
+            VaultError result = service_.upsertEntry(std::move(*pendingData));
+            if (!result.isError())
+                result = service_.save();
+            return result;
+        });
     if (error.isError()) {
         if (!handleExternalChangeError(error) && showSuccess)
             showError(error, tr("保存失败"));
@@ -1778,10 +1845,17 @@ void VaultDock::removeCurrentEntry()
     }
 
     const bool permanentDelete = currentEntryRecycled_;
-    VaultError error = permanentDelete ? service_.removeEntry(currentEntryId_)
-                                       : service_.recycleEntry(currentEntryId_);
-    if (!error.isError())
-        error = service_.save();
+    const QUuid entryId = currentEntryId_;
+    VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        permanentDelete ? tr("正在永久删除账户") : tr("正在移动账户到回收站"),
+        [this, permanentDelete, entryId] {
+            VaultError result = permanentDelete ? service_.removeEntry(entryId)
+                                                : service_.recycleEntry(entryId);
+            if (!result.isError())
+                result = service_.save();
+            return result;
+        });
     if (error.isError()) {
         if (!handleExternalChangeError(error))
             showError(error, currentEntryRecycled_ ? tr("永久删除失败") : tr("移到回收站失败"));
@@ -1801,9 +1875,15 @@ void VaultDock::restoreCurrentEntry()
         return;
     }
     const QUuid restoredId = currentEntryId_;
-    VaultError error = service_.restoreEntry(restoredId);
-    if (!error.isError())
-        error = service_.save();
+    VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        tr("正在恢复账户"),
+        [this, restoredId] {
+            VaultError result = service_.restoreEntry(restoredId);
+            if (!result.isError())
+                result = service_.save();
+            return result;
+        });
     if (error.isError()) {
         if (!handleExternalChangeError(error))
             showError(error, tr("恢复失败"));
@@ -1892,10 +1972,17 @@ void VaultDock::showEntryHistory()
                 QMessageBox::No) != QMessageBox::Yes) {
             return;
         }
-        VaultError restoreError = service_.restoreEntryHistory(
-            currentEntryId_, selected->data(Qt::UserRole).toInt());
-        if (!restoreError.isError())
-            restoreError = service_.save();
+        const QUuid entryId = currentEntryId_;
+        const int historyIndex = selected->data(Qt::UserRole).toInt();
+        VaultError restoreError = runSerializedSecurityOperation(
+            &dialog, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+            tr("正在恢复账户历史"),
+            [this, entryId, historyIndex] {
+                VaultError result = service_.restoreEntryHistory(entryId, historyIndex);
+                if (!result.isError())
+                    result = service_.save();
+                return result;
+            });
         if (restoreError.isError()) {
             if (!handleExternalChangeError(restoreError))
                 showError(restoreError, tr("恢复账号历史失败"));
@@ -1915,10 +2002,17 @@ void VaultDock::showEntryHistory()
                 QMessageBox::No) != QMessageBox::Yes) {
             return;
         }
-        VaultError removeError = service_.removeEntryHistory(
-            currentEntryId_, selected->data(Qt::UserRole).toInt());
-        if (!removeError.isError())
-            removeError = service_.save();
+        const QUuid entryId = currentEntryId_;
+        const int historyIndex = selected->data(Qt::UserRole).toInt();
+        VaultError removeError = runSerializedSecurityOperation(
+            &dialog, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+            tr("正在删除账户历史"),
+            [this, entryId, historyIndex] {
+                VaultError result = service_.removeEntryHistory(entryId, historyIndex);
+                if (!result.isError())
+                    result = service_.save();
+                return result;
+            });
         if (removeError.isError()) {
             if (!handleExternalChangeError(removeError))
                 showError(removeError, tr("删除历史版本失败"));
@@ -1934,9 +2028,16 @@ void VaultDock::showEntryHistory()
                 QMessageBox::No) != QMessageBox::Yes) {
             return;
         }
-        VaultError clearError = service_.clearEntryHistory(currentEntryId_);
-        if (!clearError.isError())
-            clearError = service_.save();
+        const QUuid entryId = currentEntryId_;
+        VaultError clearError = runSerializedSecurityOperation(
+            &dialog, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+            tr("正在清理账户历史"),
+            [this, entryId] {
+                VaultError result = service_.clearEntryHistory(entryId);
+                if (!result.isError())
+                    result = service_.save();
+                return result;
+            });
         if (clearError.isError()) {
             if (!handleExternalChangeError(clearError))
                 showError(clearError, tr("清空账号历史失败"));
@@ -1971,9 +2072,16 @@ void VaultDock::cloneCurrentEntry()
     copy->title = tr("%1 - 副本").arg(copy->title);
     copy->synchronizeExtendedFields = true;
     copy->recordHistory = false;
-    error = service_.upsertEntry(std::move(*copy));
-    if (!error.isError())
-        error = service_.save();
+    auto pendingCopy = std::shared_ptr<VaultEntryData>(std::move(copy));
+    error = runSerializedSecurityOperation(
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        tr("正在克隆账户"),
+        [this, pendingCopy]() mutable {
+            VaultError result = service_.upsertEntry(std::move(*pendingCopy));
+            if (!result.isError())
+                result = service_.save();
+            return result;
+        });
     if (error.isError()) {
         if (!handleExternalChangeError(error))
             showError(error, tr("克隆账号失败"));
@@ -2724,6 +2832,13 @@ void VaultDock::openCurrentUrl()
 
 void VaultDock::refreshTotpCode()
 {
+    // Security operations mutate the non-thread-safe KDBX backend on a worker.
+    // A one-second UI timer must never read it concurrently; the next tick is
+    // soon enough and avoids adding a second synchronization mechanism.
+    if (AsyncSerialQueue::security().busy()) {
+        totpRefreshTimer_->start();
+        return;
+    }
     wipeQString(currentTotpCode_);
     if (service_.state() != VaultState::Open || currentEntryId_.isNull()
         || currentKind_ != EntryKind::Login || currentEntryRecycled_) {

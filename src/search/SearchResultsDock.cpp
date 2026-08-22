@@ -9,10 +9,12 @@
 #include <QStackedWidget>
 #include <QStyledItemDelegate>
 #include <QPainter>
+#include <QTextLayout>
 #include <QApplication>
 #include <QPalette>
 #include <QMouseEvent>
 #include <QUuid>
+#include <QSizePolicy>
 #include <limits>
 #include <utility>
 
@@ -48,32 +50,103 @@ QVector<GroupedL1Line> groupL1Matches(const QVector<SearchMatch> &matches)
     return grouped;
 }
 
-int hitTestModelMatch(const QModelIndex &index, int xInColumn,
-                      const QFontMetrics &metrics)
+struct VisualMatchRange {
+    int start = 0;
+    int length = 0;
+    int sourceIndex = -1;
+};
+
+struct PreparedContext {
+    QString text;
+    QVector<VisualMatchRange> matches;
+};
+
+int previousUtf16Boundary(const QString &text, int position)
 {
+    int candidate = qMax(0, position - 1);
+    if (candidate > 0 && text.at(candidate).isLowSurrogate()
+        && text.at(candidate - 1).isHighSurrogate()) {
+        --candidate;
+    }
+    return candidate;
+}
+
+PreparedContext prepareContext(const QModelIndex &index, int maxWidth,
+                               const QFontMetrics &metrics)
+{
+    PreparedContext prepared;
     const QString text = index.data(SearchResultsModel::ContextRole).toString();
     const QVariantList ranges =
         index.data(SearchResultsModel::MatchPositionsRole).toList();
-    const int x = xInColumn - 4;
-    if (x < 0 || text.isEmpty() || ranges.isEmpty()) return -1;
-    int nearest = -1;
-    int nearestDistance = std::numeric_limits<int>::max();
+    if (text.isEmpty() || ranges.isEmpty() || maxWidth <= 0) {
+        prepared.text = metrics.elidedText(text, Qt::ElideRight, qMax(0, maxWidth));
+        return prepared;
+    }
+
+    const QVariantMap primary = ranges.first().toMap();
+    const int primaryStart = qBound(
+        0, primary.value(QStringLiteral("start")).toInt(), text.size());
+    const int primaryLength = qBound(
+        0, primary.value(QStringLiteral("length")).toInt(),
+        text.size() - primaryStart);
+    const int matchWidth = metrics.horizontalAdvance(
+        text.mid(primaryStart, primaryLength));
+    const int ellipsisWidth = metrics.horizontalAdvance(QString(QChar(0x2026)));
+    const int prefixBudget = qMax(0, (maxWidth - matchWidth) * 2 / 5
+                                     - ellipsisWidth);
+    int sourceStart = primaryStart;
+    while (sourceStart > 0) {
+        const int candidate = previousUtf16Boundary(text, sourceStart);
+        if (metrics.horizontalAdvance(
+                text.mid(candidate, primaryStart - candidate)) > prefixBudget) {
+            break;
+        }
+        sourceStart = candidate;
+    }
+
+    const QString leading = sourceStart > 0 ? QString(QChar(0x2026)) : QString();
+    const QString raw = leading + text.mid(sourceStart);
+    prepared.text = metrics.elidedText(raw, Qt::ElideRight, maxWidth);
+    const bool rightElided = prepared.text != raw;
+    const int visibleContentEnd = qMax(
+        0, prepared.text.size() - (rightElided ? 1 : 0));
+
     for (int i = 0; i < ranges.size(); ++i) {
         const QVariantMap range = ranges.at(i).toMap();
         const int start = qBound(0, range.value(QStringLiteral("start")).toInt(),
                                  text.size());
         const int length = qMax(0, range.value(QStringLiteral("length")).toInt());
         const int end = qBound(start, start + length, text.size());
-        const int startX = metrics.horizontalAdvance(text.left(start));
-        const int endX = metrics.horizontalAdvance(text.left(end));
-        if (x >= startX && x <= endX) return i;
-        const int distance = qMin(qAbs(x - startX), qAbs(x - endX));
-        if (distance < nearestDistance) {
-            nearestDistance = distance;
-            nearest = i;
-        }
+        int visualStart = leading.size() + start - sourceStart;
+        int visualEnd = leading.size() + end - sourceStart;
+        if (visualEnd <= 0 || visualStart >= visibleContentEnd)
+            continue;
+        visualStart = qBound(0, visualStart, visibleContentEnd);
+        visualEnd = qBound(visualStart, visualEnd, visibleContentEnd);
+        if (visualEnd > visualStart)
+            prepared.matches.append({visualStart, visualEnd - visualStart, i});
     }
-    return nearest;
+    return prepared;
+}
+
+int hitTestModelMatch(const QModelIndex &index, int xInColumn,
+                      int columnWidth, const QFontMetrics &metrics)
+{
+    constexpr int HorizontalPadding = 6;
+    const int x = xInColumn - HorizontalPadding;
+    const PreparedContext prepared = prepareContext(
+        index, qMax(0, columnWidth - 2 * HorizontalPadding), metrics);
+    if (x < 0)
+        return -1;
+    for (const VisualMatchRange &range : prepared.matches) {
+        const int startX = metrics.horizontalAdvance(
+            prepared.text.left(range.start));
+        const int endX = metrics.horizontalAdvance(
+            prepared.text.left(range.start + range.length));
+        if (x >= startX && x <= endX)
+            return range.sourceIndex;
+    }
+    return -1;
 }
 } // namespace
 
@@ -459,82 +532,57 @@ public:
             return;
         }
 
-        const QString text = index.data(SearchResultsModel::ContextRole).toString();
         const QVariantList encodedRanges =
             index.data(SearchResultsModel::MatchPositionsRole).toList();
-        if (text.isNull() || encodedRanges.isEmpty()) {
+        if (index.data(SearchResultsModel::ContextRole).isNull()
+            || encodedRanges.isEmpty()) {
             QStyledItemDelegate::paint(painter, option, index);
             return;
         }
 
         painter->save();
 
-        // 背景（交替行颜色 + 选中高亮）
         QStyleOptionViewItem opt = option;
         initStyleOption(&opt, index);
+        // 让当前平台样式一次性绘制交替色、悬停、整行选择和焦点边框。
+        // 之后只覆盖文字，不再手工拼接几块不同高度的背景。
+        opt.text.clear();
+        opt.icon = QIcon();
+        QStyle *style = opt.widget ? opt.widget->style() : QApplication::style();
+        style->drawControl(QStyle::CE_ItemViewItem, &opt, painter, opt.widget);
 
-        if (opt.state & QStyle::State_Selected) {
-            painter->fillRect(opt.rect, opt.palette.highlight());
-        } else if (opt.features & QStyleOptionViewItem::Alternate) {
-            painter->fillRect(opt.rect, opt.palette.alternateBase());
-        } else {
-            painter->fillRect(opt.rect, opt.palette.base());
+        constexpr int HorizontalPadding = 6;
+        const QRect textRect = option.rect.adjusted(HorizontalPadding, 0,
+                                                    -HorizontalPadding, 0);
+        const QFontMetrics metrics(option.font);
+        const PreparedContext prepared = prepareContext(index, textRect.width(),
+                                                        metrics);
+        QTextLayout textLayout(prepared.text, option.font);
+        QVector<QTextLayout::FormatRange> formats;
+        const bool selected = option.state & QStyle::State_Selected;
+        for (const VisualMatchRange &range : prepared.matches) {
+            QTextCharFormat format;
+            format.setFontWeight(QFont::DemiBold);
+            format.setBackground(selected ? QColor(255, 255, 255, 72)
+                                          : QColor(255, 214, 64, 155));
+            format.setForeground(selected
+                ? option.palette.color(QPalette::HighlightedText)
+                : QColor(132, 72, 0));
+            formats.append({range.start, range.length, format});
         }
-
-        // 文字区域（留 padding）
-        QRect textRect = opt.rect.adjusted(4, 0, -4, 0);
-        QFontMetrics fm(opt.font);
-        int ascent = fm.ascent();
-        int y = opt.rect.y() + (opt.rect.height() - fm.height()) / 2 + ascent;
-
-        // 先画匹配背景
-        QColor hlBg(0xFF, 0xFF, 0x00, 0xC0);  // 半透明黄
-        QColor hlFg(0xFF, 0x00, 0x00);         // 红
-        QColor normalFg = (opt.state & QStyle::State_Selected)
-                          ? opt.palette.color(QPalette::HighlightedText)
-                          : opt.palette.color(QPalette::Text);
-
-        // 计算文本宽度限制（超出显示区域的用省略号）
-        int maxWidth = textRect.width();
-        QString elidedText = fm.elidedText(text, Qt::ElideRight, maxWidth);
-
-        // Draw the shaped string as a whole.  Painting one QChar at a time
-        // splits emoji surrogate pairs and combining sequences, disables font
-        // fallback/kerning and makes the result text visibly corrupt.  Match
-        // ranges are UTF-16 positions, so their pixel rectangles can be
-        // derived from shaped prefixes; clipping a second full-string paint
-        // then changes only the matched foreground without breaking glyphs.
-        painter->setFont(opt.font);
-        QVector<QRect> highlightRects;
-        for (const QVariant &encoded : encodedRanges) {
-            const QVariantMap range = encoded.toMap();
-            const int start = qBound(
-                0, range.value(QStringLiteral("start")).toInt(), elidedText.size());
-            const int end = qBound(
-                start,
-                start + qMax(0, range.value(QStringLiteral("length")).toInt()),
-                elidedText.size());
-            if (end <= start)
-                continue;
-            const int startX = fm.horizontalAdvance(elidedText.left(start));
-            const int endX = fm.horizontalAdvance(elidedText.left(end));
-            QRect highlightRect(textRect.left() + startX, opt.rect.y(),
-                                qMax(1, endX - startX), opt.rect.height());
-            highlightRect = highlightRect.intersected(textRect);
-            if (!highlightRect.isEmpty()) {
-                painter->fillRect(highlightRect, hlBg);
-                highlightRects.append(highlightRect);
-            }
-        }
-
-        painter->setPen(normalFg);
-        painter->drawText(textRect.left(), y, elidedText);
-        painter->setPen(hlFg);
-        for (const QRect &highlightRect : std::as_const(highlightRects)) {
-            painter->save();
-            painter->setClipRect(highlightRect);
-            painter->drawText(textRect.left(), y, elidedText);
-            painter->restore();
+        textLayout.setFormats(formats);
+        textLayout.beginLayout();
+        QTextLine line = textLayout.createLine();
+        if (line.isValid())
+            line.setLineWidth(textRect.width());
+        textLayout.endLayout();
+        painter->setPen(selected
+            ? option.palette.color(QPalette::HighlightedText)
+            : option.palette.color(QPalette::Text));
+        if (line.isValid()) {
+            const qreal y = textRect.top()
+                + (textRect.height() - line.height()) / 2.0;
+            textLayout.draw(painter, QPointF(textRect.left(), y));
         }
 
         painter->restore();
@@ -570,6 +618,8 @@ SearchResultsDock::SearchResultsDock(QWidget *parent)
     m_summary = new QLabel(container);
     m_summary->setObjectName(QStringLiteral("searchResultsSummary"));
     m_summary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_summary->setMinimumWidth(0);
+    m_summary->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     m_rerunButton = new QPushButton(QStringLiteral("重新搜索"), container);
     m_rerunButton->setObjectName(QStringLiteral("searchResultsRerunButton"));
     m_rerunButton->setToolTip(QStringLiteral("使用当前查找条件重新生成有效结果"));
@@ -585,6 +635,8 @@ SearchResultsDock::SearchResultsDock(QWidget *parent)
     m_treeView->setObjectName(QStringLiteral("searchResultsTree"));
     m_treeView->setAlternatingRowColors(true);
     m_treeView->setUniformRowHeights(true);
+    m_treeView->setMouseTracking(true);
+    m_treeView->viewport()->setAttribute(Qt::WA_Hover, true);
     m_treeView->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_treeView->setEditTriggers(QAbstractItemView::NoEditTriggers);
     // 搜索结果的核心信息是上下文。禁止 QHeaderView 自动把最后一列（匹配数）
@@ -624,10 +676,8 @@ void SearchResultsDock::setRerunAvailable(bool available,
 void SearchResultsDock::updateSummary(const QString &pattern, const QString &fileName,
                                       qint64 totalMatches)
 {
-    m_summary->setText(QStringLiteral("在 %1 中搜索 \"%2\"：找到 %3 处匹配")
-                           .arg(fileName)
-                           .arg(pattern)
-                           .arg(totalMatches));
+    m_summary->setText(QStringLiteral("%1 · “%2” · %3 处")
+                           .arg(fileName, pattern).arg(totalMatches));
 }
 
 void SearchResultsDock::setResults(const QVector<SearchMatch> &matches,
@@ -658,8 +708,8 @@ void SearchResultsDock::setResults(const QVector<SearchMatch> &matches,
     m_treeView->setModel(m_singleL1Model);
     m_treeView->setRootIsDecorated(false);
     if (incomplete) {
-        m_summary->setText(QStringLiteral("在 %1 中搜索 \"%2\"：至少 %3 处匹配（结果已截断）")
-                               .arg(fileName).arg(pattern).arg(matches.size()));
+        m_summary->setText(QStringLiteral("%1 · “%2” · 至少 %3 处（已截断）")
+                               .arg(fileName, pattern).arg(matches.size()));
     } else {
         updateSummary(pattern, fileName, qint64(matches.size()));
     }
@@ -742,16 +792,13 @@ void SearchResultsDock::setResultsModel(SearchResultsModel *model,
         qint64 lines = model->groupedCount();
         const QString groupUnit = model->bytePositionMode()
             ? QStringLiteral("个字节窗口") : QStringLiteral("行");
-        m_summary->setText(QStringLiteral("在 %1 中搜索 \"%2\"：找到 %3 处匹配（%4 %5）")
-                               .arg(fileName)
-                               .arg(pattern)
-                               .arg(total)
-                               .arg(lines)
-                               .arg(groupUnit));
+        m_summary->setText(QStringLiteral("%1 · “%2” · %3 处 / %4 %5")
+                               .arg(fileName, pattern).arg(total)
+                               .arg(lines).arg(groupUnit));
         if (model->isIncomplete()) {
             m_summary->setText(
-                QStringLiteral("在 %1 中搜索 \"%2\"：至少 %3 处匹配（结果不完整：%4）")
-                    .arg(fileName).arg(pattern).arg(total)
+                QStringLiteral("%1 · “%2” · 至少 %3 处（%4）")
+                    .arg(fileName, pattern).arg(total)
                     .arg(model->incompleteReason()));
         }
         // The line index may have completed after this search captured its
@@ -768,8 +815,10 @@ void SearchResultsDock::beginSingleFileResults(const QString &pattern,
 {
     auto *preview = new SearchResultsModel(this);
     preview->setBytePositionMode(target && target->isBinaryDocument());
+    if (target)
+        preview->setTextEncoding(target->displayEncoding());
     setResultsModel(preview, pattern, fileName, target);
-    m_summary->setText(QStringLiteral("正在 %1 中搜索 “%2”…")
+    m_summary->setText(QStringLiteral("%1 · 正在搜索 “%2”…")
                            .arg(fileName, pattern));
     show();
     raise();
@@ -787,7 +836,7 @@ void SearchResultsDock::appendSingleFilePreview(
     const int take = qMin(remaining, batch.size());
     for (int i = 0; i < take; ++i) m_singlePreviewMatches.append(batch.at(i));
     m_model->setResults(m_singlePreviewMatches, {}, 0);
-    m_summary->setText(QStringLiteral("正在 %1 中搜索：已发现至少 %2 处…")
+    m_summary->setText(QStringLiteral("%1 · 已发现至少 %2 处…")
                            .arg(target->fileName()).arg(m_singlePreviewMatches.size()));
 }
 
@@ -982,6 +1031,7 @@ void SearchResultsDock::beginMultiFileTarget(EditorTab *tab)
     const QString targetId = registerTarget(tab);
     auto *preview = new SearchResultsModel(m_multiModel);
     preview->setBytePositionMode(tab->isBinaryDocument());
+    preview->setTextEncoding(tab->displayEncoding());
     m_multiModel->addL2Preview(tab, targetId, preview);
 }
 
@@ -1080,7 +1130,8 @@ bool SearchResultsDock::eventFilter(QObject *watched, QEvent *event)
                     QRect colRect = m_treeView->visualRect(idx);
                     int xInCol = me->pos().x() - colRect.left();
                     QFontMetrics fm(m_treeView->font());
-                    int matchIdx = hitTestModelMatch(idx, xInCol, fm);
+                    int matchIdx = hitTestModelMatch(idx, xInCol,
+                                                     colRect.width(), fm);
                     m_lastHitMatchIdx = matchIdx;
                     m_lastHitRow = idx.row();
                 } else {

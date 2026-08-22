@@ -29,6 +29,13 @@ enum class AsyncTaskType : int {
     Unknown = 0,
     LineIndexBuild = 1,   // L2 行索引构建（全量/增量/补扫）
     LargeFileSearch = 2,  // 大文件分块搜索
+    CharacterCount = 3,
+    EncodingConversion = 4,
+    SessionSnapshot = 5,
+    SecureOpen = 6,
+    SecureSave = 7,
+    SecureIdentity = 8,
+    VaultOperation = 9,
     Other           = 99
 };
 
@@ -70,8 +77,11 @@ struct AsyncTask {
     QDateTime startedAt;
     QDateTime finishedAt;
     qint64 elapsedMs() const;        // 运行中/已完成 耗时
+    // 基于已完成工作量的线性估计；数据不足或任务已结束时返回 -1。
+    qint64 estimatedRemainingMs() const;
 
     AsyncCancelPtr cancel;           // 取消原子；Manager 分配 & 持有 cancel->store(true) 来取消
+    bool cancellable = true;          // 原子提交/安全收尾阶段必须关闭取消
     AsyncErrorInfo error;            // 失败信息
     QString categoryTag;             // 可选：例如 "LineIndex" / "Crypto-Decrypt" / "Search"
 

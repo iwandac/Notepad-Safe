@@ -66,8 +66,8 @@ Notepad Safe 是 Windows 优先、离线优先的 Qt 桌面产品，提供三组
 | ADR-003 | KeePassXC Core + Botan 是 KDBX 生产实现 | 写入、历史、附件、KDF 和兼容性成熟；不自行实现密码学 |
 | ADR-004 | Rust/Tauri 保险库保留为原型，不进入正式桌面构建 | 当前 keepass-rs 写入成熟度和现有 Qt 产品边界不匹配 |
 | ADR-005 | S2 与 S3 均使用窗口化 mmap 只读 Provider；禁用 ILoader 后台晋升 | 用户实测证明后台完整加载不可用；代码和 UI 不得继续暗示 32 MiB–2 GiB 可编辑 |
-| ADR-006 | 32 MiB 及以上永久只读 | 保留大日志分析价值，不承担编辑器内核重写成本 |
-| ADR-007 | 正则统一为 PCRE2 | 三档语义一致；不混用 Scintilla 正则、QRegularExpression 和自制分块语义 |
+| ADR-006 | 当前发布线 32 MiB 及以上只读；32 MiB 是首屏延迟准入线，不是 Scintilla 能力上限 | 保留大日志分析价值；只有新 Provider 通过即时打开、内存、完整编辑和保存门禁后才允许调整路由 |
+| ADR-007 | 正则以 PCRE2 兼容语义为产品契约，执行后端按原始编码选择 | UTF-8 快照走 PCRE2；UTF-16 与受支持的无状态传统编码走统一 Unicode 标量迭代器，正文不转码且结果始终是原始字节坐标；不复用逐字节的 Scintilla 正则 |
 | ADR-008 | 安全文档使用自包含的 KDBX4 文件，密钥槽写入 `PublicCustomData` | 继续复用 KeePassXC/KDBX，不再依赖易丢失的 `.nsk` 旁车文件 |
 | ADR-009 | 新建和未命名草稿默认加密；普通保存保持原格式 | 用户不需要在日常编辑中理解或选择加解密 |
 | ADR-010 | 打开入口统一，按文件头路由文本、安全文档、兼容 KDBX 和未知二进制 | 应用支持所有格式，扩展名不能决定安全边界 |
@@ -80,6 +80,7 @@ Notepad Safe 是 Windows 优先、离线优先的 Qt 桌面产品，提供三组
 | ADR-017 | 查找、查找全部和结果导航共享全局 SearchSession | 当前/全部打开/目录范围以及 Text/Hex/Secure/各大小档不再产生孤立实现和不一致语义 |
 | ADR-018 | 任一文档工作区同一时刻只有一个用户可见、可操作的纵向滚动条 | 外层虚拟滚动条与 Scintilla 内部滚动条并存会形成两个位置真值，导致滚动无效、窗口回跳和无法遍历全文；禁止以双向同步补丁作为目标方案 |
 | ADR-019 | “全部打开文件”同时支持查找和对可编辑目标的批量替换 | 这是 Notepad++ 类编辑器的正常一致性预期；S3/只读/不兼容查询类型按目标明确跳过，不能因混合范围而禁用全部替换 |
+| ADR-020 | 十六进制控件、字节存储 Provider 与搜索引擎分层 | 可替换成熟 Hex UI，但 B2/B3 仍复用 mmap 窗口、64 位坐标和异步搜索；禁止让控件自带同步搜索或全量缓冲接管大文件路径 |
 
 ## 3. 总体分层
 
@@ -103,7 +104,9 @@ flowchart TB
     SEARCH --> ENGINE["SearchService / SearchCursor"]
     ENGINE --> SNAP["Text / Byte / Account SearchTarget"]
     ENGINE --> RESULT["Paged ResultStore"]
-    ENGINE --> PCRE["PCRE2 RegexEngine"]
+    ENGINE --> DIALECT["PCRE2-compatible RegexQuery"]
+    DIALECT --> PCRE["UTF PCRE2 backend"]
+    DIALECT --> RAW["Raw encoded Unicode-scalar Boost.Regex backend"]
 
     SECURE --> KEY["KeyResolver / KeySlotCodec"]
     ACCOUNT --> ADAPTER["KeePassXcStorageAdapter"]
@@ -124,7 +127,7 @@ flowchart TB
 |---|---|
 | notepadsafe_domain | 无 UI 的文档、探测、保存策略、搜索和安全领域类型 |
 | notepadsafe_editor | ScintillaGateway、文本编辑、十六进制编辑、窗口化只读视图 |
-| notepadsafe_search | SearchScope/Target/Cursor、Text/Byte/Account 快照、PositionMapper、PCRE2、分页结果存储和导航契约 |
+| notepadsafe_search | SearchScope/Target/Cursor、Text/Byte/Account 快照、编码感知 RegexEngine、分页结果存储和原始字节导航契约 |
 | notepadsafe_secure | SecureDocumentService、KeyResolver、KeySlotCodec、KeePassXC 适配器 |
 | notepadsafe_accounts | AccountService、账号领域类型、安全剪贴板、TOTP |
 | notepadsafe_session | SecuritySessionService、DraftStore、WorkspaceSession |
@@ -142,28 +145,30 @@ flowchart TB
 | Scintilla | 编辑器内核 | 当前随 QScintilla vendoring；未来独立锁定稳定版 | 作为真正战略上游；后续可替换为直接 Qt 端口 |
 | KeePassXC | KDBX 读写和领域实现 | 2.7.12 为首个集成候选 | 固定 release tag/commit；只通过适配器访问 |
 | Botan | KeePassXC 密码学依赖 | 由固定 KeePassXC 版本约束后锁定 | 不单独抢跑大版本；Botan 2 已 EOL，不新增 Botan 2 基线 |
-| PCRE2 | 统一正则引擎 | 10.47，与 Qt 6.11.1 内置版本对齐 | 直接静态链接同版本的 8/16 位库，统一搜索语义 |
+| PCRE2 | UTF 正则与产品方言校验 | 10.47，与 Qt 6.11.1 内置版本对齐 | 静态 8-bit 后端；所有表达式先按 PCRE2 兼容语义校验 |
+| Boost.Regex | 原始编码正则执行 | 1.90.0 standalone/header-only | `basic_regex<char32_t>` 消费直接遍历 mmap 的编码感知标量迭代器，捕获组保留原始字节范围；不复制全文或建立字符偏移表 |
 | zlib/minizip 等 | KDBX 传递依赖 | 随 KeePassXC 基线确定 | 在锁文件中展开记录，不视为“隐式依赖” |
 
 “最新版本”不是构建输入。所有生产构建只读取仓库中的供应链锁文件。
 
 ### 4.2 供应链锁文件
 
-仓库中的 `third_party/dependencies.lock.json` 是机器可读的唯一锁文件，每个组件至少记录：
+仓库中的 `third_party/dependencies.lock.json` 是机器可读的唯一锁文件。Qt 是精确版本的外部静态工具链；QScintilla、KeePassXC、Botan、Argon2、zlib、PCRE2、Boost.Regex 七个运行时依赖全部以纯源码提交到 `third_party/src`。每个 vendored 组件同时记录上游身份校验与规范化后实际源码树 SHA-256：
 
 ```yaml
 - name: keepassxc
   version: 2.7.12
   revision: refs/tags/2.7.12
   source: https://github.com/keepassxreboot/keepassxc
-  archive_sha256: TBD
-  signature: verified
+  source_integrity: { kind: sha256, value: exact-upstream-archive-digest }
+  local_path: third_party/src/keepassxc-2.7.12
+  integrity: { kind: source-tree-sha256, value: exact-real-tree-digest }
   license: GPL-2.0-or-later
   patches: []
   build_options: [static, core-only]
 ```
 
-同时保存上游源码归档或只读 subtree，支持离线、可重复构建。禁止构建时从 develop/master 或网络自动拉取源码。所有本地补丁放在 third_party/patches/<component>/<version>/，附原因、上游 issue 和删除条件。
+`build.bat`、`build_incr.bat` 和测试脚本统一调用 `prepare_dependencies.bat`；生产构建不下载、不 clone，也不依赖嵌套 Git 元数据。QScintilla/Botan 生成物只能进入 `.deps/build|install`，PCRE2/Argon2/zlib/KeePassXC Core 由正式 CMake 从 vendored 源码编译。`verify_supply_chain.ps1` 对真实磁盘文件逐个散列，任何未跟踪文件或源码修改都会改变树摘要；`.lib/.obj/.dll/.exe/.pdb`、构建目录和嵌套 VCS 元数据会被直接拒绝。所有本地补丁放在 `third_party/patches/<component>/<version>/`，附原因、上游 issue 和删除条件。
 
 当前 QScintilla 包的版本是明确的，但其内嵌 Scintilla 的文档版本与实际 API 集合不能作为可靠的独立版本标识；首次治理时必须补充源树 hash、接口清单和编译选项，不能只写“Scintilla 版本未知”。
 
@@ -185,7 +190,7 @@ flowchart LR
 - Qt/QScintilla/Scintilla 与 KeePassXC/Botan 不在同一常规变更中升级。
 - KeePassXC 升级必须通过双向 KDBX golden corpus：旧版本创建、新版本打开保存、KeePass/KeePassXC 再次打开。
 - Scintilla 升级必须通过编辑命令、IME、编码、撤销、32 MiB 只读边界和性能基线。
-- PCRE2 升级必须通过三档同语义正则语料和 ReDoS 资源限制测试。
+- PCRE2/Boost.Regex 任一升级必须通过三档、UTF/CP936 同查询语料，以及取消、状态/内存上限和 ReDoS 门禁。
 - 例行依赖每季度评估；严重安全问题立即评估，不能等待季度窗口。
 - 发布产物生成 SPDX/CycloneDX SBOM、源代码对应物、构建器版本和 SHA-256。
 - 任一升级都保留上一套锁文件和可安装包，数据库格式升级默认保持向后可读，不静默进行不可逆迁移。
@@ -194,7 +199,25 @@ flowchart LR
 
 - QScintilla：EditorProvider 和 ScintillaGateway 隔离后，可迁移到上游 Scintilla Qt 控件。
 - KeePassXC：SecureDocumentService/AccountService 不暴露上游类型，可替换 KDBX adapter；KDBX 文件和离线恢复导出工具仍是用户的退出路径。
-- PCRE2：SearchQuery/SearchResult 不暴露 pcre2_code 指针，允许替换实现，但产品正则语义必须保持。
+- 正则引擎：SearchQuery/SearchResult 不暴露 PCRE2/Boost 类型；允许替换实现，但 PCRE2 兼容查询语义、捕获组和原始字节范围必须保持。
+
+### 4.5 十六进制控件候选与 mmap 边界
+
+候选控件只解决绘制、光标、选区、插入/覆盖、Undo/Redo 等交互成熟度，不自动成为文件
+Provider 或搜索引擎。正式分层固定为 `HexEditorView → HexDocument/Command → ByteProvider →
+SearchSession`，因此 B1 可以采用成熟控件的可编辑内存/分块后端，B2/B3 则必须接入现有
+64 位 mmap/窗口 Provider 和异步字节搜索。控件若不能注入自定义 Provider，就不能进入 B2/B3。
+
+| 候选 | 上游事实 | 适合范围 | 当前裁决 |
+|---|---|---|---|
+| QHexView | Qt 5/6 document/view；公开 `QMappedFileBuffer`、只读 `QDeviceBuffer`，并允许自定义 backend | B1 交互与 B2/B3 视图候选 | 优先做供应链/接口切片；使用其 UI 和可插拔 backend，不直接采用未经验证的保存/搜索路径 |
+| QHexEdit2 | QIODevice 按需读；首次只取 size，读取时 seek/read，修改时懒复制 4 KiB chunk；上游声明可编辑 2 GiB+ | B1 交互候选、验证分块编辑思路 | 不替换 B2/B3 mmap/异步搜索；大量离散 insert/delete、同步 64 KiB 搜索和全量流式保存必须单独压测 |
+
+这里的关键不是“源码里是否出现 mmap”四个字，而是首次打开是否只读取元数据/首屏、随机滚动
+是否有界读取、是否保持 64 位绝对位置、是否不建立完整副本。QIODevice 的 seek/read 也可以即时
+打开，但本项目已经验证 mmap 窗口和全量异步扫描，故不因更换 Hex 控件而丢弃它。QHexView
+明确提供 mmap backend，结构上更接近我们的 B2/B3；仍需验证其 backend 是否只读、映射粒度、
+Windows 文件替换语义和 4.9 GiB 实际滚动，不能根据 README 直接承诺可编辑大文件。
 
 ## 5. 统一文档模型、探测与路由
 
@@ -331,7 +354,9 @@ stateDiagram-v2
 
 - 使用当前已验证的 QScintilla 完整文档路径；打开完成后启用撤销、语法高亮、折叠、换行、多选和书签。
 - 当前实现的分块追加只属于 S1，不代表可复用的大文件后台装载能力。
-- 任何未来 S1 装载优化都必须保持 32 MiB 边界，不能暗中为 S2/S3 创建完整文档。
+- 32 MiB 是为了保证“选择文件后立即可编辑”的默认延迟预算，不是 QScintilla 的硬容量上限。
+  不能因为加载完成后编辑流畅就提高门限；未来只有在目标机器分档上证明首屏/可编辑就绪时间、
+  峰值内存和取消均达标，才可把更大文件准入完整内核。未通过前不得暗中为 S2/S3 创建完整文档。
 
 ## 7. S2：32 MiB 至 2 GiB 的大文件只读分析
 
@@ -354,11 +379,12 @@ S2 和 S3 只读必须进入同一个 `EditorSurface`；用户可见结构和交
 - 同一左侧 gutter 槽位。完整索引时显示精确行号；索引未完成时在相同槽位显示“约/计算中”或
   全局 byte offset，不得让 gutter 消失、改变宽度或显示窗口局部伪行号；
 - 同一纵向/横向滚动条位置、尺寸、主题和 wheel/Page/drag 手感，任何时刻可见纵向滚动条恰好
-  一条；换行、缩放、标尺、空白符显示和右键菜单使用同一视图配置；
+  一条；缩放、标尺、空白符显示和右键菜单使用同一视图配置。自动换行是明确的 capability
+  例外：S1/Secure Text 保留，S2/S3 的有界投影强制物理行并禁用菜单；
 - 同一查找高亮、书签、复制、标签、状态栏和 Dock 跳转表现。只读 Tier 通过 capability 禁用
   Cut/Paste/Undo/Replace/Save 等命令，不能换成简陋的“大文件查看器”；
 - S2/S3 不发生 Provider 晋升或编辑器表面替换；滚动、搜索和外部文件刷新始终保留同一全局
-  top、caret、selection、horizontal offset、wrap、zoom、bookmark 和 active search match；
+  top、caret、selection、horizontal offset、zoom、bookmark 和 active search match；
 - Tier/只读能力仅在状态栏表达。正文区域不得增加常驻大文件横幅、水印、第二套
   工具栏或不同的上下文菜单来暴露内部实现。
 
@@ -430,8 +456,8 @@ S3 复用 WindowedByteSource、WindowedReadOnlyView、SparseLineIndex 和 Search
 - 跳转 byte offset、已知行号、文件头尾和搜索结果。
 - 有界复制、导出选择、导出匹配行。
 - 字面搜索、完整 PCRE2 正则、结果 Dock、取消和进度。
-- 与 S1 相同入口和外观的自动换行、缩放、字体、主题、选择、书签、右键菜单和搜索高亮；
-  实现可以只重排当前有界窗口，但不得改变全局位置或造成假 EOF。
+- 与 S1 相同入口和外观的缩放、字体、主题、选择、书签、右键菜单和搜索高亮。自动换行在
+  S2/S3 禁用：有界窗口无法在不布局全文的情况下把折行 display row 稳定映射为全局位置。
 - 日志 tail/follow 可作为后续增量功能。
 
 不支持：
@@ -567,7 +593,7 @@ PatchList，再以 flush 后的 revision 启动任务。有编辑发生时取消
 
 ### 9.3 正则搜索
 
-产品正则方言固定为 PCRE2 10.47。Qt/QRegularExpression 可用于 UI 校验，但搜索执行统一走 RegexEngine 的 PCRE2 8/16 位接口。
+产品查询方言以 PCRE2 10.47 兼容语义为准。UTF-8 快照由 PCRE2 8-bit 执行；UTF-16LE/BE、GBK、GB18030、Big5、Shift-JIS 与 Windows-1252 物理快照先通过同一 PCRE2 方言校验，再由 Boost.Regex `basic_regex<char32_t>` 消费统一编码感知双向迭代器。迭代器一次解码一个 Unicode 标量，位置始终是原始字节指针；UTF-16 代理对与 GB18030 四字节字符都只消费一个正则字符，因此没有全文转码、第二份正文或“字符位置映射回字节”的阶段。无效序列按一个确定的原始单元暴露为 U+FFFD，不被丢弃。Boost 与 PCRE2 超出兼容核心的语义差异不能静默接受。
 
 任意正则不采用固定 overlap 并行分块。原因是 .*、多行模式、可变长度量词、lookaround 和反向引用的最大匹配跨度可能无界，固定 4 KiB/64 KiB overlap 都会产生静默漏报。
 
@@ -575,8 +601,8 @@ PatchList，再以 flush 后的 revision 启动任务。有编辑发生时取消
 
 1. 对稳定、逻辑连续的快照编译一次 pattern。
 2. 在 worker 中从起始 offset 顺序 global match，不复制整个 mmap。
-3. 零长度匹配按一个 Unicode code point 前进，防止死循环。
-4. 使用 match/depth/heap limit 和自动 callout 检查取消，约束灾难性回溯。
+3. 零长度匹配按当前物理编码的一个完整 Unicode 标量前进，防止死循环和落入多字节字符内部。
+4. PCRE2 使用 match/depth/heap limit；原始编码后端使用非递归匹配、状态/块上限，并在字符迭代器内部检查取消。
 5. 达到资源限制时返回“正则资源超限”，不伪装为“没有匹配”；用户可提高单次任务限制后重试。
 
 只有静态分析证明不跨行、无回溯引用、无 lookaround 且测试语料验证等价的安全子集，未来才允许并行；优化失败自动回退顺序路径。
@@ -1181,7 +1207,7 @@ Hex 的 cut/copy/paste/select all 按字节语义实现；行操作在 Hex 和�
 | Command ID | 菜单结构 | 快捷键 | 来源/决策 |
 |---|---|---|---|
 | `view.appearance.system/light/dark` | 外观 > 跟随系统/浅色/深色 | 无 | 把单一“深色模式”升级为互斥三态 |
-| `view.wordWrap` | 自动换行 | 无 | 保留；移除冲突的 Ctrl+W |
+| `view.wordWrap` | 自动换行 | 无 | S1/Secure Text 保留；S2/S3 禁用并显示未勾选；移除冲突的 Ctrl+W |
 | `view.edge.visible` | 长行标尺 > 显示标尺 | 无 | 保留 |
 | `view.edge.column.*` | 长行标尺 > 72/80/100/120/150/200 | 无 | 聚合现有列数；本版不为低频自定义值增加重复设置入口 |
 | `view.presentation.text/hex` | 呈现方式 > 文本/十六进制 | Ctrl+Shift+H 切换 | 替代“仅 L2 生效”的单一 Hex check action |
@@ -1202,14 +1228,12 @@ Hex 的 cut/copy/paste/select all 按字节语义实现；行操作在 Hex 和�
 
 #### 编码
 
-编码菜单拆成两个语义明确的子菜单，保留现有五种能力但把 UCS-2 文案更正为 UTF-16：
+编码菜单把最常用的“以 … 编码显示”作为外层直接动作；低频且会产生新文件的 `转换为` 折叠为子菜单。两处均支持 GBK、GB18030、Big5、Shift-JIS、Windows-1252、UTF-8、UTF-8 BOM、UTF-16 LE 与 UTF-16 BE。
 
-- `转换为`：GBK、UTF-8、UTF-8 BOM、UTF-16 LE、UTF-16 BE。改变文档编码并标脏，保存时重编码。
-- `以编码重新打开`：同五种编码。重新解释原始字节，不改变文件；存在未保存编辑时必须保存、放弃或取消。
+- `以 … 编码显示`：重新解释原始字节，不改变文件。L1 存在未保存编辑时只提供统一的保存/取消决定；保存成功后重新解释磁盘字节，取消保持正文、修改状态和菜单勾选不变。S2/S3 不完整重开文件，只替换当前有界窗口的解码投影。
+- `转换为`：先选择新路径，以目标编码原子写入新文件，成功后携带目标编码强制打开；不得再由自动检测覆盖用户选择。L1 从当前编辑文本严格编码，S2/S3 从原文件严格流式解码和编码；非法源序列、目标不可表示字符、取消或转换期间源文件变化均不提交目标。
 
-Hex 和 Accounts 禁用整个编码菜单；S2/S3 只读视图允许“以编码重新打开”，不允许“转换为”。菜单勾选必须来自当前 DocumentPresentation，而不是全局 QAction 残留状态。
-
-当前迁移实现已阻断旧路径的数据丢失风险：L1 文档存在未保存修改时，“以编码重新打开”必须选择“保存并重新打开 / 放弃修改并重新打开 / 取消”，取消保持正文、修改状态和菜单勾选不变；放弃才重新读取磁盘。安全 Text 不读取外层 KDBX 密文字节，Hex/Accounts/未命名草稿不暴露无效的编码重开动作。UTF-16 仅在真实 BOM 存在时跳过 BOM，GBK 固定使用 GB18030 解码器而不是依赖 Windows 当前代码页。L2 Text 在刷新可见投影前先把编辑 overlay 回写到 byte patch，改变解码方式不丢未保存字节；Hex→Text 后会立即重算编码菜单能力。真实 GUI 证据为 `build-codex-kdbx-default/gui-encoding-reopen-unsaved.png`。
+Hex、Accounts、安全容器和未命名草稿不暴露无效编码动作；普通 Text 与 S2/S3 Text 允许显示编码和转换。编码勾选、状态栏、Provider 和转换源编码统一来自 `EditorTab` 的当前文档编码状态，不保留第二套 L2 编码入口。
 
 #### 工具与帮助
 
@@ -1252,7 +1276,7 @@ Hex 和 Accounts 禁用整个编码菜单；S2/S3 只读视图允许“以编码
 
 当前迁移实现已经补齐真实 `QTabBar` 右键菜单：右击非活动标签会先激活该文档；保存、另存为与主菜单复用同一路由，关闭其他/全部在删除任何标签前完成全量保存预检，取消时不留下半关闭工作区；路径复制和资源管理器定位只对用户命名文件出现，内部 `.nsafe-draft` 不暴露。文本/Hex 项仅在当前 Provider 已声明双呈现能力时启用，切换不改变 Binary/Text 内容身份。菜单使用非阻塞 `popup()`，避免在大文件后台任务运行时引入嵌套事件循环。真实鼠标 GUI 用例覆盖路径复制、Binary Hex→Text、关闭其他和 `Ctrl+W` 一致性，证据为 `build-codex-kdbx-default/gui-tab-context-text.png`。
 
-最近文件列表允许显示实际文件名和路径，但不缓存安全文档正文摘要、窗口缩略图或账号信息。文件不存在时从列表删除并给出非阻塞提示。S1 文本在打开/重新解释时检测主导 CRLF/LF/CR，把它设置为 Scintilla 后续输入模式；状态栏以“编码 · 行尾”持续显示。编码转换属于元数据修改，必须独立于 Scintilla 文本 save-point 标脏，保存成功才清除；“以编码重新打开”是放弃/重读语义，成功后必须为 clean。`gui-round4-lifecycle-final.txt` 已用真实 Enter 键、保存动作、UTF-16LE BOM 和磁盘字节回读验证该闭环。
+最近文件列表允许显示实际文件名和路径，但不缓存安全文档正文摘要、窗口缩略图或账号信息。文件不存在时从列表删除并给出非阻塞提示。S1 文本在打开/重新解释时检测主导 CRLF/LF/CR，把它设置为 Scintilla 后续输入模式；状态栏以“编码 · 行尾”持续显示，并在完整解码发现非法字节时明确标注。普通保存和转换共享严格目标编码器；“以编码显示”成功后文档为 clean，转换则保留源标签并打开新标签。
 
 ### 11.8 状态栏设计
 
@@ -1326,9 +1350,9 @@ LineIndex、LargeFileSearch 和通用 Other；没有调用者的 `FileEncrypt/Fi
 | 查找/查找全部 | 是；可作为当前/全部打开/目录 target | 是；同左 | 是；Text/Byte 查询显式 | 是；同左 | 是，结果仅内存分区 | 非秘密账号字段 target |
 | 替换/全部替换 | 是；当前/全部打开/文件夹 ReplacePlan 的 eligible target | 否并在全局计划中明确跳过 | 条件启用；兼容 Byte ReplacePlan 可跨全部打开文件 | 否并明确跳过 | 按当前 Provider；已解锁且 editable 时可参与全部打开文件计划 | 否 |
 | 语言/高亮 | 是 | 预览受限 | 否 | 否 | 仅 Secure Text | 否 |
-| 转换编码 | 是 | 否 | 否 | 否 | Secure Text 是 | 否 |
-| 以编码重新打开 | 是 | 是 | 切到 Text 时 | 切到 Text 时 | Text payload | 否 |
-| 自动换行/长行标尺 | 是 | 受资源策略限制 | 否 | 否 | Secure Text | 否 |
+| 转换编码 | 是，另存新文件 | 是，严格流式另存 | 否 | 否 | 否 | 否 |
+| 以编码显示 | 是 | 是 | 切到 Text 时 | 切到 Text 时 | Text payload | 否 |
+| 自动换行/长行标尺 | 是 | 自动换行否；标尺按 Provider 能力 | 否 | 否 | Secure Text | 否 |
 | 书签 | 是 | 是，64 位位置 | 是 | 是，64 位位置 | 是 | 否 |
 | Text/Hex 呈现切换 | 是 | 是 | 是 | 是 | Text/Binary payload 均可 | 否 |
 
@@ -1709,11 +1733,13 @@ revision 的已完成 spool，并从稀疏 checkpoint 定位，不重复全文�
 S1 过渡 provider 的“查找全部”最多发布 200,000 处并明确标记截断，避免稠密
 表达式在统一 SearchSession 完成前重新制造无界 QWidget/QString 压力。
 
-PCRE2 10.47 的 8-bit provider 已接入统一搜索执行路径。S2/S3 直接以稳定的物理文件快照
-作为完整 subject，以 offset window 限制候选起点，匹配本身可自然跨读取边界和换行；
-不再存在 L2 patch、虚拟快照或批量替换路径。S1“查找全部”和 S2/S3 共用 Unicode、大小写、
-整词、零长度推进和错误语义。PCRE2 match/depth/heap 均有上限，取消检查接入同一
-token；无效 UTF-8 和资源上限形成可见失败，不能伪装成零结果。
+PCRE2 10.47 的 UTF-8 provider 与 Boost.Regex 1.90.0 的统一原始编码 provider 已接入同一
+`LargeFileSearch` 路径。S2/S3 直接以稳定的物理文件快照作为完整 subject；UTF-16LE/BE、
+GBK、GB18030、Big5、Shift-JIS 与 Windows-1252 的 `.`、量词、环视、反向引用和命名捕获
+按 Unicode 标量执行，命中及替换捕获直接保留 mmap 字节范围。无效编码单元以 U+FFFD
+语义占用确定的原始字节，不丢弃、不跨越；结果 Dock 按目标编码解码有界行上下文。
+ISO-2022、HZ、UTF-7 等依赖前文转换状态的编码不属于随机访问后端，避免为罕见格式引入
+检查点状态机。
 
 S1 的“查找全部”、F3/Shift+F3 和批量替换已共用同一 PCRE2 provider 与 byte-range
 缓存，内容 revision 变化时统一失效；跨行命中不再用单行 `line/index/length` 近似导航，
@@ -1848,9 +1874,9 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 
 仓库内直接验证点：
 
-- `.deps/src/keepassxc-2.7.12/src/format/Kdbx4Reader.cpp`：读取 `PublicCustomData`。
-- `.deps/src/keepassxc-2.7.12/src/format/Kdbx4Writer.cpp`：序列化并写回 `PublicCustomData`。
-- `.deps/src/keepassxc-2.7.12/tests/TestKdbx4.cpp`：现有 custom data round-trip 测试，可作为产品 key envelope golden test 的基础。
+- `third_party/src/keepassxc-2.7.12/src/format/Kdbx4Reader.cpp`：读取 `PublicCustomData`。
+- `third_party/src/keepassxc-2.7.12/src/format/Kdbx4Writer.cpp`：序列化并写回 `PublicCustomData`。
+- `third_party/src/keepassxc-2.7.12/tests/TestKdbx4.cpp`：现有 custom data round-trip 测试，可作为产品 key envelope golden test 的基础。
 
 ## 18. 真实用户成熟度复审后的强制架构约束（2026-08-17）
 
@@ -1908,7 +1934,7 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 |---|---|---|---|
 | S1 Text `<32 MiB` | 原生 QScintilla | 保持完整编辑基线 | 与 Secure Text 共用搜索/命令动态复审 |
 | S2 Text `32 MiB–<2 GiB` | WindowedReadOnlyProvider | 与 S3 等价只读；后台编辑装载已移除 | 继续编码、长行、增长日志、搜索跳转和零修改组合验收 |
-| S3 Text `>=2 GiB` | WindowedReadOnlyProvider | 只读分析；本轮正式 2 GiB+ wrap/EOF 通过 | 全量 PCRE2、结果 Dock 与日志增长继续复审 |
+| S3 Text `>=2 GiB` | WindowedReadOnlyProvider | 只读分析；自动换行已因拖动重排成本禁用；K02 已以原生 EOF 边界和绘制后收敛关闭 | 继续复审全量 PCRE2、结果 Dock 与日志增长 |
 | B2/B3 Hex | WindowedReadOnlyProvider Hex + ASCII pane | 已统一为地址 margin、纯 Hex、独立 ASCII、单滚动；真实大文件与契约用例通过 | 跨窗口鼠标选区、全部搜索分支、右键与 DPI 继续复审 |
 | B1 Hex `<32 MiB` | VirtualFileView + Scintilla/ASCII overlay | 可见三栏与单滚动契约已和 B2/B3 对齐；编辑、保存、Undo 基线通过 | 保留行为门禁后抽取统一 HexEditorProvider，清除内部 overlay 技术债务 |
 
@@ -1917,11 +1943,15 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 - WindowedReadOnlyProvider 的 gutter 现在按呈现切换：Hex 使用全局十六进制 byte address，
   Text 使用 Scintilla NumberMargin 的十进制文本行号；Binary→Text、切回 Hex 与会话恢复均有
   GUI 契约保护，不再把二进制地址残留在文本编辑界面。
-- scrollbar 最大值会把最后一个 window 固定到物理 EOF，并将最后一屏滚入 viewport；
-  `build/gui-formal-s2-eof.png` 可见 `FINAL_FORMAL_S2_EOF_MARKER`，取得正文焦点后连续
-  64 次 Down 仍保持 `value == maximum`。
-- word wrap 滚动按 display line 计算；正式 2 GiB+ S3 脚本把 RangeValue 设为 1,000,000，
-  连续 Down 后仍为 1,000,000，截图为 `build/gui-formal-s3-wrap-eof.png`。
+- K02 已关闭：全局 scrollbar 最大值先固定最后一个 window 到物理 EOF，再调用 Scintilla
+  原生 `SCI_SCROLLTOEND`，首个真实 paint 后按最终 viewport 指标再次收敛。EOF 可见性直接用
+  文档末尾的绘制坐标判断，不再用“完整可见行数”猜测部分可见的最后一行。GUI 用例连续执行
+  首次拖尾、两次拖离/拖回、64 次 Down 和滚轮，截图
+  `gui-windowed-nowrap-physical-eof.png` 可见第 513 行 `FINAL_PHYSICAL_EOF_MARKER`；完整大文件
+  套件 22/22 通过。
+- 历史切片曾实现 window-local word wrap EOF 补偿，但真实拖柄操作仍需要反复解码和重排
+  2 MiB 投影，且没有全文 display-line 坐标。当前产品边界改为 S2/S3 强制 `WrapNone`；菜单
+  disabled/unchecked，直接调用 Provider 也会拒绝开启，S1 的全局偏好在切回标签后恢复。
 - 状态栏文档 segment 已改为 permanent widget；S2 恢复消息位于左侧，右侧“行/编码/EOL/
   呈现/256.00 MiB·S2·预览”无覆盖。
 - 未修改 B1 保存动作禁用且 `EditorTab::saveFile` 为 no-op；GUI 回归同时检查文件 identity、
@@ -1965,7 +1995,7 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 2. **统一 SearchSession 动态复审批次**：Text/Hex × S1/S2/S3/Secure × 当前/全部打开文件，
    真实打开 Dock、观察增量分组和高亮、双击正文精确 selection、快速切 tab/关闭/编辑导致
    revision 失效、取消与重跑；Replace All 只覆盖 eligible editable targets 且每文档一次 Undo。
-3. **S2/S3 只读成熟度批次**：256 MiB 日常样本、接近 2 GiB 基准样本和 2 GiB+ 日志均执行首/中/尾浏览、滚轮/拖柄/换行、查找/查找全部、取消和内存压力验证；同时断言零编辑装载任务、全部修改入口禁用且源文件 hash 不变。
+3. **S2/S3 只读成熟度批次**：256 MiB 日常样本、接近 2 GiB 基准样本和 2 GiB+ 日志均执行首/中/尾浏览、滚轮/拖柄、长行横向浏览、查找/查找全部、取消和内存压力验证；同时断言自动换行及全部修改入口禁用、零编辑装载任务且源文件 hash 不变。
 
 以上三批未完成前，不得把成熟度标记为 50% 以上，不得生成新发布候选。每批只运行受影响
 测试和少量邻接回归；阶段门才运行全矩阵，以控制剩余资源。

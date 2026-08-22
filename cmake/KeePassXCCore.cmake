@@ -1,15 +1,15 @@
 # Headless KDBX core extracted from the pinned KeePassXC 2.7.12 source tree.
-# Source archives/checkouts are intentionally external to git and are populated
-# by tools/bootstrap_crypto_deps.ps1. This file is the small, reviewable source
-# closure that is replayed whenever KeePassXC is updated.
+# All source inputs are committed under third_party/src. Only the minimized
+# Botan build/install products are generated under .deps by the offline
+# bootstrap. This file is the small, reviewable KeePassXC source closure.
 
 enable_language(C)
 
-set(NOTEPADSAFE_KEEPASSXC_SOURCE_DIR "${CMAKE_SOURCE_DIR}/.deps/src/keepassxc-2.7.12"
+set(NOTEPADSAFE_KEEPASSXC_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third_party/src/keepassxc-2.7.12"
     CACHE PATH "KeePassXC 2.7.12 source root")
-set(NOTEPADSAFE_ARGON2_SOURCE_DIR "${CMAKE_SOURCE_DIR}/.deps/src/argon2-20190702"
+set(NOTEPADSAFE_ARGON2_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third_party/src/argon2-20190702"
     CACHE PATH "Argon2 20190702 source root")
-set(NOTEPADSAFE_ZLIB_SOURCE_DIR "${CMAKE_SOURCE_DIR}/.deps/src/zlib-1.3.2"
+set(NOTEPADSAFE_ZLIB_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third_party/src/zlib-1.3.2"
     CACHE PATH "zlib 1.3.2 source root")
 set(NOTEPADSAFE_BOTAN_ROOT "${CMAKE_SOURCE_DIR}/.deps/install/botan-3.12.0"
     CACHE PATH "Botan 3.12.0 static installation prefix")
@@ -22,7 +22,7 @@ foreach(required_path
     if(NOT EXISTS "${${required_path}}")
         message(FATAL_ERROR
             "${required_path} does not exist: ${${required_path}}. "
-            "Run tools/bootstrap_crypto_deps.ps1 first or pass an audited path.")
+            "Run prepare_dependencies.bat first or pass an audited path.")
     endif()
 endforeach()
 

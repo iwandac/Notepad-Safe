@@ -1,6 +1,6 @@
 // ============================================================================
 //  smoke_find_replace：查找/替换 GUI 冒烟测试（Qt6 Test，真实 GUI 事件）
-//  对应 QUALITY_ASSURANCE_AND_GUI_TESTING.md §3.2 强制清单。
+//  对应 GUI contract matrix 的查找与替换清单。
 //
 //  覆盖：
 //    TC_FR_001：替换模式能把 FindReplaceDialog 正确 show 出来；主窗口快捷键为 Ctrl+R。

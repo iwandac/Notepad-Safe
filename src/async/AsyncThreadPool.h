@@ -3,6 +3,7 @@
 
 #include <QThreadPool>
 #include <QMutex>
+#include <QVector>
 #include <functional>
 #include "AsyncTask.h"
 
@@ -27,8 +28,17 @@ public:
      */
     void startWorker(std::function<void()> fn, AsyncTaskPriority priority);
 
-    // Private pools (currently LineIndex) reserve from the same process-wide
-    // budget. A zero result means the caller must stay serial.
+    /**
+     * Run a bounded parallel batch on framework-owned workers. The caller may
+     * block, but first-party domain code never creates a QThread/QThreadPool.
+     * One central interactive slot remains available while the batch runs.
+     */
+    void runBatchBlocking(QVector<std::function<void()>> jobs,
+                          AsyncTaskPriority priority = AsyncTaskPriority::Normal);
+
+    // Framework-owned parallel batches reserve from the same process-wide
+    // budget while leaving one additional central slot available. A zero
+    // result means the caller must stay serial.
     int reserveExternalCapacity(int requestedWorkers);
     void releaseExternalCapacity(int reservedWorkers);
 
@@ -44,6 +54,7 @@ private:
     mutable QMutex capacityMutex_;
     int externalReserved_ = 0;
     int externalActive_ = 0;
+    int configuredMaxThreads_ = MaximumWorkerThreads;
 };
 
 #endif // ASYNCTHREADPOOL_H

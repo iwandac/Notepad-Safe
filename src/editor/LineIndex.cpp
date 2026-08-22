@@ -2,10 +2,6 @@
 
 #include <QBuffer>
 #include <QDataStream>
-#include <QtConcurrent>
-#include <QFutureSynchronizer>
-#include <QThreadPool>
-#include <QThread>
 #include <atomic>
 #include <algorithm>
 #include <cstring>
@@ -243,20 +239,14 @@ bool LineIndex::buildFromMmap(const uchar* data, qint64 size,
 
     const int desiredThreads = DynamicThresholds::instance().SEARCH_THREADS;
     const qint64 parallelThreshold = qint64(16) * 1024 * 1024 * desiredThreads;
-    int reservedThreads = 0;
-    int numThreads = desiredThreads;
-    if (desiredThreads > 1 && size >= parallelThreshold) {
-        reservedThreads = AsyncThreadPool::instance()
-                              .reserveExternalCapacity(desiredThreads);
-        numThreads = reservedThreads;
-    }
+    int numThreads = (desiredThreads > 1 && size >= parallelThreshold)
+        ? qMin(desiredThreads, qMax(1, AsyncThreadPool::instance().maxThreads() - 2))
+        : 1;
 
     // -------------------------------------------------------------------
     //  小文件或单线程：保持原单线程串行逻辑（扫描 + 编码同步进行）
     // -------------------------------------------------------------------
     if (numThreads <= 1 || size < parallelThreshold) {
-        if (reservedThreads > 0)
-            AsyncThreadPool::instance().releaseExternalCapacity(reservedThreads);
         qint64 lines = 0;
         qint64 lastLineStart = 0;
 
@@ -343,13 +333,6 @@ bool LineIndex::buildFromMmap(const uchar* data, qint64 size,
     // -------------------------------------------------------------------
     //  大文件：多线程并行扫描 newline 位置，单线程合并 + varint 编码
     // -------------------------------------------------------------------
-    struct ExternalCapacityGuard {
-        int count = 0;
-        ~ExternalCapacityGuard() {
-            AsyncThreadPool::instance().releaseExternalCapacity(count);
-        }
-    } capacityGuard{reservedThreads};
-
     std::atomic<qint64> bytesScanned(0);
     std::atomic<qint64> linesFound(0);
 
@@ -363,13 +346,6 @@ bool LineIndex::buildFromMmap(const uchar* data, qint64 size,
         segments.append(Segment{s, e});
     }
 
-    // 独立线程池，避免与全局池其它任务互相阻塞
-    QThreadPool pool;
-    pool.setMaxThreadCount(numThreads);
-
-    QFutureSynchronizer<QVector<qint64>> sync;
-    sync.setCancelOnWait(false);
-
     // Worker：扫描自己的字节范围，收集所有换行后的位置（即下一行的起始偏移）。
     //   - LF ('\n') → 记录 i+1
     //   - 裸 CR ('\r') → 记录 i+1
@@ -382,22 +358,20 @@ bool LineIndex::buildFromMmap(const uchar* data, qint64 size,
     struct MtExtraInfo { bool endsWithCR; bool startsWithLF; qint64 segStart; qint64 segEnd; };
     auto extras = std::make_shared<QVector<MtExtraInfo>>();
     extras->resize(numThreads);
+    QVector<QVector<qint64>> segmentPositions(numThreads);
+    QVector<std::function<void()>> jobs;
+    jobs.reserve(numThreads);
 
     // Worker：扫描自己的字节范围，收集所有「换行结束位置」（即下一行的起始偏移）。
     for (int segIdx = 0; segIdx < segments.size(); ++segIdx) {
         const auto seg = segments[segIdx];
-        sync.addFuture(QtConcurrent::run(&pool,
-            [seg, segIdx, extras, data, cancel, &bytesScanned, &linesFound, step]() -> QVector<qint64> {
-                struct ExternalActivityGuard {
-                    ExternalActivityGuard() {
-                        AsyncThreadPool::instance().externalWorkerStarted();
-                    }
-                    ~ExternalActivityGuard() {
-                        AsyncThreadPool::instance().externalWorkerFinished();
-                    }
-                } activityGuard;
+        jobs.append([seg, segIdx, extras, data, cancel, &bytesScanned,
+                     &linesFound, &segmentPositions, step, progress]() {
                 QVector<qint64> positions;
-                if (seg.end <= seg.start) return positions;
+                if (seg.end <= seg.start) {
+                    segmentPositions[segIdx] = std::move(positions);
+                    return;
+                }
                 positions.reserve(int(qMin<qint64>(qint64(8) * 1024 * 1024,
                                                     (seg.end - seg.start) / 40 + 16)));
                 qint64 localBytes = 0;
@@ -430,8 +404,12 @@ bool LineIndex::buildFromMmap(const uchar* data, qint64 size,
                         localBytes = 0;
                         localLines = 0;
                         if (cancel && cancel->load(std::memory_order_relaxed)) {
-                            return positions;
+                            segmentPositions[segIdx] = std::move(positions);
+                            return;
                         }
+                        if (progress)
+                            progress(linesFound.load(std::memory_order_relaxed),
+                                     bytesScanned.load(std::memory_order_relaxed));
                         nextCheck = step;
                     }
                 }
@@ -443,36 +421,13 @@ bool LineIndex::buildFromMmap(const uchar* data, qint64 size,
                 bool endsWithCR = (seg.end > seg.start && data[seg.end - 1] == '\r');
                 bool startsWithLF = (seg.end > seg.start && data[seg.start] == '\n');
                 (*extras)[segIdx] = { endsWithCR, startsWithLF, seg.start, seg.end };
-                return positions;
-            }));
+                segmentPositions[segIdx] = std::move(positions);
+            });
     }
 
-    // 主线程轮询：周期性报告进度 + 检查取消（buildFromMmap 通常在无事件循环的后台线程）
-    qint64 nextProgressAt = step;
-    while (true) {
-        bool allDone = true;
-        const auto& futures = sync.futures();
-        for (int i = 0; i < futures.size(); ++i) {
-            if (!futures.at(i).isFinished()) { allDone = false; break; }
-        }
-        if (allDone) break;
-
-        const qint64 curBytes = bytesScanned.load(std::memory_order_relaxed);
-        if (curBytes >= nextProgressAt) {
-            if (cancel && cancel->load(std::memory_order_relaxed)) {
-                sync.waitForFinished();
-                clear();
-                return false;
-            }
-            if (progress) {
-                progress(linesFound.load(std::memory_order_relaxed), curBytes);
-            }
-            nextProgressAt = curBytes + step;
-            if (nextProgressAt <= curBytes) nextProgressAt = curBytes + step;
-        }
-
-        QThread::msleep(20);
-    }
+    // All child parallelism is owned and budgeted by the async framework.
+    AsyncThreadPool::instance().runBatchBlocking(std::move(jobs),
+                                                  AsyncTaskPriority::Normal);
 
     // 轮询循环退出后补报最终进度（所有线程已完成，但最后一批字节的进度可能未及上报）
     if (progress) {
@@ -511,9 +466,8 @@ bool LineIndex::buildFromMmap(const uchar* data, qint64 size,
     qint64 lines = 0;
     qint64 prevEnd = 0;  // 上一个换行之后的位置
 
-    const auto& futures = sync.futures();
-    for (int k = 0; k < futures.size(); ++k) {
-        const QVector<qint64>& p = futures[k].result();
+    for (int k = 0; k < segmentPositions.size(); ++k) {
+        const QVector<qint64>& p = segmentPositions[k];
         if (p.isEmpty()) continue;
         qint64 startIdx = 0;
         // ----------------------------------------------------------

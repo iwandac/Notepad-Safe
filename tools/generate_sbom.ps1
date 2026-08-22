@@ -49,11 +49,19 @@ foreach ($component in @($lock.components)) {
         copyrightText = "NOASSERTION"
         comment = "Pinned revision: $([string]$component.revision); status: $([string]$component.status)"
     }
-    if ([string]$component.integrity.kind -eq "sha256") {
+    $upstreamIntegrity = if ($component.PSObject.Properties.Name -contains "source_integrity") {
+        $component.source_integrity
+    } else {
+        $component.integrity
+    }
+    if ([string]$upstreamIntegrity.kind -eq "sha256") {
         $package.checksums = @([ordered]@{
             algorithm = "SHA256"
-            checksumValue = [string]$component.integrity.value
+            checksumValue = [string]$upstreamIntegrity.value
         })
+    }
+    if ([string]$component.integrity.kind -eq "source-tree-sha256") {
+        $package.comment += "; vendored source-tree SHA-256: $([string]$component.integrity.value)"
     }
     $packages += $package
     $relationships += [ordered]@{

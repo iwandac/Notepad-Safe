@@ -1,13 +1,13 @@
 set(NOTEPADSAFE_PCRE2_VERSION "10.47")
 set(NOTEPADSAFE_PCRE2_SOURCE_DIR
-    "${CMAKE_SOURCE_DIR}/.deps/src/pcre2-${NOTEPADSAFE_PCRE2_VERSION}"
+    "${CMAKE_SOURCE_DIR}/third_party/src/pcre2-${NOTEPADSAFE_PCRE2_VERSION}"
     CACHE PATH "Pinned PCRE2 source directory"
 )
 
 if(NOT EXISTS "${NOTEPADSAFE_PCRE2_SOURCE_DIR}/CMakeLists.txt")
     message(FATAL_ERROR
         "Pinned PCRE2 ${NOTEPADSAFE_PCRE2_VERSION} source is missing at "
-        "${NOTEPADSAFE_PCRE2_SOURCE_DIR}. Run tools/bootstrap_pcre2.ps1 first."
+        "${NOTEPADSAFE_PCRE2_SOURCE_DIR}. Restore the vendored source tree."
     )
 endif()
 

@@ -29,6 +29,7 @@
 | 2026-08-18 `4e9159e` | Hex 输入/选择/IME/剪贴板成熟度；搜索三态、Literal/Regex/Hex、整词、替换模板、S3 真实搜索；不可见 byte 往返；B1 Text 行号 | H0/H1/S0/S1（见第 3 节）；`tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers` | `EditorTab`、Hex/ASCII 投影、FindReplaceDialog、LargeFileSearch、PCRE2 或搜索结果模型变化 | 全部打开文件的完整动态竞态；编码 PositionMapper；S2 真实资源门禁 |
 | 2026-08-18 工作树 | 加密专项：胶囊丢失立即失效、Secure Text 复制条件清理、锁定态标题脱敏、编辑区快捷键/右键统一入口 | C0；`secureClipboardIsConditionalAndClearedOnLock`；完整 security unit/GUI slice | SecuritySessionService、MainWindow 剪贴板/锁定、EditorTab secure title、VaultDock 变化 | 抗同用户恶意进程；操作系统剪贴板历史/云同步中已经复制出去的历史副本 |
 | 2026-08-18 工作树 | 禁用未实现的 S2 编辑：S2/S3 capability 统一只读，删除 LargeFileLoad、ILoader 晋升、资源准入、编辑保存/恢复分支和独立 promotion target | `test_filetierpolicy`；40 MiB 动态浏览/输入/直调保存拒绝；`mmapS2RemainsReadOnlyAndStartsNoBackgroundLoad`、`s2DoesNotQueueBackgroundEditLoad`、`invalidEncodingDoesNotStartBackgroundLoader`、`nearTwoGiBReadOnlyReachesHeadMiddleAndTailWithoutEditLoad`；真实 `smalltestfile` 的 `realB2BinaryRemainsReadOnlyAndStartsNoBackgroundLoad`；恢复导出与旧日志拒绝；KDBX=ON 生产目标构建 | FileTierPolicy、EditorTab L2、Windowed Provider、任务类型或 capability 变化 | 本批不宣称 S2/S3 已具备成熟的全量搜索、wrap 和持续增长日志体验 |
+| 2026-08-19 工作树 | 运行时依赖源码全部迁入 `third_party/src`；移除 QScintilla 预编译库/生成物与嵌套 Git；统一离线准备、实树双摘要、工具链发现和缓存失效 | 六树/6608 文件、0 ignored；QScintilla `/MT` 源码构建；正式 KDBX=ON 167/167；非 GUI 10/10；增量 supply-chain target | lock、CMake/批处理、依赖源码/补丁、Qt/MSVC 版本、SBOM 或发布脚本变化 | 不改变产品 GUI/编辑行为，因此未重复 GUI 轨迹；Qt 仍是精确版本外部静态工具链 |
 
 ## 3. 可复用最小冒烟集合
 
@@ -305,3 +306,39 @@
   documents 8/8、核心单元/安全/KDBX/供应链 10/10。正式 `build-slice/notepad-safe.exe`
   与测试从同一源码和依赖重新链接。本记录只关闭第 19 章范围，第 18 章三批全产品成熟度门槛
   仍保持有效。
+
+## 12. 2026-08-18 — S2/S3 自动换行能力收缩
+
+- 用户真实拖柄操作证明窗口化只读 Provider 的 word wrap 需要反复解码并排版 2 MiB 投影，
+  而未布局全文时不存在稳定的全局 display-line 坐标。产品不再为菜单表面对称保留该高成本路径。
+- `view.wordWrap` 在 S2/S3/B2/B3 标签上 disabled 且 unchecked；`EditorTab` 不把 S1 全局偏好
+  传入只读 Provider，`WindowedReadOnlyProvider::setWordWrap(true)` 也强制保持 `WrapNone`。
+  切回 S1 后原偏好恢复，避免禁用大文件能力反向削弱标准编辑器。
+- GUI 证据：`gui_smoke_smallfixes` 完整套件 41/41；
+  `tc_d007_lifecycle_actions_enabled_states` 验证 S1 wrap ON → S2/B2 disabled/OFF → S1 ON；
+  聚焦运行 `windowedTextRejectsWrapAndReachesPhysicalEofWithGutter` 证明 Provider 直接请求也会被
+  拒绝并保持 `WrapNone`。同一大文件套件连续运行为 21/22：K02 物理 EOF 可见性偶发
+  失败（尾窗口已装入，窗口内 viewport 未稳定对齐最后一屏）。该缺陷与 wrap 已禁用
+  的新边界分开记录，不宣称本轮已关闭 K02。正式 exe 本次对象已编译，但因用户
+  正在运行该 exe，Windows `LNK1104` 阻止覆盖；待进程关闭后增量链接正式程序。
+
+## 13. 2026-08-19 — K02 物理 EOF 状态机关闭与 Hex Provider 选型边界
+
+- K02 根因分为两个层次：尾部 mmap 窗口已正确覆盖物理 EOF，但旧代码在 `setText()` 阶段
+  用可能尚未稳定的 `SCI_LINESONSCREEN` 重建 Scintilla 最大滚动位置；同时
+  `visibleBottomOffset()` 把“完整可见行”当作全部可见行，最后一行部分可见时会误报大间隙。
+- 修复改为调用 Scintilla 原生 `SCI_SCROLLTOEND`，并在首个 `SCN_PAINTED` 后以最终 viewport
+  指标再次收敛；EOF 可见性通过文档末尾的真实绘制 Y 坐标判断。窗口和扫描仍严格限定在
+  当前 2 MiB 投影，没有恢复后台完整加载或全文排版。
+- 动态证据：聚焦用例通过真实 thumb 首次拖尾、两次拖离/拖回、64 次 Down 和鼠标滚轮；
+  截图 `gui-windowed-nowrap-physical-eof.png` 明确显示第 513 行尾 marker。完整
+  `gui_smoke_large_readonly` 为 22/22，K02 关闭。
+- 用户进程退出后已执行正式 `build.bat` 干净构建，167/167 编译/链接完成；最终程序
+  `build/notepad-safe.exe`（32,340,992 bytes）包含本轮 K02、S2/S3 wrap 边界和相关 UI 修改。
+- 构建环境记录：原 `build`/`build-slice` 的 Ninja 进程停在调度层且未启动 cl/link；本轮没有
+  把它误判为源码失败。使用同一 MSVC/Qt/QScintilla 的临时 NMake 构建树完成编译和 GUI
+  验证，临时构建树与测试日志在验证后清理。
+- 选型边界：32 MiB 是即时可编辑的延迟准入线，不是 Scintilla 最大容量。QHexView 明确提供
+  `QMappedFileBuffer` 和自定义 backend，QHexEdit2 是 QIODevice 按需读取与 4 KiB 懒编辑块；
+  二者都只能作为 Hex UI/文档层候选，不能替换现有 S2/S3 mmap 窗口和异步搜索。是否进入
+  供应链须以后续 32 MiB、228 MiB、接近 2 GiB、4.9 GiB 的真实打开/滚动/编辑门禁决定。

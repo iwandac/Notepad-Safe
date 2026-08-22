@@ -8,6 +8,7 @@
 #include <QFontMetrics>
 
 #include "LargeFileSearch.h"  // LargeFileSearchMatch
+#include "TextEncoding.h"
 
 class LineIndex;
 
@@ -73,6 +74,7 @@ public:
     bool isIncomplete() const { return !incompleteReason_.isEmpty(); }
     void setBytePositionMode(bool enabled) { bytePositionMode_ = enabled; }
     bool bytePositionMode() const { return bytePositionMode_; }
+    void setTextEncoding(TextEncoding encoding) { textEncoding_ = encoding; }
     bool hasUnknownLineNumbers() const;
 
     // Search is allowed to publish byte-offset results before the background
@@ -111,6 +113,7 @@ private:
     qint64 totalMatchCount_ = 0;
     QString incompleteReason_;
     bool bytePositionMode_ = false;
+    TextEncoding textEncoding_ = TextEncoding::Utf8;
 
     QString overrunFile_;
     qint64 overrunCount_ = 0;

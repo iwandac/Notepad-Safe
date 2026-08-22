@@ -32,10 +32,11 @@
 | Qt 6.11.x 静态库（MSVC 64-bit，/MT 构建） | 需自行编译静态版 Qt（推荐路径 `E:\programs\Qt_6.11.1-static-Release_msvc2026_64\msvc2026_64`） |
 | CMake ≥ 3.22 | 或 Visual Studio 自带 |
 | Ninja | 或 Visual Studio 自带 |
-| Python 3（可选） | 用于需要用 `resources/make_ico.py` 重新生成图标时 |
+| Python 3 | 首次从仓库内 Botan 源码生成最小静态库；也用于图标辅助脚本 |
 
-> QScintilla 2.14.1 的源码和已构建静态库 `qscintilla2_qt6.lib` 已内置在本仓库 `third_party/`，
-> 无需用户再下载构建。
+> QScintilla、KeePassXC、Botan、Argon2、zlib、PCRE2 和 Boost.Regex 的锁定源码均随仓库保存在
+> `third_party/src`。仓库不再携带 QScintilla 预编译库；首次构建离线生成 QScintilla/Botan
+> 静态库到 `.deps/install`，后续按源码摘要、Qt/MSVC 版本命中缓存。
 
 ### 2.2 设置 Qt 路径
 
@@ -49,15 +50,16 @@ setx NOTEPADSAFE_QT6_DIR "你的Qt静态库路径\msvc2026_64"
 ### 2.3 一键构建
 
 ```bat
-cd notepad-safe
+cd /d <repository-root>
 build.bat
 ```
 
 脚本内部流程：
-1. 调用 `vcvars64.bat`（若未在 VS x64 Native Tools 环境）
-2. `cmake -G Ninja -S . -B build`（QScintilla 相对路径；Qt 路径从环境变量/缓存）
-3. `cmake --build build --target notepad-safe -j`
-4. 产出：`build\notepad-safe.exe`（单文件 ~24MB）
+1. 调用 `vcvars64.bat`。
+2. 校验锁文件及六棵 `third_party/src` 实际源码树，拒绝嵌套 Git 和二进制生成物。
+3. 离线构建/复用 QScintilla 2.14.1 与最小 Botan 3.12.0 `/MT` 缓存。
+4. CMake 直接从 vendored PCRE2、Boost.Regex、Argon2、zlib 和 KeePassXC Core 编译。
+5. 产出：`build\notepad-safe.exe`。
 
 ### 2.4 运行测试
 
@@ -94,9 +96,10 @@ build\notepad-safe.exe a.txt      :: 启动并打开指定文件（支持多文�
 ## 4. 目录概览
 
 ```
-notepad-safe/
+notepadsafe/
 ├── CMakeLists.txt              # 默认产品目标；测试/诊断显式 opt-in
 ├── build.bat / run_tests.bat   # 产品构建与非 GUI 测试脚本
+├── prepare_dependencies.bat    # 统一的离线源码校验/依赖构建入口
 ├── run_all_gui_smoke.bat       # GUI smoke 显式构建/执行
 ├── src/                        # window/editor/search/session/async/vault/domain
 ├── tests/                      # 活动单元、集成、GUI 与 E2E 测试
@@ -109,7 +112,10 @@ notepad-safe/
 │   ├── app_resources.qrc       # QRC：运行时图标
 │   └── make_ico.py             # 从 notepad_safe.png 重新生成 app.ico（辅助）
 ├── third_party/
-│   └── QScintilla_src-2.14.1/  # QScintilla 源码 + release/qscintilla2_qt6.lib
+│   ├── dependencies.lock.json  # 上游身份 + 仓库实树双重锁
+│   ├── patches/                # 可回放补丁记录
+│   └── src/                    # 六个运行时依赖的纯源码；无 .lib/.obj/.git
+├── .deps/                      # 可删除、可重建且被 Git 忽略的依赖产物
 ├── tests/                      # 逻辑、组件、GUI 冒烟与真实进程 E2E 测试
 └── docs/
     ├── README.md               # 用户文档（本文件）
@@ -128,7 +134,7 @@ notepad-safe/
 - 小于 32 MiB：Scintilla 完整编辑。
 - 32 MiB–2 GiB：窗口化 mmap 只读查看、复制和搜索，不编辑、不替换。
 - 大于 2 GiB：相同的窗口化 mmap 只读分析能力；S2/S3 仅保留尺寸分级。
-- 字面搜索可并行；完整正则统一 PCRE2，以稳定快照保证跨块正确性。
+- 字面搜索可并行；UTF-8 正则走 PCRE2，UTF-16、GBK、GB18030、Big5、Shift-JIS 与 Windows-1252 正则由同一个 Unicode 标量迭代器直接遍历原始 mmap，结果保持原始字节坐标。查找框内的正则助手只编辑同一表达式，不引入第二种查询语言。
 - KeePassXC Core + Botan + KDBX 4.x 的加密笔记和账号保险库。
 
 旧 S2 ILoader 后台晋升和独立 promotion 测试目标已禁用/移除；PatchList 仅服务小型 Hex 兼容路径，不代表大文件编辑能力。
@@ -137,4 +143,4 @@ notepad-safe/
 
 - Notepad Safe 代码：**GPL v3**（与 QScintilla 许可证一致）
 - Qt：根据您的 Qt 许可证（GPL / LGPL / 商业）
-- QScintilla 2.14.1：GPL v3，源码位于本仓库 `third_party/QScintilla_src-2.14.1`
+- QScintilla 2.14.1：GPL v3，源码位于本仓库 `third_party/src/qscintilla-2.14.1`

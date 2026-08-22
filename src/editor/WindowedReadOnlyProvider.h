@@ -3,9 +3,11 @@
 // Bounded mmap-backed read-only provider shared by S2 and S3.
 
 #include <QDateTime>
+#include <QVector>
 #include <QWidget>
 
 #include "SharedReadOnlyFile.h"
+#include "TextEncoding.h"
 
 class QFileSystemWatcher;
 class QPlainTextEdit;
@@ -26,6 +28,8 @@ public:
     bool openFile(const QString &path, Presentation presentation, QString *error = nullptr);
     void closeFile();
     void setPresentation(Presentation presentation);
+    void setTextEncoding(TextEncoding encoding);
+    TextEncoding textEncoding() const { return m_textEncoding; }
     void setWordWrap(bool enabled);
     bool wordWrap() const { return m_wordWrap; }
     Presentation presentation() const { return m_presentation; }
@@ -99,6 +103,9 @@ private:
     void selectProjectedBytes(qint64 absoluteOffset, qint64 selectionBytes);
     void startCharacterCount();
     void cancelCharacterCount();
+    void startLineNumberIndex();
+    void cancelLineNumberIndex();
+    bool lineNumberBaseForOffset(qint64 offset, qint64 *baseLine) const;
 
     SharedReadOnlyFile m_file;
     QString m_path;
@@ -106,6 +113,10 @@ private:
     qint64 m_globalOffset = 0;
     qint64 m_windowStart = 0;
     qint64 m_windowEnd = 0;
+    TextEncoding m_textEncoding = TextEncoding::Utf8;
+    QVector<qint32> m_projectedToSource;
+    QVector<qint32> m_sourceBoundaries;
+    QVector<qint32> m_projectedBoundaries;
     qint64 m_windowSpan = 2LL * 1024 * 1024;
     Presentation m_presentation = Presentation::Text;
     QsciScintilla *m_editor = nullptr;
@@ -138,4 +149,10 @@ private:
     qint64 m_characterCountTaskId = -1;
     quint64 m_characterCountGeneration = 0;
     bool m_characterCountPending = false;
+    qint64 m_lineNumberTaskId = -1;
+    quint64 m_lineNumberGeneration = 0;
+    bool m_lineNumberPending = false;
+    QVector<qint64> m_lineBreakPrefix;
+    QVector<quint8> m_lineBreakPrefixEndsWithCr;
+    TextEncoding m_lineBreakPrefixEncoding = TextEncoding::Utf8;
 };

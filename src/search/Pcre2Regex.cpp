@@ -117,6 +117,7 @@ qint64 nextUtf8Offset(const uchar *subject, qint64 size, qint64 offset)
 struct Pcre2Regex::Impl {
     pcre2_code *code = nullptr;
     bool utfMode = true;
+    bool matchInvalidUtf = false;
     bool literalMode = false;
 
     ~Impl()
@@ -133,7 +134,7 @@ Pcre2Regex &Pcre2Regex::operator=(Pcre2Regex &&) noexcept = default;
 
 bool Pcre2Regex::compile(const QString &pattern, bool literal,
                          bool caseSensitive, bool wholeWord, QString *error,
-                         bool utfMode)
+                         bool utfMode, bool matchInvalidUtf)
 {
     if (impl_->code) {
         pcre2_code_free(impl_->code);
@@ -141,6 +142,7 @@ bool Pcre2Regex::compile(const QString &pattern, bool literal,
     }
     QByteArray expression = pattern.toUtf8();
     impl_->utfMode = utfMode;
+    impl_->matchInvalidUtf = utfMode && matchInvalidUtf;
     impl_->literalMode = literal;
     if (literal)
         expression = escapeLiteral(expression);
@@ -164,6 +166,8 @@ bool Pcre2Regex::compile(const QString &pattern, bool literal,
     uint32_t options = PCRE2_USE_OFFSET_LIMIT;
     if (utfMode)
         options |= PCRE2_UTF | PCRE2_UCP;
+    if (impl_->matchInvalidUtf)
+        options |= PCRE2_MATCH_INVALID_UTF;
     if (!caseSensitive)
         options |= PCRE2_CASELESS;
     impl_->code = pcre2_compile(
@@ -213,7 +217,8 @@ bool Pcre2Regex::expandReplacementAt(
     const int result = pcre2_match(
         impl_->code, reinterpret_cast<PCRE2_SPTR>(subject),
         PCRE2_SIZE(subjectSize), PCRE2_SIZE(matchOffset),
-        PCRE2_ANCHORED | (impl_->utfMode ? PCRE2_NO_UTF_CHECK : 0),
+        PCRE2_ANCHORED | (impl_->utfMode && !impl_->matchInvalidUtf
+                              ? PCRE2_NO_UTF_CHECK : 0),
         matchData, nullptr);
     if (result < 0) {
         if (error)
@@ -354,7 +359,7 @@ Pcre2Regex::ScanResult Pcre2Regex::scan(
         return ScanResult::Cancelled;
 
     qint64 badOffset = -1;
-    if (impl_->utfMode
+    if (impl_->utfMode && !impl_->matchInvalidUtf
         && !validateUtf8(subject, subjectSize, isCancelled, &badOffset)) {
         if (isCancelled && isCancelled())
             return ScanResult::Cancelled;
@@ -388,11 +393,16 @@ Pcre2Regex::ScanResult Pcre2Regex::scan(
     pcre2_set_depth_limit(matchContext, limits.depthLimit);
     pcre2_set_heap_limit(matchContext, limits.heapLimitKiB);
     PCRE2_SIZE offset = 0;
-    const uint32_t noUtfCheck = impl_->utfMode ? PCRE2_NO_UTF_CHECK : 0;
+    const uint32_t noUtfCheck = impl_->utfMode && !impl_->matchInvalidUtf
+        ? PCRE2_NO_UTF_CHECK : 0;
     uint32_t matchOptions = noUtfCheck;
     bool retryEmptyAtSameOffset = false;
     while (offset <= PCRE2_SIZE(subjectSize)) {
-        constexpr PCRE2_SIZE SearchWindow = PCRE2_SIZE(16) * 1024 * 1024;
+        // Offset limits preserve full-subject semantics (a match may extend
+        // beyond the window) while bounding the interval between cancellation
+        // and progress checks. One MiB keeps invalid-UTF binary presentations
+        // responsive without allocating a converted copy of the file.
+        constexpr PCRE2_SIZE SearchWindow = PCRE2_SIZE(1) * 1024 * 1024;
         const PCRE2_SIZE offsetLimit = std::min(
             PCRE2_SIZE(subjectSize),
             offset > std::numeric_limits<PCRE2_SIZE>::max() - SearchWindow

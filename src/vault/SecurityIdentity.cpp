@@ -12,6 +12,8 @@
 #include <QStringList>
 #include <QUuid>
 
+#include <cmath>
+
 #ifdef Q_OS_WIN
 #include <Windows.h>
 #endif
@@ -64,6 +66,40 @@ bool decodeBase64(const QString &text, QByteArray *output)
     return true;
 }
 
+bool parseEnvelopeKdfNumbers(const QJsonObject &kdf,
+                             quint64 *memoryKiB,
+                             int *iterations,
+                             int *parallelism)
+{
+    if (!memoryKiB || !iterations || !parallelism)
+        return false;
+    const QJsonValue memoryValue = kdf.value(QStringLiteral("memoryKiB"));
+    const QJsonValue iterationsValue = kdf.value(QStringLiteral("iterations"));
+    const QJsonValue parallelismValue = kdf.value(QStringLiteral("parallelism"));
+    if (!memoryValue.isDouble() || !iterationsValue.isDouble()
+        || !parallelismValue.isDouble()) {
+        return false;
+    }
+    const double memory = memoryValue.toDouble();
+    const double rounds = iterationsValue.toDouble();
+    const double lanes = parallelismValue.toDouble();
+    if (!std::isfinite(memory) || !std::isfinite(rounds) || !std::isfinite(lanes)
+        || std::floor(memory) != memory || std::floor(rounds) != rounds
+        || std::floor(lanes) != lanes
+        || memory < double(SecurityIdentity::DefaultMemoryKiB)
+        || memory > double(SecurityIdentity::MaximumEnvelopeMemoryKiB)
+        || rounds < double(SecurityIdentity::DefaultIterations)
+        || rounds > double(SecurityIdentity::MaximumEnvelopeIterations)
+        || lanes < 1.0
+        || lanes > double(SecurityIdentity::MaximumEnvelopeParallelism)) {
+        return false;
+    }
+    *memoryKiB = static_cast<quint64>(memory);
+    *iterations = static_cast<int>(rounds);
+    *parallelism = static_cast<int>(lanes);
+    return true;
+}
+
 VaultError deriveUnlockKey(const SecureBuffer &passphraseUtf8,
                            const QByteArray &salt,
                            quint64 memoryKiB,
@@ -78,12 +114,23 @@ VaultError deriveUnlockKey(const SecureBuffer &passphraseUtf8,
     }
     if (salt.size() != SaltBytes
         || memoryKiB < SecurityIdentity::DefaultMemoryKiB
-        || memoryKiB > 2ULL * 1024ULL * 1024ULL
-        || iterations < SecurityIdentity::DefaultIterations || iterations > 100
-        || parallelism < 1 || parallelism > 64) {
+        || memoryKiB > SecurityIdentity::MaximumEnvelopeMemoryKiB
+        || iterations < SecurityIdentity::DefaultIterations
+        || iterations > SecurityIdentity::MaximumEnvelopeIterations
+        || parallelism < 1
+        || parallelism > SecurityIdentity::MaximumEnvelopeParallelism) {
         return identityError(VaultErrorCode::CorruptKeyEnvelope,
                              QStringLiteral("安全身份参数损坏或超出支持范围。"),
                              QStringLiteral("identity.envelope.kdf-parameters"));
+    }
+    if (memoryKiB > SecurityIdentity::MaximumInteractiveMemoryKiB
+        || quint64(iterations)
+               > SecurityIdentity::MaximumInteractiveWorkKiB / memoryKiB
+        || parallelism > SecurityIdentity::MaximumInteractiveParallelism) {
+        return identityError(
+            VaultErrorCode::UnsupportedFormat,
+            QStringLiteral("此文件要求的密码派生资源超过安全交互预算，已拒绝打开。"),
+            QStringLiteral("identity.argon2.interactive-budget"));
     }
 
     Argon2Kdf kdf(Argon2Kdf::Type::Argon2id);
@@ -375,9 +422,13 @@ VaultError SecurityIdentity::describe(const QVariantMap &publicCustomData,
     const QJsonObject kdf = root.value(QStringLiteral("passwordSlot"))
                                 .toObject().value(QStringLiteral("kdf")).toObject();
     QByteArray salt;
+    quint64 memoryKiB = 0;
+    int iterations = 0;
+    int parallelism = 0;
     if (kdf.value(QStringLiteral("name")).toString() != QLatin1String(KdfName)
         || !decodeBase64(kdf.value(QStringLiteral("salt")).toString(), &salt)
-        || salt.size() != SaltBytes) {
+        || salt.size() != SaltBytes
+        || !parseEnvelopeKdfNumbers(kdf, &memoryKiB, &iterations, &parallelism)) {
         return identityError(VaultErrorCode::CorruptKeyEnvelope,
                              QStringLiteral("安全口令派生参数损坏。"),
                              QStringLiteral("identity.describe.kdf"));
@@ -386,16 +437,9 @@ VaultError SecurityIdentity::describe(const QVariantMap &publicCustomData,
     result.identityId = root.value(QStringLiteral("identityId")).toString();
     result.keyVersion = root.value(QStringLiteral("keyVersion")).toInt();
     result.kdfSalt = salt;
-    result.memoryKiB = static_cast<quint64>(kdf.value(QStringLiteral("memoryKiB")).toDouble());
-    result.iterations = kdf.value(QStringLiteral("iterations")).toInt();
-    result.parallelism = kdf.value(QStringLiteral("parallelism")).toInt();
-    if (result.memoryKiB < DefaultMemoryKiB || result.memoryKiB > 2ULL * 1024ULL * 1024ULL
-        || result.iterations < DefaultIterations || result.iterations > 100
-        || result.parallelism < 1 || result.parallelism > 64) {
-        return identityError(VaultErrorCode::CorruptKeyEnvelope,
-                             QStringLiteral("安全口令派生参数超出支持范围。"),
-                             QStringLiteral("identity.describe.kdf-range"));
-    }
+    result.memoryKiB = memoryKiB;
+    result.iterations = iterations;
+    result.parallelism = parallelism;
     *parameters = result;
     if (documentType)
         *documentType = root.value(QStringLiteral("documentType")).toString();
@@ -575,17 +619,20 @@ VaultError SecurityIdentity::unlock(const QVariantMap &publicCustomData,
     const QJsonObject slot = root.value(QStringLiteral("passwordSlot")).toObject();
     const QJsonObject kdf = slot.value(QStringLiteral("kdf")).toObject();
     QByteArray salt;
+    quint64 memoryKiB = 0;
+    int iterations = 0;
+    int parallelism = 0;
     if (kdf.value(QStringLiteral("name")).toString() != QLatin1String(KdfName)
-        || !decodeBase64(kdf.value(QStringLiteral("salt")).toString(), &salt)) {
+        || !decodeBase64(kdf.value(QStringLiteral("salt")).toString(), &salt)
+        || salt.size() != SaltBytes
+        || !parseEnvelopeKdfNumbers(kdf, &memoryKiB, &iterations, &parallelism)) {
         return identityError(VaultErrorCode::CorruptKeyEnvelope,
                              QStringLiteral("安全口令派生参数损坏。"),
                              QStringLiteral("identity.password-slot.kdf"));
     }
     QByteArray unlockKey;
-    error = deriveUnlockKey(passphraseUtf8, salt,
-                            static_cast<quint64>(kdf.value(QStringLiteral("memoryKiB")).toDouble()),
-                            kdf.value(QStringLiteral("iterations")).toInt(),
-                            kdf.value(QStringLiteral("parallelism")).toInt(), &unlockKey);
+    error = deriveUnlockKey(passphraseUtf8, salt, memoryKiB, iterations,
+                            parallelism, &unlockKey);
     if (error.isError())
         return error;
     SecureBuffer masterUnlockKey(unlockKey.constData(), unlockKey.size());

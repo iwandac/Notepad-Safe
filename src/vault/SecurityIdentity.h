@@ -25,6 +25,16 @@ public:
     static constexpr int DefaultIterations = 3;
     static constexpr int DefaultParallelism = 4;
 
+    // Envelope compatibility is deliberately wider than the interactive
+    // execution budget. Untrusted file metadata must not be able to request
+    // multi-gigabyte or minutes-long Argon2 work on the UI thread.
+    static constexpr quint64 MaximumEnvelopeMemoryKiB = 2ULL * 1024ULL * 1024ULL;
+    static constexpr int MaximumEnvelopeIterations = 100;
+    static constexpr int MaximumEnvelopeParallelism = 64;
+    static constexpr quint64 MaximumInteractiveMemoryKiB = 256ULL * 1024ULL;
+    static constexpr quint64 MaximumInteractiveWorkKiB = 768ULL * 1024ULL;
+    static constexpr int MaximumInteractiveParallelism = 16;
+
     static QString publicDataKey();
     static bool hasEnvelope(const QVariantMap &publicCustomData);
 

@@ -4,6 +4,7 @@
 #include <QApplication>
 #include <QPalette>
 #include <QMap>
+#include <QStringConverter>
 #include <algorithm>
 #include <limits>
 
@@ -54,7 +55,13 @@ bool readRecord(QDataStream &stream, quint32 version, LargeFileSearchMatch *matc
     return true;
 }
 
-QPair<qint32, qint32> displayRange(const LargeFileSearchMatch &match)
+QString decodeContext(const QByteArray &bytes, TextEncoding encoding)
+{
+    return decodeTextFragment(bytes, encoding);
+}
+
+QPair<qint32, qint32> displayRange(const LargeFileSearchMatch &match,
+                                   TextEncoding encoding)
 {
     const qint64 relative64 = match.contextByteOffset >= 0
         ? match.byteOffset - match.contextByteOffset : match.col;
@@ -62,13 +69,14 @@ QPair<qint32, qint32> displayRange(const LargeFileSearchMatch &match)
                                             match.lineContext.size()));
     const int byteLength = qBound(0, int(match.length),
                                   match.lineContext.size() - relative);
-    const int charStart = QString::fromUtf8(match.lineContext.constData(), relative).size();
-    const int charLength = QString::fromUtf8(match.lineContext.constData() + relative,
-                                             byteLength).size();
+    const int charStart = decodeContext(match.lineContext.left(relative), encoding).size();
+    const int charLength = decodeContext(
+        match.lineContext.mid(relative, byteLength), encoding).size();
     return qMakePair(qint32(charStart), qint32(charLength));
 }
 
-void appendMatch(GroupedSearchLine *group, const LargeFileSearchMatch &match)
+void appendMatch(GroupedSearchLine *group, const LargeFileSearchMatch &match,
+                 TextEncoding encoding)
 {
     if (!group)
         return;
@@ -80,7 +88,7 @@ void appendMatch(GroupedSearchLine *group, const LargeFileSearchMatch &match)
         group->firstByteOffset = match.byteOffset;
         group->firstLength = match.length;
     }
-    group->matchPositions.append(displayRange(match));
+    group->matchPositions.append(displayRange(match, encoding));
     group->matchByteRanges.append(qMakePair(match.byteOffset, match.length));
 }
 } // namespace
@@ -125,7 +133,7 @@ void SearchResultsModel::buildGrouped(const QVector<LargeFileSearchMatch>& match
             g.line = m.line;
             g.contextByteOffset = m.contextByteOffset;
             g.lineContext = m.lineContext;
-            appendMatch(&g, m);
+            appendMatch(&g, m, textEncoding_);
             groupedLines_.append(std::move(g));
             cur = &groupedLines_.last();
             currentLine = m.line;
@@ -133,7 +141,7 @@ void SearchResultsModel::buildGrouped(const QVector<LargeFileSearchMatch>& match
         } else {
             // 同一行的后续匹配
             if (cur) {
-                appendMatch(cur, m);
+                appendMatch(cur, m, textEncoding_);
             }
         }
     }
@@ -221,7 +229,7 @@ bool SearchResultsModel::readOverrunGroupedLine(qint64 relativeRow,
             previousContext = match.contextByteOffset;
         }
         if (currentRow == relativeRow)
-            appendMatch(&current, match);
+            appendMatch(&current, match, textEncoding_);
     }
     if (currentRow == relativeRow && !current.matchByteRanges.isEmpty()) {
         *line = std::move(current);
@@ -372,7 +380,7 @@ int SearchResultsModel::hitTestMatchIndex(int row, int xInColumn, int columnWidt
     int x = xInColumn - pad;
     if (x < 0) return -1;
 
-    QString text = QString::fromUtf8(g.lineContext);
+    QString text = decodeContext(g.lineContext, textEncoding_);
     if (text.isEmpty()) return -1;
 
     // 直接用实际字体宽度计算每个 UTF-16 命中范围的像素区间；中文、emoji
@@ -469,7 +477,7 @@ QVariant SearchResultsModel::data(const QModelIndex& idx, int role) const {
     if (role == LineRole)
         return g.line;
     if (role == ContextRole)
-        return QString::fromUtf8(g.lineContext);
+        return decodeContext(g.lineContext, textEncoding_);
     if (role == MatchPositionsRole) {
         QVariantList list;
         for (const auto &range : g.matchPositions) {
@@ -480,48 +488,25 @@ QVariant SearchResultsModel::data(const QModelIndex& idx, int role) const {
         }
         return list;
     }
-    // ToolTip：显示全部匹配词的位置+列，便于查看超长行中的多匹配
     if (role == Qt::ToolTipRole) {
         switch (idx.column()) {
         case COL_CONTEXT: {
-            QString tt = bytePositionMode_
-                ? QObject::tr("偏移 0x%1 的 16 字节窗口，共 %2 处匹配\n")
-                      .arg(QString::number(quint64(g.contextByteOffset), 16).toUpper())
-                      .arg(g.matchPositions.size())
-                : g.line < 0
-                ? QObject::tr("行号索引计算中；偏移 0x%1，共 %2 处匹配\n")
+            const QString location = bytePositionMode_ || g.line < 0
+                ? QObject::tr("偏移 0x%1")
                       .arg(QString::number(quint64(g.firstByteOffset), 16).toUpper())
-                      .arg(g.matchPositions.size())
-                : QObject::tr("第 %1 行共 %2 处匹配\n")
-                      .arg(g.line + 1).arg(g.matchPositions.size());
-            for (int i = 0; i < g.matchPositions.size() && i < 50; ++i) {
-                int col = g.matchPositions[i].first;
-                int len = g.matchPositions[i].second;
-                qint64 bo = i < g.matchByteRanges.size() ? g.matchByteRanges[i].first : g.firstByteOffset;
-                // 截取附近上下文（最多 60 字符）
-                QString lineText = QString::fromUtf8(g.lineContext);
-                int ctxStart = qMax(0, col - 10);
-                int ctxEnd = qMin(lineText.size(), col + len + 20);
-                QString snippet = lineText.mid(ctxStart, ctxEnd - ctxStart);
-                tt += bytePositionMode_
-                    ? QObject::tr("  #%1 偏移 0x%2，%3 字节: …%4…\n")
-                          .arg(i + 1)
-                          .arg(QString::number(quint64(bo), 16).toUpper())
-                          .arg(len).arg(snippet)
-                    : QObject::tr("  #%1 列%2-%3(字节%4): …%5…\n")
-                          .arg(i + 1).arg(col + 1).arg(col + len).arg(bo).arg(snippet);
-            }
-            if (g.matchPositions.size() > 50) {
-                tt += QObject::tr("  …还有 %1 处匹配").arg(g.matchPositions.size() - 50);
-            }
-            tt += QObject::tr("\n双击任意匹配词可跳转到正文对应位置（根据点击位置选择匹配词）");
-            return tt;
+                : QObject::tr("第 %1 行").arg(g.line + 1);
+            return QObject::tr("%1 · %2 处匹配\n双击跳转；双击高亮词可选择该处")
+                .arg(location).arg(g.matchPositions.size());
         }
         case COL_MATCHCOUNT:
             return QObject::tr("该行有 %1 处匹配").arg(g.matchPositions.size());
         default:
             break;
         }
+    }
+    if (role == Qt::TextAlignmentRole) {
+        if (idx.column() == COL_LINE || idx.column() == COL_MATCHCOUNT)
+            return int(Qt::AlignRight | Qt::AlignVCenter);
     }
     if (role != Qt::DisplayRole) return {};
 
@@ -535,7 +520,7 @@ QVariant SearchResultsModel::data(const QModelIndex& idx, int role) const {
                   QString::number(quint64(g.firstByteOffset), 16).toUpper())
             : QString::number(g.line + 1);  // UI 1-based
     case COL_CONTEXT:
-        return QString::fromUtf8(g.lineContext);
+        return decodeContext(g.lineContext, textEncoding_);
     case COL_MATCHCOUNT:
         return QString::number(g.matchPositions.size());
     default:

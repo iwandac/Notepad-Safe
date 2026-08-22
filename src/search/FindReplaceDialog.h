@@ -11,6 +11,7 @@ class QLabel;
 class QPushButton;
 class QComboBox;
 class QTabWidget;
+class QWidget;
 class EditorTab;
 class SearchResultsDock;
 
@@ -61,6 +62,9 @@ private:
     QCheckBox *m_caseCheck = nullptr;
     QCheckBox *m_wordCheck = nullptr;
     QCheckBox *m_wrapCheck = nullptr;
+    QPushButton *m_regexAssistantToggle = nullptr;
+    QWidget *m_regexAssistant = nullptr;
+    QLabel *m_queryHintLabel = nullptr;
     QPushButton *m_findNextBtn = nullptr;
     QPushButton *m_findPrevBtn = nullptr;
     QPushButton *m_replaceBtn = nullptr;
@@ -81,6 +85,8 @@ private:
     QMetaObject::Connection m_l2FinishedConn;
     QMetaObject::Connection m_rerunConnection;
     bool m_l2SearchInProgress = false;
+    bool m_navigationInProgress = false;
+    bool m_allowNavigationDuringBusy = false;
     bool m_replaceMode = false;
     int m_multiSearchGeneration = 0;
     int m_pendingMultiL2 = 0;
@@ -102,10 +108,14 @@ private:
     QString currentReplaceText() const;
     void emitFindParameters();
     // L2 异步搜索期间：按钮启用/禁用 + 状态提示
-    void setL2SearchUiBusy(bool busy, const QString& msg = QString());
+    void setL2SearchUiBusy(bool busy, const QString& msg = QString(),
+                           bool allowNavigation = false);
+    void setNavigationUiBusy(bool busy, const QString& msg = QString());
     bool allOpenScope() const;
     bool hexBytesMode() const;
     void updateQueryUi();
+    void insertRegexTemplate(const QString &prefix, const QString &suffix,
+                             const QString &placeholder);
     QList<EditorTab *> openTabs() const;
     void findAcrossTabs(bool forward);
     void startAllOpenFindAll();

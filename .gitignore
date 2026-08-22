@@ -1,11 +1,22 @@
 # ====== Build / Artifact ======
-build/
-build_*/
-build-*/
-out/
-cmake-build-*/
-dist/
-.deps/
+/build/
+/build_*/
+/build-*/
+/out/
+/cmake-build-*/
+/dist/
+/.deps/
+
+# Vendored dependencies are source-only. All generated dependency build and
+# install products belong under .deps/ and must never re-enter third_party/src.
+third_party/src/**/CMakeFiles/
+third_party/src/**/.qmake.stash
+third_party/src/**/Makefile.Debug
+third_party/src/**/Makefile.Release
+third_party/src/**/*.obj
+third_party/src/**/*.lib
+third_party/src/**/*.dll
+third_party/src/**/*.pdb
 
 # ====== CMake / Ninja / CTest ======
 CMakeCache.txt
@@ -35,6 +46,18 @@ desktop.ini
 *.log
 *.tmp
 *.bak
+/*.obj
+
+# Root-level GUI/manual verification evidence is generated on demand and must
+# not become repository state.  Large local fixtures are intentionally kept
+# outside Git as well.
+/gui-*.png
+/gui-*-data*/
+/gui-manual-*/
+/gui-old-probe-data/
+/bigtestfile
+/smalltestfile
+/tinytestfile
 
 # ====== Python 辅助脚本产物（app.ico 已生成，保留） ======
 # 不排除 resources/app.ico 和 resources/notepad_safe.png（这些是仓库必需品）
@@ -42,6 +65,6 @@ __pycache__/
 *.py[cod]
 
 # ====== 测试生成临时目录 ======
-tests\tmp_*
-tests\_tmp_*
+tests/tmp_*
+tests/_tmp_*
 _temp_*

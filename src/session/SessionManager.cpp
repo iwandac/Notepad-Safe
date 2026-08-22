@@ -15,6 +15,8 @@
 #include <QUuid>
 #include <QProcessEnvironment>
 #include <QSet>
+#include <QBuffer>
+#include <limits>
 
 #ifdef Q_OS_WIN
 #include <Windows.h>
@@ -344,6 +346,303 @@ bool SessionManager::saveSession(const QVector<EditorTab *> &tabs, int activeInd
         return false;
     f.write(doc.toJson());
     return f.commit();
+}
+
+struct SessionManager::AsyncSavePlan {
+    struct Item {
+        SessionTab state;
+        QUuid instanceId;
+        quint64 revision = 0;
+        QString previousPath;
+        QString targetPath;
+        bool previousExists = false;
+        bool existingSnapshot = false;
+        bool writeSnapshot = false;
+        bool payloadReady = false;
+        DraftStore::PayloadKind payloadKind = DraftStore::PayloadKind::SmallOrJournal;
+        int payloadEncoding = 0;
+        QByteArray payload;
+        QString exportError;
+    };
+
+    QVector<Item> items;
+    QSet<QUuid> activeInstances;
+    int activeIndex = 0;
+    QDateTime capturedAtUtc;
+    QString autosaveDir;
+    QString sessionPath;
+};
+
+struct SessionManager::AsyncSaveResult {
+    struct ItemResult {
+        QUuid instanceId;
+        quint64 revision = 0;
+        QString autosavePath;
+        bool snapshotWritten = false;
+    };
+
+    QVector<ItemResult> items;
+    QSet<QUuid> activeInstances;
+    QDateTime capturedAtUtc;
+    bool sessionWritten = false;
+};
+
+std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSave(
+    const QVector<EditorTab *> &tabs, int activeIndex, bool forceSnapshots)
+{
+    ensureDirs();
+    auto plan = std::make_shared<AsyncSavePlan>();
+    plan->activeIndex = activeIndex;
+    plan->capturedAtUtc = QDateTime::currentDateTimeUtc();
+    plan->autosaveDir = m_autosaveDir;
+    plan->sessionPath = sessionFilePath();
+    constexpr qint64 largeSnapshotIntervalMs = 5LL * 60 * 1000;
+
+    for (EditorTab *tab : tabs) {
+        if (!tab)
+            continue;
+        AsyncSavePlan::Item item;
+        item.instanceId = tab->sessionInstanceId();
+        item.revision = tab->contentRevision();
+        plan->activeInstances.insert(item.instanceId);
+        SessionTab &st = item.state;
+        st.filePath = tab->filePath();
+        st.encoding = encodingName(tab->encoding());
+        st.syntax = static_cast<int>(tab->syntax());
+        tab->getCursorPosition(&st.cursorLine, &st.cursorIndex);
+        if (tab->isL2Mode() && tab->l2View()) {
+            st.cursorByteOffset = tab->currentByteOffset();
+            st.selectionStartByte = tab->l2View()->selectionStart();
+            st.selectionEndByte = tab->l2View()->selectionEnd();
+            st.presentation = tab->viewModeL2() == ViewMode::Hex
+                ? QStringLiteral("hex") : QStringLiteral("text");
+        } else if (tab->editor()) {
+            st.cursorByteOffset = tab->editor()->SendScintilla(
+                QsciScintillaBase::SCI_GETCURRENTPOS);
+            st.selectionStartByte = tab->editor()->SendScintilla(
+                QsciScintillaBase::SCI_GETSELECTIONSTART);
+            st.selectionEndByte = tab->editor()->SendScintilla(
+                QsciScintillaBase::SCI_GETSELECTIONEND);
+            st.presentation = QStringLiteral("text");
+        }
+        st.modified = tab->isModified();
+        st.splitView = tab->splitViewEnabled();
+        if (st.splitView) {
+            st.splitOrientation = tab->splitOrientation() == Qt::Vertical
+                ? QStringLiteral("vertical") : QStringLiteral("horizontal");
+        }
+        st.secureDocument = tab->isSecureDocument();
+        if (st.secureDocument) {
+            st.documentId = tab->secureDocumentId().toString(QUuid::WithoutBraces);
+            st.autosavePath = tab->autosavePath();
+            plan->items.append(std::move(item));
+            continue;
+        }
+
+        if (!(tab->isUntitled() || tab->isModified())) {
+            plan->items.append(std::move(item));
+            continue;
+        }
+        const bool emptyUntitled = tab->isUntitled() && !tab->isModified()
+                                   && !tab->isLargeDocument() && tab->editor()
+                                   && tab->editor()->length() == 0;
+        if (emptyUntitled) {
+            st.autosavePath.clear();
+            plan->items.append(std::move(item));
+            continue;
+        }
+
+        item.previousPath = tab->autosavePath();
+        item.previousExists = !item.previousPath.isEmpty()
+                              && QFileInfo::exists(item.previousPath);
+        item.targetPath = item.previousPath;
+        if (!item.previousExists || !DraftStore::isEncryptedDraft(item.targetPath))
+            item.targetPath = generateAutosavePath();
+        st.autosavePath = item.targetPath;
+        item.existingSnapshot = QFileInfo::exists(item.targetPath);
+        const bool sameRevision = item.existingSnapshot
+                                  && m_snapshotRevisions.value(item.instanceId,
+                                                               std::numeric_limits<quint64>::max())
+                                         == item.revision;
+        const QDateTime previousTime = m_snapshotTimes.value(item.instanceId);
+        const bool largeThrottled = tab->isLargeDocument() && item.existingSnapshot
+                                    && previousTime.isValid()
+                                    && previousTime.msecsTo(plan->capturedAtUtc)
+                                           < largeSnapshotIntervalMs;
+        item.writeSnapshot = !item.existingSnapshot
+                             || (!sameRevision && (forceSnapshots || !largeThrottled));
+
+        if (item.writeSnapshot) {
+            if (tab->isBinaryDocument()) {
+                QBuffer buffer(&item.payload);
+                buffer.open(QIODevice::WriteOnly);
+                item.payloadReady = tab->exportBinaryRecoveryJournal(
+                    &buffer, &item.exportError);
+                item.payloadKind = DraftStore::PayloadKind::BinaryPatchJournal;
+            } else {
+                item.payloadReady = tab->exportRecoveryPayload(&item.payload,
+                                                                &item.exportError);
+                item.payloadKind = DraftStore::PayloadKind::SmallOrJournal;
+                if (!item.payloadReady && tab->isLargeDocument() && !tab->isL2Mode()) {
+                    item.exportError.clear();
+                    item.payload.clear();
+                    QBuffer buffer(&item.payload);
+                    buffer.open(QIODevice::WriteOnly);
+                    item.payloadReady = tab->exportRecoveryCheckpoint(
+                        &buffer, &item.exportError);
+                    item.payloadKind = DraftStore::PayloadKind::FullCheckpoint;
+                    item.payloadEncoding = int(tab->encoding());
+                }
+            }
+        }
+        plan->items.append(std::move(item));
+    }
+    return plan;
+}
+
+std::shared_ptr<SessionManager::AsyncSaveResult> SessionManager::writeAsyncSave(
+    const std::shared_ptr<AsyncSavePlan> &plan) const
+{
+    auto result = std::make_shared<AsyncSaveResult>();
+    if (!plan)
+        return result;
+    result->activeInstances = plan->activeInstances;
+    result->capturedAtUtc = plan->capturedAtUtc;
+    QStringList toKeep;
+    QJsonArray tabsArray;
+
+    for (auto &item : plan->items) {
+        AsyncSaveResult::ItemResult itemResult;
+        itemResult.instanceId = item.instanceId;
+        itemResult.revision = item.revision;
+        QString finalPath = item.state.autosavePath;
+
+        if (!item.state.secureDocument && item.writeSnapshot) {
+            bool written = false;
+            QString error = item.exportError;
+            if (item.payloadReady) {
+                if (item.payloadKind == DraftStore::PayloadKind::SmallOrJournal) {
+                    written = DraftStore::writeSnapshot(item.targetPath, item.payload,
+                                                        &error);
+                } else {
+                    const QByteArray *payload = &item.payload;
+                    const auto writer = [payload](QIODevice *output, QString *writerError) {
+                        if (output->write(*payload) == payload->size())
+                            return true;
+                        if (writerError)
+                            *writerError = QObject::tr("恢复快照写入不完整。");
+                        return false;
+                    };
+                    written = item.payloadKind == DraftStore::PayloadKind::FullCheckpoint
+                        ? DraftStore::writeCheckpoint(item.targetPath,
+                                                      item.payloadEncoding, writer, &error)
+                        : DraftStore::writeBinaryPatchJournal(item.targetPath, writer,
+                                                              &error);
+                }
+            }
+            scrubSnapshot(item.payload);
+            if (written) {
+                finalPath = item.targetPath;
+                itemResult.snapshotWritten = true;
+                if (item.previousExists && item.previousPath != item.targetPath)
+                    QFile::remove(item.previousPath);
+            } else if (item.existingSnapshot) {
+                finalPath = item.targetPath;
+            } else if (item.previousExists) {
+                finalPath = item.previousPath;
+            } else {
+                finalPath.clear();
+            }
+            if (!written && !error.isEmpty())
+                qWarning("[SessionManager] encrypted draft write failed: %s",
+                         qUtf8Printable(error));
+        }
+        item.state.autosavePath = finalPath;
+        itemResult.autosavePath = finalPath;
+        if (!finalPath.isEmpty())
+            toKeep.append(finalPath);
+        result->items.append(itemResult);
+
+        QJsonObject obj;
+        obj["filePath"] = item.state.filePath;
+        obj["encoding"] = item.state.encoding;
+        obj["syntax"] = item.state.syntax;
+        obj["cursorLine"] = item.state.cursorLine;
+        obj["cursorIndex"] = item.state.cursorIndex;
+        obj["cursorByteOffset"] = QString::number(item.state.cursorByteOffset);
+        obj["selectionStartByte"] = QString::number(item.state.selectionStartByte);
+        obj["selectionEndByte"] = QString::number(item.state.selectionEndByte);
+        obj["modified"] = item.state.modified;
+        obj["autosavePath"] = item.state.autosavePath;
+        obj["secureDocument"] = item.state.secureDocument;
+        obj["documentId"] = item.state.documentId;
+        obj["presentation"] = item.state.presentation;
+        obj["splitView"] = item.state.splitView;
+        obj["splitOrientation"] = item.state.splitOrientation;
+        tabsArray.append(obj);
+    }
+
+    QJsonObject root;
+    root["version"] = 2;
+    root["tabs"] = tabsArray;
+    root["activeTab"] = plan->activeIndex;
+    const QByteArray json = QJsonDocument(root).toJson();
+    QSaveFile file(plan->sessionPath);
+    file.setDirectWriteFallback(false);
+    if (file.open(QIODevice::WriteOnly) && file.write(json) == json.size()) {
+        result->sessionWritten = file.commit();
+    }
+    // The old session must remain fully recoverable until the replacement
+    // session file has committed atomically.
+    if (result->sessionWritten) {
+        QDir dir(plan->autosaveDir);
+        const auto oldFiles = dir.entryInfoList(
+            {"autosave_*.ndraft", "autosave_*.tmp", "tab_*.tmp"}, QDir::Files);
+        for (const QFileInfo &oldFile : oldFiles) {
+            if (!toKeep.contains(oldFile.absoluteFilePath()))
+                QFile::remove(oldFile.absoluteFilePath());
+        }
+    }
+    return result;
+}
+
+bool SessionManager::asyncSaveSucceeded(
+    const std::shared_ptr<AsyncSaveResult> &result) const
+{
+    return result && result->sessionWritten;
+}
+
+void SessionManager::applyAsyncSave(
+    const std::shared_ptr<AsyncSaveResult> &result,
+    const QVector<EditorTab *> &tabs)
+{
+    if (!result)
+        return;
+    QHash<QUuid, EditorTab *> tabsByInstance;
+    for (EditorTab *tab : tabs) {
+        if (tab)
+            tabsByInstance.insert(tab->sessionInstanceId(), tab);
+    }
+    for (const auto &item : result->items) {
+        if (EditorTab *tab = tabsByInstance.value(item.instanceId, nullptr))
+            tab->setAutosavePath(item.autosavePath);
+        if (item.snapshotWritten) {
+            m_snapshotRevisions.insert(item.instanceId, item.revision);
+            m_snapshotTimes.insert(item.instanceId, result->capturedAtUtc);
+        }
+    }
+    for (auto it = m_snapshotRevisions.begin(); it != m_snapshotRevisions.end();) {
+        if (!result->activeInstances.contains(it.key()))
+            it = m_snapshotRevisions.erase(it);
+        else
+            ++it;
+    }
+    for (auto it = m_snapshotTimes.begin(); it != m_snapshotTimes.end();) {
+        if (!result->activeInstances.contains(it.key()))
+            it = m_snapshotTimes.erase(it);
+        else
+            ++it;
+    }
 }
 
 SessionData SessionManager::loadSession() const

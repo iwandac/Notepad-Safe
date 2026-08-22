@@ -4,7 +4,7 @@ REM  notepad-safe GUI 冒烟测试一键脚本（Windows / PowerShell 环境）
 REM  按 QUALITY_ASSURANCE_AND_GUI_TESTING.md §2 强制管理。
 REM
 REM  用法：
-REM    cd ^<repository^>\notepad-safe
+REM    cd /d ^<repository-root^>
 REM    .\run_all_gui_smoke.bat          构建+运行全部 GUI smoke，输出汇总 PASS/FAIL
 REM    .\run_all_gui_smoke.bat build    只构建，不运行
 REM    .\run_all_gui_smoke.bat coord    只跑 gui_smoke_coord

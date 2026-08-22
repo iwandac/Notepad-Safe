@@ -6,6 +6,7 @@
 #include <QVector>
 #include <QUuid>
 #include <limits>
+#include <optional>
 #include <Qsci/qsciscintilla.h>
 #include "TextEncoding.h"
 #include "LargeFileSearch.h"   // 先入 LargeFileSearchMatch 定义
@@ -101,7 +102,8 @@ public:
 
     // ---- L1 路径（QsciScintilla，现有接口完全不变，避免功能回退）----
     // 文件操作
-    bool loadFile(const QString &path);
+    bool loadFile(const QString &path,
+                  std::optional<TextEncoding> forcedEncoding = std::nullopt);
     bool loadAutosave(const QString &autosavePath);  // 兼容旧版明文恢复文件
     // 从已解密的内部恢复快照加载，不把正文再次落入临时文件。
     bool loadAutosaveBytes(const QByteArray &data, const QString &backingPath);
@@ -128,6 +130,10 @@ public:
         return isSecureDocument() && m_secureBinaryDocument;
     }
     bool isBinaryDocument() const { return m_binaryDocument; }
+    // Content classification and the active representation are independent.
+    // A Binary document shown as Text participates in decoded text search;
+    // byte/hex search belongs only to the Hex representation.
+    bool isHexPresentation() const;
     bool hexOverwriteMode() const { return m_hexOverwriteMode; }
     void toggleHexOverwriteMode();
     bool isSecureDocumentMasked() const { return m_secureDocumentMasked; }
@@ -147,10 +153,15 @@ public:
     }
     void setSecurePayloadLimitExclusive(qint64 limit);
     void maskSecureDocument();
+    void beginSecureDocumentLocking();
+    void cancelSecureDocumentLocking();
     void setSecureDocumentTitle(const QString &title);
     void convertToPlainDocument(const QString &filePath);
     TextEncoding encoding() const;
     void setEncoding(TextEncoding enc);
+    EncodingOrigin encodingOrigin() const { return m_encodingOrigin; }
+    EncodingConfidence encodingConfidence() const { return m_encodingConfidence; }
+    bool encodingHasDecodeErrors() const { return m_encodingDecodeErrors; }
     QString lineEndingName() const;
     Syntax syntax() const;
 
@@ -199,6 +210,13 @@ public:
     bool findNext(const QString &pattern, bool regex, bool caseSensitive,
                   bool wholeWord, bool forward, bool wrap,
                   bool hexBytes = false);
+    // Large-file F3 path: directional scan runs in AsyncTaskManager and calls
+    // back as soon as one match is available; it never builds Find All first.
+    bool findNextL2Async(const QString &pattern, bool regex,
+                         bool caseSensitive, bool wholeWord,
+                         bool forward, bool wrap, bool hexBytes,
+                         QObject *callbackContext,
+                         std::function<void(bool found, QString error)> callback);
     void resetSearchPosition(bool forward);
     bool currentSelectionMatchesSearch(const QString &pattern, bool regex,
                                        bool caseSensitive, bool wholeWord,
@@ -281,8 +299,6 @@ public:
     // L2 模式：设置 VirtualFileView 的 displayEncoding，重绘
     void setDisplayEncoding(TextEncoding enc);
     TextEncoding displayEncoding() const;
-    void setDisplayEncodingL2(TextEncoding enc);
-    TextEncoding displayEncodingL2() const;
 
     // L2 视图模式：文本 / 16 进制（仅 L2 生效）
     void setViewModeL2(ViewMode mode);
@@ -341,7 +357,8 @@ public:
     // presentation/contentKind 只决定文本或 Hex 投影，不改变能力边界。
     bool openLargeFileL2(const QString &path, QString *errMsg = nullptr,
                          L2Presentation presentation = L2Presentation::Text,
-                         L2ContentKind contentKind = L2ContentKind::Text);
+                         L2ContentKind contentKind = L2ContentKind::Text,
+                         std::optional<TextEncoding> forcedEncoding = std::nullopt);
     // 仅供 S1 兼容 Hex 路径保存；32 MiB 以上由策略门禁拒绝。
     bool saveL2As(const QString &path, QString *errMsg = nullptr);
 
@@ -417,6 +434,7 @@ private:
     QsciScintilla *m_splitEditor = nullptr;
     QSplitter *m_l1Splitter = nullptr;
     QStackedWidget *m_stack = nullptr;  // 0: m_editor (L1), 1: m_l2View (L2)
+    QWidget *m_secureLockingPage = nullptr;
     QString m_filePath;       // 真实文件路径（空=未命名）
     QString m_autosavePath;   // 内部 autosave 临时路径（对用户透明）
     QUuid m_sessionInstanceId = QUuid::createUuid();
@@ -432,6 +450,9 @@ private:
     bool m_secureBinaryDocument = false;
     bool m_binaryDocument = false;
     TextEncoding m_encoding = TextEncoding::Utf8;
+    EncodingOrigin m_encodingOrigin = EncodingOrigin::Fallback;
+    EncodingConfidence m_encodingConfidence = EncodingConfidence::Low;
+    bool m_encodingDecodeErrors = false;
     Syntax m_syntax = Syntax::Plain;
     int m_bookmarkMarker = -1;
     bool m_edgeVisible = true;
@@ -551,6 +572,9 @@ private:
     // ============================================================================
     struct L2ScintillaBridge {
         QByteArray baseline;        // 上次 setText 的窗口 bytes（用于桥 2 diff）
+        QVector<qint32> projectedToSource; // UTF-8 projection byte -> source byte
+        QVector<qint32> sourceBoundaries;  // source byte boundaries
+        QVector<qint32> projectedBoundaries; // matching UTF-8 boundaries
         qint64    windowStart = -1; // 对应窗口的全局起始字节（-1 无）
         qint64    windowLen   = 0;  // 窗口长度（= W_active）
         QTimer    syncVfvDebounce;  // 桥 3 Scintilla→VFV 防抖（250ms single-shot）
@@ -576,6 +600,9 @@ private:
     void bridgePopulateScintilla(qint64 s, qint64 e);
     // 桥 2：把 Scintilla 当前文本 vs baseline 做 diff → 写 VFV patches()。s/e 同 baseline 窗口。
     bool bridgeFlushOverlayToPatches(QString* errMsg = nullptr);
+    qint64 bridgeSourceOffsetForProjectedPosition(qint64 position,
+                                                  bool endBoundary = false) const;
+    long bridgeProjectedPositionForSourceOffset(qint64 sourceOffset) const;
     int preferredHexBytesPerRow() const;
     void adaptHexBytesPerRow(bool repopulate);
     void alignTextOverlayToGlobalScroll();

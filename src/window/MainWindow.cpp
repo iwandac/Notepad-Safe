@@ -7,6 +7,8 @@
 #include "FileTierPolicy.h"
 #include "VirtualFileView.h"
 #include "StatusBarTaskWidget.h"
+#include "AsyncSerialQueue.h"
+#include "AsyncUiOperation.h"
 #include "VaultDock.h"
 #ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
 #include "KdbxFormatProbe.h"
@@ -69,8 +71,13 @@
 #include <QDesktopServices>
 #include <QProcess>
 #include <QLocale>
+#include <QEventLoop>
+#include <QProgressDialog>
 
+#include <atomic>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <utility>
 
 #ifndef NOTEPADSAFE_VERSION
@@ -284,6 +291,11 @@ private:
 // view; everything else continues through the normal text tier policy.
 bool looksLikeBinaryFile(const QString &path)
 {
+    const EncodingDetection detection = detectFileEncoding(path);
+    if (detection.encoding == TextEncoding::Utf16LE
+        || detection.encoding == TextEncoding::Utf16BE) {
+        return false;
+    }
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly))
         return false;
@@ -332,12 +344,13 @@ static void syncEncodingMenuTo(QMenu *menu, TextEncoding enc)
 //   S2/S3 → 只允许 mmap 路径。失败时绝不回退到主线程 readAll；否则一个
 //           2 GiB+ 文件会把“只读分析”退化成界面卡死或进程内存耗尽。
 // 返回是否成功（与 loadFile 返回一致）
-static bool openTabAutoMode(EditorTab *tab, const QString &path)
+static bool openTabAutoMode(EditorTab *tab, const QString &path,
+                            std::optional<TextEncoding> forcedEncoding = std::nullopt)
 {
     if (!tab) return false;
     // Binary routing belongs to the shared document opener so normal Open,
     // recent files, drag/drop and session restore cannot disagree.
-    if (looksLikeBinaryFile(path)) {
+    if (!forcedEncoding && looksLikeBinaryFile(path)) {
         QString error;
         if (!tab->openLargeFileL2(path, &error,
                                   L2Presentation::Hex,
@@ -354,13 +367,14 @@ static bool openTabAutoMode(EditorTab *tab, const QString &path)
     const FileTierDecision decision = FileTierPolicy::classify(size);
     if (decision.usesMappedPreview()) {
         QString err;
-        if (tab->openLargeFileL2(path, &err))
+        if (tab->openLargeFileL2(path, &err, L2Presentation::Text,
+                                 L2ContentKind::Text, forcedEncoding))
             return true;
         qWarning("[openTabAutoMode] mmap 打开失败，拒绝回退到同步全量加载: path='%s', error='%s'",
                  qUtf8Printable(path), qUtf8Printable(err));
         return false;
     }
-    return tab->loadFile(path);
+    return tab->loadFile(path, forcedEncoding);
 }
 
 static bool openSessionFile(EditorTab *tab, const SessionTab &state)
@@ -688,6 +702,10 @@ MainWindow::MainWindow(QWidget *parent)
     m_secureAutosaveTimer.setSingleShot(true);
     m_secureAutosaveTimer.setInterval(1200);
     connect(&m_secureAutosaveTimer, &QTimer::timeout, this, [this]() {
+        if (AsyncSerialQueue::security().busy()) {
+            m_secureAutosaveTimer.start();
+            return;
+        }
         if (!m_secureDocuments || !m_securitySession
             || !m_securitySession->hasActiveSession())
             return;
@@ -700,6 +718,8 @@ MainWindow::MainWindow(QWidget *parent)
 
     m_securityExpiryTimer.setInterval(60 * 1000);
     connect(&m_securityExpiryTimer, &QTimer::timeout, this, [this]() {
+        if (AsyncSerialQueue::security().busy())
+            return;
         if (!m_securitySession || !m_securitySession->expiresAtUtc().isValid()
             || QDateTime::currentDateTimeUtc() < m_securitySession->expiresAtUtc()) {
             return;
@@ -1014,12 +1034,11 @@ void MainWindow::changeMasterPassword()
     currentPassword->setFocus();
 
     while (dialog.exec() == QDialog::Accepted) {
-        QString currentText = currentPassword->text();
-        QString replacementText = newPassword->text();
-        QString confirmationText = confirmation->text();
+        QString currentText = takeSensitiveLineEdit(currentPassword);
+        QString replacementText = takeSensitiveLineEdit(newPassword);
+        QString confirmationText = takeSensitiveLineEdit(confirmation);
         if (replacementText.size() < 12) {
             errorLabel->setText(QStringLiteral("新主密码至少需要 12 个字符。"));
-            newPassword->selectAll();
             newPassword->setFocus();
             currentText.fill(QChar(0));
             replacementText.fill(QChar(0));
@@ -1028,8 +1047,7 @@ void MainWindow::changeMasterPassword()
         }
         if (replacementText != confirmationText) {
             errorLabel->setText(QStringLiteral("两次输入的新主密码不一致。"));
-            clearSensitiveLineEdit(confirmation);
-            confirmation->setFocus();
+            newPassword->setFocus();
             currentText.fill(QChar(0));
             replacementText.fill(QChar(0));
             confirmationText.fill(QChar(0));
@@ -1037,7 +1055,6 @@ void MainWindow::changeMasterPassword()
         }
         if (currentText == replacementText) {
             errorLabel->setText(QStringLiteral("新主密码必须与当前主密码不同。"));
-            newPassword->selectAll();
             newPassword->setFocus();
             currentText.fill(QChar(0));
             replacementText.fill(QChar(0));
@@ -1047,9 +1064,6 @@ void MainWindow::changeMasterPassword()
 
         QByteArray currentUtf8 = currentText.toUtf8();
         QByteArray replacementUtf8 = replacementText.toUtf8();
-        clearSensitiveLineEdit(currentPassword);
-        clearSensitiveLineEdit(newPassword);
-        clearSensitiveLineEdit(confirmation);
         currentText.fill(QChar(0));
         replacementText.fill(QChar(0));
         confirmationText.fill(QChar(0));
@@ -1058,8 +1072,13 @@ void MainWindow::changeMasterPassword()
                                        replacementUtf8.size());
         scrubByteArray(currentUtf8);
         scrubByteArray(replacementUtf8);
-        const VaultError result = m_securitySession->changeMasterPassword(
-            currentSecret, replacementSecret);
+        const VaultError result = runSerializedSecurityOperation(
+            this, AsyncTaskType::SecureIdentity, AsyncTaskPriority::Highest,
+            QStringLiteral("正在更新安全身份"),
+            [this, &currentSecret, &replacementSecret] {
+                return m_securitySession->changeMasterPassword(
+                    currentSecret, replacementSecret);
+            });
         currentSecret.clear();
         replacementSecret.clear();
         if (result.isError()) {
@@ -1233,8 +1252,14 @@ void MainWindow::verifyRecoveryKey()
         if (!recoveryText.isEmpty())
             recoveryText.fill(QChar(0));
         recoveryText.clear();
-        if (!result.isError())
-            result = m_securitySession->verifyRecoverySecret(candidate);
+        if (!result.isError()) {
+            result = runSerializedSecurityOperation(
+                this, AsyncTaskType::SecureIdentity, AsyncTaskPriority::High,
+                QStringLiteral("正在验证恢复密钥"),
+                [this, &candidate] {
+                    return m_securitySession->verifyRecoverySecret(candidate);
+                });
+        }
         candidate.clear();
         if (result.isError()) {
             errorLabel->setText(result.userMessage);
@@ -1937,31 +1962,37 @@ void MainWindow::createMenus()
     m_encodingMenu->menuAction()->setObjectName(QStringLiteral("menu.encoding"));
     m_documentOnlyActions.append(m_encodingMenu->menuAction());
     auto *encGroup = new QActionGroup(this);
-    // 按 Notepad++ 顺序：ANSI -> UTF-8 -> UTF-8 BOM -> UCS-2 LE -> UCS-2 BE
+    m_displayEncodingMenu = m_encodingMenu;
     QVector<QPair<QString, TextEncoding>> encItems = {
-        {QStringLiteral("转为 ANSI (GBK)"),          TextEncoding::GBK},
-        {QStringLiteral("转为 UTF-8 (无 BOM)"),       TextEncoding::Utf8},
-        {QStringLiteral("转为 UTF-8 (含 BOM)"),       TextEncoding::Utf8Bom},
-        {QStringLiteral("转为 UTF-16 Little Endian"), TextEncoding::Utf16LE},
-        {QStringLiteral("转为 UTF-16 Big Endian"),    TextEncoding::Utf16BE},
+        {QStringLiteral("以 GBK 编码显示"),                 TextEncoding::GBK},
+        {QStringLiteral("以 GB18030 编码显示"),             TextEncoding::GB18030},
+        {QStringLiteral("以 Big5 编码显示"),                TextEncoding::Big5},
+        {QStringLiteral("以 Shift-JIS 编码显示"),           TextEncoding::ShiftJis},
+        {QStringLiteral("以 Windows-1252 编码显示"),        TextEncoding::Windows1252},
+        {QStringLiteral("以 UTF-8 编码显示"),               TextEncoding::Utf8},
+        {QStringLiteral("以 UTF-8 BOM 编码显示"),           TextEncoding::Utf8Bom},
+        {QStringLiteral("以 UTF-16 Little Endian 编码显示"), TextEncoding::Utf16LE},
+        {QStringLiteral("以 UTF-16 Big Endian 编码显示"),    TextEncoding::Utf16BE},
     };
     const QStringList convertEncodingIds = {
-        QStringLiteral("gbk"), QStringLiteral("utf8"),
+        QStringLiteral("gbk"), QStringLiteral("gb18030"),
+        QStringLiteral("big5"), QStringLiteral("shiftjis"),
+        QStringLiteral("windows1252"), QStringLiteral("utf8"),
         QStringLiteral("utf8bom"), QStringLiteral("utf16le"),
         QStringLiteral("utf16be"),
     };
-    m_convertEncodingActions.clear();
+    m_displayEncodingActions.clear();
     for (int i = 0; i < encItems.size(); ++i) {
         const auto &item = encItems[i];
         auto *a = m_encodingMenu->addAction(item.first);
-        a->setObjectName(QStringLiteral("encoding.convert.%1")
+        a->setObjectName(QStringLiteral("encoding.display.%1")
                              .arg(convertEncodingIds[i]));
         a->setCheckable(true);
         a->setData(static_cast<int>(item.second));
         encGroup->addAction(a);
-        m_convertEncodingActions.append(a);
+        m_displayEncodingActions.append(a);
         m_documentOnlyActions.append(a);
-        connect(a, &QAction::triggered, this, &MainWindow::convertEncodingFromAction);
+        connect(a, &QAction::triggered, this, &MainWindow::displayEncodingFromAction);
     }
 
     m_encodingMenu->addSeparator();
@@ -1991,29 +2022,33 @@ void MainWindow::createMenus()
         });
     }
 
-    // "以编码重新打开"：重新解释原始字节，不把它误解为编码转换。
+    // Conversion is intentionally folded away from the direct display
+    // interpretation actions. It always saves a new file in the target
+    // encoding and opens that result; the source file is never overwritten.
     m_encodingMenu->addSeparator();
-    m_displayEncodingMenu = m_encodingMenu->addMenu(QStringLiteral("以编码重新打开"));
-    m_displayEncodingMenu->setObjectName(QStringLiteral("encoding.reopen"));
-    auto *dispEncGroup = new QActionGroup(this);
+    auto *convertMenu = m_encodingMenu->addMenu(QStringLiteral("转换为"));
+    convertMenu->setObjectName(QStringLiteral("encoding.convert"));
     QVector<QPair<QString, TextEncoding>> dispEncItems = {
-        {QStringLiteral("以 ANSI (GBK) 重新打开"),        TextEncoding::GBK},
-        {QStringLiteral("以 UTF-8 重新打开"),             TextEncoding::Utf8},
-        {QStringLiteral("以 UTF-8 (含 BOM) 重新打开"),    TextEncoding::Utf8Bom},
-        {QStringLiteral("以 UTF-16 Little Endian 重新打开"), TextEncoding::Utf16LE},
-        {QStringLiteral("以 UTF-16 Big Endian 重新打开"),    TextEncoding::Utf16BE},
+        {QStringLiteral("转为 GBK"),               TextEncoding::GBK},
+        {QStringLiteral("转为 GB18030"),           TextEncoding::GB18030},
+        {QStringLiteral("转为 Big5"),              TextEncoding::Big5},
+        {QStringLiteral("转为 Shift-JIS"),         TextEncoding::ShiftJis},
+        {QStringLiteral("转为 Windows-1252"),      TextEncoding::Windows1252},
+        {QStringLiteral("转为 UTF-8"),             TextEncoding::Utf8},
+        {QStringLiteral("转为 UTF-8 BOM"),         TextEncoding::Utf8Bom},
+        {QStringLiteral("转为 UTF-16 Little Endian"), TextEncoding::Utf16LE},
+        {QStringLiteral("转为 UTF-16 Big Endian"),    TextEncoding::Utf16BE},
     };
+    m_convertEncodingActions.clear();
     for (int i = 0; i < dispEncItems.size(); ++i) {
         const auto &item = dispEncItems[i];
-        auto *a = m_displayEncodingMenu->addAction(item.first);
-        a->setObjectName(QStringLiteral("encoding.reopen.%1")
+        auto *a = convertMenu->addAction(item.first);
+        a->setObjectName(QStringLiteral("encoding.convert.%1")
                              .arg(convertEncodingIds[i]));
-        a->setCheckable(true);
         a->setData(static_cast<int>(item.second));
-        dispEncGroup->addAction(a);
-        m_displayEncodingActions.append(a);
+        m_convertEncodingActions.append(a);
         m_documentOnlyActions.append(a);
-        connect(a, &QAction::triggered, this, &MainWindow::displayEncodingFromAction);
+        connect(a, &QAction::triggered, this, &MainWindow::convertEncodingFromAction);
     }
     // 注意：菜单勾选在 onTabChanged / onTabEncodingChanged 中同步
 
@@ -2049,14 +2084,15 @@ void MainWindow::createMenus()
                            "<b>QScintilla：</b>2.14.1<br>"
                            "<b>KDBX：</b>KeePassXC Core 2.7.12<br>"
                            "<b>密码学：</b>Botan 3.12.0 + libargon2 20190702<br>"
-                           "<b>正则：</b>PCRE2 10.47</p>"
+                           "<b>正则：</b>PCRE2 10.47 + Boost.Regex 1.90.0</p>"
                            "<p>许可证：GNU GPL v3。核心供应商均按锁文件和 SHA-256/commit 固定，"
                            "更新必须通过格式、加密、搜索与 GUI 回归门禁。</p>"
                            "<p><a href='https://www.qt.io/'>Qt</a> · "
                            "<a href='https://www.riverbankcomputing.com/software/qscintilla/'>QScintilla</a> · "
                            "<a href='https://keepassxc.org/'>KeePassXC</a> · "
                            "<a href='https://botan.randombit.net/'>Botan</a> · "
-                           "<a href='https://www.pcre.org/'>PCRE2</a></p>")
+                           "<a href='https://www.pcre.org/'>PCRE2</a> · "
+                           "<a href='https://www.boost.org/libs/regex/'>Boost.Regex</a></p>")
                 .arg(QStringLiteral(NOTEPADSAFE_VERSION),
                      QString::fromLatin1(qVersion())));
     });
@@ -2203,7 +2239,12 @@ bool MainWindow::ensureSecuritySessionInteractive()
                 if (backing.isEmpty() || !QFileInfo::exists(backing))
                     continue;
                 SecureDocumentSnapshot restored;
-                const VaultError restoreError = m_secureDocuments->open(backing, &restored);
+                const VaultError restoreError = runSerializedSecurityOperation(
+                    this, AsyncTaskType::SecureOpen, AsyncTaskPriority::High,
+                    QStringLiteral("正在恢复安全文档"),
+                    [this, backing, &restored] {
+                        return m_secureDocuments->open(backing, &restored);
+                    });
                 if (!restoreError.isError()) {
                     adoptSecureSnapshot(restored, masked);
                     restored.text.fill(QChar(0));
@@ -2262,30 +2303,38 @@ bool MainWindow::ensureSecuritySessionInteractive()
     password->setFocus();
 
     while (dialog.exec() == QDialog::Accepted) {
-        QString passwordText = password->text();
+        QString passwordText = takeSensitiveLineEdit(password);
+        QString confirmationText = creating && confirmation
+            ? takeSensitiveLineEdit(confirmation) : QString();
         if (passwordText.size() < 12) {
             errorLabel->setText(QStringLiteral("主密码至少需要 12 个字符。"));
-            password->selectAll();
+            passwordText.fill(QChar(0));
+            confirmationText.fill(QChar(0));
+            password->setFocus();
             continue;
         }
-        if (creating && confirmation && passwordText != confirmation->text()) {
+        if (creating && confirmation && passwordText != confirmationText) {
             errorLabel->setText(QStringLiteral("两次输入的主密码不一致。"));
-            clearSensitiveLineEdit(confirmation);
-            confirmation->setFocus();
             passwordText.fill(QChar(0));
+            confirmationText.fill(QChar(0));
+            password->setFocus();
             continue;
         }
         QByteArray passwordUtf8 = passwordText.toUtf8();
-        clearSensitiveLineEdit(password);
-        if (confirmation)
-            clearSensitiveLineEdit(confirmation);
         passwordText.fill(QChar(0));
+        confirmationText.fill(QChar(0));
         SecureBuffer passphrase(passwordUtf8.constData(), passwordUtf8.size());
         scrubByteArray(passwordUtf8);
         QString recoveryKey;
-        VaultError result = creating
-                                ? m_securitySession->createIdentity(passphrase, &recoveryKey)
-                                : m_securitySession->unlockIdentity(passphrase);
+        VaultError result = runSerializedSecurityOperation(
+            this, AsyncTaskType::SecureIdentity, AsyncTaskPriority::High,
+            creating ? QStringLiteral("正在建立安全身份")
+                     : QStringLiteral("正在解锁安全身份"),
+            [this, creating, &passphrase, &recoveryKey] {
+                return creating
+                    ? m_securitySession->createIdentity(passphrase, &recoveryKey)
+                    : m_securitySession->unlockIdentity(passphrase);
+            });
         passphrase.clear();
         if (result.isError()) {
             errorLabel->setText(result.userMessage);
@@ -2351,7 +2400,10 @@ void MainWindow::newFile()
     if (!ensureSecuritySessionInteractive() || !m_secureDocuments)
         return;
     SecureDocumentSnapshot snapshot;
-    const VaultError error = m_secureDocuments->newDraft(&snapshot);
+    const VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::SecureSave, AsyncTaskPriority::High,
+        QStringLiteral("正在建立加密草稿"),
+        [this, &snapshot] { return m_secureDocuments->newDraft(&snapshot); });
     if (error.isError()) {
         QMessageBox::critical(this, QStringLiteral("无法新建文档"), error.userMessage);
         return;
@@ -2598,13 +2650,27 @@ bool MainWindow::saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool
                 QMessageBox::critical(this, QStringLiteral("加密保存失败"), exportError);
             return false;
         }
-        error = m_secureDocuments->saveBinary(
-            tab->secureDocumentId(), body, title, targetPath);
+        error = runSerializedSecurityOperation(
+            this, AsyncTaskType::SecureSave,
+            showErrors ? AsyncTaskPriority::High : AsyncTaskPriority::Low,
+            showErrors ? QStringLiteral("正在安全保存")
+                       : QStringLiteral("正在保存加密恢复点"),
+            [this, tab, &body, title, targetPath] {
+                return m_secureDocuments->saveBinary(
+                    tab->secureDocumentId(), body, title, targetPath);
+            }, showErrors);
         scrubByteArray(body);
     } else {
         QString body = tab->editor()->text();
-        error = m_secureDocuments->save(
-            tab->secureDocumentId(), body, title, targetPath);
+        error = runSerializedSecurityOperation(
+            this, AsyncTaskType::SecureSave,
+            showErrors ? AsyncTaskPriority::High : AsyncTaskPriority::Low,
+            showErrors ? QStringLiteral("正在安全保存")
+                       : QStringLiteral("正在保存加密恢复点"),
+            [this, tab, &body, title, targetPath] {
+                return m_secureDocuments->save(
+                    tab->secureDocumentId(), body, title, targetPath);
+            }, showErrors);
         if (!body.isEmpty())
             body.fill(QChar(0));
         body.clear();
@@ -2687,22 +2753,34 @@ void MainWindow::openSecureNote(const QUuid &id)
 void MainWindow::lockSecureDocuments()
 {
     m_secureAutosaveTimer.stop();
+    QVector<EditorTab *> lockingTabs;
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
+        if (tab && tab->isSecureDocument() && !tab->isSecureDocumentMasked()) {
+            lockingTabs.append(tab);
+            tab->beginSecureDocumentLocking();
+        }
+    }
+    purgeSensitiveSearchState();
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
         if (tab && tab->isSecureDocument() && !tab->isSecureDocumentMasked()
             && tab->isModified() && !saveSecureTab(tab, false, false)) {
+            for (EditorTab *lockingTab : lockingTabs)
+                lockingTab->cancelSecureDocumentLocking();
             statusBar()->showMessage(QStringLiteral("未能保存加密文档，已取消锁定。"), 5000);
             return;
         }
     }
     if (m_vaultDock && !m_vaultDock->prepareToLock()) {
+        for (EditorTab *lockingTab : lockingTabs)
+            lockingTab->cancelSecureDocumentLocking();
         statusBar()->showMessage(QStringLiteral("账户修改尚未处理，已取消锁定。"), 5000);
         return;
     }
     // Lock is also a recovery boundary for ordinary documents. The operation is
     // explicit, so establish the latest encrypted S1/S2 recovery point first.
     saveSessionNow(true);
-    purgeSensitiveSearchState();
     if (m_secureDocuments)
         m_secureDocuments->closeAll();
     if (m_securitySession)
@@ -2898,7 +2976,10 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
         return false;
 
     SecureDocumentSnapshot snapshot;
-    VaultError error = m_secureDocuments->open(path, &snapshot);
+    VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::SecureOpen, AsyncTaskPriority::High,
+        QStringLiteral("正在打开安全文档"),
+        [this, path, &snapshot] { return m_secureDocuments->open(path, &snapshot); });
     if (!error.isError()) {
         if (!adoptSecureSnapshot(snapshot, reuseTab))
             return false;
@@ -2925,7 +3006,13 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
                 dialog.showError(QStringLiteral("请输入恢复密钥。"));
                 continue;
             }
-            error = m_secureDocuments->openWithRecovery(path, recoveryText, &snapshot);
+            error = runSerializedSecurityOperation(
+                this, AsyncTaskType::SecureOpen, AsyncTaskPriority::High,
+                QStringLiteral("正在恢复安全文档"),
+                [this, path, &recoveryText, &snapshot] {
+                    return m_secureDocuments->openWithRecovery(path, recoveryText,
+                                                               &snapshot);
+                });
             recoveryText.fill(QChar(0));
             recoveryText.clear();
         } else {
@@ -2934,7 +3021,12 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
                 dialog.showError(QStringLiteral("请输入文件密码。"));
                 continue;
             }
-            error = m_secureDocuments->openWithPassphrase(path, buffer, &snapshot);
+            error = runSerializedSecurityOperation(
+                this, AsyncTaskType::SecureOpen, AsyncTaskPriority::High,
+                QStringLiteral("正在解锁安全文档"),
+                [this, path, &buffer, &snapshot] {
+                    return m_secureDocuments->openWithPassphrase(path, buffer, &snapshot);
+                });
             buffer.clear();
         }
         if (!error.isError()) {
@@ -2950,7 +3042,8 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
 #endif
 }
 
-bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab)
+bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
+                                 std::optional<TextEncoding> forcedEncoding)
 {
     const QFileInfo info(path);
     if (!info.isFile())
@@ -3126,7 +3219,7 @@ bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab)
         // reused tab must stop being a secure document before ordinary routing.
         reuseTab->convertToPlainDocument(QString());
     }
-    const bool opened = openTabAutoMode(tab, path);
+    const bool opened = openTabAutoMode(tab, path, forcedEncoding);
     if (!opened) {
         if (!reuseTab) {
             const int index = m_tabs->indexOf(tab);
@@ -3187,6 +3280,24 @@ bool MainWindow::saveFile()
         return saveSecureTab(tab, true);
     if (tab->isUntitled())
         return saveAsFile();
+    if (tab->encodingHasDecodeErrors()) {
+        QMessageBox box(QMessageBox::Warning, QStringLiteral("编码需要确认"),
+                        QStringLiteral("源文件包含不符合当前 %1 解释的字节。"
+                                       "继续保存会用当前显示文本覆盖这些原始字节。")
+                            .arg(encodingName(tab->displayEncoding())),
+                        QMessageBox::NoButton, this);
+        auto *overwrite = box.addButton(
+            QStringLiteral("仍以 %1 覆盖").arg(encodingName(tab->displayEncoding())),
+                                        QMessageBox::AcceptRole);
+        auto *cancel = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+        box.setDefaultButton(cancel);
+        box.exec();
+        if (box.clickedButton() != overwrite)
+            return false;
+        // The explicit decision turns the fallback into a user-selected
+        // encoding so subsequent saves do not ask the same question again.
+        tab->setEncoding(tab->displayEncoding());
+    }
     switch (resolveExternalSaveConflict(tab)) {
     case ExternalSaveDisposition::HandledSuccess:
         return true;
@@ -3316,7 +3427,12 @@ bool MainWindow::reloadSecureTabFromDisk(EditorTab *tab)
     if (!tab || !tab->isSecureDocument() || !m_secureDocuments)
         return false;
     SecureDocumentSnapshot snapshot;
-    const VaultError error = m_secureDocuments->reload(tab->secureDocumentId(), &snapshot);
+    const VaultError error = runSerializedSecurityOperation(
+        this, AsyncTaskType::SecureOpen, AsyncTaskPriority::High,
+        QStringLiteral("正在重新加载安全文档"),
+        [this, tab, &snapshot] {
+            return m_secureDocuments->reload(tab->secureDocumentId(), &snapshot);
+        });
     if (error.isError()) {
         QMessageBox box(QMessageBox::Critical, QStringLiteral("无法重新加载安全文档"),
                         error.userMessage, QMessageBox::Ok, this);
@@ -3530,8 +3646,13 @@ bool MainWindow::saveAsFile()
                 return false;
             }
             if (tab->isSecureDocument()) {
-                error = m_secureDocuments->saveBinary(
-                    tab->secureDocumentId(), body, title, fileName);
+                error = runSerializedSecurityOperation(
+                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::High,
+                    QStringLiteral("正在另存安全文档"),
+                    [this, tab, &body, title, fileName] {
+                        return m_secureDocuments->saveBinary(
+                            tab->secureDocumentId(), body, title, fileName);
+                    });
                 if (!error.isError()) {
                     tab->setFilePath(QFileInfo(fileName).absoluteFilePath());
                     tab->setAutosavePath(
@@ -3541,8 +3662,13 @@ bool MainWindow::saveAsFile()
                 }
             } else {
                 SecureDocumentSnapshot snapshot;
-                error = m_secureDocuments->saveAsSecureBinary(
-                    body, title, fileName, &snapshot);
+                error = runSerializedSecurityOperation(
+                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::High,
+                    QStringLiteral("正在创建安全文档"),
+                    [this, &body, title, fileName, &snapshot] {
+                        return m_secureDocuments->saveAsSecureBinary(
+                            body, title, fileName, &snapshot);
+                    });
                 if (!error.isError() && !adoptSecureSnapshot(snapshot, tab)) {
                     scrubByteArray(body);
                     return false;
@@ -3552,8 +3678,13 @@ bool MainWindow::saveAsFile()
         } else {
             QString body = tab->editor()->text();
             if (tab->isSecureDocument()) {
-                error = m_secureDocuments->save(
-                    tab->secureDocumentId(), body, title, fileName);
+                error = runSerializedSecurityOperation(
+                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::High,
+                    QStringLiteral("正在另存安全文档"),
+                    [this, tab, &body, title, fileName] {
+                        return m_secureDocuments->save(
+                            tab->secureDocumentId(), body, title, fileName);
+                    });
                 if (!error.isError()) {
                     tab->setFilePath(QFileInfo(fileName).absoluteFilePath());
                     tab->setAutosavePath(
@@ -3563,8 +3694,13 @@ bool MainWindow::saveAsFile()
                 }
             } else {
                 SecureDocumentSnapshot snapshot;
-                error = m_secureDocuments->saveAsSecure(
-                    body, title, fileName, &snapshot);
+                error = runSerializedSecurityOperation(
+                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::High,
+                    QStringLiteral("正在创建安全文档"),
+                    [this, &body, title, fileName, &snapshot] {
+                        return m_secureDocuments->saveAsSecure(
+                            body, title, fileName, &snapshot);
+                    });
                 if (!error.isError() && !adoptSecureSnapshot(snapshot, tab)) {
                     body.fill(QChar(0));
                     return false;
@@ -3883,6 +4019,12 @@ void MainWindow::setEdgeColumnFromAction()
 
 void MainWindow::toggleWordWrap()
 {
+    EditorTab *active = currentTab();
+    if (active && active->isReadOnlyByPolicy()) {
+        syncCommandStates(active);
+        syncGlobalMenuCheckStates();
+        return;
+    }
     m_wordWrap = !m_wordWrap;
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *t = qobject_cast<EditorTab *>(m_tabs->widget(i));
@@ -3920,7 +4062,11 @@ void MainWindow::syncGlobalMenuCheckStates()
         m_actAppearanceLight->setChecked(m_appearanceMode == AppearanceMode::Light);
     if (m_actDarkMode)
         m_actDarkMode->setChecked(m_appearanceMode == AppearanceMode::Dark);
-    if (m_actWordWrap)  m_actWordWrap->setChecked(m_wordWrap);
+    if (m_actWordWrap) {
+        EditorTab *tab = currentTab();
+        m_actWordWrap->setChecked(tab && tab->isReadOnlyByPolicy()
+                                      ? false : m_wordWrap);
+    }
     if (m_actWhitespaceVisible)
         m_actWhitespaceVisible->setChecked(m_whitespaceVisible);
     if (m_actEolVisible)
@@ -4030,26 +4176,138 @@ void MainWindow::convertEncodingFromAction()
     auto enc = static_cast<TextEncoding>(act->data().toInt());
     auto *tab = currentTab();
     if (!tab) return;
-    if (tab->encoding() == enc) return;
+    if (tab->isSecureDocument() || tab->isUntitled() || tab->isBinaryDocument())
+        return;
+    if (tab->encodingHasDecodeErrors()) {
+        QMessageBox::information(
+            this, QStringLiteral("请先确认源编码"),
+            QStringLiteral("源文件包含不符合当前 %1 解释的字节。"
+                           "请先用“以 … 编码显示”选择正确源编码，再执行转换。")
+                .arg(encodingName(tab->displayEncoding())));
+        return;
+    }
+    if (tab->isL2Active()
+        && tab->externalFileState() != EditorTab::ExternalFileState::Unchanged) {
+        QMessageBox::warning(
+            this, QStringLiteral("源文件已经变化"),
+            QStringLiteral("磁盘文件在打开后已被修改、替换或删除。"
+                           "请重新打开源文件后再执行编码转换。"));
+        return;
+    }
 
-    // Notepad++ 语义：改变下次保存时的编码标记，并在状态栏显示
-    if (!tab->isUntitled() && tab->isModified()) {
-        auto ret = QMessageBox::question(
-            this, QStringLiteral("编码切换"),
-            QStringLiteral("当前文件有未保存的修改。\n"
-                           "切换编码后，下次保存将使用新编码写入。\n"
-                           "是否继续？"),
-            QMessageBox::Yes | QMessageBox::No);
-        if (ret != QMessageBox::Yes) {
-            // 恢复勾选状态
-            syncEncodingMenuTo(m_encodingMenu, tab->encoding());
+    const QFileInfo sourceInfo(tab->filePath());
+    QString suffix = sourceInfo.completeSuffix();
+    const QString stem = sourceInfo.completeBaseName().isEmpty()
+        ? sourceInfo.fileName() : sourceInfo.completeBaseName();
+    QString targetSuggestion = sourceInfo.dir().filePath(
+        stem + QStringLiteral("-")
+        + encodingName(enc).toLower().replace(QLatin1Char(' '), QLatin1Char('-'))
+        + (suffix.isEmpty() ? QString() : QLatin1Char('.') + suffix));
+    QFileDialog conversionDialog(
+        this, QStringLiteral("转换为 %1 并另存为").arg(encodingName(enc)),
+        targetSuggestion, QStringLiteral("所有文件 (*)"));
+    conversionDialog.setObjectName(QStringLiteral("encodingConversionSaveAsDialog"));
+    conversionDialog.setAcceptMode(QFileDialog::AcceptSave);
+    conversionDialog.setFileMode(QFileDialog::AnyFile);
+    conversionDialog.setOption(QFileDialog::DontUseNativeDialog, true);
+    conversionDialog.selectFile(targetSuggestion);
+    if (conversionDialog.exec() != QDialog::Accepted
+        || conversionDialog.selectedFiles().isEmpty()) {
+        return;
+    }
+    const QString target = conversionDialog.selectedFiles().constFirst();
+    if (sameDiskFilePath(tab->filePath(), target)) {
+        QMessageBox::warning(this, QStringLiteral("请选择新文件"),
+                             QStringLiteral("编码转换不会覆盖源文件，请选择其他路径。"));
+        return;
+    }
+    for (int index = 0; index < m_tabs->count(); ++index) {
+        auto *openTab = qobject_cast<EditorTab *>(m_tabs->widget(index));
+        if (openTab && openTab != tab && !openTab->filePath().isEmpty()
+            && sameDiskFilePath(openTab->filePath(), target)) {
+            QMessageBox::warning(
+                this, QStringLiteral("目标文件已打开"),
+                QStringLiteral("为避免写入后仍显示旧内容，请关闭目标文件标签，或选择其他路径。"));
             return;
         }
     }
-    tab->setEncoding(enc);
-    // 切换编码视为需要保存的修改
-    if (!tab->isModified())
-        tab->setModified(true);
+
+    struct ConversionResult { bool converted = false; QString error; };
+    auto result = QSharedPointer<ConversionResult>::create();
+    auto smallText = tab->isL2Active()
+        ? QSharedPointer<QString>()
+        : QSharedPointer<QString>::create(tab->editor()->text());
+    const QString sourcePath = tab->filePath();
+    const TextEncoding sourceEncoding = tab->displayEncoding();
+    QProgressDialog progress(QStringLiteral("正在转换编码…"),
+                             QStringLiteral("取消"), 0, 1000, this);
+    progress.setObjectName(QStringLiteral("encodingConversionProgress"));
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    progress.setAutoClose(false);
+    progress.setValue(0);
+
+    QEventLoop loop;
+    qint64 conversionTaskId = -1;
+    const auto finishedConnection = connect(
+        &AsyncTaskManager::instance(), &AsyncTaskManager::taskFinished, &loop,
+        [&loop, &conversionTaskId](qint64 id, AsyncTaskState) {
+            if (id == conversionTaskId)
+                loop.quit();
+        });
+    const auto progressConnection = connect(
+        &AsyncTaskManager::instance(), &AsyncTaskManager::taskProgressChanged,
+        &progress, [&progress, &conversionTaskId](qint64 id, qint64 done, qint64 total) {
+            if (id == conversionTaskId && total > 0)
+                progress.setValue(int(qMin<qint64>(1000, done * 1000 / total)));
+        });
+    conversionTaskId = AsyncTaskManager::instance().submit(
+        AsyncTaskType::EncodingConversion, AsyncTaskPriority::High,
+        QStringLiteral("正在转换文件编码"), QString(),
+        [result, smallText, sourcePath, sourceEncoding, target, enc]
+        (qint64, AsyncCancelPtr cancel, const auto &reportProgress,
+         const auto &reportError) {
+            if (smallText) {
+                result->converted = writeTextAsEncoding(
+                    target, *smallText, enc, &result->error);
+                smallText->fill(QChar(0));
+                smallText->clear();
+            } else {
+                result->converted = transcodeFileEncoding(
+                    sourcePath, sourceEncoding, target, enc, &result->error,
+                    cancel.data(), reportProgress);
+            }
+            if (!result->converted && result->error != QStringLiteral("转换已取消。")) {
+                AsyncErrorInfo asyncError;
+                asyncError.message = QStringLiteral("编码转换未完成。");
+                reportError(asyncError);
+            }
+        }, 0, QStringLiteral("Encoding"), 1000, tab->isL2Active());
+    connect(&progress, &QProgressDialog::canceled, this,
+            [conversionTaskId] {
+                AsyncTaskManager::instance().cancel(conversionTaskId);
+            });
+    progress.show();
+    loop.exec(QEventLoop::ExcludeUserInputEvents);
+    disconnect(finishedConnection);
+    disconnect(progressConnection);
+    progress.close();
+
+    const bool converted = result->converted;
+    const QString error = result->error;
+    if (!converted) {
+        if (error != QStringLiteral("转换已取消。")) {
+            QMessageBox::warning(this, QStringLiteral("编码转换失败"), error);
+        }
+        return;
+    }
+    if (!openPathUnified(QFileInfo(target).absoluteFilePath(), nullptr, enc)) {
+        QMessageBox::warning(this, QStringLiteral("转换完成但打开失败"),
+                             QStringLiteral("新文件已保存：\n%1").arg(target));
+        return;
+    }
+    statusBar()->showMessage(
+        QStringLiteral("已转换为 %1，并打开新文件").arg(encodingName(enc)), 4000);
 }
 
 void MainWindow::displayEncodingFromAction()
@@ -4067,31 +4325,22 @@ void MainWindow::displayEncodingFromAction()
     if (tab->displayEncoding() == enc)
         return;
 
-    // L1 must reread the original bytes. Never let that silently overwrite
-    // unsaved text. L2 owns a byte-preserving virtual source, so changing its
-    // decoder can retain pending byte patches without a destructive reload.
+    // L1 rereads the saved bytes. A modified small document uses the ordinary
+    // Save/Cancel decision; after Save it follows the exact unmodified path.
     if (!tab->isL2Active() && tab->isModified()) {
-        QMessageBox box(QMessageBox::Warning, QStringLiteral("以编码重新打开"),
-                        QStringLiteral("“%1”有未保存的修改。重新解释磁盘字节前要如何处理？")
-                            .arg(tab->fileName()),
-                        QMessageBox::NoButton, this);
-        auto *saveButton = box.addButton(QStringLiteral("保存并重新打开"),
-                                         QMessageBox::AcceptRole);
-        auto *discardButton = box.addButton(QStringLiteral("放弃修改并重新打开"),
-                                            QMessageBox::DestructiveRole);
-        auto *cancelButton = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
-        box.setDefaultButton(cancelButton);
-        box.exec();
-        if (box.clickedButton() == cancelButton || !box.clickedButton()) {
+        const auto decision = QMessageBox::warning(
+            this, QStringLiteral("保存修改"),
+            QStringLiteral("“%1”有未保存的修改。要先保存再以 %2 编码显示吗？")
+                .arg(tab->fileName(), encodingName(enc)),
+            QMessageBox::Save | QMessageBox::Cancel, QMessageBox::Cancel);
+        if (decision != QMessageBox::Save) {
             syncEncodingMenuTo(m_displayEncodingMenu, tab->displayEncoding());
             return;
         }
-        if (box.clickedButton() == saveButton && !saveFile()) {
+        if (!saveFile()) {
             syncEncodingMenuTo(m_displayEncodingMenu, tab->displayEncoding());
             return;
         }
-        if (box.clickedButton() == discardButton)
-            tab->clearAutosaveFile();
     }
 
     tab->setDisplayEncoding(enc);
@@ -4259,6 +4508,8 @@ void MainWindow::syncCommandStates(EditorTab *tab)
     }
     if (m_selectAllAction)
         m_selectAllAction->setEnabled(hasDocument && !tab->isSecureDocumentMasked());
+    if (m_actWordWrap)
+        m_actWordWrap->setEnabled(hasDocument && !tab->isReadOnlyByPolicy());
     const bool editableHex = hasDocument && canModify && tab->isL2Active()
         && tab->viewModeL2() == ViewMode::Hex;
     if (m_hexInsertModeAction) {
@@ -4327,7 +4578,7 @@ void MainWindow::syncCommandStates(EditorTab *tab)
     const bool displayEncodingAvailable = textPresentation
         && !tab->isSecureDocument() && !tab->isUntitled();
     const bool conversionAvailable = displayEncodingAvailable
-        && !tab->isL2Active() && !tab->isBinaryDocument();
+        && !tab->isBinaryDocument();
     if (m_encodingMenu)
         m_encodingMenu->menuAction()->setEnabled(displayEncodingAvailable
                                                  || conversionAvailable);
@@ -4656,8 +4907,13 @@ void MainWindow::onTabTitleChanged(const QString &title)
 void MainWindow::onTabEncodingChanged(TextEncoding encoding)
 {
     const EditorTab *tab = currentTab();
+    const QString origin = tab && tab->encodingHasDecodeErrors()
+        ? QStringLiteral(" · 包含非法字节")
+        : tab && tab->encodingOrigin() == EncodingOrigin::Fallback
+            ? QStringLiteral(" · 默认假设") : QString();
     m_statusEncoding->setText(tab
-        ? QStringLiteral("%1 · %2").arg(encodingName(encoding), tab->lineEndingName())
+        ? QStringLiteral("%1%2 · %3")
+              .arg(encodingName(encoding), origin, tab->lineEndingName())
         : encodingName(encoding));
     syncEncodingMenuTo(m_encodingMenu, encoding);
 }
@@ -4766,9 +5022,13 @@ void MainWindow::updateStatusBar()
     } else {
         m_statusPos->setText(QStringLiteral("行: %1, 列: %2").arg(line + 1).arg(index + 1));
     }
+    const QString origin = tab->encodingHasDecodeErrors()
+        ? QStringLiteral(" · 包含非法字节")
+        : tab->encodingOrigin() == EncodingOrigin::Fallback
+            ? QStringLiteral(" · 默认假设") : QString();
     m_statusEncoding->setText(hexMode ? QStringLiteral("原始字节")
-                                     : QStringLiteral("%1 · %2")
-                                           .arg(encodingName(tab->encoding()),
+                                     : QStringLiteral("%1%2 · %3")
+                                           .arg(encodingName(tab->encoding()), origin,
                                                 tab->lineEndingName()));
 
     const QStringList syntaxNames = {
@@ -5088,6 +5348,9 @@ void MainWindow::restoreSession()
 
 void MainWindow::saveSessionNow(bool forceSnapshots)
 {
+    if (!forceSnapshots && AsyncSerialQueue::session().busy())
+        return; // Coalesce periodic autosaves; the next timer captures the latest revision.
+
     QVector<EditorTab *> tabs;
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
@@ -5096,7 +5359,70 @@ void MainWindow::saveSessionNow(bool forceSnapshots)
         if (tab)
             tabs.append(tab);
     }
-    m_session->saveSession(tabs, m_tabs->currentIndex(), forceSnapshots);
+    auto plan = m_session->captureAsyncSave(
+        tabs, m_tabs->currentIndex(), forceSnapshots);
+    auto result = std::make_shared<std::shared_ptr<SessionManager::AsyncSaveResult>>();
+
+    AsyncSerialQueue::Request request;
+    request.type = AsyncTaskType::SessionSnapshot;
+    request.priority = forceSnapshots ? AsyncTaskPriority::Highest
+                                      : AsyncTaskPriority::Lowest;
+    request.title = forceSnapshots ? QStringLiteral("正在提交恢复点")
+                                   : QStringLiteral("正在保存恢复快照");
+    request.categoryTag = QStringLiteral("Recovery");
+    request.cancellable = false;
+    request.worker = [manager = m_session, plan, result]
+        (qint64, AsyncCancelPtr, const auto &, const auto &) {
+            *result = manager->writeAsyncSave(plan);
+            if (!manager->asyncSaveSucceeded(*result))
+                throw std::runtime_error("session recovery snapshot commit failed");
+        };
+
+    QPointer<MainWindow> guarded(this);
+    if (!forceSnapshots) {
+        request.completed = [guarded, result](AsyncTaskState state) {
+            if (!guarded || !guarded->m_session)
+                return;
+            QVector<EditorTab *> currentTabs;
+            for (int i = 0; i < guarded->m_tabs->count(); ++i) {
+                if (auto *tab = qobject_cast<EditorTab *>(guarded->m_tabs->widget(i)))
+                    currentTabs.append(tab);
+            }
+            guarded->m_session->applyAsyncSave(*result, currentTabs);
+            if (state == AsyncTaskState::Failed)
+                guarded->statusBar()->showMessage(
+                    QStringLiteral("自动恢复快照未能提交；将稍后重试。"), 5000);
+        };
+        AsyncSerialQueue::session().enqueue(std::move(request));
+        return;
+    }
+
+    QProgressDialog progress(QStringLiteral("正在建立最新恢复点…"), QString(),
+                             0, 0, this);
+    progress.setObjectName(QStringLiteral("sessionCommitProgress"));
+    progress.setWindowModality(Qt::ApplicationModal);
+    progress.setMinimumDuration(150);
+    progress.setCancelButton(nullptr);
+    QEventLoop loop;
+    request.completed = [guarded, result, &loop, &progress](AsyncTaskState state) {
+        if (guarded && guarded->m_session) {
+            QVector<EditorTab *> currentTabs;
+            for (int i = 0; i < guarded->m_tabs->count(); ++i) {
+                if (auto *tab = qobject_cast<EditorTab *>(guarded->m_tabs->widget(i)))
+                    currentTabs.append(tab);
+            }
+            guarded->m_session->applyAsyncSave(*result, currentTabs);
+            if (state == AsyncTaskState::Failed) {
+                guarded->statusBar()->showMessage(
+                    QStringLiteral("恢复点提交失败；已有恢复文件仍被保留。"), 7000);
+            }
+        }
+        progress.close();
+        loop.quit();
+    };
+    AsyncSerialQueue::session().enqueue(std::move(request));
+    progress.show();
+    loop.exec(QEventLoop::ExcludeUserInputEvents);
 }
 
 // ============================================================================

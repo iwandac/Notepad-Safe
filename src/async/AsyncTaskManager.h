@@ -29,8 +29,10 @@ public:
         TaskStartedAtRole,
         TaskFinishedAtRole,
         TaskElapsedMsRole,
+        TaskEstimatedRemainingMsRole,
         TaskErrorRole,
         TaskCategoryTagRole,
+        TaskCancellableRole,
         TaskStateTextRole,
         TaskPriorityTextRole,
         TaskTypeTextRole
@@ -70,7 +72,11 @@ public:
                   WorkerFn workerFn = WorkerFn(),
                   qint64 batchId = 0,
                   const QString &categoryTag = QString(),
-                  qint64 progressTotalInit = -1);
+                  qint64 progressTotalInit = -1,
+                  bool cancellable = true);
+
+    /** 切换到短暂的不可取消提交阶段；不会改变任务的排队优先级。 */
+    Q_INVOKABLE void setTaskCancellable(qint64 taskId, bool cancellable);
 
     /** 取消单个任务（设置 cancel 原子 + 改为 Canceled 状态） */
     Q_INVOKABLE void cancel(qint64 taskId);

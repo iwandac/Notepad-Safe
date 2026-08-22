@@ -55,7 +55,9 @@
 #include <QtWidgets/QStatusBar>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QMessageBox>
+#include <QtWidgets/QFileDialog>
 #include <QtWidgets/QPushButton>
+#include <QtWidgets/QCheckBox>
 #include <QtWidgets/QLineEdit>
 #include <QtWidgets/QComboBox>
 #include <QtWidgets/QTreeView>
@@ -78,9 +80,11 @@
 #include "MainWindow.h"
 #include "EditorTab.h"
 #include "VirtualFileView.h"
+#include "WindowedReadOnlyProvider.h"
 #include "FindReplaceDialog.h"
 #include "SearchResultsDock.h"
 #include "SearchResultsModel.h"
+#include "TextEncoding.h"
 #include "AsyncTaskManager.h"
 #include "AsyncTaskPanelDialog.h"
 #include "SessionManager.h"
@@ -325,6 +329,67 @@ static QString makeL1FixtureFile(QTemporaryDir& td, const QString& name) {
     return QFileInfo(p).absoluteFilePath();
 }
 
+struct EncodedSearchFixture {
+    QString path;
+    QString markerText;
+    QString regexQuery;
+    QByteArray markerBytes;
+    qint64 markerOffset = -1;
+};
+
+// A real S2 text document whose only non-ASCII record is encoded as GB18030.
+// Keeping the marker near the beginning makes both the initial visible
+// projection and the search result independently observable in the GUI.
+static EncodedSearchFixture makeGb18030SearchFixture(QTemporaryDir& td) {
+    EncodedSearchFixture fixture;
+    const char32_t supplementary = 0x20000;
+    const QString rareCharacter = QString::fromUcs4(&supplementary, 1);
+    fixture.markerText = QStringLiteral("用户") + rareCharacter
+        + QStringLiteral(" id=4821 END");
+    fixture.regexQuery = QStringLiteral("用户") + rareCharacter
+        + QStringLiteral("\\s+id=\\d+\\s+END");
+    bool encodedExactly = false;
+    fixture.markerBytes = encodeTextFragment(
+        fixture.markerText, TextEncoding::GB18030, &encodedExactly);
+    if (!encodedExactly || fixture.markerBytes.isEmpty())
+        return fixture;
+
+    fixture.path = td.filePath(QStringLiteral("gui-search-gb18030-s2.log"));
+    QFile file(fixture.path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        fixture.path.clear();
+        return fixture;
+    }
+    const QByteArray prefix("boot complete\nrequest accepted\n");
+    if (file.write(prefix) != prefix.size()) {
+        fixture.path.clear();
+        return fixture;
+    }
+    fixture.markerOffset = prefix.size();
+    if (file.write(fixture.markerBytes) != fixture.markerBytes.size()
+        || file.write("\n", 1) != 1) {
+        fixture.path.clear();
+        return fixture;
+    }
+    QByteArray filler;
+    filler.reserve(1024 * 1024);
+    while (filler.size() < 1024 * 1024)
+        filler.append("ordinary log record status=ok sequence=00000000\n");
+    const qint64 target = 33LL * 1024 * 1024;
+    while (file.pos() < target) {
+        const qint64 remaining = target - file.pos();
+        const qsizetype amount = static_cast<qsizetype>(
+            qMin<qint64>(remaining, filler.size()));
+        if (file.write(filler.constData(), amount) != amount) {
+            fixture.path.clear();
+            return fixture;
+        }
+    }
+    file.close();
+    fixture.path = QFileInfo(fixture.path).absoluteFilePath();
+    return fixture;
+}
+
 // openFilesFromExternal 是异步/阻塞未知？给一段等待直到 tab 出现 & L2 标记切换：
 static bool waitForTabCountAndL2(MainWindow* mw, int expectedCount, bool wantL2OnActive,
                                   int timeoutMs = 8000) {
@@ -379,6 +444,54 @@ private:
     QString l2FixtureD003_;
     QString l2FixtureD007_;
     QString l1FixtureD007_;
+    EncodedSearchFixture gb18030SearchFixture_;
+
+    bool ensureGb18030SearchFixture() {
+        if (!gb18030SearchFixture_.path.isEmpty()
+            && QFileInfo::exists(gb18030SearchFixture_.path)) {
+            return true;
+        }
+        gb18030SearchFixture_ = makeGb18030SearchFixture(tmpDir_);
+        return !gb18030SearchFixture_.path.isEmpty()
+            && gb18030SearchFixture_.markerOffset >= 0;
+    }
+
+    static QPushButton *buttonWithText(QWidget *parent, const QString &text) {
+        if (!parent) return nullptr;
+        for (QPushButton *button : parent->findChildren<QPushButton *>()) {
+            if (button->text() == text)
+                return button;
+        }
+        return nullptr;
+    }
+
+    bool displayCurrentDocumentAs(const QString &encodingId) {
+        auto *action = mw_->findChild<QAction *>(
+            QStringLiteral("encoding.display.%1").arg(encodingId));
+        QMenu *menu = nullptr;
+        for (QMenu *candidate : mw_->findChildren<QMenu *>()) {
+            if (candidate->actions().contains(action)) {
+                menu = candidate;
+                break;
+            }
+        }
+        if (!menu || !action || !action->isEnabled())
+            return false;
+        menu->popup(mw_->mapToGlobal(QPoint(180, mw_->menuBar()->height() + 40)));
+        if (!QTest::qWaitForWindowExposed(menu))
+            return false;
+        const QRect geometry = menu->actionGeometry(action);
+        if (!geometry.isValid())
+            return false;
+        QTest::mouseClick(menu, Qt::LeftButton, Qt::NoModifier, geometry.center());
+        QElapsedTimer timer;
+        timer.start();
+        while (menu->isVisible() && timer.elapsed() < 1000) {
+            QApplication::processEvents(QEventLoop::AllEvents, 50);
+            QTest::qWait(10);
+        }
+        return !menu->isVisible();
+    }
 
 private slots:
     void initTestCase() {
@@ -633,6 +746,8 @@ private slots:
         auto sortAsc = [&]{ return findMenuActionByExactDisplay(mw_, QStringLiteral("行升序排序")); };
         auto sortDesc = [&]{ return findMenuActionByExactDisplay(mw_, QStringLiteral("行降序排序")); };
         auto encActs = [&]{ return collectEncodingActions(mw_); };
+        auto *wordWrap = mw_->findChild<QAction *>(QStringLiteral("view.wordWrap"));
+        QVERIFY(wordWrap != nullptr);
 
         // 阶段 0 断言：无 tab → sortAsc/sortDesc + 转为组 5 项全 false
         QVERIFY(sortAsc() && !sortAsc()->isEnabled());
@@ -653,6 +768,11 @@ private slots:
         QVERIFY(waitForTabCountAndL2(mw_, 1, false, 3000));
         auto* etL1 = currentEditorTab(mw_);
         QVERIFY(etL1 && !etL1->isL2Active());
+        QVERIFY(wordWrap->isEnabled());
+        if (!wordWrap->isChecked())
+            wordWrap->trigger();
+        QVERIFY(wordWrap->isChecked());
+        QVERIFY(etL1->wordWrap());
         QVERIFY2(sortAsc()->isEnabled(), "D007 阶段1 L1 打开：行升序排序应 enabled=true（L1 可执行排序）");
         QVERIFY2(sortDesc()->isEnabled(), "D007 阶段1 L1 打开：行降序排序应 enabled=true");
         {
@@ -672,6 +792,9 @@ private slots:
         mw_->openFilesFromExternal(QStringList{l2FixtureD007_});
         QVERIFY(waitForTabCountAndL2(mw_, 2, true, 15000));
         QCOMPARE(tabCount(mw_), 2);
+        QVERIFY(!wordWrap->isEnabled());
+        QVERIFY(!wordWrap->isChecked());
+        QVERIFY(!currentEditorTab(mw_)->wordWrap());
         QVERIFY2(!sortAsc()->isEnabled(), "D007 阶段2 切 L2：行升序排序应该立即变灰 enabled=false（D002 切 tab 同步）");
         QVERIFY2(!sortDesc()->isEnabled(), "D007 阶段2 切 L2：行降序排序应该立即变灰 enabled=false（D002 切 tab 同步）");
         {
@@ -692,6 +815,12 @@ private slots:
         switchToTab(mw_, 0);
         auto* backL1 = currentEditorTab(mw_);
         QVERIFY(backL1 && !backL1->isL2Active());
+        QVERIFY(wordWrap->isEnabled());
+        QVERIFY(wordWrap->isChecked());
+        QVERIFY(backL1->wordWrap());
+        wordWrap->trigger();
+        QVERIFY(!wordWrap->isChecked());
+        QVERIFY(!backL1->wordWrap());
         QVERIFY2(sortAsc()->isEnabled(), "D007 阶段3 切回 L1：行升序排序应恢复 enabled=true（D002 false→true）");
         QVERIFY2(sortDesc()->isEnabled(), "D007 阶段3 切回 L1：行降序排序应恢复 enabled=true");
         {
@@ -707,6 +836,7 @@ private slots:
         //       每一步断言 enabled 状态不跳变
         switchToTab(mw_, 1);
         QVERIFY(currentEditorTab(mw_) && currentEditorTab(mw_)->isL2Active());
+        QVERIFY(!wordWrap->isEnabled() && !wordWrap->isChecked());
         QVERIFY(!sortAsc()->isEnabled() && !sortDesc()->isEnabled());
         {
             auto e = encActs();
@@ -2798,7 +2928,7 @@ private slots:
         closeAllEditorTabs(mw_);
     }
 
-    void tc_reopen_with_encoding_protects_unsaved_text() {
+    void tc_gui_display_encoding_modified_small_file_uses_save_or_cancel() {
         closeAllEditorTabs(mw_);
         QCOMPARE(tabCount(mw_), 0);
 
@@ -2815,58 +2945,53 @@ private slots:
         QVERIFY(tab && !tab->isL2Active());
         QCOMPARE(tab->encoding(), TextEncoding::Utf8);
 
-        QAction *reopenAsUtf8Bom = findMenuActionByExactDisplay(
-            mw_, QStringLiteral("以 UTF-8 (含 BOM) 重新打开"));
+        QAction *reopenAsUtf8Bom = mw_->findChild<QAction *>(
+            QStringLiteral("encoding.display.utf8bom"));
         QVERIFY(reopenAsUtf8Bom && reopenAsUtf8Bom->isEnabled());
         tab->editor()->setText(QStringLiteral("UNSAVED 用户修改"));
         tab->setModified(true);
 
         bool cancelDialogSeen = false;
-        QTimer::singleShot(50, this, [&]() {
-            for (QWidget *widget : QApplication::topLevelWidgets()) {
-                auto *box = qobject_cast<QMessageBox *>(widget);
-                if (!box || !box->isVisible()
-                    || box->windowTitle() != QStringLiteral("以编码重新打开")) {
-                    continue;
-                }
+        QTimer cancelPoll;
+        cancelPoll.setInterval(20);
+        connect(&cancelPoll, &QTimer::timeout, this, [&]() {
+            auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+            if (box && box->isVisible()
+                && box->windowTitle() == QStringLiteral("保存修改")) {
                 cancelDialogSeen = true;
                 const QString screenshot = QCoreApplication::applicationDirPath()
                     + QStringLiteral("/gui-encoding-reopen-unsaved.png");
                 box->grab().save(screenshot);
-                for (QPushButton *button : box->findChildren<QPushButton *>()) {
-                    if (button->text().contains(QStringLiteral("取消"))) {
-                        QTest::mouseClick(button, Qt::LeftButton);
-                        return;
-                    }
-                }
+                auto *button = qobject_cast<QPushButton *>(
+                    box->button(QMessageBox::Cancel));
+                if (button) QTest::mouseClick(button, Qt::LeftButton);
             }
         });
+        cancelPoll.start();
         reopenAsUtf8Bom->trigger();
+        cancelPoll.stop();
         QVERIFY(cancelDialogSeen);
         QCOMPARE(tab->editor()->text(), QStringLiteral("UNSAVED 用户修改"));
         QVERIFY(tab->isModified());
         QCOMPARE(tab->encoding(), TextEncoding::Utf8);
 
-        bool discardDialogSeen = false;
-        QTimer::singleShot(50, this, [&]() {
-            for (QWidget *widget : QApplication::topLevelWidgets()) {
-                auto *box = qobject_cast<QMessageBox *>(widget);
-                if (!box || !box->isVisible()
-                    || box->windowTitle() != QStringLiteral("以编码重新打开")) {
-                    continue;
-                }
-                discardDialogSeen = true;
-                for (QPushButton *button : box->findChildren<QPushButton *>()) {
-                    if (button->text().contains(QStringLiteral("放弃修改"))) {
-                        QTest::mouseClick(button, Qt::LeftButton);
-                        return;
-                    }
-                }
+        bool saveDialogSeen = false;
+        QTimer savePoll;
+        savePoll.setInterval(20);
+        connect(&savePoll, &QTimer::timeout, this, [&]() {
+            auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+            if (box && box->isVisible()
+                && box->windowTitle() == QStringLiteral("保存修改")) {
+                saveDialogSeen = true;
+                auto *button = qobject_cast<QPushButton *>(box->button(QMessageBox::Save));
+                if (button) QTest::mouseClick(button, Qt::LeftButton);
             }
         });
+        savePoll.start();
         reopenAsUtf8Bom->trigger();
-        QVERIFY(discardDialogSeen);
-        QCOMPARE(tab->editor()->text(), QString::fromUtf8(original));
+        savePoll.stop();
+        QVERIFY(saveDialogSeen);
+        QCOMPARE(tab->editor()->text(), QStringLiteral("UNSAVED 用户修改"));
         QVERIFY(!tab->isModified());
         QCOMPARE(tab->encoding(), TextEncoding::Utf8Bom);
         QCOMPARE(tab->displayEncoding(), TextEncoding::Utf8Bom);
@@ -2874,12 +2999,12 @@ private slots:
         {
             QFile file(path);
             QVERIFY(file.open(QIODevice::ReadOnly));
-            QCOMPARE(file.readAll(), original);
+            QCOMPARE(file.readAll(), QStringLiteral("UNSAVED 用户修改").toUtf8());
         }
         closeAllEditorTabs(mw_);
     }
 
-    void tc_encoding_conversion_preserves_detected_line_endings() {
+    void tc_gui_encoding_conversion_saves_new_file_and_opens_it() {
         closeAllEditorTabs(mw_);
         const QString path = tmpDir_.filePath(QStringLiteral("encoding-eol.txt"));
         {
@@ -2921,17 +3046,38 @@ private slots:
                 QVERIFY2(i > 0 && utf8Bytes.at(i - 1) == '\r', "found a lone LF in CRLF document");
         }
 
-        QAction *convertUtf16 = findMenuActionByExactDisplay(
-            mw_, QStringLiteral("转为 UTF-16 Little Endian"));
+        QAction *convertUtf16 = mw_->findChild<QAction *>(
+            QStringLiteral("encoding.convert.utf16le"));
         QVERIFY(convertUtf16 && convertUtf16->isEnabled());
+        const QString convertedPath = tmpDir_.filePath(
+            QStringLiteral("encoding-eol-converted.txt"));
+        bool saveAsSeen = false;
+        QTimer saveAsPoll;
+        saveAsPoll.setInterval(20);
+        connect(&saveAsPoll, &QTimer::timeout, this, [&]() {
+            auto *dialog = mw_->findChild<QFileDialog *>(
+                QStringLiteral("encodingConversionSaveAsDialog"));
+            if (!dialog || !dialog->isVisible())
+                return;
+            saveAsSeen = true;
+            dialog->selectFile(convertedPath);
+            static_cast<QDialog *>(dialog)->accept();
+        });
+        saveAsPoll.start();
         convertUtf16->trigger();
-        QCOMPARE(tab->encoding(), TextEncoding::Utf16LE);
-        QVERIFY(tab->isModified());
-        saveAction->trigger();
-        QTRY_VERIFY_WITH_TIMEOUT(!tab->isModified(), 3000);
+        saveAsPoll.stop();
+        QVERIFY(saveAsSeen);
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 2, 3000);
+        EditorTab *convertedTab = currentEditorTab(mw_);
+        QVERIFY(convertedTab && convertedTab != tab);
+        QCOMPARE(QFileInfo(convertedTab->filePath()).absoluteFilePath(),
+                 QFileInfo(convertedPath).absoluteFilePath());
+        QCOMPARE(convertedTab->encoding(), TextEncoding::Utf16LE);
+        QCOMPARE(tab->encoding(), TextEncoding::Utf8);
+        QVERIFY(!tab->isModified());
         QByteArray utf16Bytes;
         {
-            QFile file(path);
+            QFile file(convertedPath);
             QVERIFY(file.open(QIODevice::ReadOnly));
             utf16Bytes = file.readAll();
         }
@@ -2939,7 +3085,7 @@ private slots:
         const DecodeResult decoded = decodeBytes(utf16Bytes);
         QCOMPARE(decoded.encoding, TextEncoding::Utf16LE);
         QVERIFY(decoded.text.contains(QStringLiteral("beta\r\ngamma")));
-        QCOMPARE(tab->lineEndingName(), QStringLiteral("CRLF"));
+        QCOMPARE(convertedTab->lineEndingName(), QStringLiteral("CRLF"));
         QVERIFY(encodingStatus->text().contains(QStringLiteral("UTF-16LE")));
         QVERIFY(encodingStatus->text().contains(QStringLiteral("CRLF")));
         closeAllEditorTabs(mw_);
@@ -3535,7 +3681,7 @@ private slots:
             context.data(SearchResultsModel::MatchByteRangesRole).toList();
         QCOMPARE(ranges.size(), 1);
 
-        QSignalSpy jumpSpy(dock, &SearchResultsDock::jumpToTabByteOffset);
+        QSignalSpy jumpSpy(dock, &SearchResultsDock::jumpToTab);
         switchToTab(mw_, 0);
         tree->resizeColumnToContents(SearchResultsModel::COL_CONTEXT);
         tree->scrollTo(context);
@@ -3858,6 +4004,441 @@ private slots:
         const QString screenshot = QCoreApplication::applicationDirPath()
                                    + QStringLiteral("/gui-status-character-count.png");
         QVERIFY2(mw_->grab().save(screenshot), qPrintable(screenshot));
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_gui_search_assistant_builds_and_runs_a_real_query() {
+        closeAllEditorTabs(mw_);
+        const QString path = tmpDir_.filePath(QStringLiteral("gui-search-assistant.log"));
+        {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            const QByteArray contents(
+                "event.id=4821 level=info\n"
+                "eventXid=99 level=noise\n"
+                "event.id=77 level=warn\n");
+            QCOMPARE(file.write(contents), qint64(contents.size()));
+        }
+        mw_->openFilesFromExternal({path});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && !tab->isL2Active());
+
+        tab->editor()->setFocus();
+        QTest::keyClick(tab->editor(), Qt::Key_F, Qt::ControlModifier);
+        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+        QTRY_VERIFY_WITH_TIMEOUT(dialog && dialog->isVisible(), 2000);
+        auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        auto *toggle = dialog->findChild<QPushButton *>(QStringLiteral("regexAssistantToggle"));
+        auto *assistant = dialog->findChild<QWidget *>(QStringLiteral("regexAssistant"));
+        auto *regex = dialog->findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+        auto *hint = dialog->findChild<QLabel *>(QStringLiteral("regexQueryHint"));
+        auto *findAll = dialog->findChild<QPushButton *>(QStringLiteral("findAllButton"));
+        auto *close = dialog->findChild<QPushButton *>(QStringLiteral("closeSearchButton"));
+        QVERIFY(pattern && toggle && assistant && regex && hint && findAll && close);
+        QVERIFY(!assistant->isVisible());
+
+        QTest::mouseClick(toggle, Qt::LeftButton);
+        QVERIFY(toggle->isChecked());
+        QVERIFY(assistant->isVisible());
+        QVERIFY(regex->isChecked());
+        QPushButton *literal = buttonWithText(assistant, QStringLiteral("原样文本"));
+        QPushButton *digits = buttonWithText(assistant, QStringLiteral("数字"));
+        QVERIFY(literal && digits);
+
+        pattern->setFocus();
+        QTest::keyClicks(pattern, QStringLiteral("event.id="));
+        QTest::keyClick(pattern, Qt::Key_A, Qt::ControlModifier);
+        QTest::mouseClick(literal, Qt::LeftButton);
+        QCOMPARE(pattern->text(), QStringLiteral("event\\.id\\="));
+        QTest::mouseClick(digits, Qt::LeftButton);
+        QCOMPARE(pattern->text(), QStringLiteral("event\\.id\\=\\d+"));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            hint->text().contains(QStringLiteral("表达式有效")), 1000);
+
+        auto *dock = mw_->findChild<SearchResultsDock *>(QStringLiteral("SearchResultsDock"));
+        auto *tree = dock ? dock->findChild<QTreeView *>(
+            QStringLiteral("searchResultsTree")) : nullptr;
+        QVERIFY(dock && tree);
+        QTest::mouseClick(findAll, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(dock->isVisible() && tree->model(), 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(tree->model()->rowCount(), 2, 3000);
+
+        const QString dialogScreenshot = QCoreApplication::applicationDirPath()
+            + QStringLiteral("/gui-search-assistant-user-query.png");
+        QVERIFY2(dialog->grab().save(dialogScreenshot), qPrintable(dialogScreenshot));
+        QTest::mouseClick(close, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!dialog->isVisible(), 1000);
+
+        QSignalSpy jumpSpy(dock, &SearchResultsDock::jumpToTabByteOffset);
+        const QModelIndex first = tree->model()->index(
+            0, SearchResultsModel::COL_CONTEXT);
+        tree->scrollTo(first);
+        QApplication::processEvents(QEventLoop::AllEvents, 100);
+        const QRect firstRect = tree->visualRect(first);
+        QVERIFY(firstRect.isValid());
+        QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                          Qt::NoModifier, firstRect.center());
+        QTest::mouseDClick(tree->viewport(), Qt::LeftButton,
+                           Qt::NoModifier, firstRect.center());
+        QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->editor()->selectedText(),
+                                  QStringLiteral("event.id=4821"), 2000);
+        const QString resultScreenshot = QCoreApplication::applicationDirPath()
+            + QStringLiteral("/gui-search-assistant-result-jump.png");
+        QVERIFY2(mw_->grab().save(resultScreenshot), qPrintable(resultScreenshot));
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_gui_gb18030_regex_search_returns_raw_byte_result() {
+        closeAllEditorTabs(mw_);
+        QVERIFY2(ensureGb18030SearchFixture(), "unable to create GB18030 S2 fixture");
+        mw_->openFilesFromExternal({gb18030SearchFixture_.path});
+        QVERIFY(waitForTabCountAndL2(mw_, 1, true, 8000));
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && tab->isL2Active());
+        QVERIFY(tab->viewModeL2() == ViewMode::Text);
+        QCOMPARE(tab->displayEncoding(), TextEncoding::GB18030);
+        QVERIFY2(displayCurrentDocumentAs(QStringLiteral("gb18030")),
+                 "GB18030 reopen menu action was not user-clickable");
+        QCOMPARE(tab->displayEncoding(), TextEncoding::GB18030);
+
+        auto *provider = tab->windowedReadOnlyProvider();
+        QVERIFY(provider);
+        provider->editor()->setFocus();
+        QTest::keyClick(provider->editor(), Qt::Key_F, Qt::ControlModifier);
+        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+        QTRY_VERIFY_WITH_TIMEOUT(dialog && dialog->isVisible(), 2000);
+        auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        auto *regex = dialog->findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+        auto *hint = dialog->findChild<QLabel *>(QStringLiteral("regexQueryHint"));
+        auto *findNext = dialog->findChild<QPushButton *>(QStringLiteral("findNextButton"));
+        auto *close = dialog->findChild<QPushButton *>(QStringLiteral("closeSearchButton"));
+        auto *status = dialog->findChild<QLabel *>(QStringLiteral("findStatusLabel"));
+        QVERIFY(pattern && regex && hint && findNext && close && status);
+
+        QApplication::clipboard()->setText(gb18030SearchFixture_.regexQuery);
+        pattern->setFocus();
+        QTest::keyClick(pattern, Qt::Key_A, Qt::ControlModifier);
+        QTest::keyClick(pattern, Qt::Key_V, Qt::ControlModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(pattern->text(),
+                                  gb18030SearchFixture_.regexQuery, 1000);
+        if (!regex->isChecked())
+            QTest::mouseClick(regex, Qt::LeftButton);
+        QVERIFY(regex->isChecked());
+        QTRY_VERIFY_WITH_TIMEOUT(
+            hint->text().contains(QStringLiteral("表达式有效")), 1000);
+
+        QElapsedTimer searchElapsed;
+        searchElapsed.start();
+        QTest::mouseClick(findNext, Qt::LeftButton);
+        QVERIFY2(searchElapsed.elapsed() < 3000,
+                 "GB18030 Find Next did not return within an interactive bound");
+        QVERIFY2(tab->lastSearchError().isEmpty(),
+                 qPrintable(tab->lastSearchError()));
+        QVERIFY(!status->text().contains(QStringLiteral("正则无效")));
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(),
+                                  gb18030SearchFixture_.markerOffset, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(),
+                                  gb18030SearchFixture_.markerOffset
+                                      + gb18030SearchFixture_.markerBytes.size(),
+                                  3000);
+        QCOMPARE(provider->sourceBytes(provider->selectionStartOffset(),
+                                       gb18030SearchFixture_.markerBytes.size()),
+                 gb18030SearchFixture_.markerBytes);
+        const QString dialogScreenshot = QCoreApplication::applicationDirPath()
+            + QStringLiteral("/gui-search-gb18030-regex-query.png");
+        QVERIFY2(dialog->grab().save(dialogScreenshot), qPrintable(dialogScreenshot));
+        QTest::mouseClick(close, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!dialog->isVisible(), 1000);
+        const QString resultScreenshot = QCoreApplication::applicationDirPath()
+            + QStringLiteral("/gui-search-gb18030-result-jump.png");
+        QVERIFY2(mw_->grab().save(resultScreenshot), qPrintable(resultScreenshot));
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_gui_small_file_detects_gb18030_without_manual_switch() {
+        closeAllEditorTabs(mw_);
+        const char32_t supplementary = 0x20000;
+        const QString expected = QStringLiteral("日志 用户")
+            + QString::fromUcs4(&supplementary, 1)
+            + QStringLiteral(" 编码检测\r\n");
+        bool encodedExactly = false;
+        const QByteArray bytes = encodeTextFragment(
+            expected, TextEncoding::GB18030, &encodedExactly);
+        QVERIFY(encodedExactly);
+        const QString path = tmpDir_.filePath(QStringLiteral("detect-small-gb18030.log"));
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(file.write(bytes), qint64(bytes.size()));
+        file.close();
+        const EncodingDetection directDetection = detectEncoding(bytes);
+        QCOMPARE(directDetection.encoding, TextEncoding::GB18030);
+
+        mw_->openFilesFromExternal({path});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && !tab->isL2Active());
+        QCOMPARE(tab->encoding(), TextEncoding::GB18030);
+        QCOMPARE(tab->editor()->text(), expected);
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_gui_gb18030_reopen_updates_the_visible_large_file_text() {
+        closeAllEditorTabs(mw_);
+        QVERIFY2(ensureGb18030SearchFixture(), "unable to create GB18030 S2 fixture");
+        mw_->openFilesFromExternal({gb18030SearchFixture_.path});
+        QVERIFY(waitForTabCountAndL2(mw_, 1, true, 8000));
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && tab->viewModeL2() == ViewMode::Text);
+        QCOMPARE(tab->displayEncoding(), TextEncoding::GB18030);
+        auto *provider = tab->windowedReadOnlyProvider();
+        QVERIFY(provider && provider->editor());
+        QVERIFY2(displayCurrentDocumentAs(QStringLiteral("gb18030")),
+                 "GB18030 reopen menu action was not user-clickable");
+        QCOMPARE(tab->displayEncoding(), TextEncoding::GB18030);
+        QApplication::processEvents(QEventLoop::AllEvents, 200);
+
+        const QString screenshot = QCoreApplication::applicationDirPath()
+            + QStringLiteral("/gui-search-gb18030-visible-projection.png");
+        QVERIFY2(mw_->grab().save(screenshot), qPrintable(screenshot));
+        QVERIFY2(provider->editor()->text().contains(gb18030SearchFixture_.markerText),
+                 qPrintable(QStringLiteral(
+                     "菜单已勾选 GB18030，但用户可见的大文件文本未按 GB18030 重新解码。当前可见前缀：%1")
+                     .arg(provider->editor()->text().left(160))));
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_gui_large_encoding_conversion_streams_to_new_file_and_opens_it() {
+        closeAllEditorTabs(mw_);
+        QVERIFY2(ensureGb18030SearchFixture(), "unable to create GB18030 S2 fixture");
+        const QByteArray originalPrefix = [&]() {
+            QFile file(gb18030SearchFixture_.path);
+            if (!file.open(QIODevice::ReadOnly)) return QByteArray();
+            return file.read(256);
+        }();
+        QVERIFY(!originalPrefix.isEmpty());
+        mw_->openFilesFromExternal({gb18030SearchFixture_.path});
+        QVERIFY(waitForTabCountAndL2(mw_, 1, true, 8000));
+        EditorTab *sourceTab = currentEditorTab(mw_);
+        QVERIFY(sourceTab && sourceTab->displayEncoding() == TextEncoding::GB18030);
+
+        QAction *convertUtf8 = mw_->findChild<QAction *>(
+            QStringLiteral("encoding.convert.utf8"));
+        QVERIFY(convertUtf8 && convertUtf8->isEnabled());
+        const QString target = tmpDir_.filePath(
+            QStringLiteral("gui-search-gb18030-converted-utf8.log"));
+        bool saveAsSeen = false;
+        QTimer saveAsPoll;
+        saveAsPoll.setInterval(20);
+        connect(&saveAsPoll, &QTimer::timeout, this, [&]() {
+            auto *dialog = mw_->findChild<QFileDialog *>(
+                QStringLiteral("encodingConversionSaveAsDialog"));
+            if (!dialog || !dialog->isVisible()) return;
+            saveAsSeen = true;
+            dialog->selectFile(target);
+            static_cast<QDialog *>(dialog)->accept();
+        });
+        saveAsPoll.start();
+        convertUtf8->trigger();
+        saveAsPoll.stop();
+        QVERIFY(saveAsSeen);
+
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 2, 8000);
+        EditorTab *convertedTab = currentEditorTab(mw_);
+        QVERIFY(convertedTab && convertedTab != sourceTab);
+        QVERIFY(convertedTab->isL2Active());
+        QCOMPARE(convertedTab->encoding(), TextEncoding::Utf8);
+        auto *provider = convertedTab->windowedReadOnlyProvider();
+        QVERIFY(provider && provider->editor());
+        QVERIFY(provider->editor()->text().contains(gb18030SearchFixture_.markerText));
+        {
+            QFile source(gb18030SearchFixture_.path);
+            QVERIFY(source.open(QIODevice::ReadOnly));
+            QCOMPARE(source.read(originalPrefix.size()), originalPrefix);
+        }
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_gui_detection_uses_middle_and_rejects_invalid_real_eof() {
+        closeAllEditorTabs(mw_);
+        QByteArray distributed(2 * 1024 * 1024, 'A');
+        const char32_t supplementary = 0x20000;
+        bool exact = false;
+        const QByteArray marker = encodeTextFragment(
+            QString::fromUcs4(&supplementary, 1), TextEncoding::GB18030, &exact);
+        QVERIFY(exact && marker.size() == 4);
+        const qsizetype middle = distributed.size() / 2;
+        distributed.replace(middle, marker.size(), marker);
+        const QString distributedPath = tmpDir_.filePath(
+            QStringLiteral("encoding-distributed-gb18030.log"));
+        QFile distributedFile(distributedPath);
+        QVERIFY(distributedFile.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(distributedFile.write(distributed), qint64(distributed.size()));
+        distributedFile.close();
+        QCOMPARE(detectFileEncoding(distributedPath).encoding, TextEncoding::GB18030);
+
+        mw_->openFilesFromExternal({distributedPath});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 5000);
+        QCOMPARE(currentEditorTab(mw_)->encoding(), TextEncoding::GB18030);
+        closeAllEditorTabs(mw_);
+
+        QByteArray invalidTail("ordinary utf8 text\n");
+        invalidTail.append(char(0xff));
+        const QString invalidPath = tmpDir_.filePath(
+            QStringLiteral("encoding-invalid-real-eof.log"));
+        QFile invalidFile(invalidPath);
+        QVERIFY(invalidFile.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(invalidFile.write(invalidTail), qint64(invalidTail.size()));
+        invalidFile.close();
+
+        mw_->openFilesFromExternal({invalidPath});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
+        EditorTab *invalidTab = currentEditorTab(mw_);
+        QVERIFY(invalidTab);
+        QCOMPARE(invalidTab->encoding(), TextEncoding::Utf8);
+        QCOMPARE(invalidTab->encodingOrigin(), EncodingOrigin::Fallback);
+        QVERIFY(invalidTab->encodingHasDecodeErrors());
+        auto *status = mw_->findChild<QLabel *>(QStringLiteral("status.encoding"));
+        QVERIFY(status && status->text().contains(QStringLiteral("包含非法字节")));
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_gui_conversion_reopens_ambiguous_ascii_with_selected_encoding() {
+        closeAllEditorTabs(mw_);
+        const QByteArray sourceBytes("plain ascii stays ambiguous after conversion\r\n");
+        const QString sourcePath = tmpDir_.filePath(QStringLiteral("encoding-ascii-source.txt"));
+        QFile source(sourcePath);
+        QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(source.write(sourceBytes), qint64(sourceBytes.size()));
+        source.close();
+        mw_->openFilesFromExternal({sourcePath});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
+
+        QAction *convert = mw_->findChild<QAction *>(
+            QStringLiteral("encoding.convert.windows1252"));
+        QVERIFY(convert && convert->isEnabled());
+        const QString target = tmpDir_.filePath(QStringLiteral("encoding-ascii-cp1252.txt"));
+        bool dialogSeen = false;
+        QTimer dialogPoll;
+        dialogPoll.setInterval(20);
+        connect(&dialogPoll, &QTimer::timeout, this, [&]() {
+            auto *dialog = mw_->findChild<QFileDialog *>(
+                QStringLiteral("encodingConversionSaveAsDialog"));
+            if (!dialog || !dialog->isVisible()) return;
+            dialogSeen = true;
+            dialog->selectFile(target);
+            static_cast<QDialog *>(dialog)->accept();
+        });
+        dialogPoll.start();
+        convert->trigger();
+        dialogPoll.stop();
+        QVERIFY(dialogSeen);
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 2, 5000);
+        EditorTab *converted = currentEditorTab(mw_);
+        QVERIFY(converted);
+        QCOMPARE(converted->encoding(), TextEncoding::Windows1252);
+        QCOMPARE(converted->encodingOrigin(), EncodingOrigin::UserSelected);
+        QFile targetFile(target);
+        QVERIFY(targetFile.open(QIODevice::ReadOnly));
+        QCOMPARE(targetFile.readAll(), sourceBytes);
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_gui_legacy_save_refuses_unrepresentable_user_edit() {
+        closeAllEditorTabs(mw_);
+        const QString originalText = QStringLiteral("用户文件编码测试\r\n");
+        bool exact = false;
+        const QByteArray originalBytes = encodeTextFragment(
+            originalText, TextEncoding::GBK, &exact);
+        QVERIFY(exact);
+        const QString path = tmpDir_.filePath(QStringLiteral("encoding-gbk-save.log"));
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(file.write(originalBytes), qint64(originalBytes.size()));
+        file.close();
+        mw_->openFilesFromExternal({path});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && tab->encoding() == TextEncoding::GBK);
+        tab->editor()->setCursorPosition(0, originalText.size() - 2);
+        QInputMethodEvent emojiCommit;
+        emojiCommit.setCommitString(QString::fromUtf8("\xF0\x9F\x98\x80"));
+        QApplication::sendEvent(tab->editor(), &emojiCommit);
+        QVERIFY(tab->isModified());
+
+        bool warningSeen = false;
+        QString warningText;
+        QTimer warningPoll;
+        warningPoll.setInterval(20);
+        connect(&warningPoll, &QTimer::timeout, this, [&]() {
+            for (QMessageBox *box : mw_->findChildren<QMessageBox *>()) {
+                if (!box->isVisible()) continue;
+                warningSeen = true;
+                warningText = box->text() + QLatin1Char(' ') + box->informativeText();
+                box->accept();
+            }
+        });
+        warningPoll.start();
+        QVERIFY(QMetaObject::invokeMethod(mw_, "saveFile", Qt::DirectConnection));
+        warningPoll.stop();
+        QVERIFY(warningSeen);
+        QVERIFY(warningText.contains(QStringLiteral("无法保存文件")));
+        QFile unchanged(path);
+        QVERIFY(unchanged.open(QIODevice::ReadOnly));
+        QCOMPARE(unchanged.readAll(), originalBytes);
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_gui_large_conversion_rejects_unsampled_invalid_source_byte() {
+        closeAllEditorTabs(mw_);
+        const QString path = tmpDir_.filePath(QStringLiteral("encoding-large-invalid.log"));
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QByteArray block(1024 * 1024, 'A');
+        for (int i = 0; i < 33; ++i) {
+            if (i == 10) block[12345] = char(0xff);
+            QCOMPARE(file.write(block), qint64(block.size()));
+            if (i == 10) block[12345] = 'A';
+        }
+        file.close();
+        mw_->openFilesFromExternal({path});
+        QVERIFY(waitForTabCountAndL2(mw_, 1, true, 8000));
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && tab->encoding() == TextEncoding::Utf8);
+        QVERIFY(!tab->encodingHasDecodeErrors());
+
+        QAction *convert = mw_->findChild<QAction *>(
+            QStringLiteral("encoding.convert.utf16le"));
+        QVERIFY(convert && convert->isEnabled());
+        const QString target = tmpDir_.filePath(QStringLiteral("encoding-large-invalid-out.txt"));
+        bool dialogSeen = false;
+        bool warningSeen = false;
+        QString warningText;
+        QTimer poll;
+        poll.setInterval(20);
+        connect(&poll, &QTimer::timeout, this, [&]() {
+            auto *dialog = mw_->findChild<QFileDialog *>(
+                QStringLiteral("encodingConversionSaveAsDialog"));
+            if (dialog && dialog->isVisible()) {
+                dialogSeen = true;
+                dialog->selectFile(target);
+                static_cast<QDialog *>(dialog)->accept();
+            }
+            for (QMessageBox *box : mw_->findChildren<QMessageBox *>()) {
+                if (!box->isVisible()) continue;
+                warningSeen = true;
+                warningText = box->text() + QLatin1Char(' ') + box->informativeText();
+                box->accept();
+            }
+        });
+        poll.start();
+        convert->trigger();
+        poll.stop();
+        QVERIFY(dialogSeen);
+        QVERIFY(warningSeen);
+        QVERIFY(warningText.contains(QStringLiteral("不符合所选的 UTF-8 编码")));
+        QVERIFY(!QFileInfo::exists(target));
         closeAllEditorTabs(mw_);
     }
 };

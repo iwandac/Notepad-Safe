@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 #include <QApplication>
+#include <QByteArrayView>
 #include <QClipboard>
 #include <QEvent>
 #include <QFileInfo>
@@ -18,6 +20,7 @@
 #include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QScrollBar>
+#include <QScopeGuard>
 #include <QTextBlock>
 #include <QTextCursor>
 #include <QThread>
@@ -40,6 +43,46 @@ constexpr qint64 kHexWindowBytes = 256LL * 1024;
 constexpr qint64 kTextWindowBytes = 2LL * 1024 * 1024;
 constexpr qint64 kMaxTextProjectionBytes = 8LL * 1024 * 1024;
 constexpr qint64 kMaxClipboardBytes = 64LL * 1024 * 1024;
+constexpr qint64 kLinePrefixChunkBytes = 1LL * 1024 * 1024;
+constexpr qint64 kLineScanReadBytes = 16LL * 1024 * 1024;
+
+qint64 countPhysicalLineBreaks(QByteArrayView bytes, TextEncoding encoding,
+                               bool previousWasCr, bool *endsWithCr)
+{
+    qint64 breaks = 0;
+    bool priorCr = previousWasCr;
+    if (encoding == TextEncoding::Utf16LE
+        || encoding == TextEncoding::Utf16BE) {
+        for (qsizetype i = 0; i + 1 < bytes.size(); i += 2) {
+            const quint16 unit = encoding == TextEncoding::Utf16LE
+                ? quint16(uchar(bytes.at(i))) | (quint16(uchar(bytes.at(i + 1))) << 8)
+                : (quint16(uchar(bytes.at(i))) << 8) | quint16(uchar(bytes.at(i + 1)));
+            if (unit == '\r') {
+                ++breaks;
+                priorCr = true;
+            } else {
+                if (unit == '\n' && !priorCr)
+                    ++breaks;
+                priorCr = false;
+            }
+        }
+    } else {
+        for (const char raw : bytes) {
+            const uchar value = uchar(raw);
+            if (value == '\r') {
+                ++breaks;
+                priorCr = true;
+            } else {
+                if (value == '\n' && !priorCr)
+                    ++breaks;
+                priorCr = false;
+            }
+        }
+    }
+    if (endsWithCr)
+        *endsWithCr = priorCr;
+    return breaks;
+}
 
 using ScintillaSigned = intptr_t;
 using ScintillaUnsigned = uintptr_t;
@@ -134,9 +177,10 @@ WindowedReadOnlyProvider::WindowedReadOnlyProvider(QWidget *parent)
     connect(m_editor, &QsciScintillaBase::SCN_PAINTED, this, [this]() {
         if (!m_scrollToEndAfterPaint)
             return;
-        // Wrap counts are lazy in Scintilla. The first setText-time count can
-        // describe only logical lines, leaving most of the final wrapped line
-        // below the viewport. Recompute exactly after the first real paint.
+        // Scintilla finalizes viewport metrics during paint. setText-time
+        // SCI_LINESONSCREEN can therefore be stale even in physical-line
+        // mode, leaving the EOF window loaded but its viewport several rows
+        // above the actual end. Calibrate once after the first real paint.
         m_scrollToEndAfterPaint = false;
         scrollProjectionToEnd();
         m_globalOffset = std::max<qint64>(0, m_fileSize - 1);
@@ -248,8 +292,10 @@ bool WindowedReadOnlyProvider::openFile(const QString &path, Presentation presen
     m_observedSize = observed.size();
     m_observedModified = observed.lastModified();
     m_filePoll->start();
-    if (presentation == Presentation::Text)
+    if (presentation == Presentation::Text) {
+        startLineNumberIndex();
         startCharacterCount();
+    }
     return true;
 }
 
@@ -268,6 +314,7 @@ void WindowedReadOnlyProvider::closeFile()
         AsyncTaskManager::instance().cancel(m_searchTaskId);
     m_searchTaskId = -1;
     m_searchResultPending = false;
+    cancelLineNumberIndex();
     cancelCharacterCount();
     m_file.close();
     m_fileSize = 0;
@@ -282,6 +329,9 @@ void WindowedReadOnlyProvider::closeFile()
     m_observedModified = {};
     m_characterCount = -1;
     m_characterCountPending = false;
+    m_lineNumberPending = false;
+    m_lineBreakPrefix.clear();
+    m_lineBreakPrefixEndsWithCr.clear();
 }
 
 bool WindowedReadOnlyProvider::refreshFileMapping(QString *error)
@@ -355,8 +405,10 @@ bool WindowedReadOnlyProvider::refreshFileMapping(QString *error)
         m_updatingScrollBar = false;
     }
     emit sourceFileChanged(previousSize, m_fileSize);
-    if (m_presentation == Presentation::Text)
+    if (m_presentation == Presentation::Text) {
+        startLineNumberIndex();
         startCharacterCount();
+    }
     return true;
 }
 
@@ -379,8 +431,22 @@ void WindowedReadOnlyProvider::setPresentation(Presentation presentation)
     m_globalScrollBar->setPageStep(std::max(
         1, int((static_cast<long double>(m_windowSpan) * kSliderMaximum) / m_fileSize)));
     reloadWindow(m_globalOffset, 0);
-    if (presentation == Presentation::Text && m_characterCount < 0
-        && !m_characterCountPending) {
+    if (presentation == Presentation::Text) {
+        if (m_lineBreakPrefix.isEmpty() && !m_lineNumberPending)
+            startLineNumberIndex();
+        if (m_characterCount < 0 && !m_characterCountPending)
+            startCharacterCount();
+    }
+}
+
+void WindowedReadOnlyProvider::setTextEncoding(TextEncoding encoding)
+{
+    if (m_textEncoding == encoding)
+        return;
+    m_textEncoding = encoding;
+    if (m_presentation == Presentation::Text && !m_path.isEmpty()) {
+        reloadWindow(m_globalOffset, 0, visibleTopOffset(), true);
+        startLineNumberIndex();
         startCharacterCount();
     }
 }
@@ -406,17 +472,26 @@ void WindowedReadOnlyProvider::startCharacterCount()
 
     const QString path = m_path;
     const qint64 size = m_fileSize;
+    const TextEncoding encoding = m_textEncoding;
     const quint64 generation = ++m_characterCountGeneration;
     QPointer<WindowedReadOnlyProvider> guard(this);
     m_characterCountTaskId = AsyncTaskManager::instance().submit(
-        AsyncTaskType::Other,
-        AsyncTaskPriority::Low,
+        AsyncTaskType::CharacterCount,
+        AsyncTaskPriority::Lowest,
         tr("统计文档字符数"),
         tr("后台扫描只读大文件并统计 Unicode 字符。"),
-        [guard, generation, path, size]
+        [guard, generation, path, size, encoding]
         (qint64, AsyncCancelPtr cancel,
          std::function<void(qint64, qint64)> reportProgress,
          std::function<void(const AsyncErrorInfo &)> reportError) {
+            const auto clearPending = qScopeGuard([guard, generation]() {
+                QMetaObject::invokeMethod(guard, [guard, generation]() {
+                    if (!guard || guard->m_characterCountGeneration != generation)
+                        return;
+                    guard->m_characterCountPending = false;
+                    guard->m_characterCountTaskId = -1;
+                }, Qt::QueuedConnection);
+            });
             QString openError;
             // Leave a short edit/save grace period and never retain a source
             // handle for the duration of a multi-GiB scan. On Windows even a
@@ -429,8 +504,8 @@ void WindowedReadOnlyProvider::startCharacterCount()
                 QThread::msleep(10);
             }
 
-            constexpr qint64 chunkBytes = 1LL * 1024 * 1024;
-            QStringDecoder decoder("UTF-8");
+            constexpr qint64 chunkBytes = kLinePrefixChunkBytes;
+            QStringDecoder utf8Decoder("UTF-8");
             qint64 totalCharacters = 0;
             qint64 offset = 0;
             bool firstDecodedChunk = true;
@@ -470,7 +545,10 @@ void WindowedReadOnlyProvider::startCharacterCount()
                     }, Qt::QueuedConnection);
                     return;
                 }
-                QString decoded = decoder(chunk);
+                QString decoded = (encoding == TextEncoding::Utf8
+                                   || encoding == TextEncoding::Utf8Bom)
+                    ? utf8Decoder(chunk)
+                    : decodeTextFragment(chunk, encoding);
                 qint64 decodedCount = unicodeScalarCount(decoded);
                 if (firstDecodedChunk && !decoded.isEmpty()
                     && decoded.front() == QChar::ByteOrderMark) {
@@ -497,15 +575,143 @@ void WindowedReadOnlyProvider::startCharacterCount()
         }, 0, QLatin1String("CharacterCount"), size);
 }
 
+void WindowedReadOnlyProvider::cancelLineNumberIndex()
+{
+    ++m_lineNumberGeneration;
+    if (m_lineNumberTaskId >= 0)
+        AsyncTaskManager::instance().cancel(m_lineNumberTaskId);
+    m_lineNumberTaskId = -1;
+    m_lineNumberPending = false;
+}
+
+void WindowedReadOnlyProvider::startLineNumberIndex()
+{
+    cancelLineNumberIndex();
+    if (m_path.isEmpty() || m_fileSize <= 0)
+        return;
+
+    m_lineBreakPrefix.clear();
+    m_lineBreakPrefixEndsWithCr.clear();
+    m_lineNumberPending = true;
+    configureProjectionMargin();
+
+    const QString path = m_path;
+    const qint64 size = m_fileSize;
+    const TextEncoding encoding = m_textEncoding;
+    m_lineBreakPrefixEncoding = encoding;
+    const quint64 generation = ++m_lineNumberGeneration;
+    QPointer<WindowedReadOnlyProvider> guard(this);
+    m_lineNumberTaskId = AsyncTaskManager::instance().submit(
+        AsyncTaskType::LineIndexBuild,
+        AsyncTaskPriority::Normal,
+        tr("扫描文本行号"),
+        tr("快速扫描换行符，使只读大文件窗口显示全局行号。"),
+        [guard, generation, path, size, encoding]
+        (qint64, AsyncCancelPtr cancel,
+         std::function<void(qint64, qint64)> reportProgress,
+         std::function<void(const AsyncErrorInfo &)> reportError) {
+            const auto clearPending = qScopeGuard([guard, generation]() {
+                QMetaObject::invokeMethod(guard, [guard, generation]() {
+                    if (!guard || guard->m_lineNumberGeneration != generation)
+                        return;
+                    guard->m_lineNumberPending = false;
+                    guard->m_lineNumberTaskId = -1;
+                }, Qt::QueuedConnection);
+            });
+            qint64 totalLineBreaks = 0;
+            bool previousWasCr = false;
+            QVector<qint64> lineBreakPrefix{0};
+            QVector<quint8> lineBreakPrefixEndsWithCr{0};
+            lineBreakPrefix.reserve(int(qMin<qint64>(
+                size / kLinePrefixChunkBytes + 2, INT_MAX)));
+            lineBreakPrefixEndsWithCr.reserve(lineBreakPrefix.capacity());
+
+            qint64 offset = 0;
+            QString openError;
+            while (offset < size) {
+                if (cancel && cancel->load(std::memory_order_acquire))
+                    return;
+                const qint64 wanted = qMin(kLineScanReadBytes, size - offset);
+                SharedReadOnlyFile reader;
+                if (!openSharedReadOnlyFile(reader, path, &openError)) {
+                    AsyncErrorInfo error;
+                    error.message = QObject::tr("无法扫描文本行号：%1").arg(openError);
+                    if (reportError)
+                        reportError(error);
+                    QMetaObject::invokeMethod(guard, [guard, generation]() {
+                        if (!guard || guard->m_lineNumberGeneration != generation)
+                            return;
+                        guard->m_lineNumberPending = false;
+                        guard->m_lineNumberTaskId = -1;
+                    }, Qt::QueuedConnection);
+                    return;
+                }
+                const QByteArray chunk = reader.readAt(
+                    offset, static_cast<qsizetype>(wanted), &openError);
+                reader.close();
+                if (chunk.size() != wanted) {
+                    AsyncErrorInfo error;
+                    error.message = QObject::tr("扫描文本行号时读取失败：%1").arg(openError);
+                    if (reportError)
+                        reportError(error);
+                    QMetaObject::invokeMethod(guard, [guard, generation]() {
+                        if (!guard || guard->m_lineNumberGeneration != generation)
+                            return;
+                        guard->m_lineNumberPending = false;
+                        guard->m_lineNumberTaskId = -1;
+                    }, Qt::QueuedConnection);
+                    return;
+                }
+
+                qsizetype local = 0;
+                while (local < chunk.size()) {
+                    if (cancel && cancel->load(std::memory_order_acquire))
+                        return;
+                    const qsizetype partSize = qMin<qsizetype>(
+                        static_cast<qsizetype>(kLinePrefixChunkBytes),
+                        chunk.size() - local);
+                    totalLineBreaks += countPhysicalLineBreaks(
+                        QByteArrayView(chunk.constData() + local, partSize),
+                        encoding, previousWasCr, &previousWasCr);
+                    local += partSize;
+                    offset += partSize;
+                    lineBreakPrefix.append(totalLineBreaks);
+                    lineBreakPrefixEndsWithCr.append(previousWasCr ? 1 : 0);
+                }
+                if (reportProgress)
+                    reportProgress(offset, size);
+            }
+            if (cancel && cancel->load(std::memory_order_acquire))
+                return;
+            QMetaObject::invokeMethod(
+                guard, [guard, generation,
+                        lineBreakPrefix = std::move(lineBreakPrefix),
+                        lineBreakPrefixEndsWithCr = std::move(lineBreakPrefixEndsWithCr),
+                        encoding]() mutable {
+                    if (!guard || guard->m_lineNumberGeneration != generation)
+                        return;
+                    guard->m_lineBreakPrefix = std::move(lineBreakPrefix);
+                    guard->m_lineBreakPrefixEndsWithCr =
+                        std::move(lineBreakPrefixEndsWithCr);
+                    guard->m_lineBreakPrefixEncoding = encoding;
+                    guard->m_lineNumberPending = false;
+                    guard->m_lineNumberTaskId = -1;
+                    guard->configureProjectionMargin();
+                }, Qt::QueuedConnection);
+        }, 0, QLatin1String("LineNumberIndex"), size);
+}
+
 void WindowedReadOnlyProvider::setWordWrap(bool enabled)
 {
-    if (m_wordWrap == enabled)
+    Q_UNUSED(enabled);
+    // This provider exclusively serves S2/S3. Word wrapping a bounded 2 MiB
+    // projection makes global scroll positions depend on lazy local layout
+    // and causes expensive reload/reflow cycles during thumb dragging.
+    if (!m_wordWrap && m_editor->wrapMode() == QsciScintilla::WrapNone)
         return;
     const qint64 preservedTop = visibleTopOffset();
-    m_wordWrap = enabled;
-    m_editor->setWrapMode(m_presentation == Presentation::Text && enabled
-                              ? QsciScintilla::WrapWord
-                              : QsciScintilla::WrapNone);
+    m_wordWrap = false;
+    m_editor->setWrapMode(QsciScintilla::WrapNone);
     m_editor->setWrapVisualFlags(QsciScintilla::WrapFlagByText);
     m_editor->setWrapIndentMode(QsciScintilla::WrapIndentSame);
     if (!m_path.isEmpty())
@@ -551,6 +757,20 @@ qint64 WindowedReadOnlyProvider::visibleBottomOffset() const
     if (m_path.isEmpty() || !m_editor || !m_editor->viewport())
         return 0;
     if (m_presentation == Presentation::Text) {
+        if (m_windowEnd == m_fileSize) {
+            // SCI_LINESONSCREEN counts fully visible rows while Scintilla's
+            // native maximum may deliberately leave the final document row
+            // only partially visible. A line-count reconstruction therefore
+            // reports a false gap at EOF. Query the painted position of the
+            // actual document end instead; this is also what the user sees.
+            const qint64 documentEnd = directScintilla(
+                m_editor, QsciScintillaBase::SCI_GETLENGTH);
+            const int endY = static_cast<int>(directScintilla(
+                m_editor, QsciScintillaBase::SCI_POINTYFROMPOSITION, 0,
+                static_cast<ScintillaSigned>(documentEnd)));
+            if (endY >= 0 && endY < m_editor->viewport()->height())
+                return m_windowEnd;
+        }
         const int firstVisible = static_cast<int>(directScintilla(
             m_editor, QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
         const int linesOnScreen = std::max(1, static_cast<int>(directScintilla(
@@ -637,7 +857,8 @@ bool WindowedReadOnlyProvider::copySelection(QString *error) const
     } else if (m_presentation == Presentation::Hex) {
         ByteClipboard::setAsciiSelection(selected);
     } else {
-        QGuiApplication::clipboard()->setText(QString::fromUtf8(selected));
+        QGuiApplication::clipboard()->setText(
+            decodeTextFragment(selected, m_textEncoding));
     }
     return true;
 }
@@ -1003,6 +1224,27 @@ void WindowedReadOnlyProvider::reloadWindow(qint64 anchorOffset, qint64 selectio
 
     if (m_presentation == Presentation::Hex) {
         start -= start % m_hexBytesPerRow;
+    } else if (m_textEncoding == TextEncoding::Utf16LE
+               || m_textEncoding == TextEncoding::Utf16BE) {
+        start -= start % 2;
+        if (start > 0) {
+            const qint64 lookBehind = std::min<qint64>(kMaxTextProjectionBytes,
+                                                       start);
+            const qint64 scanStart = start - lookBehind;
+            const QByteArray prefix = sourceBytes(scanStart,
+                                                   static_cast<qsizetype>(lookBehind));
+            for (qsizetype i = prefix.size() - (prefix.size() % 2) - 2;
+                 i >= 0; i -= 2) {
+                const uchar a = uchar(prefix.at(i));
+                const uchar b = uchar(prefix.at(i + 1));
+                const bool newline = m_textEncoding == TextEncoding::Utf16LE
+                    ? a == 0x0a && b == 0x00 : a == 0x00 && b == 0x0a;
+                if (newline) {
+                    start = scanStart + i + 2;
+                    break;
+                }
+            }
+        }
     } else if (start > 0) {
         const qint64 lookBehind = std::min<qint64>(kMaxTextProjectionBytes, start);
         const QByteArray prefix = sourceBytes(start - lookBehind,
@@ -1018,31 +1260,57 @@ void WindowedReadOnlyProvider::reloadWindow(qint64 anchorOffset, qint64 selectio
         m_fileSize,
         std::max(start + m_windowSpan,
                  anchorOffset + std::max<qint64>(1, selectionBytes)));
+    if (m_presentation == Presentation::Text
+        && (m_textEncoding == TextEncoding::Utf16LE
+            || m_textEncoding == TextEncoding::Utf16BE)
+        && end < m_fileSize && end % 2 != 0) {
+        ++end;
+    }
     if (m_presentation == Presentation::Text && end < m_fileSize
         && end - start < kMaxTextProjectionBytes) {
         const qint64 scanBytes = std::min(kMaxTextProjectionBytes - (end - start),
                                           m_fileSize - end);
         const QByteArray suffix = sourceBytes(end, static_cast<qsizetype>(scanBytes));
-        const qsizetype lineEnd = suffix.indexOf('\n');
-        end += lineEnd >= 0 ? lineEnd + 1 : suffix.size();
+        if (m_textEncoding == TextEncoding::Utf16LE
+            || m_textEncoding == TextEncoding::Utf16BE) {
+            qsizetype lineEnd = -1;
+            for (qsizetype i = 0; i + 1 < suffix.size(); i += 2) {
+                const uchar a = uchar(suffix.at(i));
+                const uchar b = uchar(suffix.at(i + 1));
+                const bool newline = m_textEncoding == TextEncoding::Utf16LE
+                    ? a == 0x0a && b == 0x00 : a == 0x00 && b == 0x0a;
+                if (newline) { lineEnd = i; break; }
+            }
+            end += lineEnd >= 0 ? lineEnd + 2 : suffix.size() - suffix.size() % 2;
+        } else {
+            const qsizetype lineEnd = suffix.indexOf('\n');
+            end += lineEnd >= 0 ? lineEnd + 1 : suffix.size();
+        }
     }
     const qsizetype length = static_cast<qsizetype>(end - start);
 
     const QByteArray source = sourceBytes(start, length);
     end = start + source.size();
     QByteArray projection;
+    QString textProjection;
     if (m_presentation == Presentation::Hex)
         projection = formatHexWindow(reinterpret_cast<const uchar *>(source.constData()),
                                      source.size(), start);
-    else
-        projection = source;
+    else {
+        const DecodedTextProjection decoded = decodeTextProjection(
+            source, m_textEncoding, start == 0);
+        textProjection = decoded.text;
+        m_projectedToSource = decoded.projectedToSource;
+        m_sourceBoundaries = decoded.sourceBoundaries;
+        m_projectedBoundaries = decoded.projectedBoundaries;
+    }
 
     m_windowStart = start;
     m_windowEnd = end;
     m_editor->setReadOnly(false);
     m_editor->setText(m_presentation == Presentation::Hex
                           ? QString::fromLatin1(projection)
-                          : QString::fromUtf8(projection));
+                          : textProjection);
     m_editor->setReadOnly(true);
     m_editor->SendScintilla(QsciScintillaBase::SCI_SETVSCROLLBAR, 0UL);
     m_editor->SendScintilla(QsciScintillaBase::SCI_SETSCROLLWIDTH, 1UL);
@@ -1079,11 +1347,13 @@ void WindowedReadOnlyProvider::reloadWindow(qint64 anchorOffset, qint64 selectio
         }
     }
     if (anchorOffset >= m_fileSize - 1) {
-        m_scrollToEndAfterPaint = m_presentation == Presentation::Text
-            && m_wordWrap;
+        // K02: loading the final mmap window and reaching its final viewport
+        // row are separate operations. Always perform a post-paint settle for
+        // both Text and Hex; it is bounded to the current projection and does
+        // not scan or lay out the full source file.
+        m_scrollToEndAfterPaint = true;
         scrollProjectionToEnd();
-        if (m_scrollToEndAfterPaint)
-            m_editor->viewport()->update();
+        m_editor->viewport()->update();
     } else {
         m_scrollToEndAfterPaint = false;
     }
@@ -1227,12 +1497,60 @@ void WindowedReadOnlyProvider::scrollProjectionToEnd()
 {
     if (!m_editor)
         return;
+    // Let Scintilla compute its own exact maximum. Reconstructing this from
+    // SCI_LINESONSCREEN is subtly wrong while a newly assigned document is
+    // settling: the value is based on the previous paint and can leave one or
+    // more physical rows below the viewport. SCI_SCROLLTOEND delegates to
+    // Editor::MaxScrollPos(), which is the same bound used by the native
+    // editor's scrolling implementation and remains valid with its scrollbar
+    // hidden behind our global byte-range scrollbar.
+    directScintilla(m_editor, QsciScintillaBase::SCI_SCROLLTOEND);
+
+    // Keep a deterministic fallback for platforms where the viewport has not
+    // yet acquired a non-zero height. The post-paint call will run the native
+    // path above again with final metrics.
     const int linesOnScreen = std::max(1, static_cast<int>(directScintilla(
         m_editor, QsciScintillaBase::SCI_LINESONSCREEN)));
     const int lastFirst = std::max(0, projectedDisplayLineCount() - linesOnScreen);
-    directScintilla(m_editor, QsciScintillaBase::SCI_SETFIRSTVISIBLELINE,
-                    static_cast<ScintillaUnsigned>(lastFirst));
+    const int firstVisible = static_cast<int>(directScintilla(
+        m_editor, QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
+    if (firstVisible < lastFirst) {
+        directScintilla(m_editor, QsciScintillaBase::SCI_SETFIRSTVISIBLELINE,
+                        static_cast<ScintillaUnsigned>(lastFirst));
+    }
     syncAsciiScrollFromHex();
+}
+
+bool WindowedReadOnlyProvider::lineNumberBaseForOffset(
+    qint64 offset, qint64 *baseLine) const
+{
+    if (!baseLine || offset < 0 || offset > m_fileSize)
+        return false;
+    if (offset == 0) {
+        *baseLine = 0;
+        return true;
+    }
+    if (m_lineBreakPrefixEncoding != m_textEncoding
+        || m_lineBreakPrefix.isEmpty()
+        || m_lineBreakPrefix.size() != m_lineBreakPrefixEndsWithCr.size()) {
+        return false;
+    }
+    const qint64 checkpoint = offset / kLinePrefixChunkBytes;
+    if (checkpoint < 0 || checkpoint >= m_lineBreakPrefix.size())
+        return false;
+    const qint64 checkpointOffset = checkpoint * kLinePrefixChunkBytes;
+    qint64 breaks = m_lineBreakPrefix.at(qsizetype(checkpoint));
+    bool previousWasCr = m_lineBreakPrefixEndsWithCr.at(qsizetype(checkpoint)) != 0;
+    if (offset > checkpointOffset) {
+        const QByteArray suffix = sourceBytes(
+            checkpointOffset, static_cast<qsizetype>(offset - checkpointOffset));
+        if (suffix.size() != offset - checkpointOffset)
+            return false;
+        breaks += countPhysicalLineBreaks(
+            suffix, m_textEncoding, previousWasCr, &previousWasCr);
+    }
+    *baseLine = breaks;
+    return true;
 }
 
 void WindowedReadOnlyProvider::configureProjectionMargin()
@@ -1259,22 +1577,26 @@ void WindowedReadOnlyProvider::configureProjectionMargin()
         return;
     }
 
-    // Text presentation follows the normal editor contract: the gutter is a
-    // decimal text-line landmark, never a hexadecimal byte address. Windowed
-    // projections may be replaced while browsing, so these are deliberately
-    // the lines currently represented by the editor; a future completed global
-    // LineIndex may supply an absolute base without changing the visual mode.
+    // A bounded projection must not expose Scintilla's local 1..N line numbers:
+    // they restart after every mmap window and make S2/S3 appear to loop. The
+    // character-count pass also builds tiny 1 MiB prefix checkpoints, so the
+    // exact global base costs at most one bounded chunk read and no second
+    // full-file index.
     directScintilla(m_editor, QsciScintillaBase::SCI_MARGINTEXTCLEARALL);
-    // QScintilla's setMarginLineNumbers() also selects its own margin type.
-    // Apply the explicit contract last so a Hex -> Text transition cannot
-    // leave margin 0 reported (or rendered) as a TextMargin.
-    m_editor->setMarginLineNumbers(0, true);
-    m_editor->setMarginType(0, QsciScintilla::NumberMargin);
+    m_editor->setMarginLineNumbers(0, false);
+    m_editor->setMarginType(0, QsciScintilla::TextMargin);
     const int lines = std::max(1, static_cast<int>(directScintilla(
         m_editor, QsciScintillaBase::SCI_GETLINECOUNT)));
-    const int lineDigits = std::max(
-        4, static_cast<int>(QString::number(lines).size()) + 1);
-    m_editor->setMarginWidth(0, QString(lineDigits, QLatin1Char('9')));
+    qint64 baseLine = 0;
+    const bool exact = lineNumberBaseForOffset(m_windowStart, &baseLine);
+    const qint64 largest = exact ? baseLine + lines : lines;
+    const int lineDigits = std::max(4, int(QString::number(largest).size()));
+    m_editor->setMarginWidth(0, QString(lineDigits + 2, QLatin1Char('9')));
+    for (int line = 0; line < lines; ++line) {
+        m_editor->setMarginText(
+            line, exact ? QString::number(baseLine + line + 1)
+                        : QStringLiteral("…"), 0);
+    }
 }
 
 qint64 WindowedReadOnlyProvider::sourceOffsetForProjectedLine(int line) const
@@ -1293,7 +1615,7 @@ qint64 WindowedReadOnlyProvider::sourceOffsetForProjectedLine(int line) const
     const qint64 localPosition = directScintilla(
         m_editor, QsciScintillaBase::SCI_POSITIONFROMLINE,
         static_cast<ScintillaUnsigned>(std::max(0, documentLine)));
-    return clampOffset(m_windowStart + std::max(0LL, localPosition), m_fileSize);
+    return sourceOffsetForProjectedPosition(localPosition, false);
 }
 
 qint64 WindowedReadOnlyProvider::sourceOffsetForProjectedPosition(
@@ -1302,8 +1624,19 @@ qint64 WindowedReadOnlyProvider::sourceOffsetForProjectedPosition(
     if (m_path.isEmpty())
         return 0;
     position = std::max(0LL, position);
-    if (m_presentation == Presentation::Text)
-        return std::clamp(m_windowStart + position, 0LL, m_fileSize);
+    if (m_presentation == Presentation::Text) {
+        if (m_projectedToSource.isEmpty())
+            return m_windowStart;
+        const qsizetype index = static_cast<qsizetype>(std::clamp<qint64>(
+            position, 0, m_projectedToSource.size() - 1));
+        qint32 relative = m_projectedToSource.at(index);
+        if (endBoundary && index + 1 < m_projectedToSource.size()
+            && m_projectedToSource.at(index + 1) > relative) {
+            relative = m_projectedToSource.at(index + 1);
+        }
+        return std::clamp(m_windowStart + qint64(relative),
+                          m_windowStart, m_windowEnd);
+    }
 
     const int line = static_cast<int>(directScintilla(
         m_editor, QsciScintillaBase::SCI_LINEFROMPOSITION,
@@ -1329,15 +1662,25 @@ int WindowedReadOnlyProvider::projectedLineForSourceOffset(qint64 offset) const
         return static_cast<int>(localOffset / m_hexBytesPerRow);
     return static_cast<int>(directScintilla(
         m_editor, QsciScintillaBase::SCI_LINEFROMPOSITION,
-        static_cast<ScintillaUnsigned>(localOffset)));
+        static_cast<ScintillaUnsigned>(projectedPositionForSourceOffset(offset))));
 }
 
 qint64 WindowedReadOnlyProvider::projectedPositionForSourceOffset(qint64 offset) const
 {
     const qint64 localOffset = std::clamp(offset - m_windowStart, 0LL,
                                           std::max(0LL, m_windowEnd - m_windowStart));
-    if (m_presentation == Presentation::Text)
-        return localOffset;
+    if (m_presentation == Presentation::Text) {
+        if (m_sourceBoundaries.isEmpty())
+            return 0;
+        const qint32 relative = qint32(localOffset);
+        auto it = std::lower_bound(m_sourceBoundaries.cbegin(),
+                                   m_sourceBoundaries.cend(), relative);
+        const qsizetype index = it == m_sourceBoundaries.cend()
+            ? m_sourceBoundaries.size() - 1
+            : qsizetype(it - m_sourceBoundaries.cbegin());
+        return m_projectedBoundaries.value(index,
+            m_projectedBoundaries.isEmpty() ? 0 : m_projectedBoundaries.constLast());
+    }
     if (localOffset >= m_windowEnd - m_windowStart)
         return directScintilla(m_editor, QsciScintillaBase::SCI_GETLENGTH);
     const qint64 row = localOffset / m_hexBytesPerRow;
@@ -1414,6 +1757,10 @@ void WindowedReadOnlyProvider::selectProjectedBytes(qint64 absoluteOffset, qint6
     qint64 localStart = absoluteOffset - m_windowStart;
     qint64 localEnd = localStart + std::max(0LL, selectionBytes);
     if (m_presentation == Presentation::Hex) {
+        localStart = projectedPositionForSourceOffset(absoluteOffset);
+        localEnd = projectedPositionForSourceOffset(
+            std::min(m_fileSize, absoluteOffset + std::max(0LL, selectionBytes)));
+    } else {
         localStart = projectedPositionForSourceOffset(absoluteOffset);
         localEnd = projectedPositionForSourceOffset(
             std::min(m_fileSize, absoluteOffset + std::max(0LL, selectionBytes)));

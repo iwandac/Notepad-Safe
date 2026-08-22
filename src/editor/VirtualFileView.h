@@ -121,6 +121,10 @@ public:
     // ---- 对外搜索 API ----
     // 返回内部 LargeFileSearch 实例；VirtualFileView 负责 setSource 更新。
     class LargeFileSearch* searchEngine();
+    // User navigation must not queue behind a potentially minutes-long Find
+    // All scan.  This engine shares the immutable mmap snapshot but owns an
+    // independent cancellation/result state and worker reservation.
+    class LargeFileSearch* navigationSearchEngine();
 
     // ---- 搜索关键词高亮 ----
     // 设置当前搜索匹配的高亮位置（字节偏移 + 长度），用于 paintEvent 染色。
@@ -422,8 +426,10 @@ private:
     qint64         selEndByte_   = 0;
     qint64         m_virtualSizeLimitExclusive = 0;
 
-    // 搜索引擎（懒创建，首次调用 searchEngine 时 new，closeFile 不删除）
+    // 搜索引擎（懒创建，closeFile 不删除）：全量索引与用户导航各自独立，
+    // 因而 F3/Shift+F3 不会被后台 Find All 的 worker reservation 阻塞。
     mutable class LargeFileSearch* search_ = nullptr;
+    mutable class LargeFileSearch* navigationSearch_ = nullptr;
 
     // 搜索关键词高亮位置（字节偏移, 长度），paintEvent 时染色
     QVector<QPair<qint64, qint32>> searchHighlights_;

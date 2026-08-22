@@ -3,8 +3,8 @@
 #include "PatchList.h"
 #include "DynamicThresholds.h"
 #include "AsyncTaskManager.h"
-#include "AsyncThreadPool.h"
 #include "Pcre2Regex.h"
+#include "RawCodePageRegex.h"
 
 #include <QFile>
 #include <QDir>
@@ -13,8 +13,8 @@
 #include <QTemporaryFile>
 #include <QCoreApplication>
 #include <QDateTime>
-#include <QPointer>
 #include <QUuid>
+#include <QPointer>
 #include <cstring>
 #include <algorithm>
 #include <utility>
@@ -50,6 +50,30 @@ int hexNibble(QChar ch)
     return -1;
 }
 
+QString escapeRawRegexLiteral(const QString &input)
+{
+    static const QString metacharacters = QStringLiteral("\\.^$|()[]{}*+?");
+    QString escaped;
+    escaped.reserve(input.size() * 2);
+    for (const QChar ch : input) {
+        if (metacharacters.contains(ch))
+            escaped.append(QLatin1Char('\\'));
+        escaped.append(ch);
+    }
+    return escaped;
+}
+
+QString rawSearchExpression(const QString &pattern,
+                            const LargeFileSearch::Options &opts)
+{
+    QString expression = opts.regexMode ? pattern : escapeRawRegexLiteral(pattern);
+    if (opts.wholeWord) {
+        expression = QStringLiteral("(?<!\\w)(?:") + expression
+                     + QStringLiteral(")(?!\\w)");
+    }
+    return expression;
+}
+
 bool prepareSearchPattern(const QString &pattern, const LargeFileSearch::Options &opts,
                           QByteArray *literal, bool *usePcre2, QString *error)
 {
@@ -68,8 +92,17 @@ bool prepareSearchPattern(const QString &pattern, const LargeFileSearch::Options
         && !opts.regexMode && !opts.wholeWord;
     *usePcre2 = opts.regexMode || opts.wholeWord
         || (!opts.caseSensitive && !binaryLiteral);
-    if (!*usePcre2)
-        *literal = pattern.toUtf8();
+    if (!*usePcre2) {
+        bool representable = true;
+        *literal = encodeTextFragment(pattern, opts.textEncoding, &representable);
+        if (!representable) {
+            if (error) {
+                *error = QObject::tr("查找文本包含 %1 无法表示的字符。")
+                             .arg(encodingName(opts.textEncoding));
+            }
+            return false;
+        }
+    }
     if (pattern.isEmpty() || (!*usePcre2 && literal->isEmpty())) {
         if (error)
             *error = QStringLiteral("查找文本为空。");
@@ -186,6 +219,7 @@ LargeFileSearch::LargeFileSearch(QObject* parent)
 }
 
 LargeFileSearch::~LargeFileSearch() {
+    stopWorkers(true);
     closeOverrunFile();
     if (!overrunFile_.isEmpty()) QFile::remove(overrunFile_);
 }
@@ -193,6 +227,9 @@ LargeFileSearch::~LargeFileSearch() {
 void LargeFileSearch::setSource(const uchar* mmapBase, qint64 mmapSize,
                                 const LineIndex* lineIndex, const PatchList* patchList)
 {
+    // All four source objects are borrowed. Never replace them while a queued
+    // or running search can still dereference the previous snapshot.
+    stopWorkers(false);
     mmapBase_ = mmapBase;
     mmapSize_ = mmapSize;
     lineIndex_ = lineIndex;
@@ -213,6 +250,45 @@ void LargeFileSearch::setSource(const uchar* mmapBase, qint64 mmapSize,
 
 void LargeFileSearch::requestCancel() {
     cancel_.store(true, std::memory_order_relaxed);
+}
+
+bool LargeFileSearch::reserveWorker()
+{
+    std::lock_guard<std::mutex> lock(workerMutex_);
+    if (shuttingDown_ || workerReservations_ != 0)
+        return false;
+    ++workerReservations_;
+    return true;
+}
+
+void LargeFileSearch::releaseWorker()
+{
+    std::lock_guard<std::mutex> lock(workerMutex_);
+    if (workerReservations_ > 0)
+        --workerReservations_;
+    if (workerReservations_ == 0)
+        workerIdle_.notify_all();
+}
+
+void LargeFileSearch::stopWorkers(bool permanent)
+{
+    cancel_.store(true, std::memory_order_release);
+    const qint64 taskId = lastTaskId_;
+    if (taskId > 0)
+        AsyncTaskManager::instance().cancel(taskId);
+
+    std::unique_lock<std::mutex> lock(workerMutex_);
+    if (permanent)
+        shuttingDown_ = true;
+    workerIdle_.wait(lock, [this] { return workerReservations_ == 0; });
+    lastTaskId_ = 0;
+    if (!permanent)
+        cancel_.store(false, std::memory_order_release);
+}
+
+void LargeFileSearch::cancelAndWait()
+{
+    stopWorkers(false);
 }
 
 // ============================================================================
@@ -544,7 +620,10 @@ bool LargeFileSearch::scanAllBounded(
                     else
                         fillLineContext(match);
                     pending.append(std::move(match));
-                    if (pending.size() >= PublishBatchSize && !publish())
+                    const bool firstVisibleResult = memMatches_.isEmpty()
+                        && overrunCount_ == 0 && pending.size() == 1;
+                    if ((firstVisibleResult || pending.size() >= PublishBatchSize)
+                        && !publish())
                         return false;
                     matched = failure.at(matched - 1);
                 }
@@ -554,13 +633,37 @@ bool LargeFileSearch::scanAllBounded(
                 reportProgress(start);
         }
     } else {
+        const bool invalidUtfText = !opts.byteContextMode
+            && opts.tolerateInvalidEncoding
+            && (opts.textEncoding == TextEncoding::Utf8
+                || opts.textEncoding == TextEncoding::Utf8Bom);
+        const bool rawEncodedRegex = !opts.byteContextMode
+            && opts.textEncoding != TextEncoding::Utf8
+            && opts.textEncoding != TextEncoding::Utf8Bom;
         Pcre2Regex compiled;
+        RawCodePageRegex rawCompiled;
         const bool binaryWholeWord = opts.byteContextMode
             && !opts.regexMode && opts.wholeWord;
-        if (!compiled.compile(pattern, !opts.regexMode, opts.caseSensitive,
-                              opts.wholeWord, &scanError_,
-                              !binaryWholeWord)) {
-            return false;
+        if (rawEncodedRegex) {
+            // PCRE2 remains the product-dialect validator. The raw backend is
+            // selected only for subject iteration; accepting a Boost-only
+            // expression here would make the same query change meaning by
+            // file encoding.
+            if (!compiled.compile(pattern, !opts.regexMode, opts.caseSensitive,
+                                  opts.wholeWord,
+                                  &scanError_)
+                || !rawCompiled.compile(rawSearchExpression(pattern, opts),
+                                        opts.caseSensitive,
+                                        opts.textEncoding,
+                                        &scanError_)) {
+                return false;
+            }
+        } else {
+            if (!compiled.compile(pattern, !opts.regexMode, opts.caseSensitive,
+                                  opts.wholeWord, &scanError_,
+                                  !binaryWholeWord, invalidUtfText)) {
+                return false;
+            }
         }
 
         const uchar *subject = mmapBase_;
@@ -605,9 +708,7 @@ bool LargeFileSearch::scanAllBounded(
                 snapshot.unmap(snapshotMap);
         });
 
-        const Pcre2Regex::ScanResult result = compiled.scan(
-            subject, virtualSize, isCancelled, reportProgress,
-            [&](qint64 offset, qint64 length) {
+        const auto recordMatch = [&](qint64 offset, qint64 length) {
                 LargeFileSearchMatch match;
                 match.byteOffset = offset;
                 match.length = qint32(length);
@@ -616,81 +717,259 @@ bool LargeFileSearch::scanAllBounded(
                 else
                     fillLineContext(match);
                 pending.append(std::move(match));
-                return pending.size() < PublishBatchSize || publish();
-            }, &scanError_);
-        if (result != Pcre2Regex::ScanResult::Complete)
-            return false;
+                const bool firstVisibleResult = memMatches_.isEmpty()
+                    && overrunCount_ == 0 && pending.size() == 1;
+                return (!firstVisibleResult && pending.size() < PublishBatchSize)
+                    || publish();
+            };
+        if (rawEncodedRegex) {
+            const RawCodePageRegex::ScanResult result = rawCompiled.scan(
+                subject, virtualSize, isCancelled, reportProgress,
+                recordMatch, &scanError_);
+            if (result != RawCodePageRegex::ScanResult::Complete)
+                return false;
+        } else if (invalidUtfText) {
+            // PCRE2's invalid-UTF start optimizer may inspect far beyond an
+            // offset limit in a multi-GiB mapped subject. Give it bounded
+            // physical windows instead: this prevents one call from faulting
+            // the complete file into RAM and restores cooperative cancellation.
+            // A generous overlap retains practical cross-line log patterns;
+            // ordinary valid UTF-8 keeps the exact full-subject path below.
+            constexpr qint64 CoreBytes = Q_INT64_C(16) * 1024 * 1024;
+            constexpr qint64 PrefixBytes = Q_INT64_C(64) * 1024;
+            constexpr qint64 OverlapBytes = Q_INT64_C(16) * 1024 * 1024;
+            for (qint64 coreStart = 0; coreStart < virtualSize;
+                 coreStart += CoreBytes) {
+                if (isCancelled && isCancelled())
+                    return false;
+                const qint64 coreEnd = qMin(virtualSize, coreStart + CoreBytes);
+                const qint64 windowStart = qMax<qint64>(0, coreStart - PrefixBytes);
+                const qint64 windowEnd = qMin(virtualSize, coreEnd + OverlapBytes);
+                const Pcre2Regex::ScanResult result = compiled.scan(
+                    subject + windowStart, windowEnd - windowStart,
+                    isCancelled, {},
+                    [&](qint64 localOffset, qint64 length) {
+                        const qint64 globalOffset = windowStart + localOffset;
+                        if (globalOffset < coreStart || globalOffset >= coreEnd)
+                            return true;
+                        return recordMatch(globalOffset, length);
+                    }, &scanError_);
+                if (result != Pcre2Regex::ScanResult::Complete)
+                    return false;
+                if (reportProgress)
+                    reportProgress(coreEnd);
+            }
+        } else {
+            const Pcre2Regex::ScanResult result = compiled.scan(
+                subject, virtualSize, isCancelled, reportProgress,
+                recordMatch, &scanError_);
+            if (result != Pcre2Regex::ScanResult::Complete)
+                return false;
+        }
     }
 
     const bool ok = publish();
     return ok && !storageFailed_ && scanError_.isEmpty();
 }
 
+bool LargeFileSearch::scanOneBounded(
+    qint64 virtualSize, const QString &pattern, const Options &opts,
+    qint64 fromByte, bool forward, bool wrap,
+    const std::function<bool()> &isCancelled,
+    const std::function<void(qint64)> &reportProgress,
+    LargeFileSearchMatch *match, QString *error) const
+{
+    if (match) *match = {};
+    if (error) error->clear();
+
+    QByteArray literalBytes;
+    bool usePcre2 = false;
+    if (!prepareSearchPattern(pattern, opts, &literalBytes, &usePcre2, error))
+        return false;
+
+    const bool rawEncodedRegex = usePcre2 && !opts.byteContextMode
+        && opts.textEncoding != TextEncoding::Utf8
+        && opts.textEncoding != TextEncoding::Utf8Bom;
+    const bool binaryWholeWord = opts.byteContextMode
+        && !opts.regexMode && opts.wholeWord;
+    Pcre2Regex compiled;
+    RawCodePageRegex rawCompiled;
+    if (usePcre2) {
+        if (rawEncodedRegex) {
+            if (!compiled.compile(pattern, !opts.regexMode, opts.caseSensitive,
+                                  opts.wholeWord, error)
+                || !rawCompiled.compile(rawSearchExpression(pattern, opts),
+                                        opts.caseSensitive, opts.textEncoding,
+                                        error)) {
+                return false;
+            }
+        } else {
+            // Physical windows can begin at an arbitrary source byte. Invalid
+            // UTF matching keeps each bounded window independent while byte
+            // offsets remain authoritative.
+            const bool windowMaySplitUtf = !binaryWholeWord
+                && (opts.textEncoding == TextEncoding::Utf8
+                    || opts.textEncoding == TextEncoding::Utf8Bom);
+            if (!compiled.compile(pattern, !opts.regexMode, opts.caseSensitive,
+                                  opts.wholeWord, error,
+                                  !binaryWholeWord, windowMaySplitUtf)) {
+                return false;
+            }
+        }
+    }
+
+    constexpr qint64 CoreBytes = Q_INT64_C(16) * 1024 * 1024;
+    constexpr qint64 PrefixBytes = Q_INT64_C(64) * 1024;
+    constexpr qint64 OverlapBytes = Q_INT64_C(16) * 1024 * 1024;
+    qint64 scannedBytes = 0;
+
+    const auto scanCore = [&](qint64 coreStart, qint64 coreEnd,
+                              LargeFileSearchMatch *accepted) -> bool {
+        if (isCancelled && isCancelled())
+            return false;
+        const qint64 windowStart = qMax<qint64>(0, coreStart - PrefixBytes);
+        const qint64 windowEnd = qMin(virtualSize, coreEnd + OverlapBytes);
+        const QByteArray bytes = readVirtualBytes(windowStart, windowEnd);
+        if (bytes.size() != windowEnd - windowStart) {
+            if (error) *error = QObject::tr("无法读取搜索窗口。");
+            return false;
+        }
+
+        bool found = false;
+        LargeFileSearchMatch best;
+        const auto consider = [&](qint64 localOffset, qint64 length) {
+            const qint64 globalOffset = windowStart + localOffset;
+            if (globalOffset < coreStart || globalOffset >= coreEnd)
+                return true;
+            if (length < 0 || length > std::numeric_limits<qint32>::max()) {
+                if (error) *error = QObject::tr("单个匹配过长。");
+                return false;
+            }
+            best.byteOffset = globalOffset;
+            best.length = qint32(length);
+            found = true;
+            // 前向扫描的首个结果就是最近结果；后向扫描保留本窗口最后一个。
+            return !forward;
+        };
+
+        if (!usePcre2) {
+            if (literalBytes.isEmpty())
+                return true;
+            const bool caseSensitive = opts.hexBytesMode ? true : opts.caseSensitive;
+            const QVector<int> failure = kmpBuildFail(literalBytes, caseSensitive);
+            int matched = 0;
+            for (qsizetype i = 0; i < bytes.size(); ++i) {
+                if ((i & ((1 << 20) - 1)) == 0
+                    && isCancelled && isCancelled()) {
+                    return false;
+                }
+                const uchar value = foldCaseAscii(uchar(bytes.at(i)), caseSensitive);
+                while (matched > 0
+                       && foldCaseAscii(uchar(literalBytes.at(matched)), caseSensitive)
+                              != value) {
+                    matched = failure.at(matched - 1);
+                }
+                if (foldCaseAscii(uchar(literalBytes.at(matched)), caseSensitive)
+                    == value) {
+                    ++matched;
+                }
+                if (matched == literalBytes.size()) {
+                    const qint64 local = i + 1 - literalBytes.size();
+                    if (!consider(local, literalBytes.size()) && found)
+                        break;
+                    matched = failure.at(matched - 1);
+                }
+            }
+        } else {
+            const auto noCancel = [&]() {
+                return isCancelled && isCancelled();
+            };
+            if (rawEncodedRegex) {
+                const auto result = rawCompiled.scan(
+                    reinterpret_cast<const uchar *>(bytes.constData()), bytes.size(),
+                    noCancel, {}, consider, error);
+                if (result == RawCodePageRegex::ScanResult::Failed)
+                    return false;
+                if (result == RawCodePageRegex::ScanResult::Cancelled && !found)
+                    return false;
+            } else {
+                const auto result = compiled.scan(
+                    reinterpret_cast<const uchar *>(bytes.constData()), bytes.size(),
+                    noCancel, {}, consider, error);
+                if (result == Pcre2Regex::ScanResult::Failed)
+                    return false;
+                if (result == Pcre2Regex::ScanResult::Cancelled && !found)
+                    return false;
+            }
+        }
+
+        if (found && accepted)
+            *accepted = best;
+        return true;
+    };
+
+    const auto scanForwardRange = [&](qint64 start, qint64 end,
+                                      LargeFileSearchMatch *accepted) {
+        for (qint64 coreStart = start; coreStart < end; ) {
+            const qint64 coreEnd = qMin(end, coreStart + CoreBytes);
+            if (!scanCore(coreStart, coreEnd, accepted))
+                return false;
+            scannedBytes += coreEnd - coreStart;
+            if (reportProgress) reportProgress(scannedBytes);
+            if (accepted && accepted->byteOffset >= 0)
+                return true;
+            coreStart = coreEnd;
+        }
+        return true;
+    };
+    const auto scanReverseRange = [&](qint64 start, qint64 end,
+                                      LargeFileSearchMatch *accepted) {
+        for (qint64 coreEnd = end; coreEnd > start; ) {
+            const qint64 coreStart = qMax(start, coreEnd - CoreBytes);
+            if (!scanCore(coreStart, coreEnd, accepted))
+                return false;
+            scannedBytes += coreEnd - coreStart;
+            if (reportProgress) reportProgress(scannedBytes);
+            if (accepted && accepted->byteOffset >= 0)
+                return true;
+            coreEnd = coreStart;
+        }
+        return true;
+    };
+
+    LargeFileSearchMatch found;
+    found.byteOffset = -1;
+    bool ok = true;
+    if (forward) {
+        const qint64 start = fromByte < 0 ? 0
+            : (fromByte >= virtualSize ? virtualSize : fromByte + 1);
+        ok = scanForwardRange(start, virtualSize, &found);
+        if (ok && found.byteOffset < 0 && wrap && start > 0)
+            ok = scanForwardRange(0, start, &found);
+    } else {
+        const qint64 end = fromByte == std::numeric_limits<qint64>::max()
+            ? virtualSize : qBound<qint64>(0, fromByte, virtualSize);
+        ok = scanReverseRange(0, end, &found);
+        if (ok && found.byteOffset < 0 && wrap && end < virtualSize)
+            ok = scanReverseRange(end, virtualSize, &found);
+    }
+    if (!ok)
+        return false;
+    if (found.byteOffset >= 0) {
+        if (opts.byteContextMode)
+            fillByteContext(found);
+        else
+            fillLineContext(found);
+        if (match) *match = std::move(found);
+    }
+    return true;
+}
+
 // ============================================================================
 //  findAll（异步）
 // ============================================================================
 void LargeFileSearch::findAll(const QString& pattern, const Options& opts) {
-    if (!mmapBase_ || (!lineIndex_ && !opts.byteContextMode)) {
-        emit failed(QStringLiteral("数据源未设置。"));
-        return;
-    }
-    // 如果已经被 requestCancel，立即取消不启动 worker（避免先 cancel 再 findAll 被重置失效）
-    if (cancel_.exchange(false, std::memory_order_acq_rel)) {
-        emit failed(QStringLiteral("已取消。"));
-        return;
-    }
-    // 内存屏障：worker 前主线程所有写入可见；memMatches/overrunCount 初始值正确刷入
-    std::atomic_thread_fence(std::memory_order_release);
-    memMatches_.clear();
-    storageFailed_ = false;
-    scanError_.clear();
-    closeOverrunFile();
-    overrunCount_ = 0;
-    overrunCheckpoints_.clear();
-    overrunCheckpointBytes_.clear();
-    overrunGroupedCount_ = 0;
-    overrunLastLine_ = std::numeric_limits<qint32>::min();
-    overrunLastContext_ = std::numeric_limits<qint64>::min();
-    if (!overrunFile_.isEmpty()) { QFile::remove(overrunFile_); overrunFile_.clear(); }
-    memMatches_.reserve(int(qMin<qint64>(maxMemMatches_, qint64(2000000))));
-
-    QByteArray literalBytes;
-    bool usePcre2 = false;
-    QString patternError;
-    if (!prepareSearchPattern(pattern, opts, &literalBytes,
-                              &usePcre2, &patternError)) {
-        emit failed(patternError);
-        return;
-    }
-
-    const qint64 virtualSize = patchList_ ? patchList_->virtualSize(mmapSize_) : mmapSize_;
-    auto worker = [this, virtualSize, pattern, opts]() {
-        const auto isCancelled = [this]() {
-            return cancel_.load(std::memory_order_relaxed);
-        };
-        const bool ok = scanAllBounded(
-            virtualSize, pattern, opts, isCancelled,
-            [this, virtualSize](qint64 done) { emit progress(done, virtualSize); },
-            [this](const QVector<LargeFileSearchMatch> &batch) {
-                emit partialBatch(batch);
-                return true;
-            });
-        if (!ok) {
-            emit failed(storageFailed_ ? QStringLiteral("搜索结果临时存储写入失败。")
-                                       : (!scanError_.isEmpty() ? scanError_
-                                                               : QStringLiteral("已取消。")));
-            return;
-        }
-        std::atomic_thread_fence(std::memory_order_release);
-        emit progress(virtualSize, virtualSize);
-        emit finished(qint64(memMatches_.size()) + overrunCount_);
-    };
-
-    // This compatibility path still blocks its caller with a nested event
-    // loop, but its worker belongs to the same capped/observable pool as all
-    // other application background work.
-    AsyncThreadPool::instance().startWorker(std::move(worker),
-                                            AsyncTaskPriority::High);
+    findAllViaTaskManager(pattern, opts, QString());
 }
 
 // ============================================================================
@@ -731,81 +1010,152 @@ qint64 LargeFileSearch::findAllViaTaskManager(const QString& pattern, const Opti
         return -1;
     }
 
+    if (!reserveWorker()) {
+        emit failed(QStringLiteral("已有搜索正在运行。"));
+        return -1;
+    }
+    auto releaseOnSubmitFailure = qScopeGuard([this] { releaseWorker(); });
+
     const qint64 virtualSize = patchList_ ? patchList_->virtualSize(mmapSize_) : mmapSize_;
 
     const QString displayName = fileDisplayName.isEmpty()
         ? QObject::tr("(未命名大文件)")
         : fileDisplayName;
     const QString title = QObject::tr("搜索大文件: %1").arg(displayName);
-    const QString desc  = QObject::tr("文件: %1\n模式: %2\n大小写敏感: %3\n整词匹配: %4\n\n可在查找窗口或「后台任务」面板取消。进度按已扫描字节/总虚拟大小计算。")
+    const QString desc  = QObject::tr("%1 · %2 · 区分大小写:%3 · 整词:%4")
         .arg(displayName)
         .arg(opts.regexMode ? QObject::tr("正则表达式") : QObject::tr("字面值"))
         .arg(opts.caseSensitive ? QObject::tr("是") : QObject::tr("否"))
         .arg(opts.wholeWord ? QObject::tr("是") : QObject::tr("否"));
 
-    // 捕获 LargeFileSearch 原始指针为本地变量，worker 中使用需谨慎：
-    //  我们通过信号的 QueuedConnection 把 finished/failed/progress 回主线程；
-    //  若对象在中途被析构，LargeFileSearch::requestCancel()/cancel_ 原子标志保证安全退出，
-    //  但要避免访问成员变量（除非对象仍存在）。这里我们用 QPointer + QMetaObject::invokeMethod
-    //  做主线程安全回调；scanAllBounded/readVirtualBytes 本身只读数据源。
-    QPointer<LargeFileSearch> that(this);
     lastTaskId_ = AsyncTaskManager::instance().submit(
         AsyncTaskType::LargeFileSearch,
         AsyncTaskPriority::High,
         title,
         desc,
-        /* workerFn = */ [that, virtualSize, pattern, opts]
+        /* workerFn = */ [this, virtualSize, pattern, opts]
         (qint64 /*taskId*/, AsyncCancelPtr cancel,
          std::function<void(qint64,qint64)> reportProgress,
          std::function<void(const AsyncErrorInfo&)> reportError)
         {
             Q_UNUSED(reportError);
-            if (!that) {
-                AsyncErrorInfo e;
-                e.message = QObject::tr("LargeFileSearch 对象已析构，搜索中止。");
-                reportError(e);
-                return;
-            }
-
-            that->cancel_.store(false, std::memory_order_release);
+            const auto release = qScopeGuard([this] { releaseWorker(); });
             const auto isCancelled = [&]() {
                 return (cancel && cancel->load(std::memory_order_acquire))
-                    || that->cancel_.load(std::memory_order_relaxed);
+                    || cancel_.load(std::memory_order_relaxed);
             };
-            const bool ok = that->scanAllBounded(
+            const bool ok = scanAllBounded(
                 virtualSize, pattern, opts, isCancelled,
-                [that, reportProgress, virtualSize](qint64 done) {
+                [this, reportProgress, virtualSize](qint64 done) {
                     reportProgress(done, virtualSize);
-                    QMetaObject::invokeMethod(that, "progress", Qt::QueuedConnection,
+                    QMetaObject::invokeMethod(this, "progress", Qt::QueuedConnection,
                                               Q_ARG(qint64, done), Q_ARG(qint64, virtualSize));
                 },
-                [that](const QVector<LargeFileSearchMatch> &batch) {
+                [this](const QVector<LargeFileSearchMatch> &batch) {
                     QMetaObject::invokeMethod(
-                        that, "partialBatch", Qt::QueuedConnection,
+                        this, "partialBatch", Qt::QueuedConnection,
                         Q_ARG(QVector<LargeFileSearchMatch>, batch));
                     return true;
                 });
             if (!ok) {
                 QMetaObject::invokeMethod(
-                    that, "failed", Qt::QueuedConnection,
-                    Q_ARG(QString, that->storageFailed_
+                    this, "failed", Qt::QueuedConnection,
+                    Q_ARG(QString, storageFailed_
                         ? QObject::tr("搜索结果临时存储写入失败。")
-                        : (!that->scanError_.isEmpty() ? that->scanError_
-                                                       : QObject::tr("已取消。"))));
+                        : (!scanError_.isEmpty() ? scanError_
+                                                : QObject::tr("已取消。"))));
                 return;
             }
             std::atomic_thread_fence(std::memory_order_release);
-            const qint64 count = qint64(that->memMatches_.size()) + that->overrunCount_;
+            const qint64 count = qint64(memMatches_.size()) + overrunCount_;
             reportProgress(virtualSize, virtualSize);
-            QMetaObject::invokeMethod(that, "progress", Qt::QueuedConnection,
+            QMetaObject::invokeMethod(this, "progress", Qt::QueuedConnection,
                                       Q_ARG(qint64, virtualSize), Q_ARG(qint64, virtualSize));
-            QMetaObject::invokeMethod(that, "finished", Qt::QueuedConnection,
+            QMetaObject::invokeMethod(this, "finished", Qt::QueuedConnection,
                                       Q_ARG(qint64, count));
         },
         /* batchId = */ 0,
         /* categoryTag = */ QLatin1String("Search"),
         /* progressTotalInit = */ virtualSize
     );
+    releaseOnSubmitFailure.dismiss();
+    return lastTaskId_;
+}
+
+qint64 LargeFileSearch::findOneViaTaskManager(
+    const QString &pattern, const Options &opts, qint64 fromByte,
+    bool forward, bool wrap, const QString &fileDisplayName,
+    QObject *callbackContext, OneMatchCallback callback)
+{
+    if (!mmapBase_ || (!lineIndex_ && !opts.byteContextMode)) {
+        if (callback)
+            callback(false, {}, QObject::tr("数据源未就绪。"));
+        return -1;
+    }
+    QString validationError;
+    QByteArray literal;
+    bool usePcre2 = false;
+    if (!prepareSearchPattern(pattern, opts, &literal, &usePcre2,
+                              &validationError)) {
+        if (callback)
+            callback(false, {}, validationError);
+        return -1;
+    }
+    if (!reserveWorker()) {
+        if (callback)
+            callback(false, {}, QObject::tr("搜索任务正在运行。"));
+        return -1;
+    }
+    auto releaseOnSubmitFailure = qScopeGuard([this] { releaseWorker(); });
+    cancel_.store(false, std::memory_order_release);
+    const qint64 virtualSize = patchList_
+        ? patchList_->virtualSize(mmapSize_) : mmapSize_;
+    const QString displayName = fileDisplayName.isEmpty()
+        ? QObject::tr("大文件") : fileDisplayName;
+    QPointer<QObject> guard(callbackContext);
+    lastTaskId_ = AsyncTaskManager::instance().submit(
+        AsyncTaskType::LargeFileSearch, AsyncTaskPriority::Highest,
+        forward ? QObject::tr("查找下一个: %1").arg(displayName)
+                : QObject::tr("查找上一个: %1").arg(displayName),
+        QObject::tr("定向扫描，找到一处即返回"),
+        [this, virtualSize, pattern, opts, fromByte, forward, wrap,
+         guard, callback = std::move(callback)]
+        (qint64, AsyncCancelPtr cancel,
+         std::function<void(qint64, qint64)> reportProgress,
+         std::function<void(const AsyncErrorInfo &)> reportError) mutable {
+            const auto release = qScopeGuard([this] { releaseWorker(); });
+            const auto isCancelled = [this, cancel]() {
+                return (cancel && cancel->load(std::memory_order_acquire))
+                    || cancel_.load(std::memory_order_acquire);
+            };
+            LargeFileSearchMatch found;
+            found.byteOffset = -1;
+            QString error;
+            const bool ok = scanOneBounded(
+                virtualSize, pattern, opts, fromByte, forward, wrap,
+                isCancelled,
+                [reportProgress, virtualSize](qint64 done) {
+                    reportProgress(qMin(done, virtualSize), virtualSize);
+                },
+                &found, &error);
+            if (!ok && error.isEmpty() && isCancelled())
+                error = QObject::tr("已取消。");
+            if (!ok && !error.isEmpty() && error != QObject::tr("已取消。")) {
+                AsyncErrorInfo taskError;
+                taskError.message = error;
+                reportError(taskError);
+            }
+            if (!guard || !callback)
+                return;
+            const bool matched = ok && found.byteOffset >= 0;
+            QMetaObject::invokeMethod(
+                guard, [callback = std::move(callback), matched,
+                        found = std::move(found), error = std::move(error)]() mutable {
+                    callback(matched, std::move(found), std::move(error));
+                }, Qt::QueuedConnection);
+        },
+        0, QLatin1String("SearchNavigation"), virtualSize);
+    releaseOnSubmitFailure.dismiss();
     return lastTaskId_;
 }
 
@@ -920,7 +1270,19 @@ bool LargeFileSearch::replaceAll(const QString& pattern, const QString& replacem
     overrunLastContext_ = std::numeric_limits<qint64>::min();
     if (!overrunFile_.isEmpty()) { QFile::remove(overrunFile_); overrunFile_.clear(); }
 
-    QByteArray replBytes = replacement.toUtf8();
+    bool replacementEncodingOk = true;
+    QByteArray replBytes = opts.byteContextMode
+        ? replacement.toUtf8()
+        : encodeTextFragment(replacement, opts.textEncoding,
+                             &replacementEncodingOk);
+    if (!opts.regexMode && !replacementEncodingOk) {
+        if (errMsg) {
+            *errMsg = QObject::tr(
+                "替换文本包含 %1 无法表示的字符；尚未修改文件。")
+                          .arg(encodingName(opts.textEncoding));
+        }
+        return false;
+    }
 
     // Step 1 简化：直接收集所有匹配（分批收集，但这里内存直接做；溢出则失败——replaceAll
     // 必须有完整匹配列表才能正确按 byteOffset 从大到小替换）
@@ -989,12 +1351,25 @@ bool LargeFileSearch::replaceAll(const QString& pattern, const QString& replacem
         }
     });
     if (opts.regexMode) {
+        const bool rawEncodedRegex = !opts.byteContextMode
+            && opts.textEncoding != TextEncoding::Utf8
+            && opts.textEncoding != TextEncoding::Utf8Bom;
         Pcre2Regex compiled;
+        RawCodePageRegex rawCompiled;
         QString expansionError;
-        if (!compiled.compile(pattern, false, opts.caseSensitive,
-                              opts.wholeWord, &expansionError)) {
-            if (errMsg) *errMsg = expansionError;
-            return false;
+        if (rawEncodedRegex) {
+            if (!rawCompiled.compile(pattern, opts.caseSensitive,
+                                     opts.textEncoding,
+                                     &expansionError)) {
+                if (errMsg) *errMsg = expansionError;
+                return false;
+            }
+        } else {
+            if (!compiled.compile(pattern, false, opts.caseSensitive,
+                                  opts.wholeWord, &expansionError)) {
+                if (errMsg) *errMsg = expansionError;
+                return false;
+            }
         }
 
         const uchar *subject = mmapBase_;
@@ -1054,9 +1429,14 @@ bool LargeFileSearch::replaceAll(const QString& pattern, const QString& replacem
         expandedReplacements.reserve(allMatches.size());
         for (const LargeFileSearchMatch &match : std::as_const(allMatches)) {
             QByteArray expanded;
-            if (!compiled.expandReplacementAt(
-                    subject, virtualSize, match.byteOffset, match.length,
-                    replacement, &expanded, &expansionError)) {
+            const bool expandedOk = rawEncodedRegex
+                ? rawCompiled.expandReplacementAt(
+                      subject, virtualSize, match.byteOffset, match.length,
+                      replacement, &expanded, &expansionError)
+                : compiled.expandReplacementAt(
+                      subject, virtualSize, match.byteOffset, match.length,
+                      replacement, &expanded, &expansionError);
+            if (!expandedOk) {
                 if (errMsg) *errMsg = expansionError;
                 return false;
             }

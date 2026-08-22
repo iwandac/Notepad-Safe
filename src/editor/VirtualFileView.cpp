@@ -138,6 +138,7 @@ VirtualFileView::~VirtualFileView() {
     closeFile(/*allowProcessEvents=*/false);
 
     if (search_) { delete search_; search_ = nullptr; }
+    if (navigationSearch_) { delete navigationSearch_; navigationSearch_ = nullptr; }
 }
 
 // ============================================================================
@@ -162,6 +163,8 @@ bool VirtualFileView::openFile(const QString& filePath, QString* errMsg)
         patches_.resetAfterSave();
         lastL2Count_ = 0;
         if (search_) search_->setSource(nullptr, 0, &lineIndex_, &patches_);
+        if (navigationSearch_)
+            navigationSearch_->setSource(nullptr, 0, &lineIndex_, &patches_);
         updateMetrics();
         updateScrollBarsFromContent();
         viewport()->update();
@@ -254,6 +257,8 @@ bool VirtualFileView::openMemory(QByteArray bytes, ViewMode mode, QString* errMs
     lastL2Count_ = 0;
     if (search_)
         search_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
+    if (navigationSearch_)
+        navigationSearch_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
 
     m_activeWindowStart = 0;
     m_activeWindowLen = 0;
@@ -296,6 +301,8 @@ void VirtualFileView::onMmapReady(quintptr ptr, qint64 size, LineIndex quickInde
     patches_.resetAfterSave();
     lastL2Count_ = 0;
     if (search_) search_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
+    if (navigationSearch_)
+        navigationSearch_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
 
     // ---- 小 chunk overlay：复位 activeWindow ----
     m_activeWindowStart = 0;
@@ -413,6 +420,14 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
     // re-enter task progress updates while closeFile waits for termination.
     m_closingFile = true;
     ++m_mappingGeneration;
+
+    // LargeFileSearch borrows mmapBase_, lineIndex_ and patches_. Its worker
+    // may still be queued when cancellation is requested, so cross its own
+    // completion barrier before any of those objects are reset or unmapped.
+    if (search_)
+        search_->cancelAndWait();
+    if (navigationSearch_)
+        navigationSearch_->cancelAndWait();
     // ========================================================================
     //  取消异步 mmap 任务（如果正在加载中）
     // ========================================================================
@@ -539,6 +554,8 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
     patches_.setSensitive(false);
     lastL2Count_ = 0;
     if (search_) search_->setSource(nullptr, 0, nullptr, nullptr);
+    if (navigationSearch_)
+        navigationSearch_->setSource(nullptr, 0, nullptr, nullptr);
 
     // ---- 关闭文件时一并清理小 chunk 状态 ----
     if (closingMemoryBacked) {
@@ -807,15 +824,29 @@ QVector<uint> VirtualFileView::decodeBytesForDisplay(const uchar* data, int len)
         }
         break;
     }
-    case TextEncoding::GBK: {
+    case TextEncoding::GBK:
+    case TextEncoding::GB18030:
+    case TextEncoding::Big5:
+    case TextEncoding::ShiftJis:
+    case TextEncoding::Windows1252: {
 #ifdef Q_OS_WIN
-        int wlen = MultiByteToWideChar(CP_ACP, 0, (const char*)data, len, nullptr, 0);
+        quint32 codePage = 0;
+        windowsCodePageForEncoding(m_displayEncoding, &codePage);
+        int wlen = MultiByteToWideChar(codePage, 0, (const char*)data, len, nullptr, 0);
         if (wlen > 0) {
             QVector<wchar_t> wstr(wlen);
-            MultiByteToWideChar(CP_ACP, 0, (const char*)data, len, wstr.data(), wlen);
+            MultiByteToWideChar(codePage, 0, (const char*)data, len, wstr.data(), wlen);
             result.reserve(wlen);
-            for (int i = 0; i < wlen; ++i)
-                result.append((uint)wstr[i]);
+            for (int i = 0; i < wlen; ++i) {
+                const quint16 first = quint16(wstr[i]);
+                if (QChar::isHighSurrogate(first) && i + 1 < wlen
+                    && QChar::isLowSurrogate(quint16(wstr[i + 1]))) {
+                    result.append(QChar::surrogateToUcs4(
+                        first, quint16(wstr[++i])));
+                } else {
+                    result.append(first);
+                }
+            }
         }
 #else
         // 非 Windows：用 Qt 的 GB18030 解码器
@@ -830,16 +861,17 @@ QVector<uint> VirtualFileView::decodeBytesForDisplay(const uchar* data, int len)
         break;
     }
     case TextEncoding::Utf16LE: {
-        int n = len / 2;
-        result.reserve(n);
-        for (int i = 0; i + 1 < len; i += 2)
-            result.append(uint(data[i]) | (uint(data[i+1]) << 8));
+        const QString text = decodeTextFragment(
+            QByteArray(reinterpret_cast<const char *>(data), len),
+            TextEncoding::Utf16LE);
+        result = text.toUcs4();
         break;
     }
     case TextEncoding::Utf16BE: {
-        result.reserve(len / 2);
-        for (int i = 0; i + 1 < len; i += 2)
-            result.append((uint(data[i]) << 8) | uint(data[i+1]));
+        const QString text = decodeTextFragment(
+            QByteArray(reinterpret_cast<const char *>(data), len),
+            TextEncoding::Utf16BE);
+        result = text.toUcs4();
         break;
     }
     }
@@ -1772,6 +1804,15 @@ LargeFileSearch* VirtualFileView::searchEngine() {
     return search_;
 }
 
+LargeFileSearch* VirtualFileView::navigationSearchEngine() {
+    if (!navigationSearch_) {
+        navigationSearch_ = new LargeFileSearch(this);
+        if (isOpen())
+            navigationSearch_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
+    }
+    return navigationSearch_;
+}
+
 void VirtualFileView::setSearchHighlights(const QVector<QPair<qint64, qint32>>& positions) {
     searchHighlights_ = positions;
     viewport()->update();
@@ -1961,6 +2002,8 @@ void VirtualFileView::onAsyncLineBuildSwapped(LineIndex result, bool buildOk)
                 m_buildProgressBytes = mmapSize_;  // 构建完成
                 viewport()->update();
                 if (search_) search_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
+                if (navigationSearch_)
+                    navigationSearch_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
                 emit lineBuildProgress(mmapSize_, mmapSize_);
                 // 同步更新任务进度到 100%（防止 QueuedConnection 进度包在任务入 history 后丢失）
                 if (m_lineBuildTaskId > 0) {

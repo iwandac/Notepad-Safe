@@ -12,7 +12,7 @@
 int main(int argc, char* argv[]) {
     QCoreApplication app(argc, argv);
 
-    QString path = "f:/projects/credentials/bigtestfile";
+    QString path = "f:/projects/notepadsafe/bigtestfile";
     if (argc > 1) path = argv[1];
 
     QFile file(path);

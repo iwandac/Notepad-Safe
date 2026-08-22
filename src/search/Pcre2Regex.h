@@ -33,7 +33,7 @@ public:
     // byte boundaries when utfMode=false (Binary literal search).
     bool compile(const QString &pattern, bool literal, bool caseSensitive,
                  bool wholeWord, QString *error = nullptr,
-                 bool utfMode = true);
+                 bool utfMode = true, bool matchInvalidUtf = false);
 
     bool isValid() const;
 

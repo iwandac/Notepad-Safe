@@ -31,8 +31,12 @@ if not defined NOTEPADSAFE_WITH_KDBX (
 )
 
 if not defined NOTEPADSAFE_VS_ROOT (
-    set "NOTEPADSAFE_VS_ROOT=C:\Program Files\Microsoft Visual Studio\18\Insiders"
+    set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+    if exist "!VSWHERE!" (
+        for /f "usebackq tokens=*" %%I in (`"!VSWHERE!" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "NOTEPADSAFE_VS_ROOT=%%I"
+    )
 )
+if not defined NOTEPADSAFE_VS_ROOT set "NOTEPADSAFE_VS_ROOT=C:\Program Files\Microsoft Visual Studio\18\Insiders"
 set "VCVARS=%NOTEPADSAFE_VS_ROOT%\VC\Auxiliary\Build\vcvars64.bat"
 set "VS_CMAKE=%NOTEPADSAFE_VS_ROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 set "VS_NINJA=%NOTEPADSAFE_VS_ROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
@@ -54,20 +58,11 @@ if defined NOTEPADSAFE_QT6_DIR (
     echo Qt path from env NOTEPADSAFE_QT6_DIR = %NOTEPADSAFE_QT6_DIR%
 )
 
-echo === [2/4] Preparing locked dependencies ===
-powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%tools\bootstrap_pcre2.ps1"
+echo === [2/4] Preparing locked offline dependencies ===
+call "%SCRIPT_DIR%prepare_dependencies.bat"
 if errorlevel 1 (
-    echo ERROR: PCRE2 dependency bootstrap failed
+    echo ERROR: dependency preparation failed
     exit /b 1
-)
-if /I "%NOTEPADSAFE_WITH_KDBX%"=="ON" (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%tools\bootstrap_crypto_deps.ps1"
-    if errorlevel 1 (
-        echo ERROR: KDBX dependency bootstrap failed
-        exit /b 1
-    )
-) else (
-    echo KDBX backend disabled by NOTEPADSAFE_WITH_KDBX=OFF
 )
 
 if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"

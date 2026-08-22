@@ -8,6 +8,7 @@
 #include "TextEncoding.h"
 
 #include <memory>
+#include <optional>
 
 class QTabWidget;
 class QShowEvent;
@@ -150,7 +151,7 @@ private:
     // L2 模式下禁用不适配菜单项（D001~D007 强制，L2 isL2Active=true 时 setEnabled(false) 变灰）
     QAction *m_actSortAsc = nullptr;          // 编辑 → 行升序排序（全 Scintilla 代码，L2 空+超大文件不可排序）
     QAction *m_actSortDesc = nullptr;         // 编辑 → 行降序排序
-    QVector<QAction *> m_convertEncodingActions;  // 编码 → 转为 GBK/UTF-8/UTF-8BOM/UTF-16LE/UTF-16BE（5 项，只改标志未做 re-encode，L2 禁用）
+    QVector<QAction *> m_convertEncodingActions;  // 转换为：另存新文件并自动打开，含大文件流式转换
 
     // 视图菜单 action（用于 loadSettings 后同步勾选状态，避免数据与UI不一致）
     QAction *m_actDarkMode = nullptr;
@@ -243,7 +244,8 @@ private:
     void exportRecoveryKey();
     void verifyRecoveryKey();
     bool ensureSecuritySessionInteractive();
-    bool openPathUnified(const QString &path, EditorTab *reuseTab = nullptr);
+    bool openPathUnified(const QString &path, EditorTab *reuseTab = nullptr,
+                         std::optional<TextEncoding> forcedEncoding = std::nullopt);
     bool openSecurePath(const QString &path, EditorTab *reuseTab = nullptr);
     EditorTab *adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
                                    EditorTab *reuseTab = nullptr);

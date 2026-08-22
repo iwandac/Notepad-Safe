@@ -22,6 +22,8 @@
 #include <QPointer>
 #include <QSharedPointer>
 #include <QSignalBlocker>
+#include <QRegularExpression>
+#include <QSizePolicy>
 #include <utility>
 
 namespace {
@@ -128,6 +130,69 @@ void FindReplaceDialog::buildUi()
     optionsLayout->addStretch();
     layout->addLayout(optionsLayout);
 
+    // A deliberately small authoring aid: it edits the same regex string as
+    // expert mode instead of introducing a second query language or a lossy
+    // visual AST. Selected text is wrapped; an empty selection gets an
+    // editable placeholder.
+    auto *assistantHeader = new QHBoxLayout;
+    m_regexAssistantToggle = new QPushButton(QStringLiteral("正则助手"));
+    m_regexAssistantToggle->setObjectName(QStringLiteral("regexAssistantToggle"));
+    m_regexAssistantToggle->setCheckable(true);
+    assistantHeader->addWidget(m_regexAssistantToggle);
+    m_queryHintLabel = new QLabel;
+    m_queryHintLabel->setObjectName(QStringLiteral("regexQueryHint"));
+    m_queryHintLabel->setStyleSheet(QStringLiteral("color:#707070;"));
+    m_queryHintLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_queryHintLabel->setWordWrap(true);
+    m_queryHintLabel->setMinimumWidth(0);
+    m_queryHintLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    assistantHeader->addWidget(m_queryHintLabel, 1);
+    layout->addLayout(assistantHeader);
+
+    m_regexAssistant = new QWidget;
+    m_regexAssistant->setObjectName(QStringLiteral("regexAssistant"));
+    auto *assistantLayout = new QHBoxLayout(m_regexAssistant);
+    assistantLayout->setContentsMargins(0, 0, 0, 0);
+    assistantLayout->setSpacing(4);
+    struct AssistantItem {
+        const char *label;
+        const char *prefix;
+        const char *suffix;
+        const char *placeholder;
+        const char *tip;
+    };
+    const AssistantItem items[] = {
+        {"原样文本", "", "", "文本", "把选择内容按普通文字匹配"},
+        {"任意内容", ".*?", "", "", "匹配任意长度内容，使用非贪婪方式"},
+        {"数字", "\\d+", "", "", "匹配一个或多个数字"},
+        {"单词", "\\w+", "", "", "匹配一个或多个文字、数字或下划线"},
+        {"空白", "\\s+", "", "", "匹配一个或多个空白字符"},
+        {"捕获", "(?<字段>", ")", "内容", "命名捕获可在替换中用 ${字段} 引用"},
+        {"任选", "(?:", ")", "A|B", "匹配多个候选之一"},
+        {"行首", "^", "", "", "只在行首匹配"},
+        {"行尾", "$", "", "", "只在行尾匹配"},
+    };
+    for (const AssistantItem &item : items) {
+        auto *button = new QPushButton(QString::fromUtf8(item.label));
+        button->setToolTip(QString::fromUtf8(item.tip));
+        assistantLayout->addWidget(button);
+        connect(button, &QPushButton::clicked, this,
+                [this, item]() {
+                    if (QString::fromUtf8(item.label) == QStringLiteral("原样文本")) {
+                        QString text = m_findEdit->selectedText();
+                        if (text.isEmpty()) text = QString::fromUtf8(item.placeholder);
+                        m_findEdit->insert(QRegularExpression::escape(text));
+                    } else {
+                        insertRegexTemplate(QString::fromUtf8(item.prefix),
+                                            QString::fromUtf8(item.suffix),
+                                            QString::fromUtf8(item.placeholder));
+                    }
+                });
+    }
+    assistantLayout->addStretch();
+    m_regexAssistant->setVisible(false);
+    layout->addWidget(m_regexAssistant);
+
     // 按钮
     auto *btnLayout = new QHBoxLayout;
     m_findNextBtn = new QPushButton(QStringLiteral("查找下一个"));
@@ -159,6 +224,9 @@ void FindReplaceDialog::buildUi()
     m_statusLabel = new QLabel(QStringLiteral(""));
     m_statusLabel->setObjectName(QStringLiteral("findStatusLabel"));
     m_statusLabel->setStyleSheet(QStringLiteral("color:#888;"));
+    m_statusLabel->setWordWrap(true);
+    m_statusLabel->setMinimumWidth(0);
+    m_statusLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     layout->addWidget(m_statusLabel);
 
     // 连接
@@ -202,6 +270,13 @@ void FindReplaceDialog::buildUi()
         updateQueryUi();
         emitFindParameters();
     });
+    connect(m_regexAssistantToggle, &QPushButton::toggled,
+            this, [this](bool visible) {
+                if (visible && !m_regexCheck->isChecked())
+                    m_regexCheck->setChecked(true);
+                m_regexAssistant->setVisible(visible);
+                adjustSize();
+            });
     connect(m_hexBytesCheck, &QCheckBox::toggled, this, [this](bool checked) {
         if (checked) {
             const QSignalBlocker blockRegex(m_regexCheck);
@@ -318,7 +393,7 @@ void FindReplaceDialog::notifyTabOpened(EditorTab *tab)
         }
         return;
     }
-    if (m_multiHexBytes && !tab->isBinaryDocument()) {
+    if (m_multiHexBytes && !tab->isHexPresentation()) {
         ++m_multiSkippedTextTargets;
         if (m_statusLabel) {
             m_statusLabel->setText(
@@ -386,6 +461,24 @@ QString FindReplaceDialog::currentReplaceText() const
     return m_replaceEdit->text();
 }
 
+void FindReplaceDialog::insertRegexTemplate(const QString &prefix,
+                                            const QString &suffix,
+                                            const QString &placeholder)
+{
+    const int start = m_findEdit->selectionStart() >= 0
+        ? m_findEdit->selectionStart() : m_findEdit->cursorPosition();
+    const QString selected = m_findEdit->selectedText();
+    const QString body = selected.isEmpty() ? placeholder : selected;
+    const QString inserted = prefix + body + suffix;
+    m_findEdit->insert(inserted);
+    if (selected.isEmpty() && !placeholder.isEmpty()) {
+        m_findEdit->setSelection(start + prefix.size(), placeholder.size());
+    } else {
+        m_findEdit->setCursorPosition(start + inserted.size());
+    }
+    m_findEdit->setFocus();
+}
+
 void FindReplaceDialog::emitFindParameters()
 {
     emit findParametersChanged(m_findEdit->text(), m_regexCheck->isChecked(),
@@ -421,7 +514,30 @@ void FindReplaceDialog::updateQueryUi()
 {
     if (!m_hexBytesCheck)
         return;
+
     const bool busy = m_l2SearchInProgress;
+    if (m_regexAssistantToggle)
+        m_regexAssistantToggle->setEnabled(!busy && !hexBytesMode());
+    if (m_queryHintLabel && !busy) {
+        if (m_regexCheck->isChecked() && !m_findEdit->text().isEmpty()) {
+            Pcre2Regex validator;
+            QString error;
+            if (validator.compile(m_findEdit->text(), false,
+                                  m_caseCheck->isChecked(), false, &error)) {
+                m_queryHintLabel->setText(QStringLiteral("正则有效"));
+                m_queryHintLabel->setStyleSheet(QStringLiteral("color:#39734a;"));
+            } else {
+                m_queryHintLabel->setText(error);
+                m_queryHintLabel->setStyleSheet(QStringLiteral("color:#a33a3a;"));
+            }
+        } else if (hexBytesMode()) {
+            m_queryHintLabel->setText(QStringLiteral("原始字节搜索"));
+            m_queryHintLabel->setStyleSheet(QStringLiteral("color:#707070;"));
+        } else {
+            m_queryHintLabel->setText(QStringLiteral("普通查找"));
+            m_queryHintLabel->setStyleSheet(QStringLiteral("color:#707070;"));
+        }
+    }
     int searchableTargetCount = 0;
     for (EditorTab *tab : openTabs()) {
         if (isSearchableDocument(tab))
@@ -436,7 +552,7 @@ void FindReplaceDialog::updateQueryUi()
         }
     }
     bool hasBinaryTarget = isSearchableDocument(m_tab)
-        && m_tab->isBinaryDocument();
+        && m_tab->isHexPresentation();
     bool hasSearchableTarget = isSearchableDocument(m_tab);
     if (allOpenScope()) {
         hasBinaryTarget = false;
@@ -445,7 +561,7 @@ void FindReplaceDialog::updateQueryUi()
             if (!isSearchableDocument(tab))
                 continue;
             hasSearchableTarget = true;
-            if (tab->isBinaryDocument()) {
+            if (tab->isHexPresentation()) {
                 hasBinaryTarget = true;
             }
         }
@@ -491,8 +607,10 @@ void FindReplaceDialog::updateQueryUi()
     m_wrapCheck->setEnabled(!busy);
     m_scopeCombo->setEnabled(!busy);
     m_findEdit->setEnabled(!busy);
-    m_findNextBtn->setEnabled(!busy && queryExecutable);
-    m_findPrevBtn->setEnabled(!busy && queryExecutable);
+    const bool navigationAllowed = !m_navigationInProgress
+        && (!busy || m_allowNavigationDuringBusy);
+    m_findNextBtn->setEnabled(navigationAllowed && queryExecutable);
+    m_findPrevBtn->setEnabled(navigationAllowed && queryExecutable);
     m_findAllBtn->setEnabled(!busy && queryExecutable);
 
     const auto replaceableTextTarget = [](EditorTab *tab) {
@@ -533,10 +651,10 @@ void FindReplaceDialog::updateQueryUi()
     m_replaceEdit->setEnabled(replacementValueAllowed);
     if (!busy && m_statusLabel) {
         if (hex && m_replaceMode)
-            m_statusLabel->setText(QStringLiteral("十六进制字节模式当前只执行查找；字节编辑请直接在 Hex 视图完成。"));
+            m_statusLabel->setText(QStringLiteral("字节模式仅查找；编辑请回到 Hex 视图。"));
         else if (allOpenScope() && m_replaceMode)
             m_statusLabel->setText(QStringLiteral(
-                "全部替换会修改可编辑文本标签；只读大文件、Hex 和锁定文档将在确认前列出。"));
+                "全部替换只修改可编辑文本；执行前列出跳过项。"));
         else
             m_statusLabel->clear();
     }
@@ -565,9 +683,46 @@ void FindReplaceDialog::findAcrossTabs(bool forward)
     if (m_statusLabel) m_statusLabel->clear();
     bool queryError = false;
     const bool hex = hexBytesMode();
+    if (!allOpenScope() && m_tab && m_tab->isL2Mode()) {
+        if (!isSearchableDocument(m_tab)) {
+            if (m_statusLabel)
+                m_statusLabel->setText(QStringLiteral("当前安全文档已锁定。"));
+            return;
+        }
+        if (hex && !m_tab->isHexPresentation()) {
+            if (m_statusLabel)
+                m_statusLabel->setText(QStringLiteral("字节搜索仅适用于 Hex 文档。"));
+            return;
+        }
+        QPointer<EditorTab> target(m_tab);
+        setNavigationUiBusy(true, forward ? QObject::tr("查找下一个…")
+                                          : QObject::tr("查找上一个…"));
+        const bool started = m_tab->findNextL2Async(
+            pattern, m_regexCheck->isChecked(), m_caseCheck->isChecked(),
+            m_wordCheck->isChecked(), forward, m_wrapCheck->isChecked(), hex,
+            this,
+            [this, target](bool found, QString error) {
+                setNavigationUiBusy(false);
+                if (!m_statusLabel)
+                    return;
+                if (!error.isEmpty() && error != QStringLiteral("已取消。"))
+                    m_statusLabel->setText(error);
+                else if (!found)
+                    m_statusLabel->setText(error.isEmpty()
+                        ? QStringLiteral("未找到更多匹配")
+                        : error);
+                else
+                    m_statusLabel->clear();
+                if (found && target)
+                    target->setFocusEditor();
+            });
+        if (!started && m_navigationInProgress)
+            setNavigationUiBusy(false);
+        return;
+    }
     const auto findIn = [this, &pattern, forward, &queryError, hex](EditorTab *tab, bool wrap) {
         if (!isSearchableDocument(tab)
-            || (hex && !tab->isBinaryDocument()))
+            || (hex && !tab->isHexPresentation()))
             return false;
         const bool ownsBusyState = tab && tab->isL2Mode()
             && !m_l2SearchInProgress;
@@ -591,7 +746,7 @@ void FindReplaceDialog::findAcrossTabs(bool forward)
                 m_statusLabel->setText(QStringLiteral("当前安全文档已锁定，无法搜索正文。"));
             return;
         }
-        if (hex && !m_tab->isBinaryDocument()) {
+        if (hex && !m_tab->isHexPresentation()) {
             if (m_statusLabel)
                 m_statusLabel->setText(QStringLiteral("十六进制字节搜索仅适用于 Binary/Hex 文档。"));
             return;
@@ -885,7 +1040,7 @@ void FindReplaceDialog::onFindAll()
             m_statusLabel->setText(validationError);
         return;
     }
-    if (hex && !allOpenScope() && !m_tab->isBinaryDocument()) {
+    if (hex && !allOpenScope() && !m_tab->isHexPresentation()) {
         if (m_statusLabel)
             m_statusLabel->setText(QStringLiteral("十六进制字节搜索仅适用于 Binary/Hex 文档。"));
         return;
@@ -899,7 +1054,7 @@ void FindReplaceDialog::onFindAll()
 
     if (m_tab->isL2Mode()) {
         // L2 大文件：纯异步 → 经 AsyncTaskManager 派发 → findAllL2Finished 设置 Dock
-        setL2SearchUiBusy(true, QObject::tr("准备搜索…"));
+        setL2SearchUiBusy(true, QObject::tr("准备搜索…"), true);
         bool started = m_tab->findAllL2Async(pattern, m_regexCheck->isChecked(),
                                              m_caseCheck->isChecked(),
                                              m_wordCheck->isChecked(),
@@ -958,7 +1113,7 @@ void FindReplaceDialog::startAllOpenFindAll()
             ++m_multiSkippedLockedTargets;
             continue;
         }
-        if (hex && (!tab || !tab->isBinaryDocument())) {
+        if (hex && (!tab || !tab->isHexPresentation())) {
             ++m_multiSkippedTextTargets;
             continue;
         }
@@ -1122,11 +1277,11 @@ void FindReplaceDialog::cancelActiveSearch()
 // ============================================================================
 //  L2 异步搜索 UI 辅助
 // ============================================================================
-void FindReplaceDialog::setL2SearchUiBusy(bool busy, const QString& msg)
+void FindReplaceDialog::setL2SearchUiBusy(bool busy, const QString& msg,
+                                          bool allowNavigation)
 {
     m_l2SearchInProgress = busy;
-    m_findNextBtn->setEnabled(!busy);
-    m_findPrevBtn->setEnabled(!busy);
+    m_allowNavigationDuringBusy = busy && allowNavigation;
     m_findAllBtn->setEnabled(!busy);
     m_cancelSearchBtn->setVisible(busy);
     m_cancelSearchBtn->setEnabled(busy);
@@ -1135,10 +1290,22 @@ void FindReplaceDialog::setL2SearchUiBusy(bool busy, const QString& msg)
     m_scopeCombo->setEnabled(!busy);
     if (m_statusLabel) m_statusLabel->setText(busy ? msg : QString());
     updateQueryUi();
-    if (!busy) {
+    if (!busy && !m_navigationInProgress) {
         if (auto *mw = qobject_cast<QMainWindow*>(window()))
             mw->statusBar()->clearMessage();
     }
+}
+
+void FindReplaceDialog::setNavigationUiBusy(bool busy, const QString& msg)
+{
+    m_navigationInProgress = busy;
+    updateQueryUi();
+    if (!m_statusLabel)
+        return;
+    if (busy)
+        m_statusLabel->setText(msg);
+    else if (!m_l2SearchInProgress)
+        m_statusLabel->clear();
 }
 
 void FindReplaceDialog::onL2FindAllProgress(int percent, qint64 done, qint64 total)
@@ -1146,7 +1313,7 @@ void FindReplaceDialog::onL2FindAllProgress(int percent, qint64 done, qint64 tot
     if (!m_l2SearchInProgress) return;
     QString msg;
     if (percent < 0) {
-        msg = QObject::tr("正在准备大文件搜索…");
+        msg = QObject::tr("准备搜索…");
     } else {
         QString doneStr, totalStr;
         if (total >= qint64(1024)*1024*1024) {
@@ -1159,7 +1326,7 @@ void FindReplaceDialog::onL2FindAllProgress(int percent, qint64 done, qint64 tot
             totalStr = QString::number(total) + QObject::tr(" B");
             doneStr  = QString::number(done)  + QObject::tr(" B");
         }
-        msg = QObject::tr("搜索大文件… %1% (%2 / %3)").arg(percent).arg(doneStr).arg(totalStr);
+        msg = QObject::tr("搜索中 %1% · %2 / %3").arg(percent).arg(doneStr).arg(totalStr);
     }
     if (m_statusLabel) m_statusLabel->setText(msg);
     // 同步刷新 MainWindow 状态栏（如果能拿到）

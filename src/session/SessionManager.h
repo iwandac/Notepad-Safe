@@ -6,6 +6,7 @@
 #include <QHash>
 #include <QDateTime>
 #include <QUuid>
+#include <memory>
 
 class EditorTab;
 
@@ -39,6 +40,8 @@ struct SessionData {
 class SessionManager : public QObject {
     Q_OBJECT
 public:
+    struct AsyncSavePlan;
+    struct AsyncSaveResult;
     explicit SessionManager(QObject *parent = nullptr);
     // 测试用构造函数：指定自定义数据目录
     SessionManager(const QString &dataDir, QObject *parent = nullptr);
@@ -52,6 +55,18 @@ public:
     // tabs: 所有标签列表，activeIndex: 当前活动标签索引
     bool saveSession(const QVector<EditorTab *> &tabs, int activeIndex,
                      bool forceSnapshots = false);
+
+    // UI-owned state is captured synchronously; encryption, filesystem I/O
+    // and cleanup operate only on the detached plan in a worker.
+    std::shared_ptr<AsyncSavePlan> captureAsyncSave(
+        const QVector<EditorTab *> &tabs, int activeIndex,
+        bool forceSnapshots = false);
+    std::shared_ptr<AsyncSaveResult> writeAsyncSave(
+        const std::shared_ptr<AsyncSavePlan> &plan) const;
+    bool asyncSaveSucceeded(
+        const std::shared_ptr<AsyncSaveResult> &result) const;
+    void applyAsyncSave(const std::shared_ptr<AsyncSaveResult> &result,
+                        const QVector<EditorTab *> &tabs);
 
     // 恢复内部快照。新版 .ndraft 在内存中解密后直接交给编辑器；旧版 .tmp
     // 仅作为迁移读取路径保留，不再产生新的 S1 明文快照。

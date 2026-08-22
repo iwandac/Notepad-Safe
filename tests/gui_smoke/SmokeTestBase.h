@@ -111,7 +111,7 @@ protected:
     // 保证 L2 的 patch/坐标链路被真实驱动。
     QString createSmallTestFile(const QByteArray& data, const QString& suffixName = "smoke-l2.txt");
 
-    // 内置的 smalltestfile 路径（F:/projects/credentials/smalltestfile）。
+    // 内置的 smalltestfile 路径（F:/projects/notepadsafe/smalltestfile）。
     static QString defaultLargeFilePath();
 
 protected:

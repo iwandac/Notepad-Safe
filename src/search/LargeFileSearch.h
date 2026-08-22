@@ -7,10 +7,13 @@
 #include <QPoint>
 #include <functional>
 #include <atomic>
+#include <condition_variable>
 #include <limits>
+#include <mutex>
 
 #include "DynamicThresholds.h"
 #include "AsyncTask.h"
+#include "TextEncoding.h"
 
 class QFile;
 class LineIndex;
@@ -61,10 +64,17 @@ public:
         bool regexMode     = false;
         bool hexBytesMode  = false; // "DE AD BE EF" -> exact raw-byte KMP
         bool byteContextMode = false; // 16-byte ASCII preview context for Hex targets
+        // Text presentation may intentionally decode malformed source bytes
+        // as U+FFFD (for example Binary -> Text). Use the raw decoding iterator
+        // instead of rejecting the complete subject as invalid UTF-8.
+        bool tolerateInvalidEncoding = false;
         bool caseSensitive = true;
         bool wholeWord     = false; // Unicode letter/number/underscore boundary
         bool forward       = true;  // 不影响 findAll（总是从头到尾），影响 findNext/findPrev
         bool useOverrunFile = true; // 超 MAX_MATCHES_MEM 是否溢出到磁盘
+        // Physical encoding of a text target. Regex over GBK is executed by
+        // the raw code-page backend and keeps mmap byte offsets authoritative.
+        TextEncoding textEncoding = TextEncoding::Utf8;
     };
 
     static bool parseHexBytePattern(const QString &pattern, QByteArray *bytes,
@@ -83,6 +93,16 @@ public:
     //  - 任务结束仍然触发 finished/failed/progress 信号（兼容旧接入）
     qint64 findAllViaTaskManager(const QString& pattern, const Options& opts,
                                  const QString& fileDisplayName = QString());
+
+    // F3/Shift+F3 use a directional scan and return the first authoritative
+    // match without waiting for a complete Find All index.
+    using OneMatchCallback = std::function<void(
+        bool found, LargeFileSearchMatch match, QString error)>;
+    qint64 findOneViaTaskManager(const QString &pattern, const Options &opts,
+                                 qint64 fromByte, bool forward, bool wrap,
+                                 const QString &fileDisplayName,
+                                 QObject *callbackContext,
+                                 OneMatchCallback callback);
 
     // 当前 taskId（findAllViaTaskManager 启动后有效；findAll 直接启动则为 0）
     qint64 lastTaskId() const { return lastTaskId_; }
@@ -111,6 +131,11 @@ public:
 
     // cancel 下一次（或当前） findAll
     void requestCancel();
+
+    // Cancel queued/running search work and wait until no worker can access
+    // this object or its borrowed mmap/LineIndex/PatchList source. Callers
+    // must cross this barrier before unmapping or replacing the source.
+    void cancelAndWait();
 
     // replaceAll 单线程：按 DESIGN.md §5.6 步骤 3 分批执行；
     // 每批调用 progressBatch / 需要中间保存时调用 onPressureSoftWarn。
@@ -156,16 +181,33 @@ private:
     std::atomic<bool>    cancel_{false};
     qint64               lastTaskId_ = 0;  // AsyncTaskManager 派发后的 taskId（0 = 非 Manager 管理）
 
+    // A reservation is acquired before a lambda containing `this` is queued,
+    // not when it eventually starts. Destruction/source replacement can then
+    // wait for both queued and running workers without a check/use race.
+    std::mutex              workerMutex_;
+    std::condition_variable workerIdle_;
+    int                     workerReservations_ = 0;
+    bool                    shuttingDown_ = false;
+
     // ---------- 内部 helper ----------
     bool prepareOverrunFile(QString* errMsg);
     void appendMatches(const QVector<LargeFileSearchMatch>& batch);  // 内存 + 溢出文件分流
     void closeOverrunFile();
+    bool reserveWorker();
+    void releaseWorker();
+    void stopWorkers(bool permanent);
 
     bool scanAllBounded(qint64 virtualSize, const QString &pattern,
                         const Options &opts,
                         const std::function<bool()> &isCancelled,
                         const std::function<void(qint64)> &reportProgress,
                         const std::function<bool(const QVector<LargeFileSearchMatch>&)> &reportBatch);
+    bool scanOneBounded(qint64 virtualSize, const QString &pattern,
+                        const Options &opts, qint64 fromByte,
+                        bool forward, bool wrap,
+                        const std::function<bool()> &isCancelled,
+                        const std::function<void(qint64)> &reportProgress,
+                        LargeFileSearchMatch *match, QString *error) const;
 
     // 工具：虚拟字节偏移 [start, end) 还原成文本（考虑 patch）
     QByteArray readVirtualBytes(qint64 start, qint64 end) const;

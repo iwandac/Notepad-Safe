@@ -33,6 +33,7 @@
 #include "WindowedReadOnlyProvider.h"
 #include "VirtualFileView.h"
 #include "AsyncTaskManager.h"
+#include "AsyncThreadPool.h"
 
 // Historical source filename; this suite now verifies that S2 and S3 stay on
 // the same read-only mmap path and never start a background editor load.
@@ -174,7 +175,7 @@ class LargeReadOnlySmokeTest final : public QObject {
         return count;
     }
 
-    static int nonCharacterCountTasks(const QSignalSpy &spy)
+    static int nonWindowedAnalysisTasks(const QSignalSpy &spy)
     {
         int count = 0;
         for (const QList<QVariant> &arguments : spy) {
@@ -182,7 +183,8 @@ class LargeReadOnlySmokeTest final : public QObject {
                 continue;
             const AsyncTask task = AsyncTaskManager::instance().taskById(
                 arguments.constFirst().toLongLong());
-            if (task.categoryTag != QStringLiteral("CharacterCount"))
+            if (task.categoryTag != QStringLiteral("CharacterCount")
+                && task.categoryTag != QStringLiteral("LineNumberIndex"))
                 ++count;
         }
         return count;
@@ -1012,7 +1014,7 @@ private slots:
         QVERIFY(tab->isL2Mode());
         tab->gotoByteOffset(dragged);
         QTest::qWait(500);
-        QCOMPARE(nonCharacterCountTasks(tasksAdded), 0);
+        QCOMPARE(nonWindowedAnalysisTasks(tasksAdded), 0);
         QVERIFY(tab->isReadOnlyByPolicy());
         QCOMPARE(tab->largeDocumentRuntimeState(),
                  EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis);
@@ -1079,7 +1081,7 @@ private slots:
         window.close();
     }
 
-    void windowedTextWrapReachesPhysicalEofAndKeepsGutter()
+    void windowedTextRejectsWrapAndReachesPhysicalEofWithGutter()
     {
         QTemporaryDir temporary;
         QVERIFY(temporary.isValid());
@@ -1109,7 +1111,8 @@ private slots:
                                     WindowedReadOnlyProvider::Presentation::Text,
                                     &error), qPrintable(error));
         provider->setWordWrap(true);
-        QVERIFY(provider->wordWrap());
+        QVERIFY(!provider->wordWrap());
+        QCOMPARE(provider->editor()->wrapMode(), QsciScintilla::WrapNone);
         QVERIFY2(provider->editor()->marginWidth(0) > 0,
                  "windowed text preview lost its navigation gutter");
 
@@ -1119,23 +1122,66 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(provider->globalScrollBar()->value(),
                                   provider->globalScrollBar()->maximum(), 3000);
         QVERIFY2(dragTimer.elapsed() < 3000,
-                 "word-wrapped global drag stalled the GUI");
+                 "physical-line global drag stalled the GUI");
         QCOMPARE(provider->windowEnd(), provider->fileSize());
-        QTRY_VERIFY_WITH_TIMEOUT(
-            provider->fileSize() - provider->visibleBottomOffset() < 8192, 3000);
+        QTRY_VERIFY2_WITH_TIMEOUT(
+            provider->fileSize() - provider->visibleBottomOffset() < 8192,
+            qPrintable(QStringLiteral("EOF gap=%1 first=%2 screen=%3 display=%4")
+                           .arg(provider->fileSize() - provider->visibleBottomOffset())
+                           .arg(provider->editor()->SendScintilla(
+                               QsciScintillaBase::SCI_GETFIRSTVISIBLELINE))
+                           .arg(provider->editor()->SendScintilla(
+                               QsciScintillaBase::SCI_LINESONSCREEN))
+                           .arg(provider->editor()->SendScintilla(
+                               QsciScintillaBase::SCI_GETLINECOUNT))),
+            3000);
         QVERIFY(provider->editor()->text().contains(QString::fromLatin1(tail)));
 
-        const qint64 topAtEnd = provider->visibleTopOffset();
+        // K02 used to be intermittent: a clean focused run could pass while a
+        // full suite left the final mmap window loaded but the local Scintilla
+        // viewport above EOF. Exercise repeated real thumb departures/returns
+        // so every EOF arrival must complete the post-paint viewport settle.
+        for (int pass = 0; pass < 2; ++pass) {
+            dragScrollBar(provider->globalScrollBar(), 0.35 + pass * 0.2);
+            QTRY_VERIFY_WITH_TIMEOUT(provider->globalScrollBar()->value()
+                                         < provider->globalScrollBar()->maximum(),
+                                     3000);
+            dragScrollBar(provider->globalScrollBar(), 1.0);
+            QTRY_COMPARE_WITH_TIMEOUT(provider->globalScrollBar()->value(),
+                                      provider->globalScrollBar()->maximum(), 3000);
+            QCOMPARE(provider->windowEnd(), provider->fileSize());
+            QTRY_VERIFY_WITH_TIMEOUT(
+                provider->fileSize() - provider->visibleBottomOffset() < 8192, 3000);
+            QVERIFY(provider->editor()->text().contains(QString::fromLatin1(tail)));
+        }
+
         provider->editor()->setFocus();
         for (int i = 0; i < 64; ++i)
             QTest::keyClick(provider->editor(), Qt::Key_Down);
         QApplication::processEvents(QEventLoop::AllEvents, 100);
-        QCOMPARE(provider->visibleTopOffset(), topAtEnd);
+        QCOMPARE(provider->globalScrollBar()->value(),
+                 provider->globalScrollBar()->maximum());
+        QVERIFY2(provider->fileSize() - provider->visibleBottomOffset() < 8192,
+                 qPrintable(QStringLiteral(
+                     "after Down keys: gap=%1 first=%2 screen=%3 lines=%4 caret=%5")
+                                .arg(provider->fileSize()
+                                     - provider->visibleBottomOffset())
+                                .arg(provider->editor()->SendScintilla(
+                                    QsciScintillaBase::SCI_GETFIRSTVISIBLELINE))
+                                .arg(provider->editor()->SendScintilla(
+                                    QsciScintillaBase::SCI_LINESONSCREEN))
+                                .arg(provider->editor()->SendScintilla(
+                                    QsciScintillaBase::SCI_GETLINECOUNT))
+                                .arg(provider->editor()->SendScintilla(
+                                    QsciScintillaBase::SCI_GETCURRENTPOS))));
         wheelLinesDown(provider->editor()->viewport(), 8);
-        QCOMPARE(provider->visibleTopOffset(), topAtEnd);
+        QCOMPARE(provider->globalScrollBar()->value(),
+                 provider->globalScrollBar()->maximum());
+        QVERIFY2(provider->fileSize() - provider->visibleBottomOffset() < 8192,
+                 "mouse wheel moved the EOF viewport away from physical EOF");
 
         const QString screenshot = QDir(QCoreApplication::applicationDirPath())
-            .filePath(QStringLiteral("gui-windowed-wrap-physical-eof.png"));
+            .filePath(QStringLiteral("gui-windowed-nowrap-physical-eof.png"));
         QVERIFY(window.grab().save(screenshot));
         window.close();
     }
@@ -1306,7 +1352,7 @@ private slots:
         QString error;
         QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
         QTest::qWait(500);
-        QCOMPARE(nonCharacterCountTasks(added), 0);
+        QCOMPARE(nonWindowedAnalysisTasks(added), 0);
         QCOMPARE(tab->largeDocumentRuntimeState(),
                  EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis);
         QVERIFY(tab->isL2Mode());
@@ -1552,7 +1598,7 @@ private slots:
         QVERIFY(provider->editor()->geometry().right()
                 <= ascii->geometry().left());
         QTest::qWait(1000);
-        QCOMPARE(nonCharacterCountTasks(tasksAdded), 0);
+        QCOMPARE(nonWindowedAnalysisTasks(tasksAdded), 0);
         QCOMPARE(provider->globalOffset(), dragged);
         QCOMPARE(provider->editor()->text(0), firstLine);
 
@@ -1620,7 +1666,7 @@ private slots:
         QCOMPARE(tab->largeDocumentRuntimeState(),
                  EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis);
         QTest::qWait(500);
-        QCOMPARE(nonCharacterCountTasks(tasksAdded), 0);
+        QCOMPARE(nonWindowedAnalysisTasks(tasksAdded), 0);
         auto *provider = tab->windowedReadOnlyProvider();
         QVERIFY(provider);
         const QByteArray before = provider->sourceBytes(0, 32);
@@ -1661,6 +1707,161 @@ private slots:
         QVERIFY(!tab.exportRecoveryCheckpoint(&checkpoint, &error));
         QCOMPARE(checkpoint.size(), qint64(0));
         QVERIFY(error.contains(QStringLiteral("只读分析")));
+    }
+
+    void binaryTextEncodingRegexAndWindowedGlobalLinesUserFlow()
+    {
+        const QString tinyPath = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
+            .absoluteFilePath(QStringLiteral("tinytestfile"));
+        QVERIFY2(QFileInfo::exists(tinyPath), qPrintable(tinyPath));
+
+        QWidget tinyWindow;
+        tinyWindow.resize(1100, 720);
+        auto *tinyLayout = new QVBoxLayout(&tinyWindow);
+        auto *tab = new EditorTab(&tinyWindow);
+        tinyLayout->addWidget(tab);
+        tinyWindow.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&tinyWindow));
+
+        QString error;
+        QVERIFY2(tab->openLargeFileL2(tinyPath, &error,
+                                      L2Presentation::Hex,
+                                      L2ContentKind::Binary), qPrintable(error));
+        QTRY_VERIFY_WITH_TIMEOUT(tab->l2View() && tab->l2View()->isOpen(), 5000);
+        tab->setViewModeL2(ViewMode::Text);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->viewModeL2(), ViewMode::Text, 3000);
+        QVERIFY(tab->editor()->isReadOnly());
+
+        tab->setDisplayEncoding(TextEncoding::Utf8);
+        QCoreApplication::processEvents();
+        const QString utf8Projection = tab->editor()->text().left(512);
+        QVERIFY(utf8Projection.contains(QChar::ReplacementCharacter));
+        tab->setDisplayEncoding(TextEncoding::Windows1252);
+        QCoreApplication::processEvents();
+        const QString cp1252Projection = tab->editor()->text().left(512);
+        QVERIFY(cp1252Projection != utf8Projection);
+        QVERIFY(cp1252Projection.contains(QChar(0x201c))); // byte 0x93 in PE header
+
+        tab->setDisplayEncoding(TextEncoding::Utf8);
+        QCoreApplication::processEvents();
+        QVERIFY2(tab->findNext(QStringLiteral("This\\s+program\\s+cannot"),
+                               true, true, false, true, true, false),
+                 qPrintable(tab->lastSearchError()));
+        QCOMPARE(tab->l2View()->selectionStart(), qint64(0x4e));
+        QCOMPARE(tab->l2View()->selectionEnd(), qint64(0x61));
+        QVERIFY(tinyWindow.grab().save(
+            QDir(QCoreApplication::applicationDirPath()).filePath(
+                QStringLiteral("gui-binary-text-decoded-regex.png"))));
+        tinyWindow.close();
+
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        const QString linesPath = temporary.filePath(QStringLiteral("global-lines.log"));
+        QSaveFile output(linesPath);
+        QVERIFY(output.open(QIODevice::WriteOnly));
+        const QByteArray line("row-data\n", 9);
+        for (int i = 0; i < 600000; ++i)
+            QCOMPARE(output.write(line), qint64(line.size()));
+        QVERIFY(output.commit());
+
+        QWidget lineWindow;
+        lineWindow.resize(900, 620);
+        auto *lineLayout = new QVBoxLayout(&lineWindow);
+        auto *provider = new WindowedReadOnlyProvider(&lineWindow);
+        lineLayout->addWidget(provider);
+        lineWindow.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&lineWindow));
+        QVERIFY2(provider->openFile(linesPath,
+                                    WindowedReadOnlyProvider::Presentation::Text,
+                                    &error), qPrintable(error));
+        QTRY_VERIFY_WITH_TIMEOUT(!provider->characterCountPending(), 15000);
+        provider->goToOffset(4LL * 1024 * 1024);
+        QTRY_VERIFY_WITH_TIMEOUT(provider->windowStart() > 0, 3000);
+        const qint64 expectedFirstLine = provider->windowStart() / line.size() + 1;
+        QTRY_COMPARE_WITH_TIMEOUT(marginText(provider->editor(), 0),
+                                  QString::number(expectedFirstLine), 3000);
+        QCOMPARE(marginText(provider->editor(), 1),
+                 QString::number(expectedFirstLine + 1));
+        QVERIFY(expectedFirstLine > 1);
+        QVERIFY(lineWindow.grab().save(
+            QDir(QCoreApplication::applicationDirPath()).filePath(
+                QStringLiteral("gui-windowed-global-line-numbers.png"))));
+        lineWindow.close();
+    }
+
+    void bigFileLineNumbersAndCharacterCountRunIndependently()
+    {
+        const QString path = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
+            .absoluteFilePath(QStringLiteral("bigtestfile"));
+        QVERIFY2(QFileInfo::exists(path), qPrintable(path));
+        const qint64 size = QFileInfo(path).size();
+        QVERIFY(size > 4LL * 1024 * 1024 * 1024);
+
+        auto &pool = AsyncThreadPool::instance();
+        const int privateCapacity = pool.reserveExternalCapacity(10);
+        QCOMPARE(privateCapacity, 8);
+        pool.releaseExternalCapacity(privateCapacity);
+
+        QWidget window;
+        window.resize(1000, 680);
+        auto *layout = new QVBoxLayout(&window);
+        auto *provider = new WindowedReadOnlyProvider(&window);
+        layout->addWidget(provider);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+        QSignalSpy added(&AsyncTaskManager::instance(),
+                         &AsyncTaskManager::taskAdded);
+        QString error;
+        QVERIFY2(provider->openFile(path,
+                                    WindowedReadOnlyProvider::Presentation::Text,
+                                    &error), qPrintable(error));
+
+        qint64 lineTaskId = -1;
+        qint64 characterTaskId = -1;
+        QTRY_VERIFY_WITH_TIMEOUT(([&]() {
+            for (const QList<QVariant> &arguments : added) {
+                if (arguments.isEmpty())
+                    continue;
+                const qint64 id = arguments.constFirst().toLongLong();
+                const AsyncTask task = AsyncTaskManager::instance().taskById(id);
+                if (task.categoryTag == QStringLiteral("LineNumberIndex"))
+                    lineTaskId = id;
+                else if (task.categoryTag == QStringLiteral("CharacterCount"))
+                    characterTaskId = id;
+            }
+            return lineTaskId > 0 && characterTaskId > 0;
+        })(), 5000);
+        QVERIFY(lineTaskId != characterTaskId);
+        QCOMPARE(AsyncTaskManager::instance().maximumThreadCount(), 10);
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            AsyncTaskManager::instance().taskById(lineTaskId).state
+                    == AsyncTaskState::Running
+                && AsyncTaskManager::instance().taskById(characterTaskId).state
+                    == AsyncTaskState::Running,
+            5000);
+        QVERIFY(AsyncTaskManager::instance().activeThreadCount() >= 2);
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            AsyncTaskManager::instance().taskById(lineTaskId).state
+                == AsyncTaskState::Finished,
+            120000);
+        QCOMPARE(AsyncTaskManager::instance().taskById(characterTaskId).state,
+                 AsyncTaskState::Running);
+
+        provider->goToOffset(size * 4 / 5);
+        QTRY_VERIFY_WITH_TIMEOUT(provider->windowStart() > 0, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            marginText(provider->editor(), 0) != QStringLiteral("…"), 5000);
+
+        AsyncTaskManager::instance().cancel(characterTaskId);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            AsyncTaskManager::instance().taskById(characterTaskId).state,
+            AsyncTaskState::Canceled, 5000);
+        QCOMPARE(AsyncTaskManager::instance().taskById(lineTaskId).state,
+                 AsyncTaskState::Finished);
+        window.close();
     }
 
     void legacyS2RecoveryIsRejected()

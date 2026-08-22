@@ -1,0 +1,3 @@
+# Vendored upstream trees are byte-for-byte inputs to the source-tree digest.
+# Do not let a developer's core.autocrlf setting rewrite them on checkout.
+third_party/src/** -text

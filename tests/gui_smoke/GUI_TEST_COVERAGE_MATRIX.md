@@ -46,7 +46,7 @@
 | L01 | S2 即时只读 | 32 MiB 边界、256 MiB、不同编码/长行 | 首屏及时可操作；左侧全局导航信息存在；浏览不依赖完整加载/索引 |
 | L02 | S2/S3 能力边界 | 32 MiB−1/等于/加1、2 GiB−1/等于/加1、解码失败、低内存 | S1 以下可编辑；S2/S3 始终只读且不创建后台编辑装载任务；输入/粘贴/删除/替换/保存修改均不可用，源 hash 不变 |
 | L03 | S3/B2/B3 只读 | 2 GiB 边界、保留真实大文件、Text/Hex | 全文可浏览/搜索/有界复制；编辑/替换显式禁用；不创建完整内存副本 |
-| L04 | 大文件连续浏览 | 拖动、滚轮、pixelDelta、Page、wrap、横向长行、静置 | 单滚动；窗口间无 gap/重复/回跳；物理 EOF 可达；UI heartbeat 持续 |
+| L04 | 大文件连续浏览 | 拖动、滚轮、pixelDelta、Page、横向长行、静置；尝试开启 wrap | 单滚动；窗口间无 gap/重复/回跳；物理 EOF 可达；S2/S3 wrap disabled/unchecked 且 Provider 保持 WrapNone；UI heartbeat 持续 |
 | L05 | 文件增长/轮转 | 追加、截断、同路径替换、搜索运行中变化 | 新尾可达；位置钳制；generation 正确失效/增量；无持久锁阻止外部替换 |
 | S01 | 当前文件查找 | Text S1/S2/S3/Secure、Hex B1/B2/B3；literal/regex/bytes；所有合法 case/whole/wrap 组合；非法组合真实点击 | 每个选项只改变其声明语义；冲突控件灰显且不可改变；Find Next/Previous/All ranges 同序；F3/Shift+F3 选中真实正文 |
 | S02 | 查找全部/Dock | 0/1/多命中、同一行多命中、head/middle/边界/EOF | 渐进分组、上下文和高亮正确；Dock 可见/关闭/重开状态正确 |
@@ -95,8 +95,8 @@
 | ID | 历史缺陷 | 必须触发失败的错误实现 |
 |---|---|---|
 | K01 | 编辑区双滚动/外内位置分离 | 出现第二条可见纵向滚动条，或 thumb、首行内容、地址不一致 |
-| K02 | S2/S3 最大值不是真 EOF | 拖到最大后仍能连续向下很久，或尾 marker 不可见 |
-| K03 | wrap 卡住/无法到底 | wrap 后拖动阻塞、display/source 映射错、EOF 不可达 |
+| K02 | S2/S3 最大值不是真 EOF | 首次拖到最大、至少两次拖离/拖回、连续 Down、Page/Wheel 任一路径仍可继续向下很久，或尾 marker/最后一行绘制坐标不在 viewport |
+| K03 | wrap 卡住/无法到底 | S1/B1 wrap 后拖动阻塞或 EOF 不可达；或 S2/S3 仍允许开启 wrap、重新引入 window-local display/source 映射 |
 | K04 | 状态栏文字重叠 | 任意宽度/DPI/消息/任务组合中 visible segment 几何相交或文本不可读 |
 | K05 | 普通输入变覆盖 | 未显式 OVR 时输入替换了 caret 后已有字符，或模式跨标签泄漏 |
 | K06 | Hex Backspace/Delete 语义错误 | 控制键未修改预期字节/长度、被当成非法十六进制字符，或文件起点 Backspace 错删首字节 |
@@ -120,6 +120,7 @@
 | K24 | 后台统计阻止外部替换文件 | 字符数/索引/搜索长期持有 Windows 源句柄，导致编辑器或外部工具的原子 replace 失败 |
 | K25 | 语言变化但命令状态滞后 | Lexer 已切换而折叠、括号或语言 QAction 仍按旧语法 enabled/checked |
 | K26 | 多选相同文本受旧 target 限制 | “选择全部相同文本”只选择当前/上次查找区间，未覆盖整个文档或误沿用旧搜索 flags |
+| K27 | S2/S3 继承全局自动换行 | S1 开启 wrap 后切到 S2/S3，菜单仍可用/勾选，或 Provider 因程序调用进入 WrapWord；切回 S1 时偏好丢失 |
 
 ## 5. 参数契约展开规则
 

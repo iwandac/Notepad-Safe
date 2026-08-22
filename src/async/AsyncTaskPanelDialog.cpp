@@ -16,6 +16,18 @@
 #include <QDateTime>
 
 namespace {
+QString taskDuration(qint64 milliseconds)
+{
+    if (milliseconds < 0) return QString();
+    const qint64 seconds = qMax<qint64>(1, (milliseconds + 999) / 1000);
+    if (seconds < 60) return QObject::tr("%1 秒").arg(seconds);
+    const qint64 minutes = (seconds + 59) / 60;
+    if (minutes < 60) return QObject::tr("%1 分钟").arg(minutes);
+    return QObject::tr("%1 小时 %2 分钟").arg(minutes / 60).arg(minutes % 60);
+}
+}
+
+namespace {
 // ====== 每一行：标题 + 状态标签 + 进度条 + 取消按钮（Queued/Running 时显示）+ 错误红色小字
 class AsyncTaskItemDelegate : public QStyledItemDelegate
 {
@@ -41,6 +53,8 @@ public:
         const auto taskState    = static_cast<AsyncTaskState>(state);
         const QString err       = index.data(AsyncTaskManager::TaskErrorRole).toString();
         const qint64 elapsedMs = index.data(AsyncTaskManager::TaskElapsedMsRole).toLongLong();
+        const qint64 remainingMs =
+            index.data(AsyncTaskManager::TaskEstimatedRemainingMsRole).toLongLong();
 
         QFont f = painter->font();
         f.setBold(true);
@@ -59,7 +73,10 @@ public:
         // 第二行：状态 pill + 耗时
         QRect line2 = r.adjusted(0, painter->fontMetrics().lineSpacing() + 4, 0, -painter->fontMetrics().lineSpacing() - 22);
         line2.setHeight(painter->fontMetrics().lineSpacing());
-        const QString pillText = QStringLiteral(" %1  ·  %2ms  ").arg(stateT).arg(elapsedMs);
+        QString pillText = QStringLiteral(" %1  ·  %2 ")
+                               .arg(stateT, taskDuration(elapsedMs));
+        if (remainingMs >= 0)
+            pillText += tr("· 约剩 %1 ").arg(taskDuration(remainingMs));
         QColor pillBg;
         QColor pillFg;
         switch (taskState) {
@@ -109,8 +126,9 @@ public:
         style->drawControl(QStyle::CE_ProgressBar, &pbar, painter);
 
         // 同一几何同时用于绘制和 editorEvent 命中；已结束任务不显示伪按钮。
-        const bool cancellable = taskState == AsyncTaskState::Queued
-                              || taskState == AsyncTaskState::Running;
+        const bool cancellable = index.data(AsyncTaskManager::TaskCancellableRole).toBool()
+                              && (taskState == AsyncTaskState::Queued
+                                  || taskState == AsyncTaskState::Running);
         if (cancellable) {
             QRect cancelRect(r.right() - 74, pillR.top(), 70, pillR.height());
             QStyleOptionButton btn;
@@ -157,7 +175,9 @@ public:
             QRect cancelRect(r.right() - 74, pillTop, 70, metrics.height() + 4);
             if (cancelRect.contains(me->pos())) {
                 const int st = index.data(AsyncTaskManager::TaskStateRole).toInt();
-                if (st == static_cast<int>(AsyncTaskState::Queued) || st == static_cast<int>(AsyncTaskState::Running)) {
+                if (index.data(AsyncTaskManager::TaskCancellableRole).toBool()
+                    && (st == static_cast<int>(AsyncTaskState::Queued)
+                        || st == static_cast<int>(AsyncTaskState::Running))) {
                     qint64 id = index.data(AsyncTaskManager::TaskIdRole).toLongLong();
                     AsyncTaskManager::instance().cancel(id);
                     return true;
@@ -309,6 +329,9 @@ void AsyncTaskPanelDialog::onCurrentRowChanged(const QModelIndex &current, const
     out += tr("进度: %1 / %2  (%3%)\n")
         .arg(t.progressDone).arg(t.progressTotal)
         .arg(t.percent() < 0 ? QStringLiteral("-") : QString::number(t.percent()));
+    const qint64 remainingMs = t.estimatedRemainingMs();
+    if (remainingMs >= 0)
+        out += tr("预计剩余: %1\n").arg(taskDuration(remainingMs));
     out += QLatin1String("\n描述:\n");
     out += t.description.isEmpty() ? QStringLiteral("(无)") : t.description;
     if (!t.error.isNull()) {
