@@ -411,6 +411,10 @@ signals:
     void contentChanged(quint64 revision);
     void characterCountChanged();
     void commandCapabilitiesChanged();
+    // Lazy Hex/L2 providers create their real input surfaces after the tab is
+    // inserted into MainWindow.  Publish each surface so external file drops
+    // can keep using the one authoritative open path.
+    void externalDropSurfaceCreated(QWidget *surface);
 
     // 当前 EditorTab 内部 L2<->L1 模式切换（从 L1 切换到 L2 或反向）——MainWindow 用它同步"不适配 L2 的菜单项 enabled"
     // 触发点：openFile/L1 打开小文件(222行m_l2Mode=false)/openAutosaveAutoMode/... 等所有设置 m_l2Mode 的位置 emit
@@ -471,6 +475,7 @@ private:
     int m_tabWidth = 4;
     bool m_backspaceUnindents = true;
     bool m_wordCompletionEnabled = true;
+    bool m_s1ScrollDragRequestedEnd = false;
 
     void setupEditor();
     void applySyntax(Syntax syntax);

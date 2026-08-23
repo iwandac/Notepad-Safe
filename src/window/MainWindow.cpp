@@ -2431,6 +2431,8 @@ EditorTab *MainWindow::addNewTab()
 
     // 注册拖放代理：保证拖到这个 EditorTab/editor/viewport 任意位置都能触发 MainWindow 打开
     registerDropProxy(tab);
+    connect(tab, &EditorTab::externalDropSurfaceCreated,
+            this, &MainWindow::registerDropProxy);
 
     // 应用全局设置（标尺 + 换行）
     tab->setEdgeVisible(m_edgeVisible);

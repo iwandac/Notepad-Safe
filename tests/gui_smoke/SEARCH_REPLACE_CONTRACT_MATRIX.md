@@ -186,3 +186,27 @@ S1 解码后编辑空间的导航；当时未覆盖的原编码 source-byte、S2
 当前产品支持边界以 `docs/REGEX_ENGINE_EXPLORATION.md` 为准：UTF 路径使用完整 PCRE2 Unicode
 模式；非 UTF 原始 subject 只启用登记的日志正则子集，超出子集在扫描前短错误拒绝，不以第二
 matcher、全文转码或隐式语义降级冒充支持。
+
+## 10. 真实 smalltestfile 定向搜索补充验收（2026-08-23）
+
+第 9 节的通过记录没有覆盖“保留的 `smalltestfile` 以 Binary→Text 显示后，从 BOF 搜索
+`field`”这一真实路径，不能用于证明该场景。现场复现显示，旧候选器只按 `f/F` 过滤且命中
+密集时不报告进度，Previous 也没有把当前 byte boundary 下传，造成任务长期显示 0%。
+
+新增 `tc_fr_034_real_smalltestfile_text_directional_search_progress`，只读使用真实 108,385,159
+字节 fixture，并通过正式 `FindReplaceDialog` 鼠标点击验证 Literal/Regex/Whole Word 的
+Next/Previous、任务进度与正文选区。专项运行结果为 3 passed / 0 failed / 0 skipped；六条路径
+耗时分别为 24/212/192/197/49/39 ms，总用时 2.325 s。视觉证据为
+`build/gui-smalltestfile-text-search-regression.png`，文本选区精确覆盖 source byte range 中的
+`field`，Whole Word 正确排除 `field_code`。该专项证据只关闭本次真实路径，不替代整套发布门禁。
+
+## 11. Regex 校验阶段进度补充验收（2026-08-23）
+
+大文件有效 UTF-8 Regex 在进入 PCRE2 匹配前必须先验证完整 subject；旧实现只在匹配阶段回调，
+因此校验期间后台任务长期停在 0%。当前实现把校验与匹配映射为同一条单调进度：校验占前 20%，
+匹配占后 80%，既不会长时间无反馈，也不会在阶段切换时从 100% 回退。
+
+新增 `tc_fr_035_valid_utf8_regex_validation_progress_is_monotonic`，使用 40 MiB 有效 UTF-8 日志和
+无命中 Regex，分别断言 `EditorTab::findAllL2Progress` 与后台任务栏数据源
+`AsyncTaskManager::taskProgressChanged` 均出现非零中间值且全程单调。专项运行结果为
+3 passed / 0 failed / 0 skipped；只运行这一新增用例，未用既有测试套件代替本次验证。

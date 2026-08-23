@@ -5,6 +5,7 @@
 #include <QString>
 
 #include <functional>
+#include <limits>
 #include <memory>
 
 class Pcre2Regex
@@ -77,7 +78,9 @@ public:
         const std::function<qint64(qint64)> &advanceAfterEmpty = {},
         qint64 startOffset = 0,
         const std::function<qint64(qint64)> &normalizeMatchStart = {},
-        const std::function<qint64(qint64)> &nextCandidateStart = {}) const;
+        const std::function<qint64(qint64)> &nextCandidateStart = {},
+        qint64 maxMatchStartExclusive = (std::numeric_limits<qint64>::max)(),
+        const std::function<void(qint64)> &reportValidationProgress = {}) const;
 
 private:
     struct Impl;

@@ -38,6 +38,7 @@ QByteArray escapeLiteral(const QByteArray &input)
 
 bool validateUtf8(const uchar *data, qint64 size,
                   const std::function<bool()> &isCancelled,
+                  const std::function<void(qint64)> &reportProgress,
                   qint64 *badOffset)
 {
     qint64 i = 0;
@@ -47,6 +48,8 @@ bool validateUtf8(const uchar *data, qint64 size,
     };
     while (i < size) {
         if (i >= nextCancelCheck) {
+            if (reportProgress)
+                reportProgress(i);
             if (isCancelled && isCancelled())
                 return false;
             nextCancelCheck = i + Q_INT64_C(1024) * 1024;
@@ -99,6 +102,8 @@ bool validateUtf8(const uchar *data, qint64 size,
             *badOffset = i;
         return false;
     }
+    if (reportProgress)
+        reportProgress(size);
     return true;
 }
 
@@ -486,7 +491,9 @@ Pcre2Regex::ScanResult Pcre2Regex::scan(
     const std::function<qint64(qint64)> &advanceAfterEmpty,
     qint64 startOffset,
     const std::function<qint64(qint64)> &normalizeMatchStart,
-    const std::function<qint64(qint64)> &nextCandidateStart) const
+    const std::function<qint64(qint64)> &nextCandidateStart,
+    qint64 maxMatchStartExclusive,
+    const std::function<void(qint64)> &reportValidationProgress) const
 {
     if (!isValid() || !subject || subjectSize < 0
         || startOffset < 0 || startOffset > subjectSize
@@ -498,9 +505,23 @@ Pcre2Regex::ScanResult Pcre2Regex::scan(
     if (isCancelled && isCancelled())
         return ScanResult::Cancelled;
 
+    const qint64 scanStartLimit = maxMatchStartExclusive
+            == (std::numeric_limits<qint64>::max)()
+        ? (subjectSize == (std::numeric_limits<qint64>::max)()
+               ? subjectSize : subjectSize + 1)
+        : qBound<qint64>(0, maxMatchStartExclusive,
+                         subjectSize == (std::numeric_limits<qint64>::max)()
+                             ? subjectSize : subjectSize + 1);
+    if (startOffset >= scanStartLimit) {
+        if (reportProgress)
+            reportProgress(qMin(subjectSize, scanStartLimit));
+        return ScanResult::Complete;
+    }
+
     qint64 badOffset = -1;
     if (impl_->utfMode && !impl_->matchInvalidUtf
-        && !validateUtf8(subject, subjectSize, isCancelled, &badOffset)) {
+        && !validateUtf8(subject, subjectSize, isCancelled,
+                         reportValidationProgress, &badOffset)) {
         if (isCancelled && isCancelled())
             return ScanResult::Cancelled;
         if (error) {
@@ -562,14 +583,15 @@ Pcre2Regex::ScanResult Pcre2Regex::scan(
         ? PCRE2_NO_UTF_CHECK : 0;
     uint32_t matchOptions = noUtfCheck;
     bool retryEmptyAtSameOffset = false;
-    while (offset <= PCRE2_SIZE(subjectSize)) {
+    while (offset <= PCRE2_SIZE(subjectSize)
+           && qint64(offset) < scanStartLimit) {
         if (nextCandidateStart && !retryEmptyAtSameOffset) {
             const qint64 candidate = nextCandidateStart(qint64(offset));
             if (candidate < 0) {
                 return isCancelled && isCancelled()
                     ? ScanResult::Cancelled : ScanResult::Failed;
             }
-            if (candidate > subjectSize)
+            if (candidate > subjectSize || candidate >= scanStartLimit)
                 break;
             offset = PCRE2_SIZE(candidate);
         }
@@ -578,10 +600,12 @@ Pcre2Regex::ScanResult Pcre2Regex::scan(
         // and progress checks. One MiB keeps invalid-UTF binary presentations
         // responsive without allocating a converted copy of the file.
         constexpr PCRE2_SIZE SearchWindow = PCRE2_SIZE(1) * 1024 * 1024;
+        const PCRE2_SIZE maximumAllowedStart = PCRE2_SIZE(
+            qMin(subjectSize, scanStartLimit - 1));
         const PCRE2_SIZE offsetLimit = std::min(
-            PCRE2_SIZE(subjectSize),
+            maximumAllowedStart,
             offset > std::numeric_limits<PCRE2_SIZE>::max() - SearchWindow
-                ? PCRE2_SIZE(subjectSize) : offset + SearchWindow);
+                ? maximumAllowedStart : offset + SearchWindow);
         pcre2_set_offset_limit(matchContext, offsetLimit);
         const uint32_t currentOptions = matchOptions
             | (nextCandidateStart ? PCRE2_ANCHORED : 0);
@@ -621,7 +645,7 @@ Pcre2Regex::ScanResult Pcre2Regex::scan(
                 matchOptions = noUtfCheck;
                 continue;
             }
-            if (offsetLimit < PCRE2_SIZE(subjectSize)) {
+            if (offsetLimit < maximumAllowedStart) {
                 qint64 advanced = qint64(offsetLimit) + 1;
                 while (impl_->utfMode && advanced < subjectSize
                        && (subject[advanced] & 0xc0u) == 0x80u) {
@@ -653,6 +677,8 @@ Pcre2Regex::ScanResult Pcre2Regex::scan(
         PCRE2_SIZE *ovector = pcre2_get_ovector_pointer(matchData);
         const PCRE2_SIZE start = ovector[0];
         const PCRE2_SIZE end = ovector[1];
+        if (qint64(start) >= scanStartLimit)
+            break;
         if (start > end || end > PCRE2_SIZE(subjectSize)
             || end - start > PCRE2_SIZE(std::numeric_limits<qint32>::max())) {
             if (error)
@@ -690,6 +716,6 @@ Pcre2Regex::ScanResult Pcre2Regex::scan(
         }
     }
     if (reportProgress)
-        reportProgress(subjectSize);
+        reportProgress(qMin(subjectSize, scanStartLimit));
     return ScanResult::Complete;
 }

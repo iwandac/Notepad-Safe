@@ -40,6 +40,10 @@
 #include <QtGui/QTextCursor>
 #include <QtGui/QTextBlock>
 #include <QtGui/QWheelEvent>
+#include <QtGui/QDragEnterEvent>
+#include <QtGui/QDropEvent>
+#include <QtCore/QMimeData>
+#include <QtCore/QUrl>
 #include <QtCore/QTemporaryDir>
 #include <QtCore/QDir>
 #include <QtCore/QElapsedTimer>
@@ -4443,6 +4447,142 @@ private slots:
         QFile unchanged(path);
         QVERIFY(unchanged.open(QIODevice::ReadOnly));
         QCOMPARE(unchanged.readAll(), originalBytes);
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_gui_hex_surfaces_route_external_file_drop_to_main_window() {
+        const QString targetPath = tmpDir_.filePath(
+            QStringLiteral("hex-drop-target.txt"));
+        {
+            QFile target(targetPath);
+            QVERIFY(target.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(target.write("opened-through-hex-drop\n"), qint64(24));
+        }
+
+        const QString smallBinary = tmpDir_.filePath(
+            QStringLiteral("hex-drop-b1.bin"));
+        {
+            QFile source(smallBinary);
+            QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(source.write(QByteArray::fromHex("00414243")), qint64(4));
+        }
+        const QString largeBinary = tmpDir_.filePath(
+            QStringLiteral("hex-drop-b2.bin"));
+        {
+            QFile source(largeBinary);
+            QVERIFY(source.open(QIODevice::ReadWrite | QIODevice::Truncate));
+            QVERIFY(source.resize(33LL * 1024 * 1024));
+        }
+
+        for (const QString &sourcePath : {smallBinary, largeBinary}) {
+            closeAllEditorTabs(mw_);
+            mw_->openFilesFromExternal({sourcePath});
+            QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 5000);
+            EditorTab *sourceTab = currentEditorTab(mw_);
+            QVERIFY(sourceTab && sourceTab->isHexPresentation());
+            QTRY_COMPARE_WITH_TIMEOUT(sourceTab->contentSizeBytes(),
+                                      QFileInfo(sourcePath).size(), 5000);
+
+            QPlainTextEdit *asciiSurface = nullptr;
+            if (sourceTab->windowedReadOnlyProvider())
+                asciiSurface = sourceTab->windowedReadOnlyProvider()->asciiPreview();
+            if (!asciiSurface) {
+                asciiSurface = sourceTab->findChild<QPlainTextEdit *>(
+                    QStringLiteral("HexAsciiPreview"));
+            }
+            QTRY_VERIFY_WITH_TIMEOUT(asciiSurface && asciiSurface->isVisible(), 5000);
+            QWidget *dropSurface = asciiSurface->viewport();
+            QVERIFY(dropSurface);
+            QVERIFY2(!asciiSurface->acceptDrops() && !dropSurface->acceptDrops(),
+                     "lazy Hex child still accepts and swallows OS file drops");
+            const QString tier = QFileInfo(sourcePath).size()
+                    < 32LL * 1024 * 1024
+                ? QStringLiteral("b1") : QStringLiteral("b2");
+            QVERIFY(mw_->grab().save(
+                QDir(QCoreApplication::applicationDirPath()).filePath(
+                    QStringLiteral("gui-hex-drop-%1-surface.png").arg(tier))));
+
+            QMimeData mime;
+            mime.setUrls({QUrl::fromLocalFile(targetPath)});
+            QDragEnterEvent enter(QPoint(8, 8), Qt::CopyAction, &mime,
+                                  Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(dropSurface, &enter);
+            QVERIFY(enter.isAccepted());
+            QDropEvent drop(QPointF(8, 8), Qt::CopyAction, &mime,
+                            Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(dropSurface, &drop);
+            QVERIFY(drop.isAccepted());
+
+            QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 2, 5000);
+            EditorTab *opened = currentEditorTab(mw_);
+            QVERIFY(opened);
+            QCOMPARE(QFileInfo(opened->filePath()).canonicalFilePath(),
+                     QFileInfo(targetPath).canonicalFilePath());
+        }
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_gui_s1_bottom_thumb_gesture_reaches_physical_eof() {
+        closeAllEditorTabs(mw_);
+        const QString path = tmpDir_.filePath(
+            QStringLiteral("s1-scroll-physical-eof.log"));
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QByteArray line(520, 'x');
+        line.append('\n');
+        for (int i = 0; i < 12000; ++i)
+            QCOMPARE(file.write(line), qint64(line.size()));
+        QCOMPARE(file.write("PHYSICAL_EOF_MARKER"), qint64(19));
+        file.close();
+
+        mw_->openFilesFromExternal({path});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 5000);
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && !tab->isL2Mode());
+        tab->setWordWrap(true);
+        QsciScintilla *editor = tab->editor();
+        QScrollBar *bar = editor->verticalScrollBar();
+        QTRY_VERIFY_WITH_TIMEOUT(bar->maximum() > 0 && bar->isVisible(), 5000);
+
+        // Reproduce the important race deterministically: while the thumb is
+        // held at the current maximum, the wrapped display range grows.  A
+        // plain QScrollBar release stays at the obsolete maximum.
+        bar->setSliderDown(true);
+        bar->setSliderPosition(bar->maximum());
+        const int oldMaximum = bar->maximum();
+        QByteArray appended;
+        for (int i = 0; i < 1200; ++i)
+            appended.append("late wrapped layout row xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
+        editor->SendScintilla(QsciScintillaBase::SCI_APPENDTEXT,
+                              static_cast<uintptr_t>(appended.size()),
+                              appended.constData());
+        QApplication::processEvents(QEventLoop::AllEvents, 100);
+        QVERIFY(bar->maximum() > oldMaximum);
+        bar->setSliderDown(false);
+        QTRY_COMPARE_WITH_TIMEOUT(bar->value(), bar->maximum(), 2000);
+
+        const int lastLine = editor->lines() - 1;
+        const long lastDisplayStart = editor->SendScintilla(
+            QsciScintillaBase::SCI_VISIBLEFROMDOCLINE,
+            static_cast<unsigned long>(lastLine));
+        const long lastWrapCount = qMax<long>(1, editor->SendScintilla(
+            QsciScintillaBase::SCI_WRAPCOUNT,
+            static_cast<unsigned long>(lastLine)));
+        const long firstVisible = editor->SendScintilla(
+            QsciScintillaBase::SCI_GETFIRSTVISIBLELINE);
+        const long linesOnScreen = qMax<long>(1, editor->SendScintilla(
+            QsciScintillaBase::SCI_LINESONSCREEN));
+        QVERIFY2(firstVisible + linesOnScreen
+                     >= lastDisplayStart + lastWrapCount,
+                 qPrintable(QStringLiteral(
+                     "EOF not visible: first=%1 screen=%2 last=%3 wraps=%4 max=%5 value=%6")
+                     .arg(firstVisible).arg(linesOnScreen)
+                     .arg(lastDisplayStart).arg(lastWrapCount)
+                     .arg(bar->maximum()).arg(bar->value())));
+        QVERIFY(mw_->grab().save(
+            QDir(QCoreApplication::applicationDirPath()).filePath(
+                QStringLiteral("gui-s1-scroll-physical-eof.png"))));
+        tab->setModified(false);
         closeAllEditorTabs(mw_);
     }
 

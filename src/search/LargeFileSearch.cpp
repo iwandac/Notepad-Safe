@@ -150,7 +150,8 @@ std::function<qint64(qint64)> makeByteCandidateFinder(
     bool caseSensitive, qint64 initialOffset,
     const std::function<bool()> &isCancelled,
     const std::function<void(qint64)> &reportProgress,
-    const std::function<qint64(qint64)> &normalizeStart)
+    const std::function<qint64(qint64)> &normalizeStart,
+    qint64 maxCandidateStartExclusive = (std::numeric_limits<qint64>::max)())
 {
     if (needle.isEmpty())
         return {};
@@ -167,19 +168,31 @@ std::function<qint64(qint64)> makeByteCandidateFinder(
         ? uchar(foldedAnchor - ('a' - 'A')) : foldedAnchor;
     struct State {
         qint64 searchOffset = 0;
+        qint64 lastReported = 0;
     };
     auto state = std::make_shared<State>();
     state->searchOffset = initialOffset + anchorIndex;
+    state->lastReported = initialOffset;
+    const qint64 candidateLimit = maxCandidateStartExclusive
+            == (std::numeric_limits<qint64>::max)()
+        ? subjectSize
+        : qBound<qint64>(0, maxCandidateStartExclusive, subjectSize);
+    const qint64 anchorSearchLimit = candidateLimit >= subjectSize - anchorIndex
+        ? subjectSize : candidateLimit + anchorIndex;
     return [subject, subjectSize, needle, caseSensitive, anchorIndex,
             anchor, foldedAnchor, alternateAnchor, state, isCancelled,
-            reportProgress, normalizeStart](qint64 minimumOffset) {
+            reportProgress, normalizeStart, candidateLimit,
+            anchorSearchLimit](qint64 minimumOffset) {
+        if (minimumOffset >= candidateLimit)
+            return subjectSize + 1;
         state->searchOffset = qMax(
             state->searchOffset, minimumOffset + qint64(anchorIndex));
         constexpr qint64 Chunk = Q_INT64_C(16) * 1024 * 1024;
-        while (state->searchOffset < subjectSize) {
+        constexpr qint64 ProgressStep = Q_INT64_C(1) * 1024 * 1024;
+        while (state->searchOffset < anchorSearchLimit) {
             if (isCancelled && isCancelled())
                 return qint64(-1);
-            const qint64 chunkEnd = qMin(subjectSize,
+            const qint64 chunkEnd = qMin(anchorSearchLimit,
                                          state->searchOffset + Chunk);
             const size_t available = size_t(chunkEnd - state->searchOffset);
             const void *first = std::memchr(subject + state->searchOffset,
@@ -197,14 +210,25 @@ std::function<qint64(qint64)> makeByteCandidateFinder(
                 hit = alternateHit;
             if (!hit) {
                 state->searchOffset = chunkEnd;
-                if (reportProgress)
-                    reportProgress(state->searchOffset);
+                const qint64 examined = qMin(
+                    candidateLimit,
+                    qMax(minimumOffset, state->searchOffset - anchorIndex));
+                if (reportProgress && examined > state->lastReported) {
+                    state->lastReported = examined;
+                    reportProgress(examined);
+                }
                 continue;
             }
             const qint64 hitOffset = hit - subject;
             state->searchOffset = hitOffset + 1;
             const qint64 candidate = hitOffset - anchorIndex;
+            if (reportProgress
+                && candidate >= state->lastReported + ProgressStep) {
+                state->lastReported = qMin(candidate, candidateLimit);
+                reportProgress(state->lastReported);
+            }
             if (candidate < minimumOffset || candidate < 0
+                || candidate >= candidateLimit
                 || candidate > subjectSize - needle.size())
                 continue;
             bool same = true;
@@ -230,15 +254,23 @@ std::function<qint64(qint64)> makeStartByteCandidateFinder(
     const uchar *subject, qint64 subjectSize,
     const Pcre2Regex::StartByteFilter &filter, qint64 initialOffset,
     bool validUtf8, const std::function<bool()> &isCancelled,
-    const std::function<void(qint64)> &reportProgress)
+    const std::function<void(qint64)> &reportProgress,
+    qint64 maxCandidateStartExclusive = (std::numeric_limits<qint64>::max)())
 {
     if (filter.isEmpty())
         return {};
-    struct State { qint64 offset = 0; };
+    struct State { qint64 offset = 0; qint64 lastReported = 0; };
     auto state = std::make_shared<State>();
     state->offset = initialOffset;
+    state->lastReported = initialOffset;
+    const qint64 candidateLimit = maxCandidateStartExclusive
+            == (std::numeric_limits<qint64>::max)()
+        ? subjectSize
+        : qBound<qint64>(0, maxCandidateStartExclusive, subjectSize);
     return [subject, subjectSize, filter, validUtf8, state, isCancelled,
-            reportProgress](qint64 minimumOffset) {
+            reportProgress, candidateLimit](qint64 minimumOffset) {
+        if (minimumOffset >= candidateLimit)
+            return subjectSize + 1;
         state->offset = qMax(state->offset, minimumOffset);
         if (validUtf8) {
             while (state->offset < subjectSize
@@ -248,10 +280,11 @@ std::function<qint64(qint64)> makeStartByteCandidateFinder(
         }
         constexpr qint64 Chunk = Q_INT64_C(16) * 1024 * 1024;
         constexpr quint64 HighBits = Q_UINT64_C(0x8080808080808080);
-        while (state->offset < subjectSize) {
+        constexpr qint64 ProgressStep = Q_INT64_C(1) * 1024 * 1024;
+        while (state->offset < candidateLimit) {
             if (isCancelled && isCancelled())
                 return qint64(-1);
-            const qint64 end = qMin(subjectSize, state->offset + Chunk);
+            const qint64 end = qMin(candidateLimit, state->offset + Chunk);
             const uchar *best = nullptr;
             const size_t available = size_t(end - state->offset);
             for (char candidate : filter.asciiBytes) {
@@ -278,15 +311,110 @@ std::function<qint64(qint64)> makeStartByteCandidateFinder(
             if (best) {
                 const qint64 result = best - subject;
                 state->offset = result + 1;
+                if (reportProgress
+                    && result >= state->lastReported + ProgressStep) {
+                    state->lastReported = result;
+                    reportProgress(result);
+                }
                 return result;
             }
             state->offset = end;
-            if (reportProgress)
+            if (reportProgress && end > state->lastReported) {
+                state->lastReported = end;
                 reportProgress(end);
+            }
         }
         return subjectSize + 1;
     };
 }
+
+QByteArray safeInvalidUtfAsciiLiteralFilter(
+    const QString &pattern, const LargeFileSearch::Options &opts,
+    bool invalidUtfText)
+{
+    if (!invalidUtfText || pattern.isEmpty())
+        return {};
+    static const QString regexMetacharacters =
+        QStringLiteral("\\.^$|()[]{}*+?");
+    QByteArray bytes;
+    bytes.reserve(pattern.size());
+    for (const QChar ch : pattern) {
+        if (ch.unicode() > 0x7f)
+            return {};
+        if (opts.regexMode && regexMetacharacters.contains(ch))
+            return {};
+        // Unicode caseless matching gives ASCII K/S non-ASCII equivalents
+        // (Kelvin sign and long s). Do not use an ASCII-only prefilter when it
+        // could suppress those authoritative PCRE2 matches.
+        if (!opts.caseSensitive
+            && (ch == QLatin1Char('k') || ch == QLatin1Char('K')
+                || ch == QLatin1Char('s') || ch == QLatin1Char('S'))) {
+            return {};
+        }
+        bytes.append(char(ch.unicode()));
+    }
+    return bytes;
+}
+
+// A UTF PCRE2 scan has two real pieces of work: validating the mapped bytes
+// before PCRE2_NO_UTF_CHECK is safe, then matching.  Both phases use source
+// byte offsets, so forwarding them directly makes the task jump to 100% after
+// validation and then move backwards when matching starts.  Keep one
+// monotonic user-visible scale and reserve a bounded share for validation.
+class RegexProgressPhases final
+{
+public:
+    RegexProgressPhases(qint64 total, bool validatesUtf8,
+                        std::function<void(qint64)> report)
+        : total_(qMax<qint64>(0, total)),
+          validationBudget_(validatesUtf8 ? total_ / 5 : 0),
+          report_(std::move(report))
+    {
+    }
+
+    std::function<void(qint64)> validationReporter()
+    {
+        if (validationBudget_ <= 0 || !report_)
+            return {};
+        return [this](qint64 done) {
+            emitMonotonic(scale(done, 0, validationBudget_));
+        };
+    }
+
+    std::function<void(qint64)> searchReporter()
+    {
+        if (!report_)
+            return {};
+        return [this](qint64 done) {
+            emitMonotonic(scale(done, validationBudget_,
+                                total_ - validationBudget_));
+        };
+    }
+
+private:
+    qint64 scale(qint64 done, qint64 base, qint64 span) const
+    {
+        if (total_ <= 0)
+            return 0;
+        const qint64 clamped = qBound<qint64>(0, done, total_);
+        const long double fraction = static_cast<long double>(clamped)
+            / static_cast<long double>(total_);
+        return qBound<qint64>(0, base + qint64(fraction * span), total_);
+    }
+
+    void emitMonotonic(qint64 done)
+    {
+        if (done <= lastReported_ && lastReported_ != 0)
+            return;
+        lastReported_ = done;
+        report_(done);
+    }
+
+    qint64 total_ = 0;
+    qint64 validationBudget_ = 0;
+    qint64 lastReported_ = 0;
+    std::function<void(qint64)> report_;
+};
 
 bool prepareSearchPattern(const QString &pattern, const LargeFileSearch::Options &opts,
                           QByteArray *literal, bool *usePcre2, QString *error)
@@ -888,6 +1016,8 @@ bool LargeFileSearch::scanAllBounded(
             && opts.tolerateInvalidEncoding
             && (opts.textEncoding == TextEncoding::Utf8
                 || opts.textEncoding == TextEncoding::Utf8Bom);
+        const QByteArray invalidUtfLiteralFilter =
+            safeInvalidUtfAsciiLiteralFilter(pattern, opts, invalidUtfText);
         const bool encodedByteRegex = !opts.byteContextMode
             && !EncodedRegexCompiler::isUtf8SubjectEncoding(opts.textEncoding);
         Pcre2Regex compiled;
@@ -918,6 +1048,13 @@ bool LargeFileSearch::scanAllBounded(
             }
             startByteFilter = compiled.startByteFilter();
         }
+
+        const bool validatesUtf8 = !encodedByteRegex && !binaryWholeWord
+            && !invalidUtfText;
+        RegexProgressPhases progressPhases(
+            virtualSize, validatesUtf8, reportProgress);
+        const auto regexProgress = progressPhases.searchReporter();
+        const auto validationProgress = progressPhases.validationReporter();
 
         const uchar *subject = mmapBase_;
         QTemporaryFile snapshot(QDir(overrunDir()).filePath(
@@ -981,29 +1118,42 @@ bool LargeFileSearch::scanAllBounded(
             const auto nextCandidate = makeByteCandidateFinder(
                 subject, virtualSize, requiredLiteral,
                 requiredLiteralCaseSensitive, 0, isCancelled,
-                reportProgress, normalizeStart);
+                regexProgress, normalizeStart);
             const Pcre2Regex::ScanResult result = compiled.scan(
-                subject, virtualSize, isCancelled, reportProgress,
+                subject, virtualSize, isCancelled, regexProgress,
                 recordMatch, &scanError_, {},
                 [subject, virtualSize, encoding = opts.textEncoding](qint64 offset) {
                     return EncodedRegexCompiler::nextUnitOffset(
                         subject, virtualSize, offset, encoding);
-                }, 0, normalizeStart, nextCandidate);
+                }, 0, normalizeStart, nextCandidate,
+                (std::numeric_limits<qint64>::max)(), validationProgress);
+            if (result != Pcre2Regex::ScanResult::Complete)
+                return false;
+        } else if (!invalidUtfLiteralFilter.isEmpty()) {
+            const auto nextCandidate = makeByteCandidateFinder(
+                subject, virtualSize, invalidUtfLiteralFilter,
+                opts.caseSensitive, 0, isCancelled, regexProgress, {});
+            const Pcre2Regex::ScanResult result = compiled.scan(
+                subject, virtualSize, isCancelled, regexProgress,
+                recordMatch, &scanError_, {}, {}, 0, {}, nextCandidate,
+                (std::numeric_limits<qint64>::max)(), validationProgress);
             if (result != Pcre2Regex::ScanResult::Complete)
                 return false;
         } else if (!startByteFilter.isEmpty()) {
             const auto nextCandidate = makeStartByteCandidateFinder(
                 subject, virtualSize, startByteFilter, 0, !invalidUtfText,
-                isCancelled, reportProgress);
+                isCancelled, regexProgress);
             const Pcre2Regex::ScanResult result = compiled.scan(
-                subject, virtualSize, isCancelled, reportProgress,
-                recordMatch, &scanError_, {}, {}, 0, {}, nextCandidate);
+                subject, virtualSize, isCancelled, regexProgress,
+                recordMatch, &scanError_, {}, {}, 0, {}, nextCandidate,
+                (std::numeric_limits<qint64>::max)(), validationProgress);
             if (result != Pcre2Regex::ScanResult::Complete)
                 return false;
         } else {
             const Pcre2Regex::ScanResult result = compiled.scan(
-                subject, virtualSize, isCancelled, reportProgress,
-                recordMatch, &scanError_);
+                subject, virtualSize, isCancelled, regexProgress,
+                recordMatch, &scanError_, {}, {}, 0, {}, {},
+                (std::numeric_limits<qint64>::max)(), validationProgress);
             if (result != Pcre2Regex::ScanResult::Complete)
                 return false;
         }
@@ -1037,7 +1187,7 @@ bool LargeFileSearch::scanOneBounded(
                                           LargeFileSearchMatch *accepted) {
             const auto next = makeByteCandidateFinder(
                 mmapBase_, virtualSize, literalBytes, caseSensitive, start,
-                isCancelled, reportProgress, {});
+                isCancelled, reportProgress, {}, end);
             const qint64 candidate = next ? next(start) : virtualSize + 1;
             if (candidate < 0)
                 return false;
@@ -1051,7 +1201,7 @@ bool LargeFileSearch::scanOneBounded(
                                          LargeFileSearchMatch *accepted) {
             const auto next = makeByteCandidateFinder(
                 mmapBase_, virtualSize, literalBytes, caseSensitive, start,
-                isCancelled, reportProgress, {});
+                isCancelled, reportProgress, {}, end);
             qint64 candidate = next ? next(start) : virtualSize + 1;
             while (candidate >= 0 && candidate < end) {
                 accepted->byteOffset = candidate;
@@ -1125,6 +1275,14 @@ bool LargeFileSearch::scanOneBounded(
             startByteFilter = compiled.startByteFilter();
         }
     }
+    const QByteArray invalidUtfLiteralFilter =
+        safeInvalidUtfAsciiLiteralFilter(pattern, opts, invalidUtfText);
+    const bool validatesUtf8 = usePcre2 && !encodedByteRegex
+        && !binaryWholeWord && !invalidUtfText;
+    RegexProgressPhases progressPhases(
+        virtualSize, validatesUtf8, reportProgress);
+    const auto regexProgress = progressPhases.searchReporter();
+    const auto validationProgress = progressPhases.validationReporter();
 
     if (usePcre2) {
         const uchar *subject = mmapBase_;
@@ -1189,25 +1347,34 @@ bool LargeFileSearch::scanOneBounded(
             found.length = qint32(length);
             return !stopAtFirst;
         };
-        const auto runForward = [&](qint64 start) {
+        const auto runForward = [&](qint64 start, qint64 endExclusive) {
             const auto normalizeStart = encodedByteRegex
                 ? makeEncodedBoundaryNormalizer(
                     subject, virtualSize, opts.textEncoding, start)
                 : std::function<qint64(qint64)>();
-            const auto nextCandidate = encodedByteRegex
-                ? makeByteCandidateFinder(
+            std::function<qint64(qint64)> nextCandidate;
+            if (encodedByteRegex) {
+                nextCandidate = makeByteCandidateFinder(
                     subject, virtualSize, requiredLiteral,
                     requiredLiteralCaseSensitive, start, isCancelled,
-                    reportProgress, normalizeStart)
-                : makeStartByteCandidateFinder(
+                    regexProgress, normalizeStart, endExclusive);
+            } else if (!invalidUtfLiteralFilter.isEmpty()) {
+                nextCandidate = makeByteCandidateFinder(
+                    subject, virtualSize, invalidUtfLiteralFilter,
+                    opts.caseSensitive, start, isCancelled,
+                    regexProgress, {}, endExclusive);
+            } else {
+                nextCandidate = makeStartByteCandidateFinder(
                     subject, virtualSize, startByteFilter, start,
                     !invalidUtfText, isCancelled,
-                    reportProgress);
+                    regexProgress, endExclusive);
+            }
             const auto result = compiled.scan(
-                subject, virtualSize, isCancelled, reportProgress,
+                subject, virtualSize, isCancelled, regexProgress,
                 [&](qint64 offset, qint64 length) {
                     return accept(offset, length, true);
-                }, error, {}, advance, start, normalizeStart, nextCandidate);
+                }, error, {}, advance, start, normalizeStart, nextCandidate,
+                endExclusive, validationProgress);
             return result != Pcre2Regex::ScanResult::Failed
                 && !domainFailure
                 && (!(isCancelled && isCancelled()));
@@ -1221,9 +1388,9 @@ bool LargeFileSearch::scanOneBounded(
                     ? EncodedRegexCompiler::nextUnitOffset(
                         subject, virtualSize, fromByte, opts.textEncoding)
                     : fromByte + 1;
-            ok = runForward(start);
+            ok = runForward(start, virtualSize + 1);
             if (ok && found.byteOffset < 0 && wrap && start > 0)
-                ok = runForward(0);
+                ok = runForward(0, start);
         } else {
             const qint64 end = fromByte == std::numeric_limits<qint64>::max()
                 ? virtualSize : qBound<qint64>(0, fromByte, virtualSize);
@@ -1231,23 +1398,32 @@ bool LargeFileSearch::scanOneBounded(
                 ? makeEncodedBoundaryNormalizer(
                     subject, virtualSize, opts.textEncoding)
                 : std::function<qint64(qint64)>();
-            const auto nextCandidate = encodedByteRegex
-                ? makeByteCandidateFinder(
+            std::function<qint64(qint64)> nextCandidate;
+            if (encodedByteRegex) {
+                nextCandidate = makeByteCandidateFinder(
                     subject, virtualSize, requiredLiteral,
                     requiredLiteralCaseSensitive, 0, isCancelled,
-                    reportProgress, normalizeStart)
-                : makeStartByteCandidateFinder(
+                    regexProgress, normalizeStart, end);
+            } else if (!invalidUtfLiteralFilter.isEmpty()) {
+                nextCandidate = makeByteCandidateFinder(
+                    subject, virtualSize, invalidUtfLiteralFilter,
+                    opts.caseSensitive, 0, isCancelled,
+                    regexProgress, {}, end);
+            } else {
+                nextCandidate = makeStartByteCandidateFinder(
                     subject, virtualSize, startByteFilter, 0,
                     !invalidUtfText, isCancelled,
-                    reportProgress);
+                    regexProgress, end);
+            }
             const auto result = compiled.scan(
-                subject, virtualSize, isCancelled, reportProgress,
+                subject, virtualSize, isCancelled, regexProgress,
                 [&](qint64 offset, qint64 length) {
                     if (offset >= end) {
                         return false;
                     }
                     return accept(offset, length, false);
-                }, error, {}, advance, 0, normalizeStart, nextCandidate);
+                }, error, {}, advance, 0, normalizeStart, nextCandidate, end,
+                validationProgress);
             ok = result != Pcre2Regex::ScanResult::Failed
                 && !domainFailure
                 && (!(isCancelled && isCancelled()));
@@ -1257,21 +1433,29 @@ bool LargeFileSearch::scanOneBounded(
                     ? makeEncodedBoundaryNormalizer(
                         subject, virtualSize, opts.textEncoding, end)
                     : std::function<qint64(qint64)>();
-                const auto wrappedCandidate = encodedByteRegex
-                    ? makeByteCandidateFinder(
+                std::function<qint64(qint64)> wrappedCandidate;
+                if (encodedByteRegex) {
+                    wrappedCandidate = makeByteCandidateFinder(
                         subject, virtualSize, requiredLiteral,
                         requiredLiteralCaseSensitive, end, isCancelled,
-                        reportProgress, wrappedNormalizer)
-                    : makeStartByteCandidateFinder(
+                        regexProgress, wrappedNormalizer, virtualSize + 1);
+                } else if (!invalidUtfLiteralFilter.isEmpty()) {
+                    wrappedCandidate = makeByteCandidateFinder(
+                        subject, virtualSize, invalidUtfLiteralFilter,
+                        opts.caseSensitive, end, isCancelled,
+                        regexProgress, {}, virtualSize + 1);
+                } else {
+                    wrappedCandidate = makeStartByteCandidateFinder(
                         subject, virtualSize, startByteFilter, end,
                         !invalidUtfText, isCancelled,
-                        reportProgress);
+                        regexProgress, virtualSize + 1);
+                }
                 const auto wrapped = compiled.scan(
-                    subject, virtualSize, isCancelled, reportProgress,
+                    subject, virtualSize, isCancelled, regexProgress,
                     [&](qint64 offset, qint64 length) {
                         return accept(offset, length, false);
                     }, error, {}, advance, end, wrappedNormalizer,
-                    wrappedCandidate);
+                    wrappedCandidate, virtualSize + 1, validationProgress);
                 ok = wrapped != Pcre2Regex::ScanResult::Failed
                     && !domainFailure
                     && (!(isCancelled && isCancelled()));

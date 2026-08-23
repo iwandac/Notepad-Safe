@@ -109,7 +109,7 @@ void AsyncThreadPool::runBatchBlocking(QVector<std::function<void()>> jobs,
     // a free slot. Each helper handles one bounded segment and exits, allowing
     // the priority queue to be reconsidered between segments.
     const int generalThreads = configuredMaxThreads_ - 1;
-    const int helpers = qMin(total - 1, qMax(0, generalThreads - 1));
+    const int helpers = qMin(total - 1, qMax(0, generalThreads - 2));
     for (int i = 0; i < helpers; ++i)
         startWorker(runOne, priority);
 

@@ -28,6 +28,8 @@
 #include <QtGui/QMouseEvent>
 #include <QtCore/QDebug>
 #include <QtCore/QDir>
+#include <QtCore/QElapsedTimer>
+#include <QtCore/QFile>
 #include <QtCore/QCoreApplication>
 #include <QtCore/QTimer>
 #include <QtCore/QUuid>
@@ -161,6 +163,14 @@ private slots:
     // S1 Find All and directional navigation are distinct central-scheduler
     // jobs; navigation remains enabled and owns the higher priority.
     void tc_fr_033_l1_find_all_and_navigation_are_async_independent();
+
+    // 真实 smalltestfile 的 Binary -> Text 路径：从 BOF 向前不得越界全扫，
+    // Literal/Regex/Whole Word 的定向任务必须推进进度并及时完成。
+    void tc_fr_034_real_smalltestfile_text_directional_search_progress();
+
+    // 有效 UTF-8 大文件 Regex 的预校验本身必须持续发布任务进度；
+    // 进度只能单调前进，不能在进入 PCRE2 匹配时回退。
+    void tc_fr_035_valid_utf8_regex_validation_progress_is_monotonic();
 
 private:
     QString s3FixturePath();
@@ -3123,6 +3133,273 @@ void SmokeFindReplace::tc_fr_033_l1_find_all_and_navigation_are_async_independen
     QVERIFY(dock.grab().save(
         QDir(QCoreApplication::applicationDirPath())
             .filePath(QStringLiteral("gui-l1-async-search-dock.png"))));
+}
+
+void SmokeFindReplace::tc_fr_034_real_smalltestfile_text_directional_search_progress()
+{
+    const QString path = defaultLargeFilePath();
+    QVERIFY2(QFileInfo::exists(path), qPrintable(path));
+    QFile fixture(path);
+    QVERIFY(fixture.open(QIODevice::ReadOnly));
+    QVERIFY(fixture.size() > 32LL * 1024 * 1024);
+    QVERIFY(fixture.size() <= INT_MAX);
+    uchar *mapped = fixture.map(0, fixture.size());
+    QVERIFY(mapped);
+    const QByteArray raw = QByteArray::fromRawData(
+        reinterpret_cast<const char *>(mapped), int(fixture.size()));
+    const QByteArray needle("field");
+    const qint64 firstLiteral = raw.indexOf(needle);
+    QVERIFY(firstLiteral >= 0);
+    const auto asciiWord = [](uchar value) {
+        return value == '_'
+            || (value >= '0' && value <= '9')
+            || (value >= 'A' && value <= 'Z')
+            || (value >= 'a' && value <= 'z');
+    };
+    qint64 firstWholeWord = -1;
+    for (qsizetype from = 0; ; ) {
+        const qsizetype hit = raw.indexOf(needle, from);
+        if (hit < 0)
+            break;
+        const bool leftWord = hit > 0 && asciiWord(uchar(raw.at(hit - 1)));
+        const qsizetype after = hit + needle.size();
+        const bool rightWord = after < raw.size()
+            && asciiWord(uchar(raw.at(after)));
+        if (!leftWord && !rightWord) {
+            firstWholeWord = hit;
+            break;
+        }
+        from = hit + 1;
+    }
+    fixture.unmap(mapped);
+    fixture.close();
+
+    QString error;
+    QVERIFY2(tab()->openLargeFileL2(
+                 path, &error, L2Presentation::Hex, L2ContentKind::Binary),
+             qPrintable(error));
+    QTRY_VERIFY_WITH_TIMEOUT(tab()->windowedReadOnlyProvider(), 5000);
+    tab()->setViewModeL2(ViewMode::Text);
+    tab()->setDisplayEncoding(TextEncoding::Utf8);
+    QTRY_COMPARE_WITH_TIMEOUT(tab()->viewModeL2(), ViewMode::Text, 5000);
+    auto *provider = tab()->windowedReadOnlyProvider();
+    QVERIFY(provider);
+
+    FindReplaceDialog dialog(container_);
+    dialog.setActiveTab(tab());
+    dialog.showFindMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+    auto *wholeWord = dialog.findChild<QCheckBox *>(QStringLiteral("wholeWordSearchCheck"));
+    auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
+    auto *next = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+    auto *previous = dialog.findChild<QPushButton *>(QStringLiteral("findPreviousButton"));
+    auto *status = dialog.findChild<QLabel *>(QStringLiteral("findStatusLabel"));
+    QVERIFY(pattern && regex && wholeWord && wrap && next && previous && status);
+    pattern->setText(QStringLiteral("field"));
+    wrap->setChecked(false);
+
+    struct NavigationRun {
+        qint64 taskId = -1;
+        qint64 elapsedMs = -1;
+        bool completed = false;
+        bool advancedProgress = false;
+    };
+    const auto runNavigation = [&](QPushButton *button, int timeoutMs) {
+        NavigationRun result;
+        auto &manager = AsyncTaskManager::instance();
+        QSignalSpy added(&manager, &AsyncTaskManager::taskAdded);
+        QSignalSpy progress(&manager, &AsyncTaskManager::taskProgressChanged);
+        QSignalSpy finished(&manager, &AsyncTaskManager::taskFinished);
+        QElapsedTimer elapsed;
+        elapsed.start();
+        QTest::mouseClick(button, Qt::LeftButton);
+        while (elapsed.elapsed() < timeoutMs && result.taskId < 0) {
+            for (const QList<QVariant> &entry : added) {
+                const qint64 id = entry.at(0).toLongLong();
+                if (manager.taskById(id).categoryTag
+                    == QStringLiteral("SearchNavigation")) {
+                    result.taskId = id;
+                    break;
+                }
+            }
+            if (result.taskId < 0)
+                QTest::qWait(10);
+        }
+        while (elapsed.elapsed() < timeoutMs && !result.completed) {
+            for (const QList<QVariant> &entry : finished) {
+                if (entry.at(0).toLongLong() == result.taskId) {
+                    result.completed = true;
+                    break;
+                }
+            }
+            if (!result.completed)
+                QTest::qWait(10);
+        }
+        for (const QList<QVariant> &entry : progress) {
+            if (entry.at(0).toLongLong() != result.taskId)
+                continue;
+            const qint64 done = entry.at(1).toLongLong();
+            const qint64 total = entry.at(2).toLongLong();
+            if (done > 0 && total > 0)
+                result.advancedProgress = true;
+        }
+        result.elapsedMs = elapsed.elapsed();
+        return result;
+    };
+
+    // The reported bug starts at BOF and clicks Previous. With wrap disabled,
+    // this must be a bounded empty range, not a scan to the first tail match.
+    const NavigationRun literalPrevious = runNavigation(previous, 5000);
+    QVERIFY(literalPrevious.taskId > 0);
+    QVERIFY(literalPrevious.completed);
+    QVERIFY2(literalPrevious.elapsedMs < 2000,
+             qPrintable(QStringLiteral("literal Previous took %1 ms")
+                            .arg(literalPrevious.elapsedMs)));
+
+    const NavigationRun literalNext = runNavigation(next, 15000);
+    QVERIFY(literalNext.taskId > 0 && literalNext.completed);
+    QVERIFY(literalNext.advancedProgress);
+    QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(), firstLiteral, 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(),
+                              firstLiteral + needle.size(), 5000);
+
+    tab()->resetSearchPosition(true);
+    regex->setChecked(true);
+    QVERIFY(regex->isChecked() && !wholeWord->isChecked());
+    const NavigationRun regexNext = runNavigation(next, 15000);
+    QVERIFY(regexNext.taskId > 0 && regexNext.completed);
+    QVERIFY(regexNext.advancedProgress);
+    QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(), firstLiteral, 5000);
+    QVERIFY(container_->grab().save(
+        QDir(QCoreApplication::applicationDirPath()).filePath(
+            QStringLiteral("gui-smalltestfile-text-search-regression.png"))));
+
+    tab()->resetSearchPosition(true);
+    const NavigationRun regexPrevious = runNavigation(previous, 5000);
+    QVERIFY(regexPrevious.taskId > 0 && regexPrevious.completed);
+    QVERIFY2(regexPrevious.elapsedMs < 2000,
+             qPrintable(QStringLiteral("regex Previous took %1 ms")
+                            .arg(regexPrevious.elapsedMs)));
+
+    regex->setChecked(false);
+    wholeWord->setChecked(true);
+    QVERIFY(wholeWord->isChecked() && !regex->isChecked());
+    tab()->resetSearchPosition(true);
+    const NavigationRun wholeNext = runNavigation(next, 15000);
+    QVERIFY(wholeNext.taskId > 0 && wholeNext.completed);
+    QVERIFY(wholeNext.advancedProgress);
+    if (firstWholeWord >= 0) {
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(),
+                                  firstWholeWord, 5000);
+    } else {
+        QTRY_VERIFY_WITH_TIMEOUT(
+            status->text().contains(QStringLiteral("未找到")), 5000);
+    }
+
+    tab()->resetSearchPosition(true);
+    const NavigationRun wholePrevious = runNavigation(previous, 5000);
+    QVERIFY(wholePrevious.taskId > 0 && wholePrevious.completed);
+    QVERIFY2(wholePrevious.elapsedMs < 2000,
+             qPrintable(QStringLiteral("whole-word Previous took %1 ms")
+                            .arg(wholePrevious.elapsedMs)));
+    qInfo().noquote()
+        << QStringLiteral(
+               "SMALLTESTFILE_TEXT_SEARCH_MS literalPrev=%1 literalNext=%2 "
+               "regexNext=%3 regexPrev=%4 wholeNext=%5 wholePrev=%6")
+               .arg(literalPrevious.elapsedMs)
+               .arg(literalNext.elapsedMs)
+               .arg(regexNext.elapsedMs)
+               .arg(regexPrevious.elapsedMs)
+               .arg(wholeNext.elapsedMs)
+               .arg(wholePrevious.elapsedMs);
+}
+
+void SmokeFindReplace::tc_fr_035_valid_utf8_regex_validation_progress_is_monotonic()
+{
+    const QString path = tmpDir_.filePath(
+        QStringLiteral("valid-utf8-regex-progress.log"));
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    QByteArray block;
+    block.reserve(1024 * 1024);
+    while (block.size() < 1024 * 1024)
+        block.append("ordinary log record status=ok sequence=00000000\n");
+    block.truncate(1024 * 1024);
+    for (int i = 0; i < 40; ++i)
+        QCOMPARE(file.write(block), qint64(block.size()));
+    file.close();
+
+    QString error;
+    QVERIFY2(openL2(path, &error), qPrintable(error));
+    tab()->setViewModeL2(ViewMode::Text);
+    tab()->setDisplayEncoding(TextEncoding::Utf8);
+
+    QSignalSpy progress(tab(), &EditorTab::findAllL2Progress);
+    auto &manager = AsyncTaskManager::instance();
+    QSignalSpy taskAdded(&manager, &AsyncTaskManager::taskAdded);
+    QSignalSpy taskProgress(&manager, &AsyncTaskManager::taskProgressChanged);
+    bool completed = false;
+    connect(tab(), &EditorTab::findAllL2Finished, tab(),
+            [&completed](SearchResultsModel *, const QString &, const QString &) {
+        completed = true;
+    });
+    // No required first byte: this exercises the PCRE2 path rather than a
+    // literal/start-byte prefilter which could hide the validation phase.
+    QVERIFY(tab()->findAllL2Async(
+        QStringLiteral("(?:NEVER_MATCH_[0-9]{12}|\u4E0D\u5B58\u5728)"),
+        true, true, false, tab()));
+    qint64 taskId = -1;
+    QTRY_VERIFY_WITH_TIMEOUT(([&]() {
+        for (const QList<QVariant> &entry : taskAdded) {
+            const qint64 candidate = entry.at(0).toLongLong();
+            if (manager.taskById(candidate).categoryTag
+                == QStringLiteral("Search")) {
+                taskId = candidate;
+                return true;
+            }
+        }
+        return false;
+    })(), 5000);
+    QCOMPARE(manager.taskById(taskId).categoryTag, QStringLiteral("Search"));
+    QTRY_VERIFY_WITH_TIMEOUT(completed, 20000);
+
+    qint64 previousDone = -1;
+    bool sawIntermediate = false;
+    bool sawValidationBand = false;
+    for (const QList<QVariant> &entry : progress) {
+        const int percent = entry.at(0).toInt();
+        const qint64 done = entry.at(1).toLongLong();
+        const qint64 total = entry.at(2).toLongLong();
+        QVERIFY(total > 0);
+        QVERIFY2(done >= previousDone,
+                 qPrintable(QStringLiteral("progress regressed: %1 -> %2")
+                                .arg(previousDone).arg(done)));
+        previousDone = done;
+        if (done > 0 && done < total)
+            sawIntermediate = true;
+        if (percent > 0 && percent <= 20)
+            sawValidationBand = true;
+    }
+    QVERIFY2(sawIntermediate, "valid UTF-8 Regex emitted no intermediate progress");
+    QVERIFY2(sawValidationBand,
+             "valid UTF-8 validation phase never became visible in task progress");
+
+    qint64 previousTaskDone = -1;
+    bool taskPanelSawIntermediate = false;
+    for (const QList<QVariant> &entry : taskProgress) {
+        if (entry.at(0).toLongLong() != taskId)
+            continue;
+        const qint64 done = entry.at(1).toLongLong();
+        const qint64 total = entry.at(2).toLongLong();
+        QVERIFY(done >= previousTaskDone);
+        previousTaskDone = done;
+        taskPanelSawIntermediate = taskPanelSawIntermediate
+            || (done > 0 && done < total);
+    }
+    QVERIFY2(taskPanelSawIntermediate,
+             "AsyncTaskManager stayed at zero until Regex completion");
 }
 
 QTEST_MAIN(SmokeFindReplace)

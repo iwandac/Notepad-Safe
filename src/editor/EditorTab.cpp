@@ -470,6 +470,33 @@ void EditorTab::setupEditor()
     m_editor->SendScintilla(QsciScintillaBase::SCI_SETMULTIPASTE,
                             QsciScintillaBase::SC_MULTIPASTE_EACH);
 
+    // With a large wrapped S1 document Scintilla may refine its display-line
+    // count while the native thumb is being dragged.  The value that was the
+    // maximum under the pointer can therefore stop being the maximum before
+    // mouse release, leaving the final physical rows unreachable in one drag.
+    // Remember the user's explicit bottom gesture and resolve it through
+    // Scintilla's own MaxScrollPos() after the drag/layout turn settles.
+    QScrollBar *s1Vertical = m_editor->verticalScrollBar();
+    connect(s1Vertical, &QScrollBar::sliderPressed, this, [this]() {
+        m_s1ScrollDragRequestedEnd = false;
+    });
+    connect(s1Vertical, &QScrollBar::sliderMoved, this,
+            [this, s1Vertical](int value) {
+        if (!isL2Mode())
+            m_s1ScrollDragRequestedEnd = value >= s1Vertical->maximum();
+    });
+    connect(s1Vertical, &QScrollBar::sliderReleased, this, [this]() {
+        const bool scrollToEnd = !isL2Mode() && m_s1ScrollDragRequestedEnd;
+        m_s1ScrollDragRequestedEnd = false;
+        if (!scrollToEnd)
+            return;
+        m_editor->SendScintilla(QsciScintillaBase::SCI_SCROLLTOEND);
+        QTimer::singleShot(0, this, [this]() {
+            if (!isL2Mode() && m_editor)
+                m_editor->SendScintilla(QsciScintillaBase::SCI_SCROLLTOEND);
+        });
+    });
+
     // 信号
     connect(m_editor, &QsciScintilla::SCN_MODIFYATTEMPTRO, this, [this]() {
         emit modificationChanged(true);
@@ -2354,6 +2381,8 @@ VirtualFileView *EditorTab::ensureL2View()
         // 加进 QStackedWidget（index 1 = L2）
         if (m_stack && m_stack->indexOf(m_l2View) < 0)
             m_stack->addWidget(m_l2View);
+        emit externalDropSurfaceCreated(m_l2View);
+        emit externalDropSurfaceCreated(m_l2View->viewport());
 
         // 连接 L2 信号：缓存数据 + 转发 EditorTab 的统一/专用信号
         connect(m_l2View, &VirtualFileView::cursorPositionChanged,
@@ -2413,6 +2442,16 @@ WindowedReadOnlyProvider *EditorTab::ensureWindowedReadOnlyProvider()
         m_windowedReadOnlyProvider->editor()->setEolVisibility(m_eolVisible);
         if (m_stack && m_stack->indexOf(m_windowedReadOnlyProvider) < 0)
             m_stack->addWidget(m_windowedReadOnlyProvider);
+        emit externalDropSurfaceCreated(m_windowedReadOnlyProvider);
+        emit externalDropSurfaceCreated(m_windowedReadOnlyProvider->editor());
+        emit externalDropSurfaceCreated(
+            m_windowedReadOnlyProvider->editor()->viewport());
+        emit externalDropSurfaceCreated(
+            m_windowedReadOnlyProvider->asciiPreview());
+        emit externalDropSurfaceCreated(
+            m_windowedReadOnlyProvider->asciiPreview()->viewport());
+        emit externalDropSurfaceCreated(
+            m_windowedReadOnlyProvider->globalScrollBar());
         connect(m_windowedReadOnlyProvider->editor(),
                 &QsciScintilla::selectionChanged,
                 this, &EditorTab::commandCapabilitiesChanged);
@@ -2594,6 +2633,8 @@ void EditorTab::ensureHexAsciiPreview(QWidget *parent)
             " background: #fafafa; padding-left: 8px; }"));
         m_hexAsciiPreview->installEventFilter(this);
         m_hexAsciiPreview->viewport()->installEventFilter(this);
+        emit externalDropSurfaceCreated(m_hexAsciiPreview);
+        emit externalDropSurfaceCreated(m_hexAsciiPreview->viewport());
         connect(m_hexAsciiPreview, &QPlainTextEdit::cursorPositionChanged,
                 this, &EditorTab::syncHexSelectionFromAscii);
         connect(m_hexAsciiPreview, &QPlainTextEdit::selectionChanged,
