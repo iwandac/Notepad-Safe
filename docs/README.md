@@ -34,7 +34,7 @@
 | Ninja | 或 Visual Studio 自带 |
 | Python 3 | 首次从仓库内 Botan 源码生成最小静态库；也用于图标辅助脚本 |
 
-> QScintilla、KeePassXC、Botan、Argon2、zlib、PCRE2 和 Boost.Regex 的锁定源码均随仓库保存在
+> QScintilla、KeePassXC、Botan、Argon2、zlib 和 PCRE2 的锁定源码均随仓库保存在
 > `third_party/src`。仓库不再携带 QScintilla 预编译库；首次构建离线生成 QScintilla/Botan
 > 静态库到 `.deps/install`，后续按源码摘要、Qt/MSVC 版本命中缓存。
 
@@ -58,7 +58,7 @@ build.bat
 1. 调用 `vcvars64.bat`。
 2. 校验锁文件及六棵 `third_party/src` 实际源码树，拒绝嵌套 Git 和二进制生成物。
 3. 离线构建/复用 QScintilla 2.14.1 与最小 Botan 3.12.0 `/MT` 缓存。
-4. CMake 直接从 vendored PCRE2、Boost.Regex、Argon2、zlib 和 KeePassXC Core 编译。
+4. CMake 直接从 vendored PCRE2、Argon2、zlib 和 KeePassXC Core 编译。
 5. 产出：`build\notepad-safe.exe`。
 
 ### 2.4 运行测试
@@ -120,6 +120,7 @@ notepadsafe/
 └── docs/
     ├── README.md               # 用户文档（本文件）
     ├── DESIGN.md               # 架构、安全边界和实现路线
+    ├── REGEX_ENGINE_EXPLORATION.md # 已接受的统一正则架构、方言与准入合同
     ├── TARGET_EXPERIENCE.md    # 目标体验、功能总账与动态 GUI 验收
     ├── REFERENCE_BASELINE.md   # 成熟产品/上游行为参考与探索停止规则
     ├── ITERATION_ROADMAP.md    # 最终目标、十轮收敛路线与发布门槛
@@ -134,7 +135,10 @@ notepadsafe/
 - 小于 32 MiB：Scintilla 完整编辑。
 - 32 MiB–2 GiB：窗口化 mmap 只读查看、复制和搜索，不编辑、不替换。
 - 大于 2 GiB：相同的窗口化 mmap 只读分析能力；S2/S3 仅保留尺寸分级。
-- 字面搜索可并行；UTF-8 正则走 PCRE2，UTF-16、GBK、GB18030、Big5、Shift-JIS 与 Windows-1252 正则由同一个 Unicode 标量迭代器直接遍历原始 mmap，结果保持原始字节坐标。查找框内的正则助手只编辑同一表达式，不引入第二种查询语言。
+- 所有正则都由仓库锁定的 PCRE2 执行。S1 和 UTF-8 S2/S3 使用 UTF/UCP；非 UTF-8
+  S2/S3 仅把有界日志分析子集编译成等价字节模式，直接扫描原始 mmap 并保留源字节坐标，
+  不做全文转码和 offset 回映射。完整子集、拒绝边界、调度和 UI 合同见
+  [统一正则搜索架构](REGEX_ENGINE_EXPLORATION.md)。
 - KeePassXC Core + Botan + KDBX 4.x 的加密笔记和账号保险库。
 
 旧 S2 ILoader 后台晋升和独立 promotion 测试目标已禁用/移除；PatchList 仅服务小型 Hex 兼容路径，不代表大文件编辑能力。

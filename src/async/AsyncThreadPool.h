@@ -16,7 +16,7 @@
 class AsyncThreadPool
 {
 public:
-    static constexpr int MaximumWorkerThreads = 10;
+    static constexpr int MaximumWorkerThreads = 12;
 
     static AsyncThreadPool& instance();
 
@@ -29,6 +29,14 @@ public:
     void startWorker(std::function<void()> fn, AsyncTaskPriority priority);
 
     /**
+     * Run stateful crypto/KDBX work on the framework-owned security lane.
+     * The lane has one non-expiring worker so QObject-based KeePassXC state
+     * never migrates between pool threads. It is included in maxThreads().
+     */
+    void startSecurityWorker(std::function<void()> fn,
+                             AsyncTaskPriority priority);
+
+    /**
      * Run a bounded parallel batch on framework-owned workers. The caller may
      * block, but first-party domain code never creates a QThread/QThreadPool.
      * One central interactive slot remains available while the batch runs.
@@ -36,24 +44,12 @@ public:
     void runBatchBlocking(QVector<std::function<void()>> jobs,
                           AsyncTaskPriority priority = AsyncTaskPriority::Normal);
 
-    // Framework-owned parallel batches reserve from the same process-wide
-    // budget while leaving one additional central slot available. A zero
-    // result means the caller must stay serial.
-    int reserveExternalCapacity(int requestedWorkers);
-    void releaseExternalCapacity(int reservedWorkers);
-
-    // Report actual worker occupancy separately from reserved capacity so the
-    // task UI shows real activity instead of an allocation estimate.
-    void externalWorkerStarted();
-    void externalWorkerFinished();
-
 private:
     AsyncThreadPool();
     ~AsyncThreadPool();
     QThreadPool pool_;
+    QThreadPool securityPool_;
     mutable QMutex capacityMutex_;
-    int externalReserved_ = 0;
-    int externalActive_ = 0;
     int configuredMaxThreads_ = MaximumWorkerThreads;
 };
 

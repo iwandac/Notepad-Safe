@@ -21,6 +21,7 @@
 #include <QStyle>
 #include <QStyleOptionSlider>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QTextCursor>
 #include <QTextBlock>
 #include <QVBoxLayout>
@@ -201,6 +202,82 @@ class LargeReadOnlySmokeTest final : public QObject {
         return bytes;
     }
 
+    QString portableTinyBinaryPath()
+    {
+        const QString path = fixtureDir_.filePath(
+            QStringLiteral("portable-tiny-binary.bin"));
+        if (QFileInfo(path).size() == 4LL * 1024 * 1024)
+            return path;
+        QByteArray bytes(4 * 1024 * 1024, 'A');
+        for (qsizetype index = 0; index < bytes.size(); ++index)
+            bytes[index] = (index % 64 == 63)
+                ? '\n' : char('A' + (index % 23));
+        bytes[0x20] = char(0x93); // invalid UTF-8; U+201C in Windows-1252
+        bytes.replace(0x4e, 19, QByteArrayLiteral("This program cannot"));
+        const QByteArray marker = QByteArray::fromHex("DEADBE");
+        bytes.replace(0x416, marker.size(), marker);
+        bytes.replace(0x1416, marker.size(), marker);
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+            || file.write(bytes) != bytes.size()) {
+            return {};
+        }
+        file.close();
+        return path;
+    }
+
+    QString portableB2BinaryPath()
+    {
+        const QString path = fixtureDir_.filePath(
+            QStringLiteral("portable-b2-binary.bin"));
+        constexpr qint64 size = 40LL * 1024 * 1024;
+        if (QFileInfo(path).size() == size)
+            return path;
+        QFile file(path);
+        if (!file.open(QIODevice::ReadWrite | QIODevice::Truncate)
+            || !file.resize(size)) {
+            return {};
+        }
+        QByteArray block(1024 * 1024, '\0');
+        for (qsizetype index = 0; index < block.size(); ++index)
+            block[index] = char(index & 0xff);
+        if (!file.seek(size * 3 / 5)
+            || file.write(block) != block.size()) {
+            return {};
+        }
+        file.close();
+        return path;
+    }
+
+    QString portableS3Path()
+    {
+        const QString path = fixtureDir_.filePath(
+            QStringLiteral("portable-s3-analysis.bin"));
+        constexpr qint64 size = 4LL * 1024 * 1024 * 1024
+                                + 64LL * 1024 * 1024;
+        if (QFileInfo(path).size() == size)
+            return path;
+        QFile file(path);
+        if (!file.open(QIODevice::ReadWrite | QIODevice::Truncate)
+            || !file.resize(size)) {
+            return {};
+        }
+        QByteArray lines;
+        lines.reserve(16 * 1024 * 1024);
+        const QByteArray line = QByteArrayLiteral("portable-s3-row\n");
+        while (lines.size() + line.size() <= 16 * 1024 * 1024)
+            lines += line;
+        if (!file.seek(0) || file.write(lines) != lines.size())
+            return {};
+        const QByteArray marker = QByteArrayLiteral("S3_ANALYSIS_MARKER");
+        if (!file.seek(size * 3 / 4)
+            || file.write(marker) != marker.size()) {
+            return {};
+        }
+        file.close();
+        return path;
+    }
+
 private slots:
     void editorSurfaceBaselineMatchesFullAndWindowedProviders()
     {
@@ -240,8 +317,7 @@ private slots:
 
     void tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers()
     {
-        const QString path = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
-            .absoluteFilePath(QStringLiteral("../tinytestfile"));
+        const QString path = portableTinyBinaryPath();
         QVERIFY2(QFileInfo::exists(path), qPrintable(path));
         QVERIFY(QFileInfo(path).size() > 0);
         QVERIFY(QFileInfo(path).size() < qint64(32) * 1024 * 1024);
@@ -348,12 +424,16 @@ private slots:
         QCOMPARE(pattern->text(), expectedHexText);
         QVERIFY(hexMode->isChecked());
         QTest::mouseClick(findNext, Qt::LeftButton);
-        QVERIFY(tab->l2View()->selectionStart() > copiedOffset);
-        QCOMPARE(tab->l2View()->selectedBytes(), expectedBytes);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            tab->l2View()->selectionStart() > copiedOffset, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectedBytes(), expectedBytes,
+                                  5000);
         tab->resetSearchPosition(true);
         QTest::mouseClick(findNext, Qt::LeftButton);
-        QCOMPARE(tab->l2View()->selectionStart(), expectedFirstOffset);
-        QCOMPARE(tab->l2View()->selectionEnd(), expectedFirstOffset + 3);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionStart(),
+                                  expectedFirstOffset, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionEnd(),
+                                  expectedFirstOffset + 3, 5000);
         dialog.close();
 
         QVERIFY(window.grab().save(
@@ -394,8 +474,7 @@ private slots:
 
     void tinyBinaryAsciiEditingTextScrollAndWrapAreByteSafe()
     {
-        const QString path = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
-            .absoluteFilePath(QStringLiteral("../tinytestfile"));
+        const QString path = portableTinyBinaryPath();
         const QFileInfo sourceInfo(path);
         QVERIFY2(sourceInfo.exists(), qPrintable(path));
         QVERIFY(sourceInfo.size() > 0);
@@ -880,9 +959,11 @@ private slots:
 
         provider->setPresentation(WindowedReadOnlyProvider::Presentation::Text);
         QCoreApplication::processEvents();
-        QCOMPARE(provider->editor()->marginType(0), QsciScintilla::NumberMargin);
+        QCOMPARE(provider->editor()->marginType(0), QsciScintilla::TextMargin);
         QVERIFY(!provider->asciiPreview()->isVisibleTo(provider));
         QVERIFY(provider->editor()->marginWidth(0) > 0);
+        QCOMPARE(marginText(provider->editor(), 0), QStringLiteral("1"));
+        QCOMPARE(marginText(provider->editor(), 1), QStringLiteral("2"));
 
         provider->setPresentation(WindowedReadOnlyProvider::Presentation::Hex);
         QCoreApplication::processEvents();
@@ -1430,8 +1511,13 @@ private slots:
         opening.start();
         QString error;
         QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
-        QVERIFY2(opening.elapsed() < 1500,
-                 "near-2-GiB preview must not load the full document");
+        const qint64 openingMs = opening.elapsed();
+        qInfo().noquote() << QStringLiteral(
+            "[PERF] near-2-GiB read-only preview opened in %1 ms").arg(openingMs);
+        QVERIFY2(openingMs < 1500,
+                 qPrintable(QStringLiteral(
+                     "near-2-GiB preview must not load the full document; actual=%1 ms")
+                                .arg(openingMs)));
         auto *provider = tab->windowedReadOnlyProvider();
         QVERIFY(provider);
         QCOMPARE(provider->fileSize(), size);
@@ -1449,8 +1535,7 @@ private slots:
 
     void s3ProductionProviderDragMatchesRenderedHex()
     {
-        const QString path = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
-            .absoluteFilePath(QStringLiteral("../bigtestfile"));
+        const QString path = portableS3Path();
         QVERIFY2(QFileInfo::exists(path), qPrintable(path));
         const qint64 size = QFileInfo(path).size();
         QVERIFY(size > 2LL * 1024 * 1024 * 1024);
@@ -1549,8 +1634,7 @@ private slots:
 
     void realB2BinaryRemainsReadOnlyAndStartsNoBackgroundLoad()
     {
-        const QString path = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
-            .absoluteFilePath(QStringLiteral("../smalltestfile"));
+        const QString path = portableB2BinaryPath();
         QVERIFY2(QFileInfo::exists(path), qPrintable(path));
         const qint64 size = QFileInfo(path).size();
         QVERIFY(size > 32LL * 1024 * 1024);
@@ -1711,8 +1795,7 @@ private slots:
 
     void binaryTextEncodingRegexAndWindowedGlobalLinesUserFlow()
     {
-        const QString tinyPath = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
-            .absoluteFilePath(QStringLiteral("tinytestfile"));
+        const QString tinyPath = portableTinyBinaryPath();
         QVERIFY2(QFileInfo::exists(tinyPath), qPrintable(tinyPath));
 
         QWidget tinyWindow;
@@ -1791,16 +1874,14 @@ private slots:
 
     void bigFileLineNumbersAndCharacterCountRunIndependently()
     {
-        const QString path = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
-            .absoluteFilePath(QStringLiteral("bigtestfile"));
+        const QString path = portableS3Path();
         QVERIFY2(QFileInfo::exists(path), qPrintable(path));
         const qint64 size = QFileInfo(path).size();
         QVERIFY(size > 4LL * 1024 * 1024 * 1024);
 
         auto &pool = AsyncThreadPool::instance();
-        const int privateCapacity = pool.reserveExternalCapacity(10);
-        QCOMPARE(privateCapacity, 8);
-        pool.releaseExternalCapacity(privateCapacity);
+        QVERIFY(pool.maxThreads() >= 1);
+        QVERIFY(pool.maxThreads() <= AsyncThreadPool::MaximumWorkerThreads);
 
         QWidget window;
         window.resize(1000, 680);
@@ -1833,7 +1914,11 @@ private slots:
             return lineTaskId > 0 && characterTaskId > 0;
         })(), 5000);
         QVERIFY(lineTaskId != characterTaskId);
-        QCOMPARE(AsyncTaskManager::instance().maximumThreadCount(), 10);
+        const int expectedTotal = qBound(
+            2, QThread::idealThreadCount() - 1,
+            AsyncThreadPool::MaximumWorkerThreads);
+        QCOMPARE(AsyncTaskManager::instance().maximumThreadCount(),
+                 expectedTotal);
 
         QTRY_VERIFY_WITH_TIMEOUT(
             AsyncTaskManager::instance().taskById(lineTaskId).state
@@ -1885,6 +1970,9 @@ private slots:
                                                TextEncoding::Utf8, 0, &error));
         QVERIFY(error.contains(QStringLiteral("已禁用")));
     }
+
+private:
+    QTemporaryDir fixtureDir_;
 };
 
 QTEST_MAIN(LargeReadOnlySmokeTest)

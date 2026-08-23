@@ -10,8 +10,8 @@
 #include <functional>
 
 enum class AsyncTaskPriority : int {
-    Highest = 0,  // 用户交互型：点击跳转后的紧急补扫等
-    High    = 1,  // 用户主动发起的搜索等
+    Highest = 0,  // 安全/数据完整性关键操作，以及定向交互导航
+    High    = 1,  // 用户主动发起且需要快速反馈的普通操作
     Normal  = 2,  // LineIndex 按需补扫（滚到哪扫到哪）
     Low     = 3,  // LineIndex 后台预扫、空闲打包
     Lowest  = 4   // 最低优先级：后台校验、统计、索引归档

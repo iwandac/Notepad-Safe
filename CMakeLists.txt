@@ -48,7 +48,6 @@ set(CMAKE_PREFIX_PATH "${NOTEPADSAFE_QT6_DIR}")
 
 find_package(Qt6 6.11.1 EXACT REQUIRED COMPONENTS Core Gui Widgets Network PrintSupport Svg SvgWidgets Concurrent TaskTree)
 include(cmake/PCRE2.cmake)
-include(cmake/BoostRegex.cmake)
 
 # QScintilla is always built from the vendored source tree by
 # tools/bootstrap_qscintilla.ps1. No binary is allowed in third_party/src.
@@ -95,8 +94,9 @@ set(APP_INCLUDE_DIRS
 )
 
 add_library(notepadsafe_search_runtime STATIC
+    src/editor/TextEncoding.cpp
+    src/search/EncodedRegexCompiler.cpp
     src/search/Pcre2Regex.cpp
-    src/search/RawCodePageRegex.cpp
 )
 target_include_directories(notepadsafe_search_runtime PUBLIC
     ${CMAKE_SOURCE_DIR}/src/search
@@ -105,7 +105,6 @@ target_include_directories(notepadsafe_search_runtime PUBLIC
 target_link_libraries(notepadsafe_search_runtime PUBLIC
     Qt6::Core
     notepadsafe_pcre2
-    notepadsafe_boost_regex
 )
 
 # Stable product-domain policies. Keep file-tier and draft-storage rules free of
@@ -194,7 +193,6 @@ add_executable(notepad-safe WIN32
     src/main.cpp
     src/window/MainWindow.cpp
     src/editor/EditorTab.cpp
-    src/editor/TextEncoding.cpp
     src/search/FindReplaceDialog.cpp
     src/search/SearchResultsDock.cpp
     src/session/SessionManager.cpp
@@ -285,7 +283,6 @@ install(FILES
     README.md
     THIRD_PARTY_NOTICES.md
     third_party/src/qscintilla-2.14.1/LICENSE
-    third_party/src/boost-regex-1.90.0/LICENSE_1_0.txt
     DESTINATION .
 )
 install(FILES
@@ -345,10 +342,9 @@ set(WIN_SYSTEM_LIBS
 # 测试 1: 编码检测（仅需 Qt6::Core）
 add_executable(test_textencoding
     tests/test_textencoding.cpp
-    src/editor/TextEncoding.cpp
 )
 target_include_directories(test_textencoding PRIVATE ${APP_INCLUDE_DIRS})
-target_link_libraries(test_textencoding PRIVATE Qt6::Core)
+target_link_libraries(test_textencoding PRIVATE notepadsafe_search_runtime Qt6::Core)
 if(WIN32)
     target_link_libraries(test_textencoding PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
@@ -374,12 +370,28 @@ if(WIN32)
     target_link_libraries(test_pcre2_regex PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
 
+add_executable(test_largefile_encoded_search
+    tests/test_largefile_encoded_search.cpp
+    src/search/LargeFileSearch.cpp
+    src/editor/LineIndex.cpp
+    src/editor/PatchList.cpp
+    src/editor/DynamicThresholds.cpp
+    src/async/AsyncTask.cpp
+    src/async/AsyncThreadPool.cpp
+    src/async/AsyncTaskManager.cpp
+)
+target_include_directories(test_largefile_encoded_search PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(test_largefile_encoded_search PRIVATE
+    notepadsafe_search_runtime Qt6::Core Qt6::Gui Qt6::Concurrent)
+if(WIN32)
+    target_link_libraries(test_largefile_encoded_search PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+
 # 测试 3: 会话序列化（需 Qt6::Core + QScintilla，因为 SessionManager.cpp 依赖 EditorTab）
 add_executable(test_session
     tests/test_session.cpp
     src/session/SessionManager.cpp
     src/editor/EditorTab.cpp
-    src/editor/TextEncoding.cpp
     src/editor/DynamicThresholds.cpp
     src/editor/LineIndex.cpp
     src/editor/PatchList.cpp
@@ -467,6 +479,7 @@ set(NOTEPADSAFE_NON_GUI_TEST_TARGETS
     test_textencoding
     test_search
     test_pcre2_regex
+    test_largefile_encoded_search
     test_session
     test_settings_ui
     test_filetierpolicy
@@ -517,6 +530,7 @@ enable_testing()
 add_test(NAME textencoding COMMAND test_textencoding)
 add_test(NAME search       COMMAND test_search)
 add_test(NAME pcre2_regex  COMMAND test_pcre2_regex)
+add_test(NAME largefile_encoded_search COMMAND test_largefile_encoded_search)
 add_test(NAME session      COMMAND test_session)
 add_test(NAME settings_ui  COMMAND test_settings_ui)
 add_test(NAME filetierpolicy COMMAND test_filetierpolicy)
@@ -542,6 +556,7 @@ if(NOTEPADSAFE_BUILD_DIAGNOSTICS)
 
 add_executable(diag_lineindex
     tests/diag_lineindex.cpp
+    src/async/AsyncThreadPool.cpp
     src/editor/DynamicThresholds.cpp
     src/editor/LineIndex.cpp
 )
@@ -553,6 +568,7 @@ target_link_libraries(diag_lineindex PRIVATE
 
 add_executable(diag_scroll_lines
     tests/diag_scroll_lines.cpp
+    src/async/AsyncThreadPool.cpp
     src/editor/DynamicThresholds.cpp
     src/editor/LineIndex.cpp
 )
@@ -582,12 +598,12 @@ set(GUI_SMOKE_SHARED_SOURCES
     src/search/SearchResultsDock.cpp
     src/editor/EditorTab.cpp
     src/search/FindReplaceDialog.cpp
-    src/editor/TextEncoding.cpp
     src/session/SessionManager.cpp
     src/editor/DynamicThresholds.cpp
     src/async/AsyncTaskManager.cpp
     src/async/AsyncTask.cpp
     src/async/AsyncThreadPool.cpp
+    src/async/AsyncSerialQueue.cpp
     ${APP_QRC_FILE}
 )
 
@@ -703,6 +719,13 @@ endif()
 add_executable(gui_smoke_vault
     tests/gui_smoke/smoke_vault.cpp
     src/vault/VaultDock.cpp
+    src/async/AsyncTask.cpp
+    src/async/AsyncThreadPool.cpp
+    src/async/AsyncTaskManager.cpp
+    src/async/AsyncSerialQueue.cpp
+)
+target_compile_definitions(gui_smoke_findreplace PRIVATE
+    NOTEPADSAFE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
 target_include_directories(gui_smoke_vault PRIVATE ${APP_INCLUDE_DIRS})
 target_link_libraries(gui_smoke_vault PRIVATE

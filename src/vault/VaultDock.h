@@ -133,6 +133,7 @@ private:
     void showError(const VaultError &error, const QString &title);
     bool handleExternalChangeError(const VaultError &error);
     void applyOpenState();
+    void lockServiceOnSecurityLane();
     void rememberManagedStore(const QString &filePath);
     static SecureBuffer secureUtf8From(const QString &text);
     static QString transientText(const SecureBuffer &value);

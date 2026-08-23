@@ -63,13 +63,13 @@ public:
     struct Options {
         bool regexMode     = false;
         bool hexBytesMode  = false; // "DE AD BE EF" -> exact raw-byte KMP
-        bool byteContextMode = false; // 16-byte ASCII preview context for Hex targets
+        bool byteContextMode = false; // bounded ASCII preview containing the full Hex match
         // Text presentation may intentionally decode malformed source bytes
         // as U+FFFD (for example Binary -> Text). Use the raw decoding iterator
         // instead of rejecting the complete subject as invalid UTF-8.
         bool tolerateInvalidEncoding = false;
         bool caseSensitive = true;
-        bool wholeWord     = false; // Unicode letter/number/underscore boundary
+        bool wholeWord     = false; // word boundary; CJK literals use exact-phrase semantics
         bool forward       = true;  // 不影响 findAll（总是从头到尾），影响 findNext/findPrev
         bool useOverrunFile = true; // 超 MAX_MATCHES_MEM 是否溢出到磁盘
         // Physical encoding of a text target. Regex over GBK is executed by

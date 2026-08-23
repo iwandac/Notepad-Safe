@@ -495,8 +495,9 @@ QVariant SearchResultsModel::data(const QModelIndex& idx, int role) const {
                 ? QObject::tr("偏移 0x%1")
                       .arg(QString::number(quint64(g.firstByteOffset), 16).toUpper())
                 : QObject::tr("第 %1 行").arg(g.line + 1);
-            return QObject::tr("%1 · %2 处匹配\n双击跳转；双击高亮词可选择该处")
-                .arg(location).arg(g.matchPositions.size());
+            const QString context = decodeContext(g.lineContext, textEncoding_);
+            return QObject::tr("%1 · %2 处匹配\n%3\n双击跳转")
+                .arg(location).arg(g.matchPositions.size()).arg(context);
         }
         case COL_MATCHCOUNT:
             return QObject::tr("该行有 %1 处匹配").arg(g.matchPositions.size());
@@ -514,7 +515,7 @@ QVariant SearchResultsModel::data(const QModelIndex& idx, int role) const {
     case COL_LINE:
         return bytePositionMode_
             ? QStringLiteral("0x%1").arg(
-                  QString::number(quint64(g.contextByteOffset), 16).toUpper())
+                  QString::number(quint64(g.firstByteOffset), 16).toUpper())
             : g.line < 0
             ? QStringLiteral("0x%1…").arg(
                   QString::number(quint64(g.firstByteOffset), 16).toUpper())

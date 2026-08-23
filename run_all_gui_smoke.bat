@@ -1,14 +1,14 @@
 @echo off
 REM ============================================================================
-REM  notepad-safe GUI 冒烟测试一键脚本（Windows / PowerShell 环境）
-REM  按 QUALITY_ASSURANCE_AND_GUI_TESTING.md §2 强制管理。
+REM  notepad-safe GUI smoke test runner (Windows / PowerShell).
+REM  Governed by QUALITY_ASSURANCE_AND_GUI_TESTING.md section 2.
 REM
-REM  用法：
+REM  Usage:
 REM    cd /d ^<repository-root^>
-REM    .\run_all_gui_smoke.bat          构建+运行全部 GUI smoke，输出汇总 PASS/FAIL
-REM    .\run_all_gui_smoke.bat build    只构建，不运行
-REM    .\run_all_gui_smoke.bat coord    只跑 gui_smoke_coord
-REM    .\run_all_gui_smoke.bat fr       只跑 gui_smoke_findreplace
+REM    .\run_all_gui_smoke.bat          Build and run every GUI smoke test.
+REM    .\run_all_gui_smoke.bat build    Build only.
+REM    .\run_all_gui_smoke.bat coord    Run gui_smoke_coord only.
+REM    .\run_all_gui_smoke.bat fr       Run gui_smoke_findreplace only.
 REM ============================================================================
 setlocal enabledelayedexpansion
 
@@ -28,30 +28,36 @@ echo.
 echo === notepad-safe GUI Smoke Suite ===
 echo.
 
-REM -------- Step 1. build --------
+REM -------- Step 1: build --------
 pushd "%ROOT%"
 if /I "%1"=="build" (
     call "%ROOT%build_incr.bat" %TARGETS% 2>&1
-    if errorlevel 1 (
+    set "BUILD_RC=!errorlevel!"
+    if not "!BUILD_RC!"=="0" (
         echo. & echo [FATAL] Build failed. & exit /b 1
     )
     echo. & echo [OK] Build-only done. & popd & exit /b 0
 )
 if /I "%1"=="coord" (
     call "%ROOT%build_incr.bat" gui_smoke_coord 2>&1
-    if errorlevel 1 ( echo [FATAL] build gui_smoke_coord failed & exit /b 1 )
+    set "BUILD_RC=!errorlevel!"
+    if not "!BUILD_RC!"=="0" ( echo [FATAL] build gui_smoke_coord failed & exit /b 1 )
     goto RUN_ONE_COORD
 )
 if /I "%1"=="fr" (
     call "%ROOT%build_incr.bat" gui_smoke_findreplace 2>&1
-    if errorlevel 1 ( echo [FATAL] build gui_smoke_findreplace failed & exit /b 1 )
+    set "BUILD_RC=!errorlevel!"
+    if not "!BUILD_RC!"=="0" ( echo [FATAL] build gui_smoke_findreplace failed & exit /b 1 )
     goto RUN_ONE_FR
 )
 
-REM 默认：构建全部 + 运行全部
+REM Default: build and run the complete suite.
 call "%ROOT%build_incr.bat" %TARGETS% 2>&1
-if errorlevel 1 (
-    echo. & echo [FATAL] Build failed (see build log above). & exit /b 1
+set "BUILD_RC=!errorlevel!"
+if not "!BUILD_RC!"=="0" (
+    echo.
+    echo [FATAL] Build failed; see build log above.
+    exit /b 1
 )
 
 :RUN_ALL
@@ -63,14 +69,14 @@ for %%T in (%TARGETS%) do (
     echo Running %%T ...
     echo ------------------------------------------------------------
     pushd "%BUILD%"
-    ".\%%T.exe" -o txt,%TEMP%\%%T.txt -xml,%TEMP%\%%T.junit.xml
+    ".\%%T.exe" -o "%TEMP%\%%T.txt",txt -o "%TEMP%\%%T.junit.xml",junitxml
     set EC=!errorlevel!
     popd
     if !EC! equ 0 (
         echo [PASS] %%T
         set /a PASS+=1
     ) else (
-        echo [FAIL] %%T  (exit=!EC!  log=%TEMP%\%%T.txt)
+        echo [FAIL] %%T  exit=!EC!  log=%TEMP%\%%T.txt
         echo ---- tail ----
         powershell -NoProfile -Command "Get-Content '%TEMP%\%%T.txt' -ErrorAction SilentlyContinue | Select-Object -Last 80"
         echo --------------

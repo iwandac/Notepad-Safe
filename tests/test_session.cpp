@@ -18,6 +18,7 @@
 #include <QDebug>
 #include <QElapsedTimer>
 #include <QIODevice>
+#include <QThread>
 
 #include <cstdio>
 #include <memory>
@@ -410,19 +411,13 @@ void test_binary_hex_patch_recovery_is_encrypted_and_restorable()
 void test_worker_limit_and_unicode_character_count()
 {
     TEST("全局 worker 上限与 Unicode 字符计数");
-    CHECK(AsyncThreadPool::instance().maxThreads() == 10,
-          "应用后台 worker 最大数量固定为 10");
-    const int reserved = AsyncThreadPool::instance().reserveExternalCapacity(2);
-    CHECK(reserved == 2, "空闲时 LineIndex 私有池可从统一预算预留 worker");
-    AsyncThreadPool::instance().externalWorkerStarted();
-    AsyncThreadPool::instance().externalWorkerStarted();
-    CHECK(AsyncThreadPool::instance().totalActiveThreadCount() == 2,
-          "任务 UI 统计包含私有池的真实活跃 worker");
-    AsyncThreadPool::instance().externalWorkerFinished();
-    AsyncThreadPool::instance().externalWorkerFinished();
-    AsyncThreadPool::instance().releaseExternalCapacity(reserved);
+    const int expectedWorkers = qBound(
+        1, qMax(1, QThread::idealThreadCount()) - 1,
+        AsyncThreadPool::MaximumWorkerThreads);
+    CHECK(AsyncThreadPool::instance().maxThreads() == expectedWorkers,
+          "应用 worker 数按逻辑核数自适应并保留系统余量");
     CHECK(AsyncThreadPool::instance().totalActiveThreadCount() == 0,
-          "私有池结束后活跃线程统计归零");
+          "空闲时全局池活跃线程数为零");
 
     auto tab = std::make_unique<EditorTab>();
     tab->editor()->setText(QStringLiteral("A中😀\n"));

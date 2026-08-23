@@ -150,16 +150,19 @@ S2/S3 不执行编辑资源准入。大小档位只用于性能策略、状态�
 
 ## 5. 搜索、正则和后台任务边界
 
-来源：[PCRE2 API](https://pcre2project.github.io/pcre2/doc/pcre2api/)、[pcre2_match](https://www.pcre.org/current/doc/html/pcre2_match.html)、[partial matching](https://www.pcre.org/current/doc/html/pcre2partial.html)、[Qt Concurrent](https://doc.qt.io/qt-6/qtconcurrent-index.html)
+来源：[PCRE2 API](https://pcre2project.github.io/pcre2/doc/pcre2api/)、[Qt Concurrent](https://doc.qt.io/qt-6/qtconcurrent-index.html)
 
 采用：
 
-- Text/Secure/Hex/S1/S2/S3 的正则语义统一到 PCRE2；偏移在内部以源字节和解码映射明确转换，禁止混用 Qt/Scintilla 正则产生不同答案。
-- 分块搜索使用重叠或 PCRE2 partial 语义处理跨块匹配；超出产品可证明边界的可变长回溯/环视必须受限并给出明确结果，而不是漏报。
+- Text/Secure/S1/S2/S3 的执行引擎统一为 PCRE2。UTF-8 subject 使用完整 UTF/UCP 路径；
+  非 UTF-8 subject 只接受明确列出的日志正则子集，并编译成 PCRE2 字节模式。
+- S2/S3 按原始物理编码扫描并直接产生源字节范围；不得用全文转码、第二份正文或全文件字符位置回映射换取正则能力。不能安全等价转换的非 UTF 查询必须在扫描前报错，不能降级或静默漏报。
 - 每个 SearchSession 有不可变查询、范围、目标快照/版本、取消令牌和 MatchId。新请求使旧结果失效，旧 worker 不能覆盖新 UI。
-- PCRE2 match/depth/heap/offset 等资源限制必须显式设置；错误、超限、取消和完成是不同状态。
+- matcher 的时间/状态/内存/offset 等资源限制必须显式设置；错误、超限、取消和完成是不同状态。
 - 当前文件是默认；全部打开文件和目录可选。worker 数量有上限，结果按批次增量提交并稳定排序。
 - Find All Dock 每项携带文档身份、版本、源字节位置、行列和上下文；双击经统一 OpenDispatcher/Provider 导航，不直接操纵第二套编辑器。
+- Find Next 得到第一处即响应，不等待 Find All；任务容量自适应且统一受 CPU/I/O/memory token、
+  优先级和协作式 yield 控制。超过 30 秒的预计长任务从状态栏气泡引导到脱敏详情。
 
 拒绝：每个标签自行启动无上限线程、一次把所有结果对象推到 UI、正则卡死被误报为“无结果”。
 
@@ -183,7 +186,7 @@ S2/S3 不执行编辑资源准入。大小档位只用于性能策略、状态�
 自由探索只能在以下边界内进行：
 
 - 能直接改善 `TARGET_EXPERIENCE.md` 的核心旅程，或消除发布阻断缺陷。
-- 优先复用 Scintilla、Qt、KeePassXC/Botan、PCRE2 和 Windows 平台能力。
+- 优先复用 Scintilla、Qt、KeePassXC/Botan、已通过准入的正则引擎和 Windows 平台能力。
 - 一个方案连续两轮不能提升既定 GUI 指标，必须降级、替换或明确砍掉，禁止继续局部打补丁。
 - 新架构若引入第二个编辑位置真值、第二套文件探测、第二套搜索语义、第二种可移植加密格式或明文恢复缓存，立即否决。
 - 未达到数据完整性、安全恢复、连续浏览和精确搜索跳转门槛时，不投入动画、装饰性视觉或低频偏好项。

@@ -35,7 +35,6 @@ inline VaultError runSerializedSecurityOperation(
         progress->setMinimumDuration(150);
         progress->setAutoClose(false);
         progress->setCancelButton(nullptr);
-        progress->show();
     }
 
     AsyncSerialQueue::Request request;

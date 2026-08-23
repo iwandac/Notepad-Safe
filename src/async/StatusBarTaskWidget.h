@@ -37,6 +37,7 @@ private:
     int m_runningThreads = 0;
     int m_maxThreads = 0;
     int m_failedTasks = 0;
+    qint64 m_longestRemainingMs = -1;
     QTimer m_estimateTimer;
     QSet<qint64> m_notifiedLongTasks;
     QPointer<QFrame> m_longTaskBubble;

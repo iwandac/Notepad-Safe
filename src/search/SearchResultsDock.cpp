@@ -13,6 +13,7 @@
 #include <QApplication>
 #include <QPalette>
 #include <QMouseEvent>
+#include <QHoverEvent>
 #include <QUuid>
 #include <QSizePolicy>
 #include <limits>
@@ -89,11 +90,34 @@ PreparedContext prepareContext(const QModelIndex &index, int maxWidth,
     const int primaryLength = qBound(
         0, primary.value(QStringLiteral("length")).toInt(),
         text.size() - primaryStart);
+    const int primaryEnd = primaryStart + primaryLength;
+    const QString ellipsis(QChar(0x2026));
     const int matchWidth = metrics.horizontalAdvance(
         text.mid(primaryStart, primaryLength));
-    const int ellipsisWidth = metrics.horizontalAdvance(QString(QChar(0x2026)));
-    const int prefixBudget = qMax(0, (maxWidth - matchWidth) * 2 / 5
-                                     - ellipsisWidth);
+    const int ellipsisWidth = metrics.horizontalAdvance(ellipsis);
+    const bool hasLeading = primaryStart > 0;
+    const bool hasTrailing = primaryEnd < text.size();
+    int decorationBudget = qMax(0, maxWidth - matchWidth);
+    bool showLeadingEllipsis = false;
+    bool showTrailingEllipsis = false;
+    if (hasLeading && hasTrailing && decorationBudget >= 2 * ellipsisWidth) {
+        showLeadingEllipsis = true;
+        showTrailingEllipsis = true;
+        decorationBudget -= 2 * ellipsisWidth;
+    } else if (hasLeading && decorationBudget >= ellipsisWidth) {
+        showLeadingEllipsis = true;
+        decorationBudget -= ellipsisWidth;
+    } else if (hasTrailing && decorationBudget >= ellipsisWidth) {
+        showTrailingEllipsis = true;
+        decorationBudget -= ellipsisWidth;
+    }
+    // Build the visible window around the match explicitly.  Passing the
+    // complete tail to elidedText() lets the platform elider cut through the
+    // match when font shaping and QFontMetrics disagree by a few pixels.  The
+    // match is the result row's primary information, so context yields first.
+    const int contextBudget = decorationBudget;
+    const int prefixBudget = contextBudget * 2 / 5;
+    const int suffixBudget = contextBudget - prefixBudget;
     int sourceStart = primaryStart;
     while (sourceStart > 0) {
         const int candidate = previousUtf16Boundary(text, sourceStart);
@@ -104,12 +128,27 @@ PreparedContext prepareContext(const QModelIndex &index, int maxWidth,
         sourceStart = candidate;
     }
 
-    const QString leading = sourceStart > 0 ? QString(QChar(0x2026)) : QString();
-    const QString raw = leading + text.mid(sourceStart);
-    prepared.text = metrics.elidedText(raw, Qt::ElideRight, maxWidth);
-    const bool rightElided = prepared.text != raw;
-    const int visibleContentEnd = qMax(
-        0, prepared.text.size() - (rightElided ? 1 : 0));
+    int sourceEnd = primaryEnd;
+    while (sourceEnd < text.size()) {
+        int candidate = sourceEnd + 1;
+        if (candidate < text.size() && text.at(sourceEnd).isHighSurrogate()
+            && text.at(candidate).isLowSurrogate()) {
+            ++candidate;
+        }
+        if (metrics.horizontalAdvance(
+                text.mid(primaryEnd, candidate - primaryEnd)) > suffixBudget) {
+            break;
+        }
+        sourceEnd = candidate;
+    }
+
+    const QString leading = sourceStart > 0 && showLeadingEllipsis
+        ? ellipsis : QString();
+    const QString trailing = sourceEnd < text.size() && showTrailingEllipsis
+        ? ellipsis : QString();
+    prepared.text = leading + text.mid(sourceStart, sourceEnd - sourceStart)
+        + trailing;
+    const int visibleContentEnd = prepared.text.size() - trailing.size();
 
     for (int i = 0; i < ranges.size(); ++i) {
         const QVariantMap range = ranges.at(i).toMap();
@@ -240,22 +279,20 @@ public:
             if (role == StaleRole) return group->stale;
             if (role == Qt::ToolTipRole && !group->incompleteReason.isEmpty())
                 return group->incompleteReason;
-            if (role == Qt::FontRole && index.column() == 0) {
+            if (role == Qt::FontRole) {
                 QFont font;
                 font.setBold(true);
                 return font;
             }
             if (role != Qt::DisplayRole) return {};
             if (index.column() == 0) {
-                return group->stale
-                    ? QStringLiteral("%1 — 结果已失效，请重新搜索此文件")
-                          .arg(group->displayName)
-                    : (group->incompleteReason.isEmpty()
-                        ? QStringLiteral("%1 — %2 处")
-                              .arg(group->displayName).arg(group->totalMatches)
-                        : QStringLiteral("%1 — 至少 %2 处（结果不完整）")
-                              .arg(group->displayName).arg(group->totalMatches));
+                return group->displayName;
             }
+            if (index.column() == SearchResultsModel::COL_CONTEXT)
+                return group->stale
+                    ? QStringLiteral("结果已失效，请重新搜索此文件")
+                    : (group->incompleteReason.isEmpty()
+                        ? QString() : QStringLiteral("结果不完整"));
             if (index.column() == SearchResultsModel::COL_MATCHCOUNT)
                 return group->totalMatches;
             return {};
@@ -526,9 +563,28 @@ public:
     void paint(QPainter* painter, const QStyleOptionViewItem& option,
                const QModelIndex& index) const override
     {
+        const auto *tree = qobject_cast<const QTreeView *>(parent());
+        const bool trackedHover = tree
+            && tree->property("searchHoverRow").toInt() == index.row()
+            && tree->property("searchHoverHasParent").toBool()
+                   == index.parent().isValid()
+            && (!index.parent().isValid()
+                || tree->property("searchHoverParentRow").toInt()
+                       == index.parent().row());
+        const bool hoveredRow = trackedHover
+            || (option.state & QStyle::State_MouseOver);
+        const bool selected = option.state & QStyle::State_Selected;
+        const auto paintHover = [&] {
+            if (!hoveredRow || selected)
+                return;
+            QColor hover = option.palette.color(QPalette::Highlight);
+            hover.setAlpha(34);
+            painter->fillRect(option.rect, hover);
+        };
         // 只对 COL_CONTEXT 列做特殊绘制
         if (index.column() != SearchResultsModel::COL_CONTEXT) {
             QStyledItemDelegate::paint(painter, option, index);
+            paintHover();
             return;
         }
 
@@ -537,6 +593,7 @@ public:
         if (index.data(SearchResultsModel::ContextRole).isNull()
             || encodedRanges.isEmpty()) {
             QStyledItemDelegate::paint(painter, option, index);
+            paintHover();
             return;
         }
 
@@ -550,6 +607,7 @@ public:
         opt.icon = QIcon();
         QStyle *style = opt.widget ? opt.widget->style() : QApplication::style();
         style->drawControl(QStyle::CE_ItemViewItem, &opt, painter, opt.widget);
+        paintHover();
 
         constexpr int HorizontalPadding = 6;
         const QRect textRect = option.rect.adjusted(HorizontalPadding, 0,
@@ -559,7 +617,6 @@ public:
                                                         metrics);
         QTextLayout textLayout(prepared.text, option.font);
         QVector<QTextLayout::FormatRange> formats;
-        const bool selected = option.state & QStyle::State_Selected;
         for (const VisualMatchRange &range : prepared.matches) {
             QTextCharFormat format;
             format.setFontWeight(QFont::DemiBold);
@@ -645,9 +702,9 @@ SearchResultsDock::SearchResultsDock(QWidget *parent)
     m_treeView->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     m_treeView->header()->setSectionResizeMode(1, QHeaderView::Stretch);
     m_treeView->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    // 设置自定义 delegate 对上下文列染色
-    m_treeView->setItemDelegateForColumn(SearchResultsModel::COL_CONTEXT,
-                                         new SearchResultItemDelegate(m_treeView));
+    // One delegate owns the whole row so hover/selection geometry cannot
+    // diverge between the location, context and count columns.
+    m_treeView->setItemDelegate(new SearchResultItemDelegate(m_treeView));
     m_stack->addWidget(m_treeView);
 
     layout->addWidget(m_stack);
@@ -1120,6 +1177,26 @@ bool SearchResultsDock::eventFilter(QObject *watched, QEvent *event)
 {
     if (watched == m_treeView->viewport()
         && (m_model || m_multiModel || m_singleL1Model)) {
+        if (event->type() == QEvent::MouseMove
+            || event->type() == QEvent::HoverMove) {
+            const QPoint position = event->type() == QEvent::MouseMove
+                ? static_cast<QMouseEvent *>(event)->position().toPoint()
+                : static_cast<QHoverEvent *>(event)->position().toPoint();
+            const QModelIndex hovered = m_treeView->indexAt(position);
+            m_treeView->setProperty("searchHoverRow",
+                                    hovered.isValid() ? hovered.row() : -1);
+            m_treeView->setProperty("searchHoverHasParent",
+                                    hovered.parent().isValid());
+            m_treeView->setProperty("searchHoverParentRow",
+                                    hovered.parent().isValid()
+                                        ? hovered.parent().row() : -1);
+            m_treeView->viewport()->update();
+        } else if (event->type() == QEvent::Leave) {
+            m_treeView->setProperty("searchHoverRow", -1);
+            m_treeView->setProperty("searchHoverHasParent", false);
+            m_treeView->setProperty("searchHoverParentRow", -1);
+            m_treeView->viewport()->update();
+        }
         if (event->type() == QEvent::MouseButtonPress) {
             auto* me = static_cast<QMouseEvent*>(event);
             if (me->button() == Qt::LeftButton) {

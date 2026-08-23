@@ -5,6 +5,8 @@
 #include <QSet>
 #include <QThread>
 #include <algorithm>
+#include <atomic>
+#include <memory>
 
 #if defined(Q_OS_WIN)
 #  define WIN32_LEAN_AND_MEAN
@@ -250,7 +252,10 @@ qint64 AsyncTaskManager::submit(AsyncTaskType type, AsyncTaskPriority priority, 
         QMetaObject::invokeMethod(mgr, "updateTaskProgressImpl", Qt::QueuedConnection,
                                   Q_ARG(qint64, weakTaskId), Q_ARG(qint64, done), Q_ARG(qint64, total));
     };
-    auto reportError = [mgr, weakTaskId](const AsyncErrorInfo &err) {
+    auto failureReported = std::make_shared<std::atomic_bool>(false);
+    auto reportError = [mgr, weakTaskId, failureReported](const AsyncErrorInfo &err) {
+        if (failureReported->exchange(true, std::memory_order_acq_rel))
+            return;
         AsyncErrorInfo copy = err;
         QMetaObject::invokeMethod(mgr, "finishTaskImpl", Qt::QueuedConnection,
                                   Q_ARG(qint64, weakTaskId),
@@ -258,7 +263,8 @@ qint64 AsyncTaskManager::submit(AsyncTaskType type, AsyncTaskPriority priority, 
                                   Q_ARG(AsyncErrorInfo, copy));
     };
 
-    AsyncThreadPool::instance().startWorker([mgr, workerFn, weakTaskId, cancelPtr, reportProgress, reportError]() {
+    auto runWorker = [mgr, workerFn, weakTaskId, cancelPtr, reportProgress,
+                      reportError, failureReported]() {
         // Keep tasks Queued while they are actually waiting in QThreadPool.
         // Besides making the task panel truthful, this lets cancel() remove a
         // not-yet-started task immediately. Queued invocations from this worker
@@ -274,6 +280,11 @@ qint64 AsyncTaskManager::submit(AsyncTaskType type, AsyncTaskPriority priority, 
             } else if (workerFn) {
                 workerFn(weakTaskId, cancelPtr, reportProgress, reportError);
             }
+            // A domain worker may report a structured failure without throwing.
+            // That terminal state must not be overwritten by the generic
+            // Finished/Canceled callback below.
+            if (failureReported->load(std::memory_order_acquire))
+                return;
             if (cancelPtr && cancelPtr->load(std::memory_order_acquire) && finalState == AsyncTaskState::Finished) {
                 finalState = AsyncTaskState::Canceled;
             }
@@ -302,7 +313,15 @@ qint64 AsyncTaskManager::submit(AsyncTaskType type, AsyncTaskPriority priority, 
                                   Q_ARG(qint64, weakTaskId),
                                   Q_ARG(AsyncTaskState, finalState),
                                   Q_ARG(AsyncErrorInfo, err));
-    }, priority);
+    };
+    const bool securityLane = type == AsyncTaskType::SecureOpen
+                           || type == AsyncTaskType::SecureSave
+                           || type == AsyncTaskType::SecureIdentity
+                           || type == AsyncTaskType::VaultOperation;
+    if (securityLane)
+        AsyncThreadPool::instance().startSecurityWorker(std::move(runWorker), priority);
+    else
+        AsyncThreadPool::instance().startWorker(std::move(runWorker), priority);
 
     return t.id;
 }

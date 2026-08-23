@@ -68,9 +68,13 @@ void StatusBarTaskWidget::onThreadCountChanged(int running, int maxThreads)
     m_runningThreads = running;
     m_maxThreads = maxThreads;
     const int active = AsyncTaskManager::instance().cancellableCount();
-    m_tasksBtn->setToolTip(tr("打开后台任务；活跃任务 %1，失败 %2，工作线程 %3/%4")
-                               .arg(active).arg(m_failedTasks)
-                               .arg(running).arg(maxThreads));
+    QString tooltip = tr("打开后台任务；活跃任务 %1，失败 %2，工作线程 %3/%4")
+                          .arg(active).arg(m_failedTasks)
+                          .arg(running).arg(maxThreads);
+    if (m_longestRemainingMs >= 0)
+        tooltip += tr("；最长预计还需 %1")
+                       .arg(compactDuration(m_longestRemainingMs));
+    m_tasksBtn->setToolTip(tooltip);
 }
 
 void StatusBarTaskWidget::onSummaryChanged(int queued, int running, int finished)
@@ -156,13 +160,8 @@ void StatusBarTaskWidget::checkLongRunningTasks()
         break;
     }
 
-    const int active = manager.queuedCount() + manager.runningCount();
-    QString tooltip = tr("打开后台任务；活跃任务 %1，失败 %2，工作线程 %3/%4")
-                          .arg(active).arg(m_failedTasks)
-                          .arg(m_runningThreads).arg(m_maxThreads);
-    if (longestRemaining >= 0)
-        tooltip += tr("；最长预计还需 %1").arg(compactDuration(longestRemaining));
-    m_tasksBtn->setToolTip(tooltip);
+    m_longestRemainingMs = longestRemaining;
+    onThreadCountChanged(m_runningThreads, m_maxThreads);
 }
 
 void StatusBarTaskWidget::showLongTaskBubble(qint64 taskId,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QtGlobal>
+#include <QByteArray>
 #include <QString>
 
 #include <functional>
@@ -21,6 +22,13 @@ public:
         quint32 heapLimitKiB = 128 * 1024;
     };
 
+    struct StartByteFilter {
+        QByteArray asciiBytes;
+        bool anyNonAscii = false;
+
+        bool isEmpty() const { return asciiBytes.isEmpty() && !anyNonAscii; }
+    };
+
     Pcre2Regex();
     ~Pcre2Regex();
     Pcre2Regex(Pcre2Regex &&) noexcept;
@@ -28,14 +36,24 @@ public:
     Pcre2Regex(const Pcre2Regex &) = delete;
     Pcre2Regex &operator=(const Pcre2Regex &) = delete;
 
-    // literal=true escapes the user text before compilation. wholeWord uses
-    // Unicode letter/number/underscore boundaries in text mode and ASCII
-    // byte boundaries when utfMode=false (Binary literal search).
+    // literal=true escapes the user text before compilation. wholeWord applies
+    // Unicode/ASCII word boundaries to space-delimited scripts; literal CJK
+    // edges use exact-phrase semantics because those scripts do not require
+    // spaces between words.
     bool compile(const QString &pattern, bool literal, bool caseSensitive,
                  bool wholeWord, QString *error = nullptr,
                  bool utfMode = true, bool matchInvalidUtf = false);
 
+    // Compile an application-generated PCRE2 8-bit expression. The caller is
+    // responsible for encoding semantics and character-boundary guarantees.
+    bool compileBytePattern(const QByteArray &pattern, bool caseSensitive,
+                            QString *error = nullptr);
+
     bool isValid() const;
+
+    // PCRE2's conservative first-code-unit set. In UTF mode anyNonAscii is
+    // retained because Unicode caseless equivalents may use multibyte UTF-8.
+    StartByteFilter startByteFilter() const;
 
     // Re-match one authoritative byte range and expand replacement references.
     // Supported syntax: $0/$1.., ${name}, $$, \1, \n, \r, \t and \\.
@@ -55,7 +73,11 @@ public:
         const std::function<void(qint64)> &reportProgress,
         const std::function<bool(qint64, qint64)> &onMatch,
         QString *error = nullptr,
-        const Limits &limits = Limits{}) const;
+        const Limits &limits = Limits{},
+        const std::function<qint64(qint64)> &advanceAfterEmpty = {},
+        qint64 startOffset = 0,
+        const std::function<qint64(qint64)> &normalizeMatchStart = {},
+        const std::function<qint64(qint64)> &nextCandidateStart = {}) const;
 
 private:
     struct Impl;

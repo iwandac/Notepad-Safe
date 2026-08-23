@@ -59,8 +59,8 @@ QString AsyncTask::stateText() const
 QString AsyncTask::priorityText() const
 {
     switch (priority) {
-    case AsyncTaskPriority::Highest: return QObject::tr("最高(解密/交互)");
-    case AsyncTaskPriority::High:    return QObject::tr("高(搜索/保存)");
+    case AsyncTaskPriority::Highest: return QObject::tr("最高(安全/导航)");
+    case AsyncTaskPriority::High:    return QObject::tr("高(用户操作)");
     case AsyncTaskPriority::Normal:  return QObject::tr("普通(补扫)");
     case AsyncTaskPriority::Low:     return QObject::tr("低(预扫)");
     case AsyncTaskPriority::Lowest:  return QObject::tr("最低");

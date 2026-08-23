@@ -203,8 +203,22 @@ VaultDock::~VaultDock()
     // workspace state into a partially destroyed MainWindow.
     blockSignals(true);
     clearProtectedClipboard();
-    service_.lock();
+    lockServiceOnSecurityLane();
     clearEditor();
+}
+
+void VaultDock::lockServiceOnSecurityLane()
+{
+    if (service_.state() == VaultState::Locked)
+        return;
+    (void)runSerializedSecurityOperation(
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
+        tr("正在锁定账户数据库"),
+        [this] {
+            service_.lock();
+            return VaultError{};
+        },
+        false);
 }
 
 void VaultDock::buildUi()
@@ -687,7 +701,7 @@ VaultError VaultDock::createVault(const QString &filePath,
         return {VaultErrorCode::Cancelled, tr("操作已取消。"), QStringLiteral("vault.ui.cancelled")};
 
     VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
         tr("正在创建账户数据库"),
         [this, filePath, &masterPasswordUtf8, keyFilePath] {
             return service_.create(filePath, masterPasswordUtf8, keyFilePath);
@@ -710,7 +724,7 @@ VaultError VaultDock::unlockVault(const QString &filePath,
         return {VaultErrorCode::Cancelled, tr("操作已取消。"), QStringLiteral("vault.ui.cancelled")};
 
     VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
         tr("正在解锁账户数据库"),
         [this, filePath, &masterPasswordUtf8, keyFilePath] {
             return service_.unlock(filePath, masterPasswordUtf8, keyFilePath);
@@ -745,7 +759,7 @@ VaultError VaultDock::createManagedStore(const QString &filePath,
     SecureBuffer databaseCredential;
     QVariantMap publicCustomData;
     VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
         tr("正在创建受保护账户数据库"),
         [this, filePath, &securityPassphraseUtf8, &databaseCredential,
          recoveryKey, &publicCustomData] {
@@ -782,7 +796,7 @@ VaultError VaultDock::unlockManagedStore(const QString &filePath,
     QVariantMap publicCustomData;
     SecureBuffer databaseCredential;
     VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
         tr("正在解析账户数据库密钥"),
         [this, filePath, &publicCustomData, &securityPassphraseUtf8,
          &databaseCredential] {
@@ -821,7 +835,7 @@ VaultError VaultDock::createManagedStoreForIdentity(
     SecureBuffer databaseCredential;
     QVariantMap publicCustomData;
     VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
         tr("正在创建账户数据库"),
         [this, filePath, &parameters, &masterUnlockKey, &recoverySecret,
          &databaseCredential, &publicCustomData] {
@@ -856,7 +870,7 @@ VaultError VaultDock::unlockManagedStoreWithMasterKey(
     QVariantMap publicCustomData;
     SecureBuffer databaseCredential;
     VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
         tr("正在解析账户数据库密钥"),
         [this, filePath, &publicCustomData, &masterUnlockKey,
          &databaseCredential] {
@@ -887,7 +901,7 @@ VaultError VaultDock::unlockManagedStoreWithRecoverySecret(
     QVariantMap publicCustomData;
     SecureBuffer databaseCredential;
     VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
         tr("正在恢复账户数据库密钥"),
         [this, filePath, &publicCustomData, &recoverySecret,
          &databaseCredential] {
@@ -932,7 +946,7 @@ VaultError VaultDock::recoverManagedStore(const QString &filePath,
     QVariantMap publicCustomData;
     SecureBuffer databaseCredential;
     VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
         tr("正在恢复账户数据库"),
         [this, filePath, &publicCustomData, &recoveryKey, &databaseCredential] {
             VaultError result = service_.readPublicCustomData(filePath, &publicCustomData);
@@ -977,7 +991,7 @@ VaultError VaultDock::saveSecureDocument(const QUuid &id, const QString &title,
     scrubByteArray(body);
     auto pendingData = std::make_shared<VaultEntryData>(std::move(data));
     VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::SecureSave, AsyncTaskPriority::High,
+        this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
         tr("正在保存加密笔记"),
         [this, pendingData]() mutable {
             VaultError result = service_.upsertEntry(std::move(*pendingData));
@@ -1335,7 +1349,7 @@ void VaultDock::lockVault()
     if (!maybeSaveChanges())
         return;
     clearProtectedClipboard();
-    service_.lock();
+    lockServiceOnSecurityLane();
     entryTree_->clear();
     loginRoot_ = nullptr;
     noteRoot_ = nullptr;
@@ -1360,7 +1374,7 @@ bool VaultDock::lockVaultSilently()
     if (editorDirty_ && !saveCurrentEntryImpl(false))
         return false;
     clearProtectedClipboard();
-    service_.lock();
+    lockServiceOnSecurityLane();
     entryTree_->clear();
     loginRoot_ = nullptr;
     noteRoot_ = nullptr;
@@ -1381,7 +1395,7 @@ bool VaultDock::releaseWorkspaceSecrets()
     if (editorDirty_ && !saveCurrentEntryImpl(false))
         return false;
     clearProtectedClipboard();
-    service_.lock();
+    lockServiceOnSecurityLane();
     entryTree_->clear();
     loginRoot_ = nullptr;
     noteRoot_ = nullptr;
@@ -1397,7 +1411,7 @@ void VaultDock::discardAndLockForExternalReload()
     editorDirty_ = false;
     editorEditing_ = false;
     clearProtectedClipboard();
-    service_.lock();
+    lockServiceOnSecurityLane();
     entryTree_->clear();
     loginRoot_ = nullptr;
     noteRoot_ = nullptr;
@@ -1419,7 +1433,7 @@ bool VaultDock::prepareToClose()
 {
     if (!maybeSaveChanges())
         return false;
-    service_.lock();
+    lockServiceOnSecurityLane();
     clearEditor();
     setVaultOpenControls(false);
     return true;
@@ -1804,7 +1818,7 @@ bool VaultDock::saveCurrentEntryImpl(bool showSuccess)
 
     auto pendingData = std::make_shared<VaultEntryData>(std::move(data));
     VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
         tr("正在保存账户"),
         [this, pendingData]() mutable {
             VaultError result = service_.upsertEntry(std::move(*pendingData));
@@ -1847,7 +1861,7 @@ void VaultDock::removeCurrentEntry()
     const bool permanentDelete = currentEntryRecycled_;
     const QUuid entryId = currentEntryId_;
     VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
         permanentDelete ? tr("正在永久删除账户") : tr("正在移动账户到回收站"),
         [this, permanentDelete, entryId] {
             VaultError result = permanentDelete ? service_.removeEntry(entryId)
@@ -1876,7 +1890,7 @@ void VaultDock::restoreCurrentEntry()
     }
     const QUuid restoredId = currentEntryId_;
     VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
         tr("正在恢复账户"),
         [this, restoredId] {
             VaultError result = service_.restoreEntry(restoredId);
@@ -1975,7 +1989,7 @@ void VaultDock::showEntryHistory()
         const QUuid entryId = currentEntryId_;
         const int historyIndex = selected->data(Qt::UserRole).toInt();
         VaultError restoreError = runSerializedSecurityOperation(
-            &dialog, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+            &dialog, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
             tr("正在恢复账户历史"),
             [this, entryId, historyIndex] {
                 VaultError result = service_.restoreEntryHistory(entryId, historyIndex);
@@ -2005,7 +2019,7 @@ void VaultDock::showEntryHistory()
         const QUuid entryId = currentEntryId_;
         const int historyIndex = selected->data(Qt::UserRole).toInt();
         VaultError removeError = runSerializedSecurityOperation(
-            &dialog, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+            &dialog, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
             tr("正在删除账户历史"),
             [this, entryId, historyIndex] {
                 VaultError result = service_.removeEntryHistory(entryId, historyIndex);
@@ -2030,7 +2044,7 @@ void VaultDock::showEntryHistory()
         }
         const QUuid entryId = currentEntryId_;
         VaultError clearError = runSerializedSecurityOperation(
-            &dialog, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+            &dialog, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
             tr("正在清理账户历史"),
             [this, entryId] {
                 VaultError result = service_.clearEntryHistory(entryId);
@@ -2074,7 +2088,7 @@ void VaultDock::cloneCurrentEntry()
     copy->recordHistory = false;
     auto pendingCopy = std::shared_ptr<VaultEntryData>(std::move(copy));
     error = runSerializedSecurityOperation(
-        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::High,
+        this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
         tr("正在克隆账户"),
         [this, pendingCopy]() mutable {
             VaultError result = service_.upsertEntry(std::move(*pendingCopy));

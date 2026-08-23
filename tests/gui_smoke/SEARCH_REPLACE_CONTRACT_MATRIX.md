@@ -10,7 +10,7 @@
 | 模式 | 合法可选项 | 必须禁用且清空 | 目标约束 |
 |---|---|---|---|
 | Literal 普通文本 | 区分大小写 × 整词 × 循环 × 当前/全部 | 无 | 所有可搜索 Text/Secure Text；Binary 的文本呈现按当前编码解释 |
-| Regex 正则 | 区分大小写 × 循环 × 当前/全部 | 整词、十六进制字节 | 仅有效 UTF-8 文本解释；PCRE2 资源上限生效 |
+| Regex 正则 | 区分大小写 × 循环 × 当前/全部 | 整词、十六进制字节 | PCRE2 产品方言；非 UTF-8 原始 subject 仅启用明确日志子集 |
 | Hex bytes 原始字节 | 循环 × 当前/全部 | 正则、区分大小写、整词 | 当前范围至少有一个 Binary/Hex；全部文件只调度 Binary/Hex |
 
 附加状态：
@@ -29,15 +29,15 @@
 
 | ID | 能力 | 必须展开的维度 | 正确性 oracle |
 |---|---|---|---|
-| SR-Q01 | Literal | 元字符 `.[]()^$*+?\\`、ASCII/中文/emoji、CRLF/LF | 元字符按字面量；UTF-8 byte range 与可见字符一致 |
-| SR-Q02 | Regex | 点号、字符类、量词、alternation、lookaround、命名/编号捕获、跨行 | PCRE2 语义；Find Next 与 Find All 有序 ranges 相同 |
+| SR-Q01 | Literal | 元字符 `.[]()^$*+?\\`、ASCII/中文/emoji、CRLF/LF、全部支持编码 | 元字符按字面量；typed byte range 与可见字符一致 |
+| SR-Q02 | Regex | 点号、量词、alternation、捕获/backreference、lookahead、ASCII 定长 lookbehind、跨行、全部支持编码；UTF 路径另测 Unicode 属性/命名捕获 | PCRE2 语义；非 UTF 子集保持源字符边界；Find Next 与 Find All 有序 ranges 相同 |
 | SR-Q03 | 非法 Regex | 未闭合组/类、错误转义、超限回溯 | 可见错误；旧结果不冒充新结果；不启动后台扫描 |
-| SR-Q04 | 大小写 | ASCII、Unicode case fold、大小写长度变化 | off 是 on 的超集；S1/S2/S3 结果一致 |
-| SR-Q05 | 整词 | `cat`/`catalog`/`_cat`、数字、下划线、中文边界、标点；Text/Binary | 查询仍按字面量解释，不开放正则语法；Text 使用 Unicode letter/number/underscore 边界，Binary 原始字节使用 ASCII letter/number/underscore 边界；无效 UTF-8 不得产生“正则错误” |
+| SR-Q04 | 大小写 | ASCII、可由单 scalar 等长编码展开的字符、`ß/ss` 等长度变化反例 | ASCII 与可安全展开字符一致；多 scalar fold 明确不承诺、不误报为已支持 |
+| SR-Q05 | 整词 | `cat`/`catalog`/`_cat`、数字、下划线、中文短语、标点；Text/Binary Text projection | UTF 使用 Unicode 边界；非 UTF 使用 ASCII word 边界，中文按精确短语；无效单元不得产生“正则错误” |
 | SR-Q06 | Hex bytes | 连续、空格、逗号、连字符、`0x`、大小写 | 解析成同一 bytes；结果 PositionSpace=SourceBytes |
 | SR-Q07 | 非法 Hex | 奇数 nibble、非 Hex、空分隔、超长查询 | 原子拒绝；不清空有效旧内容为“0 结果” |
-| SR-Q08 | 零长度 | `^`、`$`、lookaround、空 alternative | 查找可终止且按 UTF-8 code point 前进；Replace All 明确拒绝 |
-| SR-Q09 | 重叠 | `ana` in `banana`、alternation 同起点 | 默认 PCRE2 非重叠全局语义，所有 Provider 一致 |
+| SR-Q08 | 零长度 | `^`、`$`、lookaround、空 alternative | 查找可终止且按当前 Source 的一个 Unicode scalar 前进；Replace All 明确拒绝 |
+| SR-Q09 | 重叠 | `ana` in `banana`、alternation 同起点 | 产品非重叠全局语义，所有 Provider/编码一致 |
 | SR-Q10 | 边界 | BOF/EOF、空文件、末行无 EOL、跨 mmap/window/chunk | 不漏首尾，不重复跨块命中 |
 | SR-Q11 | 长文本 | 超长行、跨行、多字节落在上下文裁剪边界 | context 围绕命中；高亮像素和 byte range 精确 |
 | SR-Q12 | 资源安全 | 灾难性回溯、大结果、取消、临时 spool 失败 | 有界失败/取消；部分结果标为 incomplete；UI 不假死 |
@@ -48,8 +48,8 @@
 |---|---|---|---|
 | SR-N01 | 打开查找 | 菜单、工具栏、Ctrl+F、已有选区、重复打开 | 单一非模态窗口；查询焦点/选中策略一致 |
 | SR-N02 | 打开替换 | 菜单、快捷键、模式往返 | 替换控件显隐正确；查询和合法选项保留 |
-| SR-N03 | Find Next | 无选择、当前命中已选、任意选择、BOF/middle/EOF | 严格向后；当前命中已选时前进一处 |
-| SR-N04 | Find Previous | 同 N03 | 严格向前；不重复当前命中 |
+| SR-N03 | Find Next | 无选择、当前命中已选、任意选择、BOF/middle/EOF、Find All 未完成 | 严格向后；当前命中已选时前进一处；第一处到达即响应，不等待全量结果 |
+| SR-N04 | Find Previous | 同 N03；已有/没有前序索引；有界/无界 Regex | 严格向前且不重复当前命中；无索引时保持正确扫描/状态，不使用可能漏报的固定回看窗口 |
 | SR-N05 | Wrap | 当前/全部 × 正/反向 × on/off | off 到边界停止；on 只回绕一次且状态可见 |
 | SR-N06 | F3/Shift+F3 | 对话框开/关、切标签、Literal/Regex/Hex | 使用最后一次完整查询状态，不暗改范围或模式 |
 | SR-N07 | 全部文件导航 | 0/1/N 标签、无命中标签、关闭/新增标签 | 按标签顺序；激活所属标签并选择精确 range |
@@ -63,8 +63,8 @@
 | SR-A02 | 全部打开文件 | S1/S2/S3/Secure/Text/Binary 混合 | 增量分文件发布；目标过滤明确；不串文件 |
 | SR-A03 | 运行中新增/关闭 | 新 L1/L2、目标销毁、切活动标签 | generation/settled 正确；无悬空跳转或重复完成 |
 | SR-A04 | 取消/重跑 | 派发前/中/完成边界、连续取消 | 保留已完成结果并标记取消；可立即重跑 |
-| SR-A05 | Dock 高亮 | Unicode、同一 context 多命中、活动命中 | 一眼可见每个关键词；非命中文本不染色 |
-| SR-A06 | 双击跳转 | 点击命中/同行空白、折叠组、失效结果 | 激活正确 tab，正文选中精确 query range；失效行不可跳 |
+| SR-A05 | Dock 高亮 | Unicode/Hex、窄宽、超长上下文、同一 context 多命中、hover/selected | 关键词优先完整可见；文件/内容正文起点一致；整行状态和 inline highlight 层级/基线正确 |
+| SR-A06 | 双击跳转 | 点击命中/同行空白、折叠组、失效结果 | 激活正确 tab，正文选中精确 query range；导航不改变 modified/revision；失效行不可跳 |
 | SR-A07 | 结果失效 | 编辑、Replace、关闭、重新解释编码/模式 | 仅相关文件失效；提供重跑；其他文件仍可跳 |
 | SR-A08 | 大结果 | 内存上限、磁盘 spool、64 位 offset | 计数准确；随机页/尾页可达；不把截断当完整 |
 | SR-A09 | 早期结果 | LineIndex 未完成、S3 随机位置 | byte offset 先可用；行号完成后原位装饰，不重搜 |
@@ -110,14 +110,18 @@
 - 每个查询同时比较 Find Next 顺序、Find All authoritative ranges、正文 selection/highlight、
   Dock 计数与双击目标；只比较“找到几处”不算通过。
 - 替换前后比较完整内存 payload、非目标哨兵、dirty、Undo/Redo、磁盘内容和结果失效状态。
-- 后台任务验证 running/progress/cancel/finished 的 GUI 状态及 generation；完成提示不能早于结果提交。
+- 后台任务验证 priority/queued/running/progress/ETA/cooperative-yield/cancel/finished 的 GUI 状态及
+  generation；完成提示不能早于结果提交；预计或实际超过 30 秒只弹一次可点击任务气泡。
 - 每次视觉改动保存对话框、正文、Dock 或确认框截图并人工检查；截图不能代替动态断言。
 - 临时 fixture 使用 `QTemporaryDir` 或 `build/` 证据目录；测试结束清除日志和临时数据。
 
 完成不是“现有测试全绿”，而是本矩阵 P0 数据正确性全部有可执行证据、真实 S2/S3/Hex
 代表组合通过、主程序构建并完成 GUI 操作验收。
 
-## 8. 当前自动化证据（2026-08-18）
+## 8. 旧实现自动化证据（2026-08-18）
+
+下列记录只证明当时旧搜索路径覆盖的历史切片，不证明 ADR-022 的编码子集编译、
+协作式调度或新 Dock 合同。它们不得被简单重跑后用作本次改造的完成证据。
 
 | 用例 | 已证明的契约 |
 |---|---|
@@ -151,9 +155,34 @@ init/cleanup），`tc_fr_030` 为 **3 passed / 0 failed**。两轮完整运行�
 通过真实 fixture 补充。视觉证据为
 `build/gui-s3-default-literal-copied-text.png`；同时复跑 `tc_fr_017/019/021/022`，确认
 Literal/Regex 状态、合法组合、文本语义和 Hex 语义没有退化。
-百万级压力、原编码 PositionMapper、正式 MainWindow 的 Regex/Hex/S2/S3 路径和跨全部锁定入口清理仍按
-第 2–6 节及 `DESIGN.md` 14.5 作为后续发布门禁，不能因该数字被标记为完成。
+当时尚未关闭的原编码、正式 MainWindow Regex/Hex/S2/S3 与跨全部锁定入口门禁，已由下方
+2026-08-22 证据取代；本段数字仍只保留为历史记录。
 
 2026-08-18 已补正式 MainWindow 的菜单/F3 S1 Literal 代表和 UTF-8/UTF-16LE Find All/Dock
 代表；后者同时修复了结果 delegate 按 `QChar` 拆坏 emoji/组合字形的问题。这里证明的是
-S1 解码后编辑空间的导航，原编码 source-byte PositionMapper、S2/S3 和动态成员竞态仍是门禁。
+S1 解码后编辑空间的导航；当时未覆盖的原编码 source-byte、S2/S3 和动态成员竞态由下节收口。
+
+## 9. ADR-022 最终验收证据（2026-08-22）
+
+本节是当前实现的完成证据，取代第 8 节的历史完成状态：
+
+- `gui_smoke_findreplace`：35 passed / 0 failed / 0 skipped。覆盖 S1 首命中独立异步导航、
+  UTF-8/UTF-16 全部文件分组与双击、GB18030 原始编码 Regex 的 Find Next + Find All +
+  Dock 精确跳转、Binary Text/Hex、中文整词、Dock 窄宽/hover/selected/关键词完整显示，且
+  导航不改变正文 revision。
+- `gui_smoke_large_readonly`：24 passed / 0 failed / 0 skipped。覆盖 40 MiB 与 4 GiB+ 便携
+  S2/S3 fixture、64 位 head/middle/tail、首结果不等待全量索引、行号和字符统计并行、动态
+  中央线程预算，以及近 2 GiB 异常超长行的有界首屏打开（最终复跑 167 ms）。
+- `gui_smoke_smallfixes`：50 passed / 0 failed / 0 skipped。覆盖编码菜单/另存转换、Binary Text
+  会话、状态栏任务 ETA 与超过 30 秒气泡、任务失败状态不可被 Finished 覆盖、搜索助手与正式
+  MainWindow 快捷键/范围。
+- `gui_smoke_coord`、`gui_smoke_vault`、`gui_smoke_secure_documents`：分别 7/8/8 passed，
+  0 failed / 0 skipped；覆盖正式启动协调、安全 lane、Vault 与安全文档生命周期。
+- 六套 GUI 统一运行合计 132 passed / 0 failed / 0 skipped；视觉截图由用例运行时生成，并同时
+  以控件状态、像素 hover 差异、model range、正文 selection/revision 进行动态断言。
+- 非 GUI CTest 11/11 通过，包括 PCRE2、原编码 LargeFileSearch、编码、会话、KDBX、安全身份和
+  供应链；E2E 2/2 通过；全目标构建与 `check_async_threading.ps1` 通过。
+
+当前产品支持边界以 `docs/REGEX_ENGINE_EXPLORATION.md` 为准：UTF 路径使用完整 PCRE2 Unicode
+模式；非 UTF 原始 subject 只启用登记的日志正则子集，超出子集在扫描前短错误拒绝，不以第二
+matcher、全文转码或隐式语义降级冒充支持。

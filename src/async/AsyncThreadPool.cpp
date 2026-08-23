@@ -3,6 +3,9 @@
 #include <QSemaphore>
 #include <QThread>
 
+#include <atomic>
+#include <memory>
+
 AsyncThreadPool& AsyncThreadPool::instance()
 {
     static AsyncThreadPool inst;
@@ -12,21 +15,26 @@ AsyncThreadPool& AsyncThreadPool::instance()
 AsyncThreadPool::AsyncThreadPool()
 {
     const int ideal = qMax(1, QThread::idealThreadCount());
-    configuredMaxThreads_ = qBound(2, ideal - 2, MaximumWorkerThreads);
-    pool_.setMaxThreadCount(configuredMaxThreads_);
+    configuredMaxThreads_ = qBound(2, ideal - 1, MaximumWorkerThreads);
+    pool_.setMaxThreadCount(configuredMaxThreads_ - 1);
+    securityPool_.setMaxThreadCount(1);
+    // KeePassXC's retained Database object owns a QObject tree. Keeping this
+    // worker alive guarantees that consecutive serialized operations have the
+    // same thread affinity.
+    securityPool_.setExpiryTimeout(-1);
 }
 
 AsyncThreadPool::~AsyncThreadPool()
 {
     pool_.waitForDone(5000);
+    securityPool_.waitForDone(5000);
 }
 
 int AsyncThreadPool::maxThreads() const { return configuredMaxThreads_; }
 
 int AsyncThreadPool::totalActiveThreadCount()
 {
-    QMutexLocker lock(&capacityMutex_);
-    return pool_.activeThreadCount() + externalActive_;
+    return pool_.activeThreadCount() + securityPool_.activeThreadCount();
 }
 
 class WrappedRunnable : public QRunnable
@@ -55,87 +63,61 @@ void AsyncThreadPool::startWorker(std::function<void()> fn, AsyncTaskPriority pr
     pool_.start(r, -static_cast<int>(priority));
 }
 
+void AsyncThreadPool::startSecurityWorker(std::function<void()> fn,
+                                          AsyncTaskPriority priority)
+{
+    WrappedRunnable *r = new WrappedRunnable();
+    r->fn = std::move(fn);
+    r->setAutoDelete(true);
+
+    QMutexLocker lock(&capacityMutex_);
+    securityPool_.start(r, -static_cast<int>(priority));
+}
+
 void AsyncThreadPool::runBatchBlocking(QVector<std::function<void()>> jobs,
                                        AsyncTaskPriority priority)
 {
-    Q_UNUSED(priority);
     if (jobs.isEmpty())
         return;
 
-    const int granted = reserveExternalCapacity(jobs.size());
-    if (granted <= 0) {
-        for (auto &job : jobs) {
-            if (job)
-                job();
+    struct BatchState {
+        QVector<std::function<void()>> jobs;
+        std::atomic<int> next{0};
+        std::atomic<int> completed{0};
+        QSemaphore completion;
+    };
+    auto state = std::make_shared<BatchState>();
+    state->jobs = std::move(jobs);
+    const int total = state->jobs.size();
+    const auto runOne = [state]() {
+        const int index = state->next.fetch_add(1, std::memory_order_relaxed);
+        if (index >= state->jobs.size())
+            return;
+        try {
+            if (state->jobs[index])
+                state->jobs[index]();
+        } catch (...) {
+            // The owning task converts its domain failure. Completion must
+            // still be signalled so the caller cannot deadlock.
         }
-        return;
-    }
+        state->completed.fetch_add(1, std::memory_order_release);
+        state->completion.release();
+    };
 
-    QThreadPool batchPool;
-    batchPool.setMaxThreadCount(granted);
-    QSemaphore completed;
-    for (auto &job : jobs) {
-        auto wrapped = [this, job = std::move(job), &completed]() mutable {
-            externalWorkerStarted();
-            try {
-                if (job)
-                    job();
-            } catch (...) {
-                // The owning central task reports its domain error. Always
-                // release capacity even when an individual segment fails.
-            }
-            externalWorkerFinished();
-            completed.release();
-        };
-        auto *runnable = QRunnable::create(std::move(wrapped));
-        runnable->setAutoDelete(true);
-        batchPool.start(runnable);
-    }
-    completed.acquire(jobs.size());
-    batchPool.waitForDone();
-    releaseExternalCapacity(granted);
-}
+    // The batch caller already occupies one framework worker. Start at most
+    // max-2 helpers so a newly queued interactive/security task normally has
+    // a free slot. Each helper handles one bounded segment and exits, allowing
+    // the priority queue to be reconsidered between segments.
+    const int generalThreads = configuredMaxThreads_ - 1;
+    const int helpers = qMin(total - 1, qMax(0, generalThreads - 1));
+    for (int i = 0; i < helpers; ++i)
+        startWorker(runOne, priority);
 
-int AsyncThreadPool::reserveExternalCapacity(int requestedWorkers)
-{
-    if (requestedWorkers <= 0)
-        return 0;
-    QMutexLocker lock(&capacityMutex_);
-    // The caller is normally already occupying one central worker. Account
-    // for it and reserve one *additional* central slot so a long parallel line
-    // build cannot prevent a newly submitted search/navigation task from
-    // starting. Central + private occupancy remains capped at ten.
-    const int centralOccupancy = qMax(1, pool_.activeThreadCount());
-    constexpr int interactiveCentralSpare = 1;
-    const int available = qMax(0, configuredMaxThreads_
-                                  - centralOccupancy
-                                  - externalReserved_
-                                  - interactiveCentralSpare);
-    const int granted = qMin(requestedWorkers, available);
-    if (granted <= 0)
-        return 0;
-    externalReserved_ += granted;
-    pool_.setMaxThreadCount(qMax(1, configuredMaxThreads_ - externalReserved_));
-    return granted;
-}
-
-void AsyncThreadPool::releaseExternalCapacity(int reservedWorkers)
-{
-    if (reservedWorkers <= 0)
-        return;
-    QMutexLocker lock(&capacityMutex_);
-    externalReserved_ = qMax(0, externalReserved_ - reservedWorkers);
-    pool_.setMaxThreadCount(qMax(1, configuredMaxThreads_ - externalReserved_));
-}
-
-void AsyncThreadPool::externalWorkerStarted()
-{
-    QMutexLocker lock(&capacityMutex_);
-    ++externalActive_;
-}
-
-void AsyncThreadPool::externalWorkerFinished()
-{
-    QMutexLocker lock(&capacityMutex_);
-    externalActive_ = qMax(0, externalActive_ - 1);
+    // The caller participates. If the pool is saturated by several batches,
+    // it continues draining work itself; therefore waiting cannot deadlock on
+    // helper runnables that have not started yet.
+    while (state->next.load(std::memory_order_relaxed) < total)
+        runOne();
+    while (state->completed.load(std::memory_order_acquire) < total)
+        state->completion.acquire();
 }

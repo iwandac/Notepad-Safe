@@ -119,6 +119,7 @@ struct Pcre2Regex::Impl {
     bool utfMode = true;
     bool matchInvalidUtf = false;
     bool literalMode = false;
+    bool jitReady = false;
 
     ~Impl()
     {
@@ -126,6 +127,49 @@ struct Pcre2Regex::Impl {
             pcre2_code_free(code);
     }
 };
+
+namespace {
+
+uint firstCodePoint(const QString &text)
+{
+    if (text.isEmpty()) return 0;
+    const QChar first = text.front();
+    return first.isHighSurrogate() && text.size() > 1
+        && text.at(1).isLowSurrogate()
+        ? QChar::surrogateToUcs4(first, text.at(1)) : first.unicode();
+}
+
+uint lastCodePoint(const QString &text)
+{
+    if (text.isEmpty()) return 0;
+    const QChar last = text.back();
+    return last.isLowSurrogate() && text.size() > 1
+        && text.at(text.size() - 2).isHighSurrogate()
+        ? QChar::surrogateToUcs4(text.at(text.size() - 2), last)
+        : last.unicode();
+}
+
+bool usesUnspacedWordSegmentation(uint codePoint)
+{
+    switch (QChar::script(codePoint)) {
+    case QChar::Script_Han:
+    case QChar::Script_Hiragana:
+    case QChar::Script_Katakana:
+    case QChar::Script_Hangul:
+    case QChar::Script_Bopomofo:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool needsWholeWordBoundary(uint codePoint)
+{
+    return !usesUnspacedWordSegmentation(codePoint)
+        && (codePoint == uint('_') || QChar::isLetterOrNumber(codePoint));
+}
+
+} // namespace
 
 Pcre2Regex::Pcre2Regex() : impl_(std::make_unique<Impl>()) {}
 Pcre2Regex::~Pcre2Regex() = default;
@@ -140,6 +184,7 @@ bool Pcre2Regex::compile(const QString &pattern, bool literal,
         pcre2_code_free(impl_->code);
         impl_->code = nullptr;
     }
+    impl_->jitReady = false;
     QByteArray expression = pattern.toUtf8();
     impl_->utfMode = utfMode;
     impl_->matchInvalidUtf = utfMode && matchInvalidUtf;
@@ -150,10 +195,22 @@ bool Pcre2Regex::compile(const QString &pattern, bool literal,
         const QByteArray wordClass = utfMode
             ? QByteArrayLiteral("\\p{L}\\p{N}_")
             : QByteArrayLiteral("A-Za-z0-9_");
-        expression = QByteArrayLiteral("(?<![") + wordClass
-                     + QByteArrayLiteral("])(?:") + expression
-                     + QByteArrayLiteral(")(?![") + wordClass
-                     + QByteArrayLiteral("])");
+        // CJK scripts do not require spaces between words. Treat a literal CJK
+        // query as an exact phrase and apply boundaries only to query edges
+        // that use space-delimited word semantics. Regex callers retain the
+        // traditional two-sided boundary because their effective edges cannot
+        // be inferred from the expression text.
+        const bool leftBoundary = !literal
+            || needsWholeWordBoundary(firstCodePoint(pattern));
+        const bool rightBoundary = !literal
+            || needsWholeWordBoundary(lastCodePoint(pattern));
+        expression = (leftBoundary
+                ? QByteArrayLiteral("(?<![") + wordClass + QByteArrayLiteral("])")
+                : QByteArray())
+            + QByteArrayLiteral("(?:") + expression + QByteArrayLiteral(")")
+            + (rightBoundary
+                ? QByteArrayLiteral("(?![") + wordClass + QByteArrayLiteral("])")
+                : QByteArray());
     }
     if (expression.isEmpty()) {
         if (error)
@@ -163,6 +220,10 @@ bool Pcre2Regex::compile(const QString &pattern, bool literal,
 
     int errorCode = 0;
     PCRE2_SIZE errorOffset = 0;
+    // Offset windows and PCRE2's match/depth/heap limits are the preemption
+    // boundary. PCRE2_AUTO_CALLOUT inserts a callback before every pattern
+    // item, disables important start optimizations and makes multi-GiB literal-
+    // anchored log regexes hundreds of times slower.
     uint32_t options = PCRE2_USE_OFFSET_LIMIT;
     if (utfMode)
         options |= PCRE2_UTF | PCRE2_UCP;
@@ -183,12 +244,86 @@ bool Pcre2Regex::compile(const QString &pattern, bool literal,
         }
         return false;
     }
+    impl_->jitReady = pcre2_jit_compile(
+        impl_->code, PCRE2_JIT_COMPLETE) == 0;
+    return true;
+}
+
+bool Pcre2Regex::compileBytePattern(const QByteArray &pattern,
+                                    bool caseSensitive, QString *error)
+{
+    if (impl_->code) {
+        pcre2_code_free(impl_->code);
+        impl_->code = nullptr;
+    }
+    impl_->jitReady = false;
+    if (pattern.isEmpty()) {
+        if (error)
+            *error = QObject::tr("正则表达式为空。");
+        return false;
+    }
+    int errorCode = 0;
+    PCRE2_SIZE errorOffset = 0;
+    uint32_t options = PCRE2_USE_OFFSET_LIMIT;
+    if (!caseSensitive)
+        options |= PCRE2_CASELESS;
+    impl_->code = pcre2_compile(
+        reinterpret_cast<PCRE2_SPTR>(pattern.constData()),
+        PCRE2_SIZE(pattern.size()), options, &errorCode, &errorOffset, nullptr);
+    impl_->utfMode = false;
+    impl_->matchInvalidUtf = false;
+    impl_->literalMode = false;
+    if (!impl_->code) {
+        if (error)
+            *error = QObject::tr("无法准备当前编码的正则：%1")
+                         .arg(pcreError(errorCode));
+        return false;
+    }
+    impl_->jitReady = pcre2_jit_compile(
+        impl_->code, PCRE2_JIT_COMPLETE) == 0;
     return true;
 }
 
 bool Pcre2Regex::isValid() const
 {
     return impl_ && impl_->code;
+}
+
+Pcre2Regex::StartByteFilter Pcre2Regex::startByteFilter() const
+{
+    StartByteFilter filter;
+    if (!isValid())
+        return filter;
+
+    uint32_t type = 0;
+    uint32_t codeUnit = 0;
+    if (pcre2_pattern_info(impl_->code, PCRE2_INFO_FIRSTCODETYPE, &type) == 0
+        && type == 1
+        && pcre2_pattern_info(impl_->code, PCRE2_INFO_FIRSTCODEUNIT,
+                              &codeUnit) == 0) {
+        if (codeUnit < 0x80u)
+            filter.asciiBytes.append(char(codeUnit));
+        else
+            filter.anyNonAscii = true;
+        return filter;
+    }
+
+    const uint8_t *bitmap = nullptr;
+    if (pcre2_pattern_info(impl_->code, PCRE2_INFO_FIRSTBITMAP, &bitmap) != 0
+        || !bitmap) {
+        return filter;
+    }
+    for (int value = 0; value < 128; ++value) {
+        if ((bitmap[value / 8] & (1u << (value & 7))) != 0)
+            filter.asciiBytes.append(char(value));
+    }
+    for (int value = 128; value < 256; ++value) {
+        if ((bitmap[value / 8] & (1u << (value & 7))) != 0) {
+            filter.anyNonAscii = true;
+            break;
+        }
+    }
+    return filter;
 }
 
 bool Pcre2Regex::expandReplacementAt(
@@ -347,9 +482,14 @@ Pcre2Regex::ScanResult Pcre2Regex::scan(
     const std::function<bool()> &isCancelled,
     const std::function<void(qint64)> &reportProgress,
     const std::function<bool(qint64, qint64)> &onMatch,
-    QString *error, const Limits &limits) const
+    QString *error, const Limits &limits,
+    const std::function<qint64(qint64)> &advanceAfterEmpty,
+    qint64 startOffset,
+    const std::function<qint64(qint64)> &normalizeMatchStart,
+    const std::function<qint64(qint64)> &nextCandidateStart) const
 {
     if (!isValid() || !subject || subjectSize < 0
+        || startOffset < 0 || startOffset > subjectSize
         || quint64(subjectSize) > quint64(std::numeric_limits<PCRE2_SIZE>::max())) {
         if (error)
             *error = QObject::tr("正则扫描器或输入无效。");
@@ -392,12 +532,47 @@ Pcre2Regex::ScanResult Pcre2Regex::scan(
     pcre2_set_match_limit(matchContext, limits.matchLimit);
     pcre2_set_depth_limit(matchContext, limits.depthLimit);
     pcre2_set_heap_limit(matchContext, limits.heapLimitKiB);
-    PCRE2_SIZE offset = 0;
+    struct CalloutControl {
+        const std::function<bool()> *cancelled = nullptr;
+        const std::function<void(qint64)> *progress = nullptr;
+        quint64 calls = 0;
+        qint64 lastProgress = 0;
+    } calloutControl{&isCancelled, &reportProgress, 0, startOffset};
+    pcre2_set_callout(
+        matchContext,
+        [](pcre2_callout_block *block, void *data) -> int {
+            auto *control = static_cast<CalloutControl *>(data);
+            if (!control || ((++control->calls & 0x0fffu) != 0u))
+                return 0;
+            if (block && control->progress && *control->progress) {
+                const qint64 current = qint64(block->current_position);
+                if (current >= control->lastProgress
+                                   + Q_INT64_C(8) * 1024 * 1024) {
+                    control->lastProgress = current;
+                    (*control->progress)(current);
+                }
+            }
+            return control->cancelled && *control->cancelled
+                       && (*control->cancelled)()
+                ? PCRE2_ERROR_CALLOUT : 0;
+        },
+        &calloutControl);
+    PCRE2_SIZE offset = PCRE2_SIZE(startOffset);
     const uint32_t noUtfCheck = impl_->utfMode && !impl_->matchInvalidUtf
         ? PCRE2_NO_UTF_CHECK : 0;
     uint32_t matchOptions = noUtfCheck;
     bool retryEmptyAtSameOffset = false;
     while (offset <= PCRE2_SIZE(subjectSize)) {
+        if (nextCandidateStart && !retryEmptyAtSameOffset) {
+            const qint64 candidate = nextCandidateStart(qint64(offset));
+            if (candidate < 0) {
+                return isCancelled && isCancelled()
+                    ? ScanResult::Cancelled : ScanResult::Failed;
+            }
+            if (candidate > subjectSize)
+                break;
+            offset = PCRE2_SIZE(candidate);
+        }
         // Offset limits preserve full-subject semantics (a match may extend
         // beyond the window) while bounding the interval between cancellation
         // and progress checks. One MiB keeps invalid-UTF binary presentations
@@ -408,19 +583,42 @@ Pcre2Regex::ScanResult Pcre2Regex::scan(
             offset > std::numeric_limits<PCRE2_SIZE>::max() - SearchWindow
                 ? PCRE2_SIZE(subjectSize) : offset + SearchWindow);
         pcre2_set_offset_limit(matchContext, offsetLimit);
-        const int result = pcre2_match(
-            impl_->code, reinterpret_cast<PCRE2_SPTR>(subject),
-            PCRE2_SIZE(subjectSize), offset, matchOptions, matchData, matchContext);
+        const uint32_t currentOptions = matchOptions
+            | (nextCandidateStart ? PCRE2_ANCHORED : 0);
+        int result = impl_->jitReady
+            ? pcre2_jit_match(
+                impl_->code, reinterpret_cast<PCRE2_SPTR>(subject),
+                PCRE2_SIZE(subjectSize), offset, currentOptions,
+                matchData, matchContext)
+            : pcre2_match(
+                impl_->code, reinterpret_cast<PCRE2_SPTR>(subject),
+                PCRE2_SIZE(subjectSize), offset, currentOptions,
+                matchData, matchContext);
+        if (result == PCRE2_ERROR_JIT_BADOPTION) {
+            result = pcre2_match(
+                impl_->code, reinterpret_cast<PCRE2_SPTR>(subject),
+                PCRE2_SIZE(subjectSize), offset, currentOptions,
+                matchData, matchContext);
+        }
         if (result == PCRE2_ERROR_NOMATCH) {
             if (retryEmptyAtSameOffset) {
-                const qint64 advanced = impl_->utfMode
-                    ? nextUtf8Offset(subject, subjectSize, qint64(offset))
-                    : qint64(offset) + 1;
+                const qint64 advanced = advanceAfterEmpty
+                    ? advanceAfterEmpty(qint64(offset))
+                    : impl_->utfMode
+                        ? nextUtf8Offset(subject, subjectSize, qint64(offset))
+                        : qint64(offset) + 1;
                 if (advanced > subjectSize)
                     break;
                 offset = PCRE2_SIZE(advanced);
                 matchOptions = noUtfCheck;
                 retryEmptyAtSameOffset = false;
+                continue;
+            }
+            if (nextCandidateStart) {
+                if (offset >= PCRE2_SIZE(subjectSize))
+                    break;
+                ++offset;
+                matchOptions = noUtfCheck;
                 continue;
             }
             if (offsetLimit < PCRE2_SIZE(subjectSize)) {
@@ -460,6 +658,20 @@ Pcre2Regex::ScanResult Pcre2Regex::scan(
             if (error)
                 *error = QObject::tr("单个正则匹配超过 2 GiB，无法在结果模型中表示。");
             return ScanResult::Failed;
+        }
+        if (normalizeMatchStart) {
+            const qint64 normalized = normalizeMatchStart(qint64(start));
+            if (normalized != qint64(start)) {
+                if (normalized <= qint64(start) || normalized > subjectSize) {
+                    if (error)
+                        *error = QObject::tr("编码边界扫描器返回了无效偏移。");
+                    return ScanResult::Failed;
+                }
+                offset = PCRE2_SIZE(normalized);
+                matchOptions = noUtfCheck;
+                retryEmptyAtSameOffset = false;
+                continue;
+            }
         }
         if (onMatch && !onMatch(qint64(start), qint64(end - start)))
             return ScanResult::Cancelled;

@@ -279,6 +279,9 @@ private:
     void purgeSensitiveSearchState();
     void rememberSensitiveDocumentClipboard(EditorTab *sourceTab);
     void clearSensitiveDocumentClipboard();
+    void closeSecureDocumentOnSecurityLane(const QUuid &documentId);
+    void closeAllSecureDocumentsOnSecurityLane();
+    void endSecuritySessionOnSecurityLane(bool preserveSealedSession);
     void protectForSystemLock();
     void restoreAfterSystemUnlock();
 

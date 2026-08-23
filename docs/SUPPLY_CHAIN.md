@@ -7,7 +7,7 @@
 | 类型 | 组件 | 仓库/构建边界 |
 |---|---|---|
 | 外部静态工具链 | Qt 6.11.1、MSVC、CMake、Ninja、Python | 不提交生成后的 Qt/MSVC；CMake 精确拒绝非 6.11.1 Qt，Qt 官方源码包 SHA-256 写入锁文件 |
-| 仓库内运行时源码 | QScintilla 2.14.1、KeePassXC 2.7.12、Botan 3.12.0、Argon2 20190702、zlib 1.3.2、PCRE2 10.47、Boost.Regex 1.90.0 | 完整纯源码提交到 `third_party/src`；正式构建不联网 |
+| 仓库内运行时源码 | QScintilla 2.14.1、KeePassXC 2.7.12、Botan 3.12.0、Argon2 20190702、zlib 1.3.2、PCRE2 10.47 | 完整纯源码提交到 `third_party/src`；正式构建不联网 |
 | 可再生产物 | QScintilla/Botan 静态库及所有 CMake/qmake 中间文件 | 只写 `.deps/build`、`.deps/install` 或 `build`，均被 Git 忽略 |
 
 Qt 被视为编译器旁的外部工具链，而不是应用运行时下载项。源码仓库加符合锁定版本的 Qt/MSVC 前置环境即可构建；应用依赖不再依赖 `.deps/src`、预编译 QScintilla 或嵌套 Git checkout。
@@ -37,9 +37,9 @@ build.bat
 
 `build.bat` 激活 x64 MSVC 后调用 `prepare_dependencies.bat`。后者按顺序：
 
-1. 校验完整锁文件与七棵源码树。
+1. 校验完整锁文件与六棵源码树。
 2. 用锁定 Qt 的 qmake/nmake 将 QScintilla 以 release、staticlib、C++17、`/MT` 构建到 `.deps`。
-3. 确认 PCRE2 与 standalone Boost.Regex vendored 输入；PCRE2 8-bit static、Argon2、zlib 和 KeePassXC Core 随正式 CMake 编译，Boost.Regex 作为受限 header-only target 编译。
+3. 确认 PCRE2 vendored 输入；PCRE2 8-bit static、Argon2、zlib 和 KeePassXC Core 随正式 CMake 编译。
 4. 以最小模块集合和 `/MT` 从 Botan 源码生成 CMake package 到 `.deps/install`。
 
 QScintilla/Botan 缓存标记包含源码树摘要、工具链版本、运行库和构建选项；任一输入变化会自动删掉对应的精确缓存目录并重建。需要人工排除缓存问题时可分别执行：
@@ -53,7 +53,7 @@ tools/bootstrap_crypto_deps.ps1 -ForceRefresh
 
 ## 4. 依赖更新流程
 
-一次只更新一个供应商族；Qt/QScintilla、KeePassXC/Botan/Argon2/zlib、PCRE2/Boost.Regex 不在同一个常规升级中混改。
+一次只更新一个供应商族；Qt/QScintilla、KeePassXC/Botan/Argon2/zlib、PCRE2 不在同一个常规升级中混改。
 
 1. 只从官网或官方仓库读取 release、签名、安全公告和许可变化。常规版本至少观察 14 天；明确安全修复可越过等待期。
 2. 在项目目录之外的临时隔离目录取得候选源码。归档先验证官方 SHA-256；Git 来源验证完整 commit 或签名 tag 与固定指纹。
@@ -76,7 +76,7 @@ Get-SourceTreeIntegrity third_party/src/qscintilla-2.14.1
 - Qt/QScintilla/Scintilla：编辑命令、IME、编码、撤销、lexer、32 MiB 边界、启动和 GUI 基线。
 - KeePassXC/KDBX：旧/新版本双向 golden corpus、KDBX3/4、AES/ChaCha20、Argon2d/id、附件、历史、未知字段和第三方 KeePass/KeePassXC 往返。
 - Botan/Argon2/zlib：KDF 参数不静默变化、错误口令/损坏认证、内存与耗时门禁。
-- PCRE2/Boost.Regex：S1/S2/S3 与 UTF-8、UTF-16、GBK、GB18030、Big5、Shift-JIS、Windows-1252 同查询语料、跨块匹配、原始字节范围、零长度推进、捕获替换、资源上限、取消和 ReDoS 门禁。
+- 当前或候选正则依赖：S1/S2/S3 与 UTF-8、UTF-16、GBK、GB18030、Big5、Shift-JIS、Windows-1252 同查询语料、跨块匹配、原始字节范围、零长度推进、捕获替换、资源上限、取消和 ReDoS 门禁；通过升级门禁不等于通过最终引擎选型。
 
 ## 5. SBOM 与发布
 
@@ -94,5 +94,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/generate_sbom.ps1 `
 - QScintilla/Scintilla 只通过编辑器适配边界使用；可迁移到直接 Scintilla Qt 端口。
 - KeePassXC 是 KDBX 行为供应商，不复制其整套桌面架构；产品服务层不暴露上游对象。
 - Botan 3、参考 Argon2 和 zlib 按 KeePassXC 闭包锁定；不自研 AES、KDF、Argon2 或认证加密。
-- PCRE2 兼容查询是产品方言；PCRE2 与 Boost.Regex 都隐藏在 RegexEngine 后端，存储 Provider 或物理编码不能改变已承诺的用户语义。
+- ADR-022 固定 PCRE2 为唯一正则供应链和执行引擎。非 UTF-8 支持属于产品侧有界编译适配，
+  不引入第二个 matcher 或字符库；存储 Provider 或物理编码不能静默改变已声明语义。
 - 用户退出路径始终是标准 KDBX/恢复导出和显式明文另存为，依赖升级不得制造不可逆数据迁移。

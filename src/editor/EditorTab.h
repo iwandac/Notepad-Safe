@@ -210,8 +210,8 @@ public:
     bool findNext(const QString &pattern, bool regex, bool caseSensitive,
                   bool wholeWord, bool forward, bool wrap,
                   bool hexBytes = false);
-    // Large-file F3 path: directional scan runs in AsyncTaskManager and calls
-    // back as soon as one match is available; it never builds Find All first.
+    // Directional navigation runs in AsyncTaskManager for every text tier and
+    // calls back as soon as one match is available; it never builds Find All.
     bool findNextL2Async(const QString &pattern, bool regex,
                          bool caseSensitive, bool wholeWord,
                          bool forward, bool wrap, bool hexBytes,
@@ -233,6 +233,14 @@ public:
     // findAll 收集所有匹配；L1 走 QVector、L2 走 SearchResultsModel
     QVector<SearchMatch> findAll(const QString &pattern, bool regex,
                                  bool caseSensitive, bool wholeWord);
+    // S1 Find All uses an immutable UTF-8 snapshot and performs compilation,
+    // scanning and result shaping in AsyncTaskManager.  The callback is always
+    // delivered on callbackContext's thread and is revision-guarded.
+    bool findAllL1Async(
+        const QString &pattern, bool regex, bool caseSensitive, bool wholeWord,
+        QObject *callbackContext,
+        std::function<void(QVector<SearchMatch> matches, bool truncated,
+                           QString error)> callback);
     bool lastFindAllWasTruncated() const { return m_lastFindAllTruncated; }
     QString lastSearchError() const { return m_lastSearchError; }
     void setSearchHighlights(const QVector<SearchMatch> &matches);
@@ -519,6 +527,22 @@ private:
     bool               m_l1SearchCacheValid = false;
     quint64            m_l1SearchCacheRevision = 0;
     int                m_lastL1MatchIndex = -1;
+    L1SearchHit        m_l1NavigationHit;
+    QString            m_l1NavigationPattern;
+    bool               m_l1NavigationRegex = false;
+    bool               m_l1NavigationCaseSensitive = true;
+    bool               m_l1NavigationWholeWord = false;
+    bool               m_l1NavigationHitValid = false;
+    quint64            m_l1NavigationRevision = 0;
+    L1SearchHit        m_l2NavigationHit;
+    QString            m_l2NavigationPattern;
+    bool               m_l2NavigationRegex = false;
+    bool               m_l2NavigationCaseSensitive = true;
+    bool               m_l2NavigationWholeWord = false;
+    bool               m_l2NavigationHexBytes = false;
+    bool               m_l2NavigationHitValid = false;
+    quint64            m_l2NavigationRevision = 0;
+    qint64             m_l1FindAllTaskId = 0;
     QString            m_lastSearchError;
     QString            m_l2SearchCachePattern;
     bool               m_l2SearchCacheRegex = false;

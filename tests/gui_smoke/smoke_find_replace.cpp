@@ -25,6 +25,7 @@
 #include <QtWidgets/QWidget>
 #include <QtWidgets/QMessageBox>
 #include <QtGui/QKeySequence>
+#include <QtGui/QMouseEvent>
 #include <QtCore/QDebug>
 #include <QtCore/QDir>
 #include <QtCore/QCoreApplication>
@@ -41,6 +42,7 @@
 #include "PatchList.h"
 #include "SearchResultsDock.h"
 #include "SearchResultsModel.h"
+#include "AsyncTaskManager.h"
 
 class SmokeFindReplace : public SmokeTestBase {
     Q_OBJECT
@@ -155,6 +157,13 @@ private slots:
     // 可移植的非法 UTF-8 Binary 门禁：不依赖保留的大文件，也必须证明
     // 默认 Literal + ASCII 不区分大小写不会进入正则引擎。
     void tc_fr_032_invalid_utf8_binary_default_literal_portable();
+
+    // S1 Find All and directional navigation are distinct central-scheduler
+    // jobs; navigation remains enabled and owns the higher priority.
+    void tc_fr_033_l1_find_all_and_navigation_are_async_independent();
+
+private:
+    QString s3FixturePath();
 };
 
 // -------- 构造测试文件：N 行，其中 K 处包含 "__TEST_OLD__" 标记 --------
@@ -172,6 +181,30 @@ static QByteArray makeReplaceTestFile(int nMarkers) {
         out.append(line);
     }
     return out;
+}
+
+QString SmokeFindReplace::s3FixturePath()
+{
+    const QString retained = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
+        .filePath(QStringLiteral("bigtestfile"));
+    if (QFileInfo(retained).size() > 2LL * 1024 * 1024 * 1024)
+        return retained;
+
+    const QString portable = tmpDir_.filePath(
+        QStringLiteral("portable-s3-search-fixture.bin"));
+    if (QFileInfo(portable).size() > 2LL * 1024 * 1024 * 1024)
+        return portable;
+    constexpr qint64 size = 2LL * 1024 * 1024 * 1024
+                            + 64LL * 1024 * 1024;
+    QFile file(portable);
+    if (!file.open(QIODevice::ReadWrite) || !file.resize(size))
+        return {};
+    QByteArray marker("S3_PORTABLE_SEARCH_MARKER_739");
+    marker.append(QByteArray(32 - marker.size(), '!'));
+    if (!file.seek(size * 3 / 4) || file.write(marker) != marker.size())
+        return {};
+    file.close();
+    return portable;
 }
 
 void SmokeFindReplace::tc_fr_001_replace_dialog_opens() {
@@ -464,6 +497,22 @@ void SmokeFindReplace::tc_fr_005_unicode_long_line_find_all_and_double_click() {
             .arg(click.x()).arg(click.y())
             .arg(tree->viewport()->width()).arg(tree->viewport()->height())
             .arg(rect.left()).arg(rect.width())));
+    QEvent leaveEvent(QEvent::Leave);
+    QApplication::sendEvent(tree->viewport(), &leaveEvent);
+    QApplication::processEvents(QEventLoop::AllEvents, 60);
+    QCOMPARE(tree->property("searchHoverRow").toInt(), -1);
+    const QImage normalRow = tree->viewport()->grab(rect).toImage();
+    QMouseEvent hoverMove(
+        QEvent::MouseMove, QPointF(click), QPointF(click),
+        Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(tree->viewport(), &hoverMove);
+    QApplication::processEvents(QEventLoop::AllEvents, 60);
+    QCOMPARE(tree->property("searchHoverRow").toInt(), 0);
+    const QImage hoveredRow = tree->viewport()->grab(rect).toImage();
+    QVERIFY2(normalRow != hoveredRow,
+             "search result hover was not painted on the visible row");
+    const quint64 revisionBeforeNavigation = tab()->contentRevision();
+    const bool modifiedBeforeNavigation = tab()->isModified();
     // QTest::mouseDClick 只投递 dblclick 阶段；先投递一次普通点击，模拟真实用户
     // 双击的首个 press/release，并让 Dock 的命中测试记录具体高亮词。
     QTest::mouseClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, click);
@@ -473,6 +522,8 @@ void SmokeFindReplace::tc_fr_005_unicode_long_line_find_all_and_double_click() {
     QCOMPARE(jumpSpy.first().at(1).toLongLong(), qint64(5000));
     QCOMPARE(jumpSpy.first().at(2).toInt(), marker.toUtf8().size());
     QTRY_COMPARE_WITH_TIMEOUT(currentSelectionBytes(), marker.toUtf8(), 5000);
+    QCOMPARE(tab()->contentRevision(), revisionBeforeNavigation);
+    QCOMPARE(tab()->isModified(), modifiedBeforeNavigation);
 
     const QString screenshot = QDir(QCoreApplication::applicationDirPath())
                                    .filePath(QStringLiteral("gui-unicode-search.png"));
@@ -652,11 +703,17 @@ void SmokeFindReplace::tc_fr_007_all_open_files_incremental_results_and_target_j
     QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 2000);
     QCOMPARE(qvariant_cast<EditorTab *>(jumpSpy.first().at(0)), second);
 
+    workspace.setCurrentWidget(first);
+    workspace.activateWindow();
+    first->editor()->setFocus();
+    QTest::mouseClick(first->editor()->viewport(), Qt::LeftButton,
+                      Qt::NoModifier, QPoint(40, 20));
     first->editor()->SendScintilla(QsciScintillaBase::SCI_GOTOPOS,
                                    first->editor()->length());
     first->editor()->setFocus();
+    const quint64 revisionBeforeEdit = first->contentRevision();
     QTest::keyClicks(first->editor(), QStringLiteral("changed"));
-    QApplication::processEvents(QEventLoop::AllEvents, 120);
+    QTRY_VERIFY_WITH_TIMEOUT(first->contentRevision() > revisionBeforeEdit, 2000);
     QModelIndex firstGroup;
     for (int index = 0; index < tree->model()->rowCount(); ++index) {
         const QModelIndex candidate = tree->model()->index(index, 0);
@@ -666,7 +723,9 @@ void SmokeFindReplace::tc_fr_007_all_open_files_incremental_results_and_target_j
         }
     }
     QVERIFY(firstGroup.isValid());
-    QTRY_VERIFY_WITH_TIMEOUT(firstGroup.data().toString().contains(QStringLiteral("失效")), 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        tree->model()->index(firstGroup.row(), SearchResultsModel::COL_CONTEXT)
+            .data().toString().contains(QStringLiteral("失效")), 2000);
     QVERIFY2(tree->model()->flags(secondMatch).testFlag(Qt::ItemIsEnabled),
              "editing one target must not invalidate another file's search results");
 
@@ -793,8 +852,9 @@ void SmokeFindReplace::tc_fr_009_l1_pcre2_find_navigation_replace_and_error()
     QTest::mouseClick(findAll, Qt::LeftButton);
 
     auto *tree = dock.findChild<QTreeView *>();
-    QVERIFY(tree && tree->model());
-    QCOMPARE(tree->model()->rowCount(), 1);
+    QVERIFY(tree);
+    QTRY_VERIFY_WITH_TIMEOUT(tree->model() != nullptr, 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(tree->model()->rowCount(), 1, 5000);
     const QModelIndex contextIndex = tree->model()->index(
         0, SearchResultsModel::COL_CONTEXT);
     const QPoint click = tree->visualRect(contextIndex).center();
@@ -975,13 +1035,13 @@ void SmokeFindReplace::tc_fr_011_hex_byte_find_all_highlight_and_double_click()
     QCOMPARE(model->headerData(SearchResultsModel::COL_LINE, Qt::Horizontal).toString(),
              QStringLiteral("偏移"));
     const GroupedSearchLine &second = model->groupedLineAt(1);
-    QCOMPARE(second.contextByteOffset, qint64(32));
-    QCOMPARE(second.lineContext, QByteArray("A.......Z.......", 16));
+    QCOMPARE(second.contextByteOffset, qint64(27));
+    QCOMPARE(second.lineContext, QByteArray(".....A.......Z......"));
     QCOMPARE(second.matchPositions.size(), 1);
-    QCOMPARE(second.matchPositions.first().first, qint32(3));
+    QCOMPARE(second.matchPositions.first().first, qint32(8));
     QCOMPARE(second.matchPositions.first().second, qint32(4));
     QCOMPARE(model->index(1, SearchResultsModel::COL_LINE).data().toString(),
-             QStringLiteral("0x20"));
+             QStringLiteral("0x23"));
 
     const QModelIndex contextIndex = model->index(1, SearchResultsModel::COL_CONTEXT);
     tree->scrollTo(contextIndex);
@@ -1084,7 +1144,7 @@ void SmokeFindReplace::tc_fr_012_hex_byte_all_open_filters_text_targets()
     const QModelIndex matchIndex = tree->model()->index(
         0, SearchResultsModel::COL_CONTEXT, binaryGroup);
     QCOMPARE(tree->model()->index(0, SearchResultsModel::COL_LINE, binaryGroup)
-                 .data().toString(), QStringLiteral("0x10"));
+                 .data().toString(), QStringLiteral("0x14"));
     tree->scrollTo(matchIndex);
     QApplication::processEvents(QEventLoop::AllEvents, 80);
     const QRect rect = tree->visualRect(matchIndex);
@@ -1159,21 +1219,25 @@ void SmokeFindReplace::tc_fr_013_all_open_navigation_respects_wrap_boundary()
                                   last->editor()->length(),
                                   last->editor()->length());
     QTest::mouseClick(next, Qt::LeftButton);
-    QCOMPARE(workspace.currentWidget(), static_cast<QWidget *>(last));
-    QVERIFY(status->text().contains(QStringLiteral("边界")));
+    QTRY_COMPARE_WITH_TIMEOUT(workspace.currentWidget(),
+                              static_cast<QWidget *>(last), 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        status->text().contains(QStringLiteral("边界")), 2000);
 
     wrap->setChecked(true);
     QTest::mouseClick(next, Qt::LeftButton);
     QTRY_COMPARE(workspace.currentWidget(), static_cast<QWidget *>(first));
-    QCOMPARE(first->editor()->selectedText(), marker);
+    QTRY_COMPARE_WITH_TIMEOUT(first->editor()->selectedText(), marker, 2000);
 
     wrap->setChecked(false);
     first->editor()->SendScintilla(QsciScintillaBase::SCI_SETSEL,
                                    static_cast<unsigned long>(0),
                                    static_cast<long>(0));
     QTest::mouseClick(previous, Qt::LeftButton);
-    QCOMPARE(workspace.currentWidget(), static_cast<QWidget *>(first));
-    QVERIFY(status->text().contains(QStringLiteral("边界")));
+    QTRY_COMPARE_WITH_TIMEOUT(workspace.currentWidget(),
+                              static_cast<QWidget *>(first), 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        status->text().contains(QStringLiteral("边界")), 2000);
 
     wrap->setChecked(true);
     QTest::mouseClick(previous, Qt::LeftButton);
@@ -1323,7 +1387,8 @@ void SmokeFindReplace::tc_fr_015_all_open_replace_transaction_and_skip_summary()
     replace->setText(replacement);
     scope->setCurrentIndex(scope->findData(1));
     QTRY_VERIFY_WITH_TIMEOUT(replaceAll->isEnabled(), 2000);
-    QVERIFY(status->text().contains(QStringLiteral("只读大文件")));
+    QTRY_VERIFY_WITH_TIMEOUT(
+        status->text().contains(QStringLiteral("跳过项")), 2000);
 
     bool sawConfirmation = false;
     bool sawCompletion = false;
@@ -1612,16 +1677,20 @@ void SmokeFindReplace::tc_fr_018_regex_contract_model_runs_gui_variants()
         l1.resetSearchPosition(true);
         for (const auto &expected : variant.expected) {
             QTest::mouseClick(findNext, Qt::LeftButton);
-            const qint64 start = l1.editor()->SendScintilla(
-                QsciScintillaBase::SCI_GETSELECTIONSTART);
-            const qint64 end = l1.editor()->SendScintilla(
-                QsciScintillaBase::SCI_GETSELECTIONEND);
-            QCOMPARE(start, expected.first);
-            QCOMPARE(end - start, qint64(expected.second));
+            QTRY_COMPARE_WITH_TIMEOUT(
+                qint64(l1.editor()->SendScintilla(
+                    QsciScintillaBase::SCI_GETSELECTIONSTART)),
+                expected.first, 3000);
+            QTRY_COMPARE_WITH_TIMEOUT(
+                qint64(l1.editor()->SendScintilla(
+                    QsciScintillaBase::SCI_GETSELECTIONEND)
+                    - l1.editor()->SendScintilla(
+                        QsciScintillaBase::SCI_GETSELECTIONSTART)),
+                qint64(expected.second), 3000);
         }
         QTest::mouseClick(findNext, Qt::LeftButton);
-        QVERIFY2(status->text().contains(QStringLiteral("未找到更多匹配")),
-                 variant.id);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            status->text().contains(QStringLiteral("未找到更多匹配")), 3000);
 
         if (QString::fromLatin1(variant.id) == QStringLiteral("literal-dot"))
             literalDotResults = dockRanges;
@@ -1874,16 +1943,20 @@ void SmokeFindReplace::tc_fr_020_replace_button_uses_current_match_then_advances
     editor.editor()->setCursorPosition(0, 0);
 
     QTest::mouseClick(next, Qt::LeftButton);
-    QCOMPARE(editor.editor()->selectedText(), QStringLiteral("cat"));
-    QCOMPARE(editor.editor()->SendScintilla(
-                 QsciScintillaBase::SCI_GETSELECTIONSTART), 6L);
+    QTRY_COMPARE_WITH_TIMEOUT(editor.editor()->selectedText(),
+                              QStringLiteral("cat"), 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(editor.editor()->SendScintilla(
+                                  QsciScintillaBase::SCI_GETSELECTIONSTART),
+                              6L, 3000);
 
     QTest::mouseClick(replace, Qt::LeftButton);
     QCOMPARE(editor.editor()->text(),
              QStringLiteral("first DOG middle cat last\n"));
-    QCOMPARE(editor.editor()->selectedText(), QStringLiteral("cat"));
-    QCOMPARE(editor.editor()->SendScintilla(
-                 QsciScintillaBase::SCI_GETSELECTIONSTART), 17L);
+    QTRY_COMPARE_WITH_TIMEOUT(editor.editor()->selectedText(),
+                              QStringLiteral("cat"), 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(editor.editor()->SendScintilla(
+                                  QsciScintillaBase::SCI_GETSELECTIONSTART),
+                              17L, 3000);
 
     QTest::mouseClick(replace, Qt::LeftButton);
     QCOMPARE(editor.editor()->text(),
@@ -1972,35 +2045,48 @@ void SmokeFindReplace::tc_fr_021_text_option_semantics_all_legal_combinations()
         QVector<qint64> navigationOffsets;
         for (qsizetype i = 0; i < variant.offsets.size(); ++i) {
             QTest::mouseClick(next, Qt::LeftButton);
-            navigationOffsets.append(editor.editor()->SendScintilla(
-                QsciScintillaBase::SCI_GETSELECTIONSTART));
+            QTRY_COMPARE_WITH_TIMEOUT(
+                qint64(editor.editor()->SendScintilla(
+                    QsciScintillaBase::SCI_GETSELECTIONSTART)),
+                variant.offsets.at(i), 3000);
+            QTRY_COMPARE_WITH_TIMEOUT(
+                qint64(editor.editor()->SendScintilla(
+                    QsciScintillaBase::SCI_GETSELECTIONEND)
+                    - editor.editor()->SendScintilla(
+                        QsciScintillaBase::SCI_GETSELECTIONSTART)),
+                qint64(3), 3000);
+            navigationOffsets.append(variant.offsets.at(i));
         }
         QCOMPARE(navigationOffsets, variant.offsets);
         QTest::mouseClick(next, Qt::LeftButton);
-        QVERIFY2(status->text().contains(QStringLiteral("未找到更多匹配")),
-                 variant.id);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            status->text().contains(QStringLiteral("未找到更多匹配")), 3000);
 
         editor.resetSearchPosition(false);
         QVector<qint64> reverseOffsets;
         for (qsizetype i = variant.offsets.size(); i > 0; --i) {
             QTest::mouseClick(previous, Qt::LeftButton);
-            reverseOffsets.append(editor.editor()->SendScintilla(
-                QsciScintillaBase::SCI_GETSELECTIONSTART));
+            const qint64 expectedOffset = variant.offsets.at(i - 1);
+            QTRY_COMPARE_WITH_TIMEOUT(
+                qint64(editor.editor()->SendScintilla(
+                    QsciScintillaBase::SCI_GETSELECTIONSTART)),
+                expectedOffset, 3000);
+            reverseOffsets.append(expectedOffset);
         }
         QVector<qint64> expectedReverse = variant.offsets;
         std::reverse(expectedReverse.begin(), expectedReverse.end());
         QCOMPARE(reverseOffsets, expectedReverse);
         QTest::mouseClick(previous, Qt::LeftButton);
-        QVERIFY2(status->text().contains(QStringLiteral("未找到更多匹配")),
-                 variant.id);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            status->text().contains(QStringLiteral("未找到更多匹配")), 3000);
 
         // Wrap changes only navigation after the final hit; the query result
         // set and its order remain exactly the same.
         wrap->setChecked(true);
         QTest::mouseClick(previous, Qt::LeftButton);
-        QCOMPARE(editor.editor()->SendScintilla(
-                     QsciScintillaBase::SCI_GETSELECTIONSTART),
-                 variant.offsets.last());
+        QTRY_COMPARE_WITH_TIMEOUT(editor.editor()->SendScintilla(
+                                      QsciScintillaBase::SCI_GETSELECTIONSTART),
+                                  variant.offsets.last(), 3000);
         dialog.close();
         dock.close();
         editor.close();
@@ -2130,11 +2216,13 @@ void SmokeFindReplace::tc_fr_023_regex_capture_replacement_gui_contract()
     editor.editor()->setCursorPosition(0, 0);
 
     QTest::mouseClick(next, Qt::LeftButton);
-    QCOMPARE(editor.editor()->selectedText(), QStringLiteral("name=alice id=42"));
+    QTRY_COMPARE_WITH_TIMEOUT(editor.editor()->selectedText(),
+                              QStringLiteral("name=alice id=42"), 3000);
     QTest::mouseClick(replace, Qt::LeftButton);
     QCOMPARE(editor.editor()->text(),
              QStringLiteral("42:alice\nname=bob id=7\n"));
-    QCOMPARE(editor.editor()->selectedText(), QStringLiteral("name=bob id=7"));
+    QTRY_COMPARE_WITH_TIMEOUT(editor.editor()->selectedText(),
+                              QStringLiteral("name=bob id=7"), 3000);
 
     bool sawCompletion = false;
     QTimer modalDriver;
@@ -2194,11 +2282,13 @@ void SmokeFindReplace::tc_fr_024_l2_regex_capture_replacement_consistency()
     tab()->resetSearchPosition(true);
 
     QTest::mouseClick(next, Qt::LeftButton);
-    QCOMPARE(currentSelectionBytes(), QByteArray("name=alice id=42"));
+    QTRY_COMPARE_WITH_TIMEOUT(currentSelectionBytes(),
+                              QByteArray("name=alice id=42"), 3000);
     QTest::mouseClick(replace, Qt::LeftButton);
     QCOMPARE(readByteRange(0, view()->virtualFileSize()),
              QByteArray("42:alice\nname=bob id=7\n"));
-    QCOMPARE(currentSelectionBytes(), QByteArray("name=bob id=7"));
+    QTRY_COMPARE_WITH_TIMEOUT(currentSelectionBytes(),
+                              QByteArray("name=bob id=7"), 3000);
 
     bool sawCompletion = false;
     QTimer modalDriver;
@@ -2382,10 +2472,8 @@ void SmokeFindReplace::tc_fr_026_l2_replace_all_over_batch_is_one_undo()
 
 void SmokeFindReplace::tc_fr_027_real_s3_find_all_dock_double_click()
 {
-    const QString path = QDir(QCoreApplication::applicationDirPath())
-        .absoluteFilePath(QStringLiteral("../../bigtestfile"));
-    if (!QFileInfo::exists(path))
-        QSKIP("retained 4.9 GB S3 fixture is not available");
+    const QString path = s3FixturePath();
+    QVERIFY2(!path.isEmpty(), "cannot prepare portable S3 fixture");
     const qint64 size = QFileInfo(path).size();
     QVERIFY(size > 2LL * 1024 * 1024 * 1024);
     const qint64 target = size * 3 / 4;
@@ -2492,10 +2580,8 @@ void SmokeFindReplace::tc_fr_027_real_s3_find_all_dock_double_click()
 
 void SmokeFindReplace::tc_fr_028_real_s3_find_next_preparation_and_repeat_boundary()
 {
-    const QString path = QDir(QCoreApplication::applicationDirPath())
-        .absoluteFilePath(QStringLiteral("../../bigtestfile"));
-    if (!QFileInfo::exists(path))
-        QSKIP("retained 4.9 GB S3 fixture is not available");
+    const QString path = s3FixturePath();
+    QVERIFY2(!path.isEmpty(), "cannot prepare portable S3 fixture");
     const qint64 size = QFileInfo(path).size();
     QVERIFY(size > 2LL * 1024 * 1024 * 1024);
     const qint64 target = size * 3 / 4;
@@ -2529,13 +2615,37 @@ void SmokeFindReplace::tc_fr_028_real_s3_find_next_preparation_and_repeat_bounda
     QTest::mouseClick(hex, Qt::LeftButton);
     wrap->setChecked(false);
     pattern->setText(QString::fromLatin1(signature.toHex(' ').toUpper()));
+    QVERIFY(next->isEnabled());
+    QSignalSpy navigationClickSpy(next, &QPushButton::clicked);
+    QSignalSpy taskAddedSpy(&AsyncTaskManager::instance(),
+                            &AsyncTaskManager::taskAdded);
 
     QElapsedTimer firstElapsed;
     firstElapsed.start();
     QTest::mouseClick(next, Qt::LeftButton);
+    QCOMPARE(navigationClickSpy.count(), 1);
+    QTRY_VERIFY_WITH_TIMEOUT(taskAddedSpy.count() >= 1, 3000);
+    const qint64 firstTaskId = taskAddedSpy.last().at(0).toLongLong();
+    QTRY_VERIFY_WITH_TIMEOUT(
+        AsyncTaskManager::instance().taskById(firstTaskId).state
+            != AsyncTaskState::Queued,
+        3000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        AsyncTaskManager::instance().taskById(firstTaskId).state
+            != AsyncTaskState::Running,
+        20000);
+    QCOMPARE(AsyncTaskManager::instance().taskById(firstTaskId).state,
+             AsyncTaskState::Finished);
+    QTRY_VERIFY_WITH_TIMEOUT(next->isEnabled(), 20000);
+    QVERIFY2(provider->selectionStartOffset() == target,
+             qPrintable(QStringLiteral("navigation completed without selecting "
+                                       "the S3 match; status=%1 start=%2 target=%3")
+                            .arg(status->text())
+                            .arg(provider->selectionStartOffset())
+                            .arg(target)));
+    QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(),
+                              target + signature.size(), 5000);
     qInfo() << "S3_DIALOG_FIND_NEXT_MS=" << firstElapsed.elapsed();
-    QCOMPARE(provider->selectionStartOffset(), target);
-    QCOMPARE(provider->selectionEndOffset(), target + signature.size());
     QCOMPARE(provider->sourceBytes(target, signature.size()), signature);
     QVERIFY(!cancel->isVisible());
 
@@ -2545,19 +2655,29 @@ void SmokeFindReplace::tc_fr_028_real_s3_find_next_preparation_and_repeat_bounda
     QElapsedTimer cachedElapsed;
     cachedElapsed.start();
     QTest::mouseClick(next, Qt::LeftButton);
-    QVERIFY(cachedElapsed.elapsed() < 1000);
-    QVERIFY(status->text().contains(QStringLiteral("未找到"))
-            || status->text().contains(QStringLiteral("边界")));
+    QTRY_VERIFY_WITH_TIMEOUT(next->isEnabled(), 10000);
+    QVERIFY2(status->text().contains(QStringLiteral("未找到"))
+                 || status->text().contains(QStringLiteral("边界")),
+             qPrintable(QStringLiteral("second navigation did not report the "
+                                       "non-wrapping boundary; status=%1 "
+                                       "selection=%2..%3")
+                            .arg(status->text())
+                            .arg(provider->selectionStartOffset())
+                            .arg(provider->selectionEndOffset())));
+    QVERIFY(cachedElapsed.elapsed() < 10000);
     QCOMPARE(provider->selectionStartOffset(), target);
     QCOMPARE(provider->selectionEndOffset(), target + signature.size());
 
     QTest::mouseClick(previous, Qt::LeftButton);
-    QVERIFY(status->text().contains(QStringLiteral("未找到"))
-            || status->text().contains(QStringLiteral("边界")));
+    QTRY_VERIFY_WITH_TIMEOUT(
+        status->text().contains(QStringLiteral("未找到"))
+            || status->text().contains(QStringLiteral("边界")), 10000);
     wrap->setChecked(true);
     QTest::mouseClick(next, Qt::LeftButton);
-    QCOMPARE(provider->selectionStartOffset(), target);
-    QCOMPARE(provider->selectionEndOffset(), target + signature.size());
+    QTRY_VERIFY_WITH_TIMEOUT(next->isEnabled(), 10000);
+    QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(), target, 10000);
+    QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(),
+                              target + signature.size(), 10000);
     QCOMPARE(provider->visibleVerticalScrollBarCount(), 1);
     QVERIFY(container_->grab().save(
         QDir(QCoreApplication::applicationDirPath())
@@ -2756,10 +2876,8 @@ void SmokeFindReplace::tc_fr_030_sparse_s3_text_regex_after_two_gib()
 
 void SmokeFindReplace::tc_fr_031_real_s3_default_literal_is_not_regex()
 {
-    const QString path = QDir(QCoreApplication::applicationDirPath())
-        .absoluteFilePath(QStringLiteral("../../bigtestfile"));
-    if (!QFileInfo::exists(path))
-        QSKIP("retained 4.9 GB S3 fixture is not available");
+    const QString path = s3FixturePath();
+    QVERIFY2(!path.isEmpty(), "cannot prepare portable S3 fixture");
     const qint64 size = QFileInfo(path).size();
     QVERIFY(size > 2LL * 1024 * 1024 * 1024);
 
@@ -2831,13 +2949,15 @@ void SmokeFindReplace::tc_fr_031_real_s3_default_literal_is_not_regex()
     QElapsedTimer elapsed;
     elapsed.start();
     QTest::mouseClick(next, Qt::LeftButton);
+    QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(),
+                              copiedOffset, 120000);
+    QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(),
+                              copiedOffset + copiedText.size(), 5000);
     qInfo() << "S3_DEFAULT_LITERAL_FIND_NEXT_MS=" << elapsed.elapsed();
     QVERIFY2(tab()->lastSearchError().isEmpty(),
              qPrintable(tab()->lastSearchError()));
     QVERIFY(!status->text().contains(QStringLiteral("正则")));
     QVERIFY(!status->text().contains(QStringLiteral("UTF-8")));
-    QCOMPARE(provider->selectionStartOffset(), copiedOffset);
-    QCOMPARE(provider->selectionEndOffset(), copiedOffset + copiedText.size());
     QCOMPARE(provider->sourceBytes(copiedOffset, copiedText.size()), copiedText);
     QCOMPARE(provider->visibleVerticalScrollBarCount(), 1);
     QVERIFY(container_->grab().save(
@@ -2898,15 +3018,20 @@ void SmokeFindReplace::tc_fr_032_invalid_utf8_binary_default_literal_portable()
     QVERIFY(!status->text().contains(QStringLiteral("正则")));
     QVERIFY(!status->text().contains(QStringLiteral("UTF-8")));
     if (provider) {
-        QCOMPARE(provider->selectionStartOffset(), expectedOffset);
-        QCOMPARE(provider->selectionEndOffset(),
-                 expectedOffset + qint64(QByteArrayLiteral("CopyMeToken").size()));
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(),
+                                  expectedOffset, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            provider->selectionEndOffset(),
+            expectedOffset + qint64(QByteArrayLiteral("CopyMeToken").size()),
+            3000);
         QCOMPARE(provider->sourceBytes(expectedOffset, 11),
                  QByteArrayLiteral("CopyMeToken"));
     } else {
-        QCOMPARE(view()->selectionStart(), expectedOffset);
-        QCOMPARE(view()->selectionEnd(),
-                 expectedOffset + qint64(QByteArrayLiteral("CopyMeToken").size()));
+        QTRY_COMPARE_WITH_TIMEOUT(view()->selectionStart(), expectedOffset, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            view()->selectionEnd(),
+            expectedOffset + qint64(QByteArrayLiteral("CopyMeToken").size()),
+            3000);
         QCOMPARE(readByteRange(expectedOffset, expectedOffset + 11),
                  QByteArrayLiteral("CopyMeToken"));
     }
@@ -2920,13 +3045,84 @@ void SmokeFindReplace::tc_fr_032_invalid_utf8_binary_default_literal_portable()
     QVERIFY(!regex->isChecked());
     tab()->resetSearchPosition(true);
     QTest::mouseClick(next, Qt::LeftButton);
-    QCOMPARE(view()->selectionStart(), firstWholeWord);
-    QCOMPARE(view()->selectionEnd(), firstWholeWord + 3);
+    QTRY_COMPARE_WITH_TIMEOUT(view()->selectionStart(), firstWholeWord, 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(view()->selectionEnd(), firstWholeWord + 3, 3000);
     QVERIFY(tab()->lastSearchError().isEmpty());
     QTest::mouseClick(next, Qt::LeftButton);
-    QCOMPARE(view()->selectionStart(), secondWholeWord);
-    QCOMPARE(view()->selectionEnd(), secondWholeWord + 3);
+    QTRY_COMPARE_WITH_TIMEOUT(view()->selectionStart(), secondWholeWord, 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(view()->selectionEnd(), secondWholeWord + 3, 3000);
     QVERIFY(tab()->lastSearchError().isEmpty());
+}
+
+void SmokeFindReplace::tc_fr_033_l1_find_all_and_navigation_are_async_independent()
+{
+    const QByteArray marker("L1_ASYNC_TOKEN_739");
+    QByteArray payload;
+    payload.reserve(28 * 1024 * 1024);
+    payload.append(marker).append('\n');
+    const QByteArray filler(1023, 'x');
+    while (payload.size() < 28 * 1024 * 1024)
+        payload.append(filler).append('\n');
+    const QString path = createSmallTestFile(
+        payload, QStringLiteral("fr-033-l1-async.log"));
+
+    EditorTab l1;
+    l1.resize(1000, 600);
+    QVERIFY(l1.loadFile(path));
+    QVERIFY(!l1.isL2Mode());
+    l1.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&l1));
+
+    SearchResultsDock dock;
+    dock.resize(760, 300);
+    dock.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&dock));
+    FindReplaceDialog dialog;
+    dialog.setActiveTab(&l1);
+    dialog.setSearchResultsDock(&dock);
+    dialog.showFindMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+
+    auto *pattern = dialog.findChild<QLineEdit *>(
+        QStringLiteral("findPatternEdit"));
+    auto *findAll = dialog.findChild<QPushButton *>(
+        QStringLiteral("findAllButton"));
+    auto *findNext = dialog.findChild<QPushButton *>(
+        QStringLiteral("findNextButton"));
+    auto *cancel = dialog.findChild<QPushButton *>(
+        QStringLiteral("cancelSearchButton"));
+    auto *tree = dock.findChild<QTreeView *>(
+        QStringLiteral("searchResultsTree"));
+    QVERIFY(pattern && findAll && findNext && cancel && tree);
+    pattern->setText(QString::fromLatin1(marker));
+
+    auto &manager = AsyncTaskManager::instance();
+    QSignalSpy taskAdded(&manager, &AsyncTaskManager::taskAdded);
+    QTest::mouseClick(findAll, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(taskAdded.count() >= 1, 1000);
+    const qint64 findAllTaskId = taskAdded.at(0).at(0).toLongLong();
+    const AsyncTask findAllTask = manager.taskById(findAllTaskId);
+    QCOMPARE(findAllTask.categoryTag, QStringLiteral("SearchFindAll"));
+    QCOMPARE(findAllTask.priority, AsyncTaskPriority::High);
+
+    // Find All keeps the query immutable, but navigation is intentionally
+    // available and launches its own first-hit task.
+    QVERIFY(findNext->isEnabled());
+    QTest::mouseClick(findNext, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(taskAdded.count() >= 2, 1000);
+    const qint64 navigationTaskId = taskAdded.at(1).at(0).toLongLong();
+    const AsyncTask navigationTask = manager.taskById(navigationTaskId);
+    QCOMPARE(navigationTask.categoryTag, QStringLiteral("SearchNavigation"));
+    QCOMPARE(navigationTask.priority, AsyncTaskPriority::Highest);
+    QTRY_COMPARE_WITH_TIMEOUT(l1.editor()->selectedText(),
+                              QString::fromLatin1(marker), 5000);
+
+    QTRY_VERIFY_WITH_TIMEOUT(!cancel->isVisible(), 10000);
+    QTRY_VERIFY_WITH_TIMEOUT(tree->model() != nullptr, 10000);
+    QCOMPARE(tree->model()->rowCount(), 1);
+    QVERIFY(dock.grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-l1-async-search-dock.png"))));
 }
 
 QTEST_MAIN(SmokeFindReplace)

@@ -735,6 +735,11 @@ MainWindow::~MainWindow()
     m_securityExpiryTimer.stop();
     if (m_vaultDock)
         disconnect(m_vaultDock, nullptr, this, nullptr);
+    // A test host or forced shutdown may destroy the window without sending a
+    // close event. Release retained KeePassXC QObject graphs on their owning
+    // security lane before the service objects themselves are destroyed.
+    closeAllSecureDocumentsOnSecurityLane();
+    endSecuritySessionOnSecurityLane(false);
 #ifdef Q_OS_WIN
     if (m_sessionNotificationsRegistered)
         ::WTSUnRegisterSessionNotification(reinterpret_cast<HWND>(winId()));
@@ -1254,7 +1259,7 @@ void MainWindow::verifyRecoveryKey()
         recoveryText.clear();
         if (!result.isError()) {
             result = runSerializedSecurityOperation(
-                this, AsyncTaskType::SecureIdentity, AsyncTaskPriority::High,
+                this, AsyncTaskType::SecureIdentity, AsyncTaskPriority::Highest,
                 QStringLiteral("正在验证恢复密钥"),
                 [this, &candidate] {
                     return m_securitySession->verifyRecoverySecret(candidate);
@@ -2084,15 +2089,14 @@ void MainWindow::createMenus()
                            "<b>QScintilla：</b>2.14.1<br>"
                            "<b>KDBX：</b>KeePassXC Core 2.7.12<br>"
                            "<b>密码学：</b>Botan 3.12.0 + libargon2 20190702<br>"
-                           "<b>正则：</b>PCRE2 10.47 + Boost.Regex 1.90.0</p>"
+                           "<b>正则：</b>PCRE2 10.47</p>"
                            "<p>许可证：GNU GPL v3。核心供应商均按锁文件和 SHA-256/commit 固定，"
                            "更新必须通过格式、加密、搜索与 GUI 回归门禁。</p>"
                            "<p><a href='https://www.qt.io/'>Qt</a> · "
                            "<a href='https://www.riverbankcomputing.com/software/qscintilla/'>QScintilla</a> · "
                            "<a href='https://keepassxc.org/'>KeePassXC</a> · "
                            "<a href='https://botan.randombit.net/'>Botan</a> · "
-                           "<a href='https://www.pcre.org/'>PCRE2</a> · "
-                           "<a href='https://www.boost.org/libs/regex/'>Boost.Regex</a></p>")
+                           "<a href='https://www.pcre.org/'>PCRE2</a></p>")
                 .arg(QStringLiteral(NOTEPADSAFE_VERSION),
                      QString::fromLatin1(qVersion())));
     });
@@ -2240,7 +2244,7 @@ bool MainWindow::ensureSecuritySessionInteractive()
                     continue;
                 SecureDocumentSnapshot restored;
                 const VaultError restoreError = runSerializedSecurityOperation(
-                    this, AsyncTaskType::SecureOpen, AsyncTaskPriority::High,
+                    this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
                     QStringLiteral("正在恢复安全文档"),
                     [this, backing, &restored] {
                         return m_secureDocuments->open(backing, &restored);
@@ -2327,7 +2331,7 @@ bool MainWindow::ensureSecuritySessionInteractive()
         scrubByteArray(passwordUtf8);
         QString recoveryKey;
         VaultError result = runSerializedSecurityOperation(
-            this, AsyncTaskType::SecureIdentity, AsyncTaskPriority::High,
+            this, AsyncTaskType::SecureIdentity, AsyncTaskPriority::Highest,
             creating ? QStringLiteral("正在建立安全身份")
                      : QStringLiteral("正在解锁安全身份"),
             [this, creating, &passphrase, &recoveryKey] {
@@ -2401,7 +2405,7 @@ void MainWindow::newFile()
         return;
     SecureDocumentSnapshot snapshot;
     const VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::SecureSave, AsyncTaskPriority::High,
+        this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
         QStringLiteral("正在建立加密草稿"),
         [this, &snapshot] { return m_secureDocuments->newDraft(&snapshot); });
     if (error.isError()) {
@@ -2750,6 +2754,48 @@ void MainWindow::openSecureNote(const QUuid &id)
     tab->setFocusEditor();
 }
 
+void MainWindow::closeSecureDocumentOnSecurityLane(const QUuid &documentId)
+{
+    if (!m_secureDocuments || documentId.isNull())
+        return;
+    (void)runSerializedSecurityOperation(
+        this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
+        QStringLiteral("正在关闭安全文档"),
+        [this, documentId] {
+            m_secureDocuments->close(documentId);
+            return VaultError{};
+        },
+        false);
+}
+
+void MainWindow::closeAllSecureDocumentsOnSecurityLane()
+{
+    if (!m_secureDocuments)
+        return;
+    (void)runSerializedSecurityOperation(
+        this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
+        QStringLiteral("正在清理安全文档"),
+        [this] {
+            m_secureDocuments->closeAll();
+            return VaultError{};
+        },
+        false);
+}
+
+void MainWindow::endSecuritySessionOnSecurityLane(bool preserveSealedSession)
+{
+    if (!m_securitySession)
+        return;
+    (void)runSerializedSecurityOperation(
+        this, AsyncTaskType::SecureIdentity, AsyncTaskPriority::Highest,
+        QStringLiteral("正在结束安全会话"),
+        [this, preserveSealedSession] {
+            m_securitySession->endSession(preserveSealedSession);
+            return VaultError{};
+        },
+        false);
+}
+
 void MainWindow::lockSecureDocuments()
 {
     m_secureAutosaveTimer.stop();
@@ -2781,10 +2827,8 @@ void MainWindow::lockSecureDocuments()
     // Lock is also a recovery boundary for ordinary documents. The operation is
     // explicit, so establish the latest encrypted S1/S2 recovery point first.
     saveSessionNow(true);
-    if (m_secureDocuments)
-        m_secureDocuments->closeAll();
-    if (m_securitySession)
-        m_securitySession->endSession(true);
+    closeAllSecureDocumentsOnSecurityLane();
+    endSecuritySessionOnSecurityLane(true);
     if (m_vaultDock)
         m_vaultDock->lockVault();
     maskSecureDocuments();
@@ -2862,10 +2906,8 @@ void MainWindow::protectForSystemLock()
         return;
     saveSessionNow(true);
     purgeSensitiveSearchState();
-    if (m_secureDocuments)
-        m_secureDocuments->closeAll();
-    if (m_securitySession)
-        m_securitySession->endSession(false);
+    closeAllSecureDocumentsOnSecurityLane();
+    endSecuritySessionOnSecurityLane(false);
     maskSecureDocuments();
     m_systemProtectionActive = true;
 }
@@ -2909,14 +2951,14 @@ EditorTab *MainWindow::adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
     if (reuseTab && reuseTab->isSecureDocument()
         && reuseTab->secureDocumentId() != snapshot.documentId
         && m_secureDocuments) {
-        m_secureDocuments->close(reuseTab->secureDocumentId());
+        closeSecureDocumentOnSecurityLane(reuseTab->secureDocumentId());
     }
     if (snapshot.payloadKind == SecureDocumentPayloadKind::Binary) {
         QString error;
         if (!tab->initializeSecureBinaryDocument(
                 snapshot.documentId, snapshot.title, std::move(snapshot.binary),
                 snapshot.filePath, &error)) {
-            m_secureDocuments->close(snapshot.documentId);
+            closeSecureDocumentOnSecurityLane(snapshot.documentId);
             if (!reuseTab) {
                 const int failedIndex = m_tabs->indexOf(tab);
                 if (failedIndex >= 0)
@@ -2977,7 +3019,7 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
 
     SecureDocumentSnapshot snapshot;
     VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::SecureOpen, AsyncTaskPriority::High,
+        this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
         QStringLiteral("正在打开安全文档"),
         [this, path, &snapshot] { return m_secureDocuments->open(path, &snapshot); });
     if (!error.isError()) {
@@ -3007,7 +3049,7 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
                 continue;
             }
             error = runSerializedSecurityOperation(
-                this, AsyncTaskType::SecureOpen, AsyncTaskPriority::High,
+                this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
                 QStringLiteral("正在恢复安全文档"),
                 [this, path, &recoveryText, &snapshot] {
                     return m_secureDocuments->openWithRecovery(path, recoveryText,
@@ -3022,7 +3064,7 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
                 continue;
             }
             error = runSerializedSecurityOperation(
-                this, AsyncTaskType::SecureOpen, AsyncTaskPriority::High,
+                this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
                 QStringLiteral("正在解锁安全文档"),
                 [this, path, &buffer, &snapshot] {
                     return m_secureDocuments->openWithPassphrase(path, buffer, &snapshot);
@@ -3214,7 +3256,7 @@ bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
     EditorTab *tab = reuseTab ? reuseTab : addNewTab();
     if (reuseTab && reuseTab->isSecureDocument()) {
         if (m_secureDocuments)
-            m_secureDocuments->close(reuseTab->secureDocumentId());
+            closeSecureDocumentOnSecurityLane(reuseTab->secureDocumentId());
         // External Open may reuse the single empty default secure draft. The
         // reused tab must stop being a secure document before ordinary routing.
         reuseTab->convertToPlainDocument(QString());
@@ -3428,7 +3470,7 @@ bool MainWindow::reloadSecureTabFromDisk(EditorTab *tab)
         return false;
     SecureDocumentSnapshot snapshot;
     const VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::SecureOpen, AsyncTaskPriority::High,
+        this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
         QStringLiteral("正在重新加载安全文档"),
         [this, tab, &snapshot] {
             return m_secureDocuments->reload(tab->secureDocumentId(), &snapshot);
@@ -3647,7 +3689,7 @@ bool MainWindow::saveAsFile()
             }
             if (tab->isSecureDocument()) {
                 error = runSerializedSecurityOperation(
-                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::High,
+                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
                     QStringLiteral("正在另存安全文档"),
                     [this, tab, &body, title, fileName] {
                         return m_secureDocuments->saveBinary(
@@ -3663,7 +3705,7 @@ bool MainWindow::saveAsFile()
             } else {
                 SecureDocumentSnapshot snapshot;
                 error = runSerializedSecurityOperation(
-                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::High,
+                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
                     QStringLiteral("正在创建安全文档"),
                     [this, &body, title, fileName, &snapshot] {
                         return m_secureDocuments->saveAsSecureBinary(
@@ -3679,7 +3721,7 @@ bool MainWindow::saveAsFile()
             QString body = tab->editor()->text();
             if (tab->isSecureDocument()) {
                 error = runSerializedSecurityOperation(
-                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::High,
+                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
                     QStringLiteral("正在另存安全文档"),
                     [this, tab, &body, title, fileName] {
                         return m_secureDocuments->save(
@@ -3695,7 +3737,7 @@ bool MainWindow::saveAsFile()
             } else {
                 SecureDocumentSnapshot snapshot;
                 error = runSerializedSecurityOperation(
-                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::High,
+                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
                     QStringLiteral("正在创建安全文档"),
                     [this, &body, title, fileName, &snapshot] {
                         return m_secureDocuments->saveAsSecure(
@@ -3749,7 +3791,7 @@ bool MainWindow::saveAsFile()
                 err = QStringLiteral("无法写入文件。");
             } else {
                 if (m_secureDocuments)
-                    m_secureDocuments->close(previousSecureId);
+                    closeSecureDocumentOnSecurityLane(previousSecureId);
                 tab->convertToPlainDocument(QFileInfo(fileName).absoluteFilePath());
             }
         } else if (!tab->saveAsFile(fileName, &err)) {
@@ -4262,7 +4304,7 @@ void MainWindow::convertEncodingFromAction()
                 progress.setValue(int(qMin<qint64>(1000, done * 1000 / total)));
         });
     conversionTaskId = AsyncTaskManager::instance().submit(
-        AsyncTaskType::EncodingConversion, AsyncTaskPriority::High,
+AsyncTaskType::EncodingConversion, AsyncTaskPriority::Highest,
         QStringLiteral("正在转换文件编码"), QString(),
         [result, smallText, sourcePath, sourceEncoding, target, enc]
         (qint64, AsyncCancelPtr cancel, const auto &reportProgress,
@@ -4767,7 +4809,7 @@ void MainWindow::closeTabUnchecked(int index)
     auto *tab = qobject_cast<EditorTab *>(widget);
     if (tab) {
         if (tab->isSecureDocument() && m_secureDocuments)
-            m_secureDocuments->close(tab->secureDocumentId());
+            closeSecureDocumentOnSecurityLane(tab->secureDocumentId());
         else
             tab->clearAutosaveFile();
         tab->shutdownL2BeforeClose();
@@ -5813,10 +5855,8 @@ void MainWindow::closeEvent(QCloseEvent *event)
 
     // Keep the sealed seven-day session for the next launch, but destroy all
     // process-resident document credentials and identity material now.
-    if (m_secureDocuments)
-        m_secureDocuments->closeAll();
-    if (m_securitySession)
-        m_securitySession->endSession(false);
+    closeAllSecureDocumentsOnSecurityLane();
+    endSecuritySessionOnSecurityLane(false);
     clearSensitiveDocumentClipboard();
 
     event->accept();

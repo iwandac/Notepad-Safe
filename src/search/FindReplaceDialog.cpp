@@ -3,6 +3,7 @@
 #include "SearchResultsDock.h"
 #include "SearchResultsModel.h"
 #include "LargeFileSearch.h"
+#include "EncodedRegexCompiler.h"
 #include "Pcre2Regex.h"
 #include "ByteClipboard.h"
 #include <QVBoxLayout>
@@ -24,6 +25,7 @@
 #include <QSignalBlocker>
 #include <QRegularExpression>
 #include <QSizePolicy>
+#include <memory>
 #include <utility>
 
 namespace {
@@ -31,6 +33,15 @@ bool isSearchableDocument(EditorTab *tab)
 {
     return tab && !tab->isSecureDocumentMasked()
         && !tab->isSecureDocumentTransitioning();
+}
+
+QString compactSearchMessage(QString message, qsizetype limit = 72)
+{
+    message.replace(QLatin1Char('\n'), QLatin1Char(' '));
+    message = message.simplified();
+    if (message.size() <= limit)
+        return message;
+    return message.left(limit - 1) + QChar(0x2026);
 }
 }
 
@@ -119,6 +130,8 @@ void FindReplaceDialog::buildUi()
     m_caseCheck->setObjectName(QStringLiteral("caseSensitiveSearchCheck"));
     m_wordCheck = new QCheckBox(QStringLiteral("整词匹配"));
     m_wordCheck->setObjectName(QStringLiteral("wholeWordSearchCheck"));
+    m_wordCheck->setToolTip(
+        QStringLiteral("西文按单词边界匹配；中文、日文和韩文按完整短语精确匹配"));
     m_wrapCheck = new QCheckBox(QStringLiteral("循环查找"));
     m_wrapCheck->setObjectName(QStringLiteral("wrapSearchCheck"));
     m_wrapCheck->setChecked(true);
@@ -174,6 +187,10 @@ void FindReplaceDialog::buildUi()
     };
     for (const AssistantItem &item : items) {
         auto *button = new QPushButton(QString::fromUtf8(item.label));
+        // The assistant operates on the current selection in the query edit.
+        // Mouse clicks must not move focus and clear that selection before the
+        // clicked handler reads it.
+        button->setFocusPolicy(Qt::NoFocus);
         button->setToolTip(QString::fromUtf8(item.tip));
         assistantLayout->addWidget(button);
         connect(button, &QPushButton::clicked, this,
@@ -520,14 +537,30 @@ void FindReplaceDialog::updateQueryUi()
         m_regexAssistantToggle->setEnabled(!busy && !hexBytesMode());
     if (m_queryHintLabel && !busy) {
         if (m_regexCheck->isChecked() && !m_findEdit->text().isEmpty()) {
-            Pcre2Regex validator;
             QString error;
-            if (validator.compile(m_findEdit->text(), false,
-                                  m_caseCheck->isChecked(), false, &error)) {
+            bool valid = false;
+            const bool encodedTarget = m_tab && m_tab->isL2Mode()
+                && !m_tab->isHexPresentation()
+                && !EncodedRegexCompiler::isUtf8SubjectEncoding(
+                    m_tab->displayEncoding());
+            if (encodedTarget) {
+                EncodedRegexCompiler::Output translated;
+                valid = EncodedRegexCompiler::compile(
+                    m_findEdit->text(), m_tab->displayEncoding(),
+                    m_caseCheck->isChecked(), &translated, &error);
+            } else {
+                Pcre2Regex validator;
+                valid = validator.compile(m_findEdit->text(), false,
+                                          m_caseCheck->isChecked(), false,
+                                          &error);
+            }
+            if (valid) {
                 m_queryHintLabel->setText(QStringLiteral("正则有效"));
+                m_queryHintLabel->setToolTip(QString());
                 m_queryHintLabel->setStyleSheet(QStringLiteral("color:#39734a;"));
             } else {
-                m_queryHintLabel->setText(error);
+                m_queryHintLabel->setText(compactSearchMessage(error));
+                m_queryHintLabel->setToolTip(error);
                 m_queryHintLabel->setStyleSheet(QStringLiteral("color:#a33a3a;"));
             }
         } else if (hexBytesMode()) {
@@ -681,9 +714,8 @@ void FindReplaceDialog::findAcrossTabs(bool forward)
         return;
     emitFindParameters();
     if (m_statusLabel) m_statusLabel->clear();
-    bool queryError = false;
     const bool hex = hexBytesMode();
-    if (!allOpenScope() && m_tab && m_tab->isL2Mode()) {
+    if (!allOpenScope() && m_tab) {
         if (!isSearchableDocument(m_tab)) {
             if (m_statusLabel)
                 m_statusLabel->setText(QStringLiteral("当前安全文档已锁定。"));
@@ -720,107 +752,101 @@ void FindReplaceDialog::findAcrossTabs(bool forward)
             setNavigationUiBusy(false);
         return;
     }
-    const auto findIn = [this, &pattern, forward, &queryError, hex](EditorTab *tab, bool wrap) {
-        if (!isSearchableDocument(tab)
-            || (hex && !tab->isHexPresentation()))
-            return false;
-        const bool ownsBusyState = tab && tab->isL2Mode()
-            && !m_l2SearchInProgress;
-        if (ownsBusyState)
-            setL2SearchUiBusy(true, QObject::tr("正在搜索大文件…"));
-        const bool found = tab && tab->findNext(
-            pattern, m_regexCheck->isChecked(), m_caseCheck->isChecked(),
-            m_wordCheck->isChecked(), forward, wrap, hex);
-        if (ownsBusyState)
-            setL2SearchUiBusy(false);
-        if (!found && tab && !tab->lastSearchError().isEmpty()) {
-            queryError = true;
-            if (m_statusLabel)
-                m_statusLabel->setText(tab->lastSearchError());
-        }
-        return found;
-    };
-    if (!allOpenScope() || !m_tabWidget) {
-        if (!isSearchableDocument(m_tab)) {
-            if (m_statusLabel)
-                m_statusLabel->setText(QStringLiteral("当前安全文档已锁定，无法搜索正文。"));
-            return;
-        }
-        if (hex && !m_tab->isHexPresentation()) {
-            if (m_statusLabel)
-                m_statusLabel->setText(QStringLiteral("十六进制字节搜索仅适用于 Binary/Hex 文档。"));
-            return;
-        }
-        const bool found = findIn(m_tab, m_wrapCheck->isChecked());
-        if (!found && !queryError && m_statusLabel)
-            m_statusLabel->setText(QStringLiteral("未找到更多匹配。"));
-        return;
-    }
-
     const QList<EditorTab *> tabs = openTabs();
     if (tabs.isEmpty())
         return;
     int start = tabs.indexOf(m_tab);
     if (start < 0)
         start = 0;
-    if (findIn(tabs.at(start), false))
-        return;
-    if (queryError) return;
-
-    const auto findInTabAt = [this, &tabs, &findIn, forward](int index) {
-        EditorTab *candidate = tabs.at(index);
-        candidate->resetSearchPosition(forward);
-        if (findIn(candidate, false)) {
-            m_tabWidget->setCurrentWidget(candidate);
-            // MainWindow normally synchronizes m_tab from currentChanged.
-            // Keep the dialog correct when embedded by another host as well.
-            if (m_tab != candidate)
-                setActiveTab(candidate);
-            candidate->setFocusEditor();
-            return true;
-        }
-        return false;
+    struct NavigationAttempt {
+        QPointer<EditorTab> tab;
+        bool reset = false;
     };
-
+    auto attempts = QSharedPointer<QVector<NavigationAttempt>>::create();
+    attempts->push_back({tabs.at(start), false});
     if (forward) {
-        for (int index = start + 1; index < tabs.size(); ++index) {
-            if (findInTabAt(index) || queryError)
-                return;
-        }
+        for (int index = start + 1; index < tabs.size(); ++index)
+            attempts->push_back({tabs.at(index), true});
     } else {
-        for (int index = start - 1; index >= 0; --index) {
-            if (findInTabAt(index) || queryError)
-                return;
-        }
+        for (int index = start - 1; index >= 0; --index)
+            attempts->push_back({tabs.at(index), true});
     }
-
     if (m_wrapCheck->isChecked()) {
         if (forward) {
-            for (int index = 0; index < start; ++index) {
-                if (findInTabAt(index) || queryError)
-                    return;
-            }
+            for (int index = 0; index < start; ++index)
+                attempts->push_back({tabs.at(index), true});
         } else {
-            for (int index = tabs.size() - 1; index > start; --index) {
-                if (findInTabAt(index) || queryError)
-                    return;
-            }
+            for (int index = tabs.size() - 1; index > start; --index)
+                attempts->push_back({tabs.at(index), true});
         }
-        EditorTab *origin = tabs.at(start);
-        origin->resetSearchPosition(forward);
-        if (findIn(origin, false)) {
-            m_tabWidget->setCurrentWidget(origin);
-            if (m_tab != origin)
-                setActiveTab(origin);
-            origin->setFocusEditor();
+        attempts->push_back({tabs.at(start), true});
+    }
+
+    auto nextIndex = QSharedPointer<int>::create(0);
+    auto step = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weakStep(step);
+    setNavigationUiBusy(true, forward ? QObject::tr("查找下一个…")
+                                      : QObject::tr("查找上一个…"));
+    *step = [this, attempts, nextIndex, weakStep, pattern, forward, hex]() {
+        const auto continuation = weakStep.lock();
+        if (!continuation)
+            return;
+        while (*nextIndex < attempts->size()) {
+            const NavigationAttempt attempt = attempts->at((*nextIndex)++);
+            EditorTab *candidate = attempt.tab.data();
+            if (!isSearchableDocument(candidate)
+                || (hex && !candidate->isHexPresentation())) {
+                continue;
+            }
+            if (attempt.reset)
+                candidate->resetSearchPosition(forward);
+            const bool started = candidate->findNextL2Async(
+                pattern, m_regexCheck->isChecked(), m_caseCheck->isChecked(),
+                m_wordCheck->isChecked(), forward, false, hex, this,
+                [this, candidate = QPointer<EditorTab>(candidate), continuation]
+                (bool found, QString error) {
+                    if (!error.isEmpty() && error != QStringLiteral("已取消。")) {
+                        setNavigationUiBusy(false);
+                        if (m_statusLabel) {
+                            m_statusLabel->setText(compactSearchMessage(error));
+                            m_statusLabel->setToolTip(error);
+                        }
+                        return;
+                    }
+                    if (found && candidate) {
+                        setNavigationUiBusy(false);
+                        if (m_tabWidget)
+                            m_tabWidget->setCurrentWidget(candidate);
+                        if (m_tab != candidate)
+                            setActiveTab(candidate);
+                        candidate->setFocusEditor();
+                        return;
+                    }
+                    QTimer::singleShot(0, this, [continuation]() {
+                        (*continuation)();
+                    });
+                });
+            if (!started) {
+                const QString error = candidate->lastSearchError();
+                if (!error.isEmpty()) {
+                    setNavigationUiBusy(false);
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(compactSearchMessage(error));
+                        m_statusLabel->setToolTip(error);
+                    }
+                    return;
+                }
+                continue;
+            }
             return;
         }
-    }
-    if (!queryError && m_statusLabel) {
-        m_statusLabel->setText(m_wrapCheck->isChecked()
-            ? QStringLiteral("未找到匹配。")
-            : QStringLiteral("已到达搜索范围边界，没有更多匹配。"));
-    }
+        setNavigationUiBusy(false);
+        if (m_statusLabel)
+            m_statusLabel->setText(m_wrapCheck->isChecked()
+                ? QStringLiteral("未找到匹配。")
+                : QStringLiteral("已到范围边界。"));
+    };
+    (*step)();
 }
 
 void FindReplaceDialog::onReplace()
@@ -1028,12 +1054,24 @@ void FindReplaceDialog::onFindAll()
     QString validationError;
     const bool hex = hexBytesMode();
     QByteArray bytePattern;
-    Pcre2Regex validator;
-    const bool valid = hex
-        ? LargeFileSearch::parseHexBytePattern(pattern, &bytePattern, &validationError)
-        : validator.compile(pattern, !m_regexCheck->isChecked(),
-                            m_caseCheck->isChecked(), m_wordCheck->isChecked(),
-                            &validationError);
+    bool valid = false;
+    if (hex) {
+        valid = LargeFileSearch::parseHexBytePattern(
+            pattern, &bytePattern, &validationError);
+    } else if (!allOpenScope() && m_regexCheck->isChecked()
+               && m_tab->isL2Mode() && !m_tab->isHexPresentation()
+               && !EncodedRegexCompiler::isUtf8SubjectEncoding(
+                   m_tab->displayEncoding())) {
+        EncodedRegexCompiler::Output translated;
+        valid = EncodedRegexCompiler::compile(
+            pattern, m_tab->displayEncoding(), m_caseCheck->isChecked(),
+            &translated, &validationError);
+    } else {
+        Pcre2Regex validator;
+        valid = validator.compile(pattern, !m_regexCheck->isChecked(),
+                                  m_caseCheck->isChecked(),
+                                  m_wordCheck->isChecked(), &validationError);
+    }
     bytePattern.fill('\0');
     if (!valid) {
         if (m_statusLabel)
@@ -1074,20 +1112,41 @@ void FindReplaceDialog::onFindAll()
         return;
     }
 
-    // L1 小文件：QsciScintilla 内存扫描 → QTreeWidget
-    auto matches = m_tab->findAll(pattern, m_regexCheck->isChecked(),
-                                  m_caseCheck->isChecked(),
-                                  m_wordCheck->isChecked());
-    if (!m_tab->lastSearchError().isEmpty()) {
+    // S1 is already UTF-8 inside QScintilla, but a near-threshold in-memory
+    // scan is still real work. Snapshot on the UI thread, then compile, scan
+    // and shape rows in the central scheduler.
+    QPointer<EditorTab> target(m_tab);
+    setL2SearchUiBusy(true, QObject::tr("正在搜索…"), true);
+    const bool started = m_tab->findAllL1Async(
+        pattern, m_regexCheck->isChecked(), m_caseCheck->isChecked(),
+        m_wordCheck->isChecked(), this,
+        [this, target, pattern](QVector<SearchMatch> matches, bool truncated,
+                                QString error) mutable {
+            setL2SearchUiBusy(false);
+            if (!target)
+                return;
+            if (!error.isEmpty()) {
+                if (m_statusLabel) {
+                    m_statusLabel->setText(compactSearchMessage(error));
+                    m_statusLabel->setToolTip(error);
+                }
+                return;
+            }
+            target->setSearchHighlights(matches);
+            if (m_resultsDock) {
+                m_resultsDock->setResults(matches, pattern, target->fileName(),
+                                          target, truncated);
+                m_resultsDock->show();
+                m_resultsDock->raise();
+            }
+        });
+    if (!started) {
+        setL2SearchUiBusy(false);
+        const QString error = m_tab->lastSearchError().isEmpty()
+            ? QStringLiteral("搜索任务未能启动。") : m_tab->lastSearchError();
         if (m_statusLabel)
-            m_statusLabel->setText(m_tab->lastSearchError());
-        return;
+            m_statusLabel->setText(compactSearchMessage(error));
     }
-    m_tab->setSearchHighlights(matches);
-    m_resultsDock->setResults(matches, pattern, m_tab->fileName(), m_tab,
-                              m_tab->lastFindAllWasTruncated());
-    m_resultsDock->show();
-    m_resultsDock->raise();
 }
 
 void FindReplaceDialog::startAllOpenFindAll()
@@ -1151,13 +1210,28 @@ void FindReplaceDialog::dispatchNextMultiTarget(int generation)
     const QPointer<EditorTab> guard = m_multiTabs.at(m_multiNextIndex++);
     EditorTab *tab = guard.data();
     if (tab && !tab->isL2Mode()) {
-        const QVector<SearchMatch> matches = tab->findAll(
-            m_multiPattern, m_multiRegex, m_multiCaseSensitive, m_multiWholeWord);
-        const bool incomplete = tab->lastFindAllWasTruncated()
-                                || !tab->lastSearchError().isEmpty();
-        tab->setSearchHighlights(matches);
-        if (m_resultsDock)
-            m_resultsDock->appendMultiFileResults(tab, matches, incomplete);
+        ++m_pendingMultiL2;
+        QPointer<EditorTab> target(tab);
+        const bool started = tab->findAllL1Async(
+            m_multiPattern, m_multiRegex, m_multiCaseSensitive,
+            m_multiWholeWord, this,
+            [this, target, generation](QVector<SearchMatch> matches,
+                                       bool truncated, QString error) mutable {
+                if (generation == m_multiSearchGeneration && target) {
+                    target->setSearchHighlights(matches);
+                    if (m_resultsDock)
+                        m_resultsDock->appendMultiFileResults(
+                            target, matches, truncated || !error.isEmpty());
+                }
+                m_pendingMultiL2 = qMax(0, m_pendingMultiL2 - 1);
+                finishMultiSearchIfReady(generation);
+            });
+        if (!started) {
+            m_pendingMultiL2 = qMax(0, m_pendingMultiL2 - 1);
+            if (m_resultsDock)
+                m_resultsDock->appendMultiFileResults(
+                    tab, QVector<SearchMatch>{}, true);
+        }
     } else if (tab) {
         ++m_pendingMultiL2;
         QPointer<EditorTab> target(tab);

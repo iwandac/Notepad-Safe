@@ -62,6 +62,7 @@
 #include <QtWidgets/QComboBox>
 #include <QtWidgets/QTreeView>
 #include <QtWidgets/QToolButton>
+#include <QtWidgets/QFrame>
 #include <QtWidgets/QListView>
 #include <QtWidgets/QPlainTextEdit>
 #include <QtWidgets/QScrollBar>
@@ -157,10 +158,9 @@ static QAction* findMenuActionByExactDisplay(const MainWindow* top, const QStrin
     return fallback;
 }
 
-// 编码菜单「转为 XXX」和「以编码显示 XXX」动作定位：
-//   先识别 MainWindow 顶层"编码(E)"菜单和"以编码显示"菜单（title 含关键字），
-//   再从这两个 menu 的 actions() 里按 data=int+checkable 收集 5+5 项。
-//   parent 链直接从 QMenu 取 actions()（避免 findChildren 混入 dialog 内部编码 action）。
+// Encoding actions have stable product object names. Display interpretation
+// stays directly in the Encoding menu and is checkable; destructive conversion
+// lives in the folded "转换为" submenu and deliberately is not checkable.
 struct EncodingActions {
     QVector<QAction*> convert;  // 「转为...」5 项（L2 应全灰）
     QVector<QAction*> display;  // 「以编码显示...」5 项（仅文本呈现可点）
@@ -168,49 +168,17 @@ struct EncodingActions {
 static EncodingActions collectEncodingActions(const MainWindow* top) {
     EncodingActions out;
     if (!top) return out;
-    QMenu* encMenu = nullptr;
-    QMenu* displayMenu = nullptr;
-    // QMenuBar::addMenu 返回的 QMenu：parent 实际上是 MainWindow 本身（不是 menuBar()），
-    // 所以我们必须在 MainWindow 全 QMenu 里找 title 匹配（而非 menuBar()->findChildren<QMenu*>）。
-    const auto menus = top->findChildren<QMenu*>();
-    for (QMenu* m : menus) {
-        const QString t = m->title();
-        if (t.contains(QStringLiteral("编码"))
-            && !t.contains(QStringLiteral("显示"))
-            && !t.contains(QStringLiteral("重新打开"))) encMenu = m;
-        if (t.contains(QStringLiteral("以编码显示"))
-            || t.contains(QStringLiteral("显示编码"))
-            || t.contains(QStringLiteral("以编码重新打开"))) displayMenu = m;
-    }
-    auto collectFromMenu = [](QMenu* m, bool wantConvert) -> QVector<QAction*> {
-        QVector<QAction*> r;
-        if (!m) return r;
-        for (QAction* a : m->actions()) {
-            if (!a || a->isSeparator()) continue;
-            const bool hasEncodingData = (a->data().typeId() == QMetaType::Int) && a->isCheckable();
-            if (!hasEncodingData) continue;
-            if (wantConvert && a->text().contains(QStringLiteral("转为"))) r.push_back(a);
-            else if (!wantConvert
-                     && (a->text().contains(QStringLiteral("显示"))
-                         || a->text().contains(QStringLiteral("重新打开")))) r.push_back(a);
+    const auto all = top->findChildren<QAction*>();
+    for (QAction *action : all) {
+        if (!action || !isInMenuOrToolbar(action, top)
+            || action->data().typeId() != QMetaType::Int) {
+            continue;
         }
-        return r;
-    };
-    if (encMenu) out.convert = collectFromMenu(encMenu, true);
-    if (displayMenu) out.display = collectFromMenu(displayMenu, false);
-    // Fallback（找不到 menu title 时）：退而求其次，直接用 MainWindow 全 QAction 按"转为/显示"
-    // + isInMenuOrToolbar 再 + data=int checkable 做筛选（保证测试不挂在结构差异上）
-    if (out.convert.isEmpty() || out.display.isEmpty()) {
-        const auto all = top->findChildren<QAction*>();
-        for (QAction* a : all) {
-            if (!isInMenuOrToolbar(a, top)) continue;
-            const bool hasEncodingData = (a->data().typeId() == QMetaType::Int) && a->isCheckable();
-            if (!hasEncodingData) continue;
-            if (out.convert.isEmpty() && a->text().contains(QStringLiteral("转为"))) out.convert.push_back(a);
-            else if (out.display.isEmpty()
-                     && (a->text().contains(QStringLiteral("显示"))
-                         || a->text().contains(QStringLiteral("重新打开")))) out.display.push_back(a);
-        }
+        if (action->objectName().startsWith(QStringLiteral("encoding.convert.")))
+            out.convert.push_back(action);
+        else if (action->objectName().startsWith(
+                     QStringLiteral("encoding.display.")))
+            out.display.push_back(action);
     }
     std::sort(out.convert.begin(), out.convert.end(), [](QAction* a, QAction* b){ return a->text() < b->text(); });
     std::sort(out.display.begin(), out.display.end(), [](QAction* a, QAction* b){ return a->text() < b->text(); });
@@ -2636,10 +2604,12 @@ private slots:
         const QString screenshot = QCoreApplication::applicationDirPath()
                                    + QStringLiteral("/gui-binary-text-session.png");
         QVERIFY2(restoredWindow->grab().save(screenshot), qPrintable(screenshot));
-        closeAllEditorTabs(restoredWindow);
+        restored->shutdownL2BeforeClose();
         // This case verifies session presentation, not the application-wide
         // close transaction (accounts workspace, autosave and security-session
-        // shutdown). All document resources have already been stopped above.
+        // shutdown). Let the owning MainWindow destroy its tab hierarchy once;
+        // deleting the page separately would run a second L2 teardown while
+        // deferred session restoration still owns queued callbacks.
         delete restoredWindow;
         qputenv("NOTEPADSAFE_DATADIR", primaryTestDataDir_.toUtf8());
     }
@@ -3589,8 +3559,14 @@ private slots:
         dialog->close();
 
         // First F3 selects the second match in A; the next one must cross to B.
+        const long allOpenFirstHit = first->editor()->SendScintilla(
+            QsciScintillaBase::SCI_GETSELECTIONSTART);
         QTest::keyClick(first->editor(), Qt::Key_F3);
-        QCOMPARE(tabs->currentIndex(), 0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            tabs->currentIndex() == 0
+                && first->editor()->SendScintilla(
+                       QsciScintillaBase::SCI_GETSELECTIONSTART) > allOpenFirstHit,
+            1000);
         QTest::keyClick(first->editor(), Qt::Key_F3);
         QTRY_COMPARE_WITH_TIMEOUT(tabs->currentIndex(), 1, 1000);
         auto *second = currentEditorTab(mw_);
@@ -3681,18 +3657,22 @@ private slots:
             context.data(SearchResultsModel::MatchByteRangesRole).toList();
         QCOMPARE(ranges.size(), 1);
 
-        QSignalSpy jumpSpy(dock, &SearchResultsDock::jumpToTab);
+        QSignalSpy jumpPositionSpy(dock, &SearchResultsDock::jumpToTab);
+        QSignalSpy jumpByteSpy(dock, &SearchResultsDock::jumpToTabByteOffset);
         switchToTab(mw_, 0);
-        tree->resizeColumnToContents(SearchResultsModel::COL_CONTEXT);
-        tree->scrollTo(context);
+        const QModelIndex jumpIndex = tree->model()->index(
+            0, SearchResultsModel::COL_LINE, secondGroup);
+        QVERIFY(jumpIndex.isValid());
+        tree->scrollTo(jumpIndex, QAbstractItemView::PositionAtCenter);
         QApplication::processEvents(QEventLoop::AllEvents, 100);
-        const QRect rect = tree->visualRect(context);
+        const QRect rect = tree->visualRect(jumpIndex);
         QVERIFY(rect.isValid());
+        QVERIFY(tree->viewport()->rect().contains(rect.center()));
         QTest::mouseClick(tree->viewport(), Qt::LeftButton,
                           Qt::NoModifier, rect.center());
         QTest::mouseDClick(tree->viewport(), Qt::LeftButton,
                            Qt::NoModifier, rect.center());
-        QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(jumpPositionSpy.count() + jumpByteSpy.count(), 1, 2000);
         QTRY_COMPARE_WITH_TIMEOUT(tabs->currentIndex(), 1, 2000);
         QTRY_COMPARE_WITH_TIMEOUT(second->editor()->selectedText(),
                                   QStringLiteral("TOKEN"), 2000);
@@ -3731,7 +3711,7 @@ private slots:
                     if (cancel && cancel->load(std::memory_order_acquire))
                         return;
                     reportProgress(step, 500);
-                    QThread::msleep(5);
+                    QThread::msleep(100);
                 }
             });
         const qint64 failedId = manager.submit(
@@ -3742,15 +3722,36 @@ private slots:
                const std::function<void(const AsyncErrorInfo &)> &) {
                 throw std::runtime_error("simulated task failure");
             });
+        const qint64 reportedFailureId = manager.submit(
+            AsyncTaskType::Other, AsyncTaskPriority::Normal,
+            QStringLiteral("业务失败任务"), QStringLiteral("结构化错误"),
+            [](qint64, AsyncCancelPtr,
+               const std::function<void(qint64, qint64)> &,
+               const std::function<void(const AsyncErrorInfo &)> &reportError) {
+                AsyncErrorInfo error;
+                error.message = QStringLiteral("simulated reported failure");
+                reportError(error);
+            });
 
         QTRY_VERIFY_WITH_TIMEOUT(manager.taskById(activeId).state
                                  == AsyncTaskState::Running, 3000);
         QTRY_VERIFY_WITH_TIMEOUT(manager.taskById(failedId).state
                                  == AsyncTaskState::Failed, 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(manager.taskById(reportedFailureId).state
+                                 == AsyncTaskState::Failed, 3000);
         QTRY_VERIFY_WITH_TIMEOUT(chip->isVisible(), 3000);
-        QVERIFY(chip->text().contains(QStringLiteral("失败 1")));
+        QVERIFY(chip->text().contains(QStringLiteral("失败 2")));
 
-        QTest::mouseClick(chip, Qt::LeftButton);
+        QFrame *longBubble = nullptr;
+        QTRY_VERIFY_WITH_TIMEOUT(
+            (longBubble = mw_->findChild<QFrame *>(
+                 QStringLiteral("longTaskNotification")))
+                && longBubble->isVisible(),
+            7000);
+        auto *viewLongTask = longBubble->findChild<QPushButton *>(
+            QStringLiteral("viewLongTaskButton"));
+        QVERIFY(viewLongTask && viewLongTask->isVisible());
+        QTest::mouseClick(viewLongTask, Qt::LeftButton);
         auto *panel = mw_->findChild<AsyncTaskPanelDialog *>(
             QStringLiteral("backgroundTaskPanel"));
         QVERIFY(panel != nullptr);
@@ -3766,12 +3767,18 @@ private slots:
         QVERIFY(cancelAll && clearHistory && failedSummary && threadSummary);
         QVERIFY(cancelAll->isEnabled());
         QVERIFY(clearHistory->isEnabled());
-        QCOMPARE(failedSummary->text(), QStringLiteral("失败: 1"));
-        QTRY_VERIFY_WITH_TIMEOUT(threadSummary->text().endsWith(QStringLiteral("/10")),
-                                 2000);
+        QCOMPARE(failedSummary->text(), QStringLiteral("失败: 2"));
+        const int expectedThreads = qBound(
+            1, QThread::idealThreadCount() - 1, 12);
+        QCOMPARE(manager.maximumThreadCount(), expectedThreads);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            threadSummary->text().endsWith(
+                QStringLiteral("/%1").arg(expectedThreads)), 2000);
         QVERIFY(manager.activeThreadCount() >= 1);
-        QVERIFY(manager.activeThreadCount() <= 10);
-        QVERIFY(chip->toolTip().contains(QStringLiteral("/10")));
+        QVERIFY(manager.activeThreadCount() <= expectedThreads);
+        QVERIFY(chip->toolTip().contains(
+            QStringLiteral("/%1").arg(expectedThreads)));
+        QVERIFY(chip->toolTip().contains(QStringLiteral("预计")));
 
         const QString runningShot = QCoreApplication::applicationDirPath()
                                     + QStringLiteral("/gui-background-tasks-running.png");
@@ -3782,7 +3789,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(manager.taskById(activeId).state
                                  == AsyncTaskState::Canceled, 3000);
         QTRY_VERIFY_WITH_TIMEOUT(chip->isVisible(), 2000);
-        QCOMPARE(chip->text(), QStringLiteral("任务失败 1"));
+        QCOMPARE(chip->text(), QStringLiteral("任务失败 2"));
         QVERIFY(!cancelAll->isEnabled());
 
         const QString failedShot = QCoreApplication::applicationDirPath()
@@ -3793,6 +3800,9 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(manager.rowCount(), 0, 2000);
         QTRY_VERIFY_WITH_TIMEOUT(!chip->isVisible(), 2000);
         panel->hide();
+        mw_->show();
+        mw_->raise();
+        mw_->activateWindow();
     }
 
     void tc_native_editor_commands_and_capability_routing() {
@@ -4024,8 +4034,9 @@ private slots:
         EditorTab *tab = currentEditorTab(mw_);
         QVERIFY(tab && !tab->isL2Active());
 
-        tab->editor()->setFocus();
-        QTest::keyClick(tab->editor(), Qt::Key_F, Qt::ControlModifier);
+        auto *findAction = mw_->findChild<QAction *>(QStringLiteral("search.find"));
+        QVERIFY(findAction != nullptr);
+        findAction->trigger();
         auto *dialog = mw_->findChild<FindReplaceDialog *>();
         QTRY_VERIFY_WITH_TIMEOUT(dialog && dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
@@ -4033,9 +4044,14 @@ private slots:
         auto *assistant = dialog->findChild<QWidget *>(QStringLiteral("regexAssistant"));
         auto *regex = dialog->findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
         auto *hint = dialog->findChild<QLabel *>(QStringLiteral("regexQueryHint"));
+        auto *scope = dialog->findChild<QComboBox *>(QStringLiteral("searchScopeCombo"));
         auto *findAll = dialog->findChild<QPushButton *>(QStringLiteral("findAllButton"));
         auto *close = dialog->findChild<QPushButton *>(QStringLiteral("closeSearchButton"));
-        QVERIFY(pattern && toggle && assistant && regex && hint && findAll && close);
+        QVERIFY(pattern && toggle && assistant && regex && hint && scope
+                && findAll && close);
+        const int currentFileScope = scope->findData(0);
+        QVERIFY(currentFileScope >= 0);
+        scope->setCurrentIndex(currentFileScope);
         QVERIFY(!assistant->isVisible());
 
         QTest::mouseClick(toggle, Qt::LeftButton);
@@ -4046,15 +4062,18 @@ private slots:
         QPushButton *digits = buttonWithText(assistant, QStringLiteral("数字"));
         QVERIFY(literal && digits);
 
-        pattern->setFocus();
-        QTest::keyClicks(pattern, QStringLiteral("event.id="));
+        QTest::mouseClick(pattern, Qt::LeftButton);
         QTest::keyClick(pattern, Qt::Key_A, Qt::ControlModifier);
+        QTest::keyClicks(pattern, QStringLiteral("event.id="));
+        QTRY_COMPARE_WITH_TIMEOUT(pattern->text(), QStringLiteral("event.id="), 1000);
+        pattern->selectAll();
+        QCOMPARE(pattern->selectedText(), QStringLiteral("event.id="));
         QTest::mouseClick(literal, Qt::LeftButton);
         QCOMPARE(pattern->text(), QStringLiteral("event\\.id\\="));
         QTest::mouseClick(digits, Qt::LeftButton);
         QCOMPARE(pattern->text(), QStringLiteral("event\\.id\\=\\d+"));
         QTRY_VERIFY_WITH_TIMEOUT(
-            hint->text().contains(QStringLiteral("表达式有效")), 1000);
+            hint->text().contains(QStringLiteral("正则有效")), 1000);
 
         auto *dock = mw_->findChild<SearchResultsDock *>(QStringLiteral("SearchResultsDock"));
         auto *tree = dock ? dock->findChild<QTreeView *>(
@@ -4105,7 +4124,11 @@ private slots:
 
         auto *provider = tab->windowedReadOnlyProvider();
         QVERIFY(provider);
+        mw_->show();
+        mw_->raise();
+        mw_->activateWindow();
         provider->editor()->setFocus();
+        QTRY_VERIFY_WITH_TIMEOUT(provider->editor()->hasFocus(), 1000);
         QTest::keyClick(provider->editor(), Qt::Key_F, Qt::ControlModifier);
         auto *dialog = mw_->findChild<FindReplaceDialog *>();
         QTRY_VERIFY_WITH_TIMEOUT(dialog && dialog->isVisible(), 2000);
@@ -4113,9 +4136,16 @@ private slots:
         auto *regex = dialog->findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
         auto *hint = dialog->findChild<QLabel *>(QStringLiteral("regexQueryHint"));
         auto *findNext = dialog->findChild<QPushButton *>(QStringLiteral("findNextButton"));
+        auto *findAll = dialog->findChild<QPushButton *>(QStringLiteral("findAllButton"));
         auto *close = dialog->findChild<QPushButton *>(QStringLiteral("closeSearchButton"));
         auto *status = dialog->findChild<QLabel *>(QStringLiteral("findStatusLabel"));
-        QVERIFY(pattern && regex && hint && findNext && close && status);
+        auto *dock = mw_->findChild<SearchResultsDock *>(QStringLiteral("SearchResultsDock"));
+        auto *tree = dock ? dock->findChild<QTreeView *>(
+            QStringLiteral("searchResultsTree")) : nullptr;
+        auto *summary = dock ? dock->findChild<QLabel *>(
+            QStringLiteral("searchResultsSummary")) : nullptr;
+        QVERIFY(pattern && regex && hint && findNext && findAll && close
+                && status && dock && tree && summary);
 
         QApplication::clipboard()->setText(gb18030SearchFixture_.regexQuery);
         pattern->setFocus();
@@ -4127,7 +4157,7 @@ private slots:
             QTest::mouseClick(regex, Qt::LeftButton);
         QVERIFY(regex->isChecked());
         QTRY_VERIFY_WITH_TIMEOUT(
-            hint->text().contains(QStringLiteral("表达式有效")), 1000);
+            hint->text().contains(QStringLiteral("正则有效")), 1000);
 
         QElapsedTimer searchElapsed;
         searchElapsed.start();
@@ -4149,8 +4179,34 @@ private slots:
         const QString dialogScreenshot = QCoreApplication::applicationDirPath()
             + QStringLiteral("/gui-search-gb18030-regex-query.png");
         QVERIFY2(dialog->grab().save(dialogScreenshot), qPrintable(dialogScreenshot));
+
+        QTest::mouseClick(findAll, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(dock->isVisible() && tree->model(), 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(tree->model()->rowCount(), 1, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(findAll->isEnabled(), 5000);
+        const QModelIndex result = tree->model()->index(
+            0, SearchResultsModel::COL_CONTEXT);
+        QVERIFY(result.isValid());
+        QVERIFY(result.data(SearchResultsModel::ContextRole).toString().contains(
+            gb18030SearchFixture_.markerText));
+        QVERIFY(!summary->text().contains(QStringLiteral("失效")));
+
         QTest::mouseClick(close, Qt::LeftButton);
         QTRY_VERIFY_WITH_TIMEOUT(!dialog->isVisible(), 1000);
+        QSignalSpy jumpSpy(dock, &SearchResultsDock::jumpToTabByteOffset);
+        tree->scrollTo(result, QAbstractItemView::PositionAtCenter);
+        QApplication::processEvents(QEventLoop::AllEvents, 100);
+        const QRect resultRect = tree->visualRect(result);
+        QVERIFY(resultRect.isValid());
+        QVERIFY(tree->viewport()->rect().contains(resultRect.center()));
+        QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                          Qt::NoModifier, resultRect.center());
+        QTest::mouseDClick(tree->viewport(), Qt::LeftButton,
+                           Qt::NoModifier, resultRect.center());
+        QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(),
+                                  gb18030SearchFixture_.markerOffset, 2000);
+        QVERIFY(!summary->text().contains(QStringLiteral("失效")));
         const QString resultScreenshot = QCoreApplication::applicationDirPath()
             + QStringLiteral("/gui-search-gb18030-result-jump.png");
         QVERIFY2(mw_->grab().save(resultScreenshot), qPrintable(resultScreenshot));

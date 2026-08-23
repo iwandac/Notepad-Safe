@@ -40,8 +40,15 @@ namespace {
 
 constexpr int kSliderMaximum = 1'000'000;
 constexpr qint64 kHexWindowBytes = 256LL * 1024;
-constexpr qint64 kTextWindowBytes = 2LL * 1024 * 1024;
-constexpr qint64 kMaxTextProjectionBytes = 8LL * 1024 * 1024;
+// One MiB is ample for the visible viewport and keeps the first projection
+// comfortably interactive even for a multi-GiB file containing one enormous
+// physical line. Search and indexing read the source directly; large
+// selections may still expand independently.
+constexpr qint64 kTextWindowBytes = 1LL * 1024 * 1024;
+// Completing a physical line is best-effort. An untrusted log can contain a
+// multi-GiB line, so line alignment must not turn a bounded preview into a
+// large synchronous UI allocation. Explicit selections are sized separately.
+constexpr qint64 kMaxTextProjectionBytes = 1LL * 1024 * 1024;
 constexpr qint64 kMaxClipboardBytes = 64LL * 1024 * 1024;
 constexpr qint64 kLinePrefixChunkBytes = 1LL * 1024 * 1024;
 constexpr qint64 kLineScanReadBytes = 16LL * 1024 * 1024;

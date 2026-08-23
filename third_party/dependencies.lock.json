@@ -140,26 +140,6 @@
         "files": 521,
         "normalization": "upstream .gitignore files preserved as .gitignore.upstream so signed-tag inputs cannot be hidden"
       }
-    },
-    {
-      "name": "Boost.Regex",
-      "status": "active",
-      "version": "1.90.0",
-      "revision": "boost-1.90.0",
-      "source": "https://github.com/boostorg/regex/archive/refs/tags/boost-1.90.0.zip",
-      "license": "BSL-1.0",
-      "integration": "vendored-source-header-only-standalone-build",
-      "local_path": "third_party/src/boost-regex-1.90.0",
-      "source_integrity": {
-        "kind": "sha256",
-        "value": "26d28f21687ef81b86a91faed4cf1a833cb10758fdce16e23d4d7160fde1baef"
-      },
-      "integrity": {
-        "kind": "source-tree-sha256",
-        "value": "ce0687fd1ec26aa2028f75c39c7f8f78da25a8459b1fc89f419c12737fadf832",
-        "files": 380,
-        "normalization": "standalone component archive plus the canonical Boost Software License 1.0 text referenced by the upstream files"
-      }
     }
   ]
 }
