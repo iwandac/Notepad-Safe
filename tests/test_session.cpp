@@ -102,7 +102,7 @@ void test_load_valid_session()
     tab1["cursorLine"] = 10;
     tab1["cursorIndex"] = 5;
     tab1["modified"] = true;
-    tab1["autosavePath"] = "/tmp/autosave_0.tmp";
+    tab1["autosavePath"] = QDir(sm.autosaveDir()).filePath("autosave_0.tmp");
     tabsArray.append(tab1);
 
     QJsonObject tab2;
@@ -135,6 +135,73 @@ void test_load_valid_session()
     }
 
     cleanupTestData(dir);
+}
+
+void test_untrusted_session_boundaries()
+{
+    TEST("会话输入资源上限与 autosave 路径边界");
+    const QString dir = testDataDir() + "_input_boundaries";
+    const QString outsideDir = testDataDir() + "_outside_autosave";
+    cleanupTestData(dir);
+    cleanupTestData(outsideDir);
+    QDir().mkpath(outsideDir);
+    SessionManager sm(dir);
+
+    const QString outsidePath = QDir(outsideDir).filePath("autosave_victim.ndraft");
+    QString draftError;
+    CHECK(DraftStore::writeSnapshot(outsidePath, QByteArrayLiteral("do-not-delete"),
+                                    &draftError),
+          "建立 autosave 目录外的有效加密文件");
+
+    QJsonArray tabs;
+    for (int i = 0; i < 300; ++i) {
+        QJsonObject tab;
+        tab["filePath"] = QStringLiteral("/test/%1.txt").arg(i);
+        tab["syntax"] = i == 0 ? 999 : 0;
+        tab["cursorLine"] = i == 0 ? -9 : i;
+        tab["autosavePath"] = i == 0 ? outsidePath : QString();
+        tabs.append(tab);
+    }
+    QJsonObject root;
+    root["version"] = 2;
+    root["tabs"] = tabs;
+    root["activeTab"] = 9999;
+    CHECK(writeTestSessionFile(sm.sessionFilePath(), root), "写入越界会话 fixture");
+
+    const SessionData bounded = sm.loadSession();
+    CHECK(bounded.tabs.size() == 256, "恢复标签数量被限制为 256");
+    CHECK(bounded.activeTab == 255, "活动标签索引被限制到已接受范围");
+    CHECK(!bounded.tabs.isEmpty() && bounded.tabs.first().syntax == int(Syntax::Asm)
+              && bounded.tabs.first().cursorLine == 0,
+          "损坏的枚举和负光标位置被收敛到有效值");
+    CHECK(!bounded.tabs.isEmpty() && bounded.tabs.first().autosavePath.isEmpty(),
+          "普通会话拒绝 autosave 目录外的恢复路径");
+
+    auto tab = std::make_unique<EditorTab>();
+    CHECK(!sm.restoreAutosave(tab.get(), outsidePath),
+          "直接恢复也拒绝 autosave 目录外的文件");
+    tab->editor()->setText(QStringLiteral("replacement"));
+    tab->setModified(true);
+    tab->setAutosavePath(outsidePath);
+    CHECK(sm.saveSession({tab.get()}, 0, true), "无效旧路径不阻止建立新的受管恢复点");
+    CHECK(QFileInfo::exists(outsidePath), "迁移清理不会删除 autosave 目录外的文件");
+
+    QFile oversized(sm.sessionFilePath());
+    CHECK(oversized.open(QIODevice::WriteOnly | QIODevice::Truncate),
+          "打开超大会话 fixture");
+    if (oversized.isOpen()) {
+        oversized.resize(4LL * 1024 * 1024 + 1);
+        oversized.close();
+    }
+    CHECK(sm.loadSession().tabs.isEmpty(), "超过 4 MiB 的会话文件在解析前被拒绝");
+
+    root["version"] = 99;
+    root["tabs"] = QJsonArray{QJsonObject{{"filePath", "/test/future.txt"}}};
+    CHECK(writeTestSessionFile(sm.sessionFilePath(), root), "写入未知版本会话 fixture");
+    CHECK(sm.loadSession().tabs.isEmpty(), "未知会话版本 fail closed");
+
+    cleanupTestData(dir);
+    cleanupTestData(outsideDir);
 }
 
 void test_load_corrupted_session()
@@ -471,6 +538,7 @@ int main(int argc, char *argv[])
     test_worker_limit_and_unicode_character_count();
     test_load_valid_session();
     test_load_corrupted_session();
+    test_untrusted_session_boundaries();
     test_clear_session();
     test_autosave_dir_exists();
     test_session_tab_default_values();

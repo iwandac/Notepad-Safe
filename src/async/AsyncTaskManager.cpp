@@ -73,6 +73,11 @@ QHash<int, QByteArray> AsyncTaskManager::roleNames() const
     rn[TaskProgressDoneRole]      = "progressDone";
     rn[TaskProgressTotalRole]     = "progressTotal";
     rn[TaskPercentRole]           = "percent";
+    rn[TaskPercentHundredthsRole] = "percentHundredths";
+    rn[TaskProgressPhaseRole]     = "progressPhase";
+    rn[TaskProgressPhaseIndexRole]= "progressPhaseIndex";
+    rn[TaskProgressPhaseCountRole]= "progressPhaseCount";
+    rn[TaskCompletedPhasesRole]   = "completedPhases";
     rn[TaskCreatedAtRole]         = "createdAt";
     rn[TaskStartedAtRole]         = "startedAt";
     rn[TaskFinishedAtRole]        = "finishedAt";
@@ -105,7 +110,10 @@ QVariant AsyncTaskManager::data(const QModelIndex &index, int role) const
         t = taskAtUnlocked(tasks_, history_, index.row());
     }
     switch (role) {
-    case Qt::DisplayRole:           return QStringLiteral("%1 [%2] %3%").arg(t.title, t.stateText(), t.percent() < 0 ? QStringLiteral("-") : QString::number(t.percent()));
+    case Qt::DisplayRole:           return QStringLiteral("%1 [%2] %3%")
+        .arg(t.title, t.stateText(),
+             t.percentHundredths() < 0 ? QStringLiteral("-")
+                 : QString::number(t.percentHundredths() / 100.0, 'f', 2));
     case TaskIdRole:                return t.id;
     case TaskBatchIdRole:           return t.batchId;
     case TaskTypeRole:              return static_cast<int>(t.type);
@@ -116,6 +124,11 @@ QVariant AsyncTaskManager::data(const QModelIndex &index, int role) const
     case TaskProgressDoneRole:      return QVariant::fromValue(t.progressDone);
     case TaskProgressTotalRole:     return QVariant::fromValue(t.progressTotal);
     case TaskPercentRole:           return t.percent();
+    case TaskPercentHundredthsRole: return t.percentHundredths();
+    case TaskProgressPhaseRole:     return t.progressPhase;
+    case TaskProgressPhaseIndexRole:return t.progressPhaseIndex;
+    case TaskProgressPhaseCountRole:return t.progressPhaseCount;
+    case TaskCompletedPhasesRole:   return t.completedPhases;
     case TaskCreatedAtRole:         return t.createdAt;
     case TaskStartedAtRole:         return t.startedAt;
     case TaskFinishedAtRole:        return t.finishedAt;
@@ -421,35 +434,126 @@ void AsyncTaskManager::clearHistory()
 void AsyncTaskManager::updateTaskProgressImpl(qint64 taskId, qint64 done, qint64 total)
 {
     int row = -1;
+    qint64 effectiveDone = done;
+    qint64 effectiveTotal = total;
     {
         QMutexLocker lk(&mu_);
         int idx = findTaskIndex(tasks_, taskId);
         if (idx < 0) return;
-        tasks_[idx].progressDone = done;
-        if (total > 0) tasks_[idx].progressTotal = total;
+        AsyncTask &task = tasks_[idx];
+        if (total > 0)
+            task.progressTotal = total;
+        effectiveTotal = task.progressTotal;
+        if (effectiveTotal > 0)
+            effectiveDone = qBound<qint64>(0, done, effectiveTotal);
+        // A phase has one linear scale.  Late queued reports and a wrapped
+        // subscan must never make its visible progress move backwards.
+        effectiveDone = qMax(effectiveTotal > 0
+                                 ? qMin(task.progressDone, effectiveTotal)
+                                 : task.progressDone,
+                             effectiveDone);
+        if (effectiveDone != task.progressDone)
+            ++task.progressSamples;
+        task.progressDone = effectiveDone;
         row = idx;
     }
     if (row >= 0) {
         Q_EMIT dataChanged(index(row), index(row));
-        emit taskProgressChanged(taskId, done, total);
+        emit taskProgressChanged(taskId, effectiveDone, effectiveTotal);
     }
 }
 
 void AsyncTaskManager::updateTaskProgress(qint64 taskId, qint64 done, qint64 total)
 {
     int row = -1;
+    qint64 effectiveDone = done;
+    qint64 effectiveTotal = total;
     {
         QMutexLocker lk(&mu_);
         int idx = findTaskIndex(tasks_, taskId);
         if (idx < 0) return;
-        tasks_[idx].progressDone = done;
-        if (total > 0) tasks_[idx].progressTotal = total;
+        AsyncTask &task = tasks_[idx];
+        if (total > 0)
+            task.progressTotal = total;
+        effectiveTotal = task.progressTotal;
+        if (effectiveTotal > 0)
+            effectiveDone = qBound<qint64>(0, done, effectiveTotal);
+        effectiveDone = qMax(effectiveTotal > 0
+                                 ? qMin(task.progressDone, effectiveTotal)
+                                 : task.progressDone,
+                             effectiveDone);
+        if (effectiveDone != task.progressDone)
+            ++task.progressSamples;
+        task.progressDone = effectiveDone;
         row = idx;
     }
     if (row >= 0) {
         Q_EMIT dataChanged(index(row), index(row));
-        emit taskProgressChanged(taskId, done, total);
+        emit taskProgressChanged(taskId, effectiveDone, effectiveTotal);
     }
+}
+
+void AsyncTaskManager::updateTaskPhaseImpl(
+    qint64 taskId, const QString &phase, int phaseIndex, int phaseCount,
+    qint64 done, qint64 total)
+{
+    int row = -1;
+    qint64 clampedDone = done;
+    {
+        QMutexLocker lk(&mu_);
+        const int idx = findTaskIndex(tasks_, taskId);
+        if (idx < 0) return;
+        AsyncTask &task = tasks_[idx];
+        const bool changedPhase = task.progressPhase != phase
+            || task.progressPhaseIndex != phaseIndex;
+        if (changedPhase) {
+            if (!task.progressPhase.isEmpty()
+                && !task.completedPhases.contains(task.progressPhase)) {
+                task.completedPhases.append(task.progressPhase);
+            }
+            task.progressPhase = phase;
+            task.progressPhaseIndex = qMax(0, phaseIndex);
+            task.progressPhaseCount = qMax(task.progressPhaseIndex, phaseCount);
+            task.phaseStartedAt = QDateTime::currentDateTime();
+            task.progressSamples = 0;
+            task.progressDone = 0;
+        }
+        if (total > 0)
+            task.progressTotal = total;
+        if (task.progressTotal > 0)
+            clampedDone = qBound<qint64>(0, done, task.progressTotal);
+        if (!changedPhase) {
+            clampedDone = qMax(task.progressTotal > 0
+                                   ? qMin(task.progressDone, task.progressTotal)
+                                   : task.progressDone,
+                               clampedDone);
+        }
+        if (clampedDone != task.progressDone)
+            ++task.progressSamples;
+        task.progressDone = clampedDone;
+        row = idx;
+    }
+    if (row >= 0) {
+        Q_EMIT dataChanged(index(row), index(row));
+        emit taskProgressChanged(taskId, clampedDone, total);
+        emit taskPhaseChanged(taskId, phase, phaseIndex, phaseCount,
+                              clampedDone, total);
+    }
+}
+
+void AsyncTaskManager::updateTaskPhase(
+    qint64 taskId, const QString &phase, int phaseIndex, int phaseCount,
+    qint64 done, qint64 total)
+{
+    if (QThread::currentThread() != thread()) {
+        QMetaObject::invokeMethod(
+            this, "updateTaskPhaseImpl", Qt::QueuedConnection,
+            Q_ARG(qint64, taskId), Q_ARG(QString, phase),
+            Q_ARG(int, phaseIndex), Q_ARG(int, phaseCount),
+            Q_ARG(qint64, done), Q_ARG(qint64, total));
+        return;
+    }
+    updateTaskPhaseImpl(taskId, phase, phaseIndex, phaseCount, done, total);
 }
 
 void AsyncTaskManager::markTaskRunningImpl(qint64 taskId)
@@ -461,6 +565,7 @@ void AsyncTaskManager::markTaskRunningImpl(qint64 taskId)
         if (idx < 0) return;
         tasks_[idx].state = AsyncTaskState::Running;
         tasks_[idx].startedAt = QDateTime::currentDateTime();
+        tasks_[idx].phaseStartedAt = tasks_[idx].startedAt;
         row = idx;
     }
     if (row >= 0) {

@@ -168,9 +168,9 @@ Windowed Provider 是一个无限文档的有限投影，必须模拟普通编�
 |---|---|---|---|
 | `LF-UX-001` | **Round 9 已关闭。** 有界投影扩展到完整逻辑长行并跟踪真实水平宽度；全局位置不受窗口切换影响 | 关闭换行时可从行首连续到达最后字符；切换窗口不改变水平位置 | 长行横向 GUI、0/25/50/75/100% 全局位置及实际 200% DPI S2/S3 4/4 通过 |
 | `LF-UX-002` | **Round 9 已关闭。** wheel/pixelDelta 在窗口内逐行移动，只在重叠边界换页 | 小幅滚轮显示相邻行；跨窗口无重复、gap、闪回和大跳 | 五个窗口双向滚轮/触控板、末尾稳定等待与 4.59 GiB 搜索跳转通过；`gui-largefile-200dpi-round9.txt` |
-| `HEX-UX-001` | **Round 3 已关闭核心阻断。** offset/Hex/ASCII 共用 byte selection，B1 编辑/Undo/保存与搜索跳转已动态验收；字节通配符和 Inspector 留作后续增强 | offset、Hex、ASCII、caret、selection、编辑、搜索和保存形成一致模型 | `gui-hex-round3-slice.txt`、`gui-hex-search-final.txt` 与逐字节 round-trip 均通过 |
+| `HEX-UX-001` | **Round 3 已关闭核心阻断。** offset/Hex/编码字符区共用 byte selection，B1 编辑/Undo/保存与搜索跳转已动态验收；字节通配符和 Inspector 留作后续增强 | offset、Hex、字符区、caret、selection、编辑、搜索和保存形成一致模型 | `gui-hex-round3-slice.txt`、`gui-hex-search-final.txt` 与逐字节 round-trip 均通过 |
 | `HEX-UX-002` | **Round 9 已关闭。** B1/B2/B3 均按 viewport 选择完整 4-byte 分组；宽窄重排不裁切首末 nibble，也不继承旧横向偏移 | 依据窗口宽度采用合适 bytes-per-row；窄/宽窗口紧凑可读 | 默认/窄宽截图及实际 200% DPI 编辑—保存—重开、崩溃恢复 4/4 通过；`gui-hex-200dpi-round9.txt` |
-| `TIER-UX-003` | **部分关闭。** Binary 可见契约已统一：B1/B2/B3 均为地址 margin、纯 Hex 网格、独立 ASCII pane、两表面同步滚轮和唯一全局纵向滚动条；Binary→Text 后统一切换为文本行号。内部 Provider 仍不同，Text S1/S2/S3 的几何与模式迁移一致性尚未关闭 | Text 各 Tier 共用 EditorSurface；Binary 各 Tier 共用 HexView 可见契约；只允许 capability/状态文案不同 | `windowedHexUsesUnifiedThreeColumnByteContract`、`windowedHexBothPanesWheelInLockstep`、Binary→Text gutter/会话恢复、真实 228MB/4.9GB 样本与 B1 邻接回归通过；Text 同内容切片及 S1 可编辑表面与 S2/S3 只读表面的逐帧几何一致性仍待证明 |
+| `TIER-UX-003` | **部分关闭。** Binary 可见契约已统一：B1/B2/B3 均为地址 margin、纯 Hex 网格、编码字符 pane、两表面同步滚轮和唯一全局纵向滚动条；Binary→Text 后统一切换为十进制 byte-offset gutter 且不构建全文行索引。内部 Provider 仍不同，可信 Text S1/S2/S3 的几何与模式迁移一致性尚未关闭 | Text 各 Tier 共用 EditorSurface；Binary 各 Tier 共用 HexView 可见契约；只允许 capability/状态文案不同 | `windowedHexUsesUnifiedThreeColumnByteContract`、`windowedHexBothPanesWheelInLockstep`、Binary Text byte-offset/零扫描、真实 228MB/4.9GB 样本与 B1 邻接回归通过；Text 同内容切片及 S1 可编辑表面与 S2/S3 只读表面的逐帧几何一致性仍待证明 |
 
 除上述已复现项外，下面是必须主动探索的风险。它们不表示已经观察到缺陷，但在关闭对应旅程前必须用动态测试证明不存在：
 
@@ -184,7 +184,7 @@ Windowed Provider 是一个无限文档的有限投影，必须模拟普通编�
 | `LF-RISK-008` | 编码字符、CRLF 或超长逻辑行在窗口边界损坏 | 把 UTF-8/16/GBK、多字节 emoji、CRLF 和 200 MiB 单行分别放在边界前后逐字符核对 |
 | `LF-RISK-009` | 全局行号与 byte offset 混淆，Go To/状态栏误导 | 在稀疏索引未完成、部分完成、完成三阶段执行 Go To line/byte 并核对状态栏和正文 |
 | `LF-RISK-010` | 归一化滚动条在 10+ GiB 上丢失 EOF 或相邻位置分辨率 | 头/中/尾、最后 1 byte、细拖与键盘微调；确认覆盖完整且 tooltip 给出真实 64 位位置 |
-| `HEX-RISK-003` | nibble/ASCII caret 不同步或覆盖错 byte | 对 0x00–0xFF fixture 交替从两栏键入、Undo/Redo，逐步核对 caret 与磁盘 byte |
+| `HEX-RISK-003` | nibble/字符区 caret 不同步或覆盖错 byte | 对单字节和多字节 fixture 交替从两栏键入、IME、Undo/Redo，逐步核对 caret 与磁盘 byte |
 | `HEX-RISK-004` | selection、复制格式、Paste 和 EOF 非完整行有 off-by-one | 覆盖空选择、1/15/16/17 bytes、跨行、跨窗口和 EOF，逐种 Copy As/Paste round-trip |
 | `HEX-RISK-005` | 切换 bytes-per-row/DPI 后地址、选择或跳转改变 | 保持同一 absolute selection，依次改变窗口宽度、DPI 和 8/16/32 布局并核对三栏 |
 | `ROUTE-RISK-001` | Ctrl+O、拖放、CLI、最近、恢复和搜索结果得到不同 Provider | 同一 fixture 经六条入口打开，比较 ProbeResult、Persistence、Presentation、SizeTier 和菜单能力 |
@@ -198,21 +198,21 @@ Windowed Provider 是一个无限文档的有限投影，必须模拟普通编�
 
 ### 7.1 视觉模型
 
-成熟 Hex 视图默认使用三列：固定宽度绝对 offset、字节值网格、字符解释。三列共享同一个 byte selection 和纵向位置。
+成熟 Hex 视图默认使用三列：固定宽度绝对 offset、字节值网格、编码字符解释。三列共享同一个 byte selection 和纵向位置。
 
 - Offset 足以显示当前文件最大地址，2 GiB+ 不截断；默认十六进制并保持等宽对齐。
 - 默认每行 16 bytes；可根据宽度选择 8/16/32 或“动态但只换完整 byte group”，不允许任意折行破坏地址心算。
-- Hex bytes 按 4 或 8 分组增强扫描；ASCII 中不可打印字符使用统一占位符，不改变 byte 数量。
+- Hex bytes 按 4 或 8 分组增强扫描；字符区按当前编码优先还原合法多字节序列，不可打印或非法单元使用不破坏 byte 定位的占位符。
 - 窄窗口优先保住 offset 和 Hex；字符列可按设置隐藏。宽窗口若仍有剩余空间，应保持紧凑居左或展示可选 Data Inspector，不把数据稀疏拉伸到难以扫读。
 - Data Inspector 是次要工具：只在选中 byte 时显示 unsigned/signed integer、float、endianness 等解释；默认不抢占编辑宽度，也不成为完成 Hex 基础体验的前置条件。
 
 ### 7.2 导航、选择和编辑
 
-- 点击 Hex 的高/低 nibble、ASCII 字符、offset 行区都有确定 caret；左右键按 nibble/byte 前进，上下键保持列。
-- Hex 和 ASCII 两栏选择完全同步；Shift、鼠标拖选、Ctrl+A、选择范围、Go to Offset 使用 byte range。
+- 点击 Hex 的高/低 nibble、字符区字符、offset 行区都有确定 caret；左右键按 nibble/byte 前进，上下键保持列。
+- Hex 和字符两栏选择完全同步；Shift、鼠标拖选、Ctrl+A、选择范围、Go to Offset 使用 byte range。
 - 状态栏显示 absolute offset、selection byte count、INS/OVR、文件大小和 B1/B2/B3 能力。
-- Copy 默认提供人可读 Hex；“复制为”支持原始 bytes、十六进制、ASCII/UTF-8、C array。Paste 先验证格式并在执行前确定插入/覆盖语义。
-- Hex/ASCII 字节面不承载 Unicode 输入法预编辑文本。IME 候选提交必须先整段校验：Hex 仅接受 `0–9/A–F`，ASCII 仅接受可打印单字节 Latin-1；非法候选原子拒绝，合法多 nibble 提交作为一个字节事务进入 OVR/INS 和 Undo，不得直接改写显示投影。切回 Text 后必须恢复正常中文输入法。
+- Hex 字节网格 Copy 提供人可读 Hex；字符区 Copy 的可见文本按当前编码解码，同时携带应用私有原始 bytes。普通应用获得文本，Notepad Safe 内部粘贴优先使用原始 bytes；Find 粘贴把私有 bytes 转为 Hex 精确查询。
+- Hex 字节网格不承载 Unicode 输入法；只接受 `0–9/A–F`。字符区可以使用输入法，但不把 preedit 写进投影；IME commit 和直接文本先按当前显示编码严格编码，合法多字节结果作为一个 byte 事务进入 OVR/INS 与 Undo/Redo，不可表示或控制输入原子拒绝。切回 Text 后保持正常输入法。
 - B1 可支持插入和覆盖，并有 Undo/Redo、保存和 hash round-trip。
 - B2 固定长度写穿只有在 crash-safe journal、外部冲突、跨窗口撤销和保存测试通过后启用；当前稳定策略是只读单滚动 fallback。
 - B3 永久只读；任何键入、Paste、Cut、Delete 和 Replace 都不能修改 mmap 或产生误导 dirty 标记。
@@ -220,10 +220,10 @@ Windowed Provider 是一个无限文档的有限投影，必须模拟普通编�
 
 ### 7.3 Hex 搜索
 
-- 查询类型明确为 Hex bytes、ASCII、UTF-8 text。当前发布的 Hex bytes 接受连续、空格、逗号、
+- 查询类型明确为 Hex bytes 或按当前显示编码解释的 text。当前发布的 Hex bytes 接受连续、空格、逗号、
   连字符、下划线和逐字节 `0x` 写法；byte wildcard 属于后续显式语法扩展，不能在未实现时展示。
 - Find Next/Previous、Find All、范围和结果 Dock 与 Text 共用 SearchSession，但 Match 的 PositionSpace 为 SourceBytes。
-- 双击结果后必须同时定位 offset、Hex selection 和 ASCII selection；不能只滚到大概窗口。
+- 双击结果后必须同时定位 offset、Hex selection 和字符区 selection；不能只滚到大概窗口。
 - 当前发布的搜索对话框不提供 Hex bytes Replace；替换输入和两个替换按钮必须灰显，字节修改走
   Hex 编辑器的 INS/OVR、选择、粘贴和 Undo 契约。未来若增加 bytes Replace，需另行定义长度、
   wildcard 捕获和 B1/B2 写入事务，不能误走 Text replacement。
@@ -287,6 +287,8 @@ Regex 必须共用当前编码投影；非法单元以可定位 U+FFFD 参与文
 - S1 正文在应用解码后以显式 UTF-8 进入 QScintilla；S2/S3 仍以原始字节为权威，正则只通过
   storage adapter 按 scalar 读取，不能把 S1 的内部 UTF-8 事实误推广为大文件全文转码。
 - 编辑后仅相应 target 结果 stale；过期结果禁止近似跳转，并提供重新搜索。
+- 每个 target 的搜索身份包含 revision、编码和 Text/Hex 呈现；切换编码或呈现不能复用旧导航缓存，也不能让旧异步回调选中当前正文。
+- Dock 渐进批次和最终结果冻结各自 target 的编码、byte range、上下文和高亮；切换活动标签或 resize 只改变绘制，不重新解码或缩短 Model 内容。
 - Secure 内容的 query、context、spool 和结果只存在于受控内存/加密临时数据；立即锁定后全部清除且恢复时不闪现。
 
 ### 8.3 替换
@@ -396,7 +398,7 @@ Regex 必须共用当前编码投影；非法单元以可定位 U+FFFD 参与文
 | 编码/EOL | 检测、重开、转换、BOM、状态栏 | UTF-8/16/GBK 与 CRLF/LF golden 保存重开 |
 | S2 | 快速只读、连续浏览、搜索、复制 | 256 MiB 与接近 2 GiB 的头/中/尾浏览；确认无编辑后台任务 |
 | S3 | 全范围只读、搜索、Tail 可选 | 4.59 GiB/10+ GiB 滚动、搜索、跳转、取消 |
-| Hex | 三栏、nibble/ASCII、选择、复制、Go to、Find | 0–255、EOF、跨窗口、B1 写入与 B2/B3 只读 |
+| Hex | 三栏、nibble/编码字符区、选择、复制、Go to、Find | 单/多字节、非法序列、EOF、跨窗口、B1 写入与 B2/B3 只读 |
 | 查找 | 当前/全部打开、literal/regex/byte；目录明确不在本版 | 真实对话框输入、F3、范围切换、取消 |
 | 查找全部 | 渐进 Dock、分组、高亮、精确双击 | S1/S2/S3/Secure/Hex 混合文件多位置跳转 |
 | 替换 | 当前和 eligible 全部打开、Undo、跳过报告 | Plain/Secure 保持类型，S3 明确跳过 |
@@ -448,7 +450,7 @@ TaskId / Phase / CompletedBytes / TotalBytes / CancelState
 
 - 菜单/对话框裁切、默认按钮、焦点框、tooltip、快捷键冲突。
 - 编辑器 gutter、滚动条、查找 indicator、selection、当前行和只读态对比度。
-- Hex offset/bytes/ASCII 对齐和有效空间利用。
+- Hex offset/bytes/编码字符区对齐和有效空间利用。
 - Search Dock 在窄高、宽矮、百万结果、长路径和 Unicode context 下仍可读。
 - Accounts 空态、列表/详情、编辑、回收站、密码揭示和窄屏返回路径。
 
@@ -470,7 +472,7 @@ TaskId / Phase / CompletedBytes / TotalBytes / CancelState
 
 ### Journey B：未知二进制
 
-统一打开→自动 Hex→offset/ASCII 联动选择→查找 byte pattern→B1 编辑保存或 B2/B3 明确只读→以文本重新解释。不会把二进制静默损坏成文本。
+统一打开→自动 Hex→offset/字符区联动选择→查找 byte pattern→B1 编辑保存或 B2/B3 明确只读→以文本重新解释。不会把二进制静默损坏成文本。
 
 ### Journey C：默认安全 Note
 
@@ -507,6 +509,15 @@ TaskId / Phase / CompletedBytes / TotalBytes / CancelState
 5. 运行最小相关组件测试和 GUI 旅程；通过后才运行相邻回归，控制构建和大文件扫描次数。
 6. 人工检查截图/实际窗口；布局、连续性或焦点不合格就不把自动化绿色视为完成。
 7. 更新功能总账、已知问题、证据和阶段状态；只在用户文件兼容、安全边界或不可逆决策变化时暂停询问。
+
+产品状态恢复不采用“退回修改前版本”作为默认答案。目标始终是：保留已接受的新能力，恢复修改前
+仍有价值的行为，并删除已确认缺陷。每个批次必须按用户旅程识别影响面，而不是只测试改动函数：
+
+- 文档/真实 bytes、显示投影、键盘与 IME、选择和剪贴板、搜索与 Dock、保存、关闭重开及会话恢复构成一条完整影响链；变化触及哪一段，就验证该段及其下游消费者。
+- 自动化通过不能代替展示中的窗口行为；复制内容、焦点、resize、高亮、状态栏和进度必须从用户可见结果验证。
+- 旧测试与新目标冲突时，必须说明旧断言保护的是缺陷还是仍有效能力；更新旧断言的同时补充新能力和相邻不回退断言。
+- 测试成本与改动成比例：先跑最小定向门禁，再跑受影响的完整功能组和用户旅程；不把未执行的安全、安装或视觉门禁宣称为已恢复。
+- 最终产品与通过测试的程序必须来自同一干净构建；增量产物只能用于诊断，不能作为跨公共接口改动的最终证据。
 
 优先级固定：数据不丢/安全边界 > 打开、编辑、保存基本可用 > 连续浏览与搜索正确 > 状态和错误可理解 > 效率与视觉精修 > 可选高级功能。
 

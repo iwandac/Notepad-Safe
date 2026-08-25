@@ -250,6 +250,191 @@ std::function<qint64(qint64)> makeByteCandidateFinder(
     };
 }
 
+qint64 findPreviousByteLiteral(
+    const uchar *subject, qint64 subjectSize, const QByteArray &needle,
+    bool caseSensitive, qint64 startInclusive, qint64 endExclusive,
+    const std::function<bool()> &isCancelled,
+    const std::function<void(qint64)> &reportProgress)
+{
+    if (!subject || needle.isEmpty() || endExclusive <= startInclusive)
+        return subjectSize + 1;
+    const qint64 last = qMin(endExclusive - qint64(needle.size()),
+                             subjectSize - qint64(needle.size()));
+    if (last < startInclusive)
+        return subjectSize + 1;
+
+    constexpr qint64 CancelStep = Q_INT64_C(256) * 1024;
+    constexpr qint64 ProgressStep = Q_INT64_C(1) * 1024 * 1024;
+    qint64 examined = 0;
+    qint64 nextCancel = CancelStep;
+    qint64 nextProgress = ProgressStep;
+    const uchar tail = foldCaseAscii(uchar(needle.back()), caseSensitive);
+    for (qint64 candidate = last; candidate >= startInclusive; --candidate) {
+        ++examined;
+        if (examined >= nextCancel) {
+            nextCancel += CancelStep;
+            if (isCancelled && isCancelled())
+                return -1;
+        }
+        if (examined >= nextProgress) {
+            nextProgress += ProgressStep;
+            if (reportProgress)
+                reportProgress(examined);
+        }
+        if (foldCaseAscii(subject[candidate + needle.size() - 1],
+                          caseSensitive) != tail) {
+            continue;
+        }
+        bool same = true;
+        for (qsizetype index = 0; index < needle.size(); ++index) {
+            if (foldCaseAscii(subject[candidate + index], caseSensitive)
+                != foldCaseAscii(uchar(needle.at(index)), caseSensitive)) {
+                same = false;
+                break;
+            }
+        }
+        if (same)
+            return candidate;
+    }
+    if (reportProgress)
+        reportProgress(last - startInclusive + 1);
+    return subjectSize + 1;
+}
+
+bool unicodeWordCharacter(const QString &text, int index)
+{
+    if (index < 0 || index >= text.size())
+        return false;
+    uint scalar = text.at(index).unicode();
+    if (text.at(index).isLowSurrogate() && index > 0
+        && text.at(index - 1).isHighSurrogate()) {
+        scalar = QChar::surrogateToUcs4(text.at(index - 1), text.at(index));
+    } else if (text.at(index).isHighSurrogate() && index + 1 < text.size()
+               && text.at(index + 1).isLowSurrogate()) {
+        scalar = QChar::surrogateToUcs4(text.at(index), text.at(index + 1));
+    }
+    return scalar == uint('_') || QChar::isLetterOrNumber(scalar);
+}
+
+bool literalWholeWordAccepted(const QString &text, int start, int length,
+                              const QString &pattern)
+{
+    if (pattern.isEmpty())
+        return false;
+    const bool requireLeft = needsRawWordBoundary(edgeCodePoint(pattern, true));
+    const bool requireRight = needsRawWordBoundary(edgeCodePoint(pattern, false));
+    return (!requireLeft || start == 0 || !unicodeWordCharacter(text, start - 1))
+        && (!requireRight || start + length >= text.size()
+            || !unicodeWordCharacter(text, start + length));
+}
+
+QVector<qint32> utf16ToSourceBoundaries(const DecodedTextProjection &projection)
+{
+    QVector<qint32> mapping(projection.text.size() + 1, 0);
+    int utf16 = 0;
+    const int scalarCount = projection.sourceBoundaries.size() - 1;
+    for (int scalar = 0; scalar < scalarCount && utf16 < projection.text.size(); ++scalar) {
+        const int units = projection.text.at(utf16).isHighSurrogate()
+                && utf16 + 1 < projection.text.size()
+                && projection.text.at(utf16 + 1).isLowSurrogate()
+            ? 2 : 1;
+        mapping[utf16] = projection.sourceBoundaries.at(scalar);
+        if (units == 2)
+            mapping[utf16 + 1] = projection.sourceBoundaries.at(scalar);
+        utf16 += units;
+        mapping[utf16] = projection.sourceBoundaries.at(scalar + 1);
+    }
+    while (utf16 < mapping.size()) {
+        mapping[utf16] = projection.sourceBoundaries.isEmpty()
+            ? 0 : projection.sourceBoundaries.back();
+        ++utf16;
+    }
+    return mapping;
+}
+
+struct ProjectedLiteralScanResult {
+    bool ok = true;
+    bool stopped = false;
+};
+
+ProjectedLiteralScanResult scanProjectedLiteralRange(
+    qint64 virtualSize, qint64 rangeStart, qint64 rangeEnd,
+    const QString &pattern, const LargeFileSearch::Options &opts, bool reverse,
+    const std::function<QByteArray(qint64, qint64)> &readBytes,
+    const std::function<bool()> &isCancelled,
+    const std::function<void(qint64)> &reportProgress,
+    const std::function<bool(qint64, qint32)> &onMatch,
+    QString *error)
+{
+    ProjectedLiteralScanResult result;
+    if (pattern.isEmpty() || rangeEnd <= rangeStart)
+        return result;
+    constexpr qint64 CoreBytes = Q_INT64_C(2) * 1024 * 1024;
+    constexpr qint64 PrefixBytes = 16;
+    const qint64 overlap = qBound<qint64>(
+        64, qint64(pattern.toUtf8().size()) * 4 + 16,
+        Q_INT64_C(8) * 1024 * 1024);
+    qint64 scanned = 0;
+    qint64 cursor = reverse ? rangeEnd : rangeStart;
+    const Qt::CaseSensitivity sensitivity = opts.caseSensitive
+        ? Qt::CaseSensitive : Qt::CaseInsensitive;
+
+    while (reverse ? cursor > rangeStart : cursor < rangeEnd) {
+        if (isCancelled && isCancelled()) {
+            result.ok = false;
+            return result;
+        }
+        const qint64 coreStart = reverse
+            ? qMax(rangeStart, cursor - CoreBytes) : cursor;
+        const qint64 coreEnd = reverse
+            ? cursor : qMin(rangeEnd, cursor + CoreBytes);
+        const qint64 windowStart = qMax<qint64>(0, coreStart - PrefixBytes);
+        const qint64 windowEnd = qMin(virtualSize, coreEnd + overlap);
+        const QByteArray bytes = readBytes(windowStart, windowEnd);
+        if (bytes.size() != windowEnd - windowStart) {
+            result.ok = false;
+            if (error)
+                *error = QObject::tr("无法读取文本搜索窗口。");
+            return result;
+        }
+        const DecodedTextProjection projection = decodeTextProjection(
+            bytes, opts.textEncoding, windowStart == 0, false);
+        const QVector<qint32> sourceAt = utf16ToSourceBoundaries(projection);
+        int hit = reverse
+            ? projection.text.lastIndexOf(pattern, -1, sensitivity)
+            : projection.text.indexOf(pattern, 0, sensitivity);
+        while (hit >= 0) {
+            const int endUtf16 = qMin(projection.text.size(), hit + pattern.size());
+            const qint64 sourceStart = windowStart + sourceAt.value(hit);
+            const qint64 sourceEnd = windowStart + sourceAt.value(endUtf16);
+            if (sourceStart >= coreStart && sourceStart < coreEnd
+                && sourceStart >= rangeStart && sourceStart < rangeEnd
+                && (!opts.wholeWord
+                    || literalWholeWordAccepted(projection.text, hit,
+                                                endUtf16 - hit, pattern))) {
+                const qint64 length = qMax<qint64>(1, sourceEnd - sourceStart);
+                if (length > std::numeric_limits<qint32>::max()) {
+                    result.ok = false;
+                    if (error) *error = QObject::tr("单个匹配过长。");
+                    return result;
+                }
+                if (onMatch && !onMatch(sourceStart, qint32(length))) {
+                    result.stopped = true;
+                    return result;
+                }
+            }
+            hit = reverse
+                ? projection.text.lastIndexOf(pattern, hit - 1, sensitivity)
+                : projection.text.indexOf(pattern, hit + 1, sensitivity);
+        }
+        scanned += coreEnd - coreStart;
+        if (reportProgress)
+            reportProgress(scanned);
+        cursor = reverse ? coreStart : coreEnd;
+    }
+    return result;
+}
+
 std::function<qint64(qint64)> makeStartByteCandidateFinder(
     const uchar *subject, qint64 subjectSize,
     const Pcre2Regex::StartByteFilter &filter, qint64 initialOffset,
@@ -365,10 +550,12 @@ class RegexProgressPhases final
 {
 public:
     RegexProgressPhases(qint64 total, bool validatesUtf8,
-                        std::function<void(qint64)> report)
+                        std::function<void(qint64)> report,
+                        std::function<void(const QString &, int, int,
+                                           qint64, qint64)> reportPhase = {})
         : total_(qMax<qint64>(0, total)),
           validationBudget_(validatesUtf8 ? total_ / 5 : 0),
-          report_(std::move(report))
+          report_(std::move(report)), reportPhase_(std::move(reportPhase))
     {
     }
 
@@ -377,6 +564,8 @@ public:
         if (validationBudget_ <= 0 || !report_)
             return {};
         return [this](qint64 done) {
+            if (reportPhase_)
+                reportPhase_(QObject::tr("验证文本编码"), 1, 2, done, total_);
             emitMonotonic(scale(done, 0, validationBudget_));
         };
     }
@@ -386,6 +575,11 @@ public:
         if (!report_)
             return {};
         return [this](qint64 done) {
+            if (reportPhase_) {
+                const int count = validationBudget_ > 0 ? 2 : 1;
+                reportPhase_(QObject::tr("执行正则匹配"), count, count,
+                             done, total_);
+            }
             emitMonotonic(scale(done, validationBudget_,
                                 total_ - validationBudget_));
         };
@@ -414,6 +608,7 @@ private:
     qint64 validationBudget_ = 0;
     qint64 lastReported_ = 0;
     std::function<void(qint64)> report_;
+    std::function<void(const QString &, int, int, qint64, qint64)> reportPhase_;
 };
 
 bool prepareSearchPattern(const QString &pattern, const LargeFileSearch::Options &opts,
@@ -423,34 +618,73 @@ bool prepareSearchPattern(const QString &pattern, const LargeFileSearch::Options
         *usePcre2 = false;
         return LargeFileSearch::parseHexBytePattern(pattern, literal, error);
     }
-    // Binary documents are not guaranteed to be valid UTF-8.  Their default
-    // (non-regex) query is therefore a raw-byte literal search, with the KMP
-    // path providing ASCII-only case folding when requested.  Routing that
-    // state through PCRE2 made the unchecked "regular expression" option lie:
-    // arbitrary binary files failed UTF-8 validation before a literal search
-    // could start.  Text documents retain PCRE2's Unicode case folding and
-    // Unicode word-boundary semantics.
-    const bool binaryLiteral = opts.byteContextMode
-        && !opts.regexMode && !opts.wholeWord;
-    const bool encodedText = !opts.byteContextMode
-        && !EncodedRegexCompiler::isUtf8SubjectEncoding(opts.textEncoding);
-    *usePcre2 = encodedText || opts.regexMode || opts.wholeWord
-        || (!opts.caseSensitive && !binaryLiteral);
+    // PCRE2 is an explicitly selected, high-cost route. Literal case folding,
+    // whole-word checks and malformed-byte display projection have their own
+    // linear matcher and must never reach the regex engine implicitly.
+    *usePcre2 = opts.regexMode;
     if (!*usePcre2) {
         bool representable = true;
         *literal = encodeTextFragment(pattern, opts.textEncoding, &representable);
-        if (!representable) {
-            if (error) {
-                *error = QObject::tr("查找文本包含 %1 无法表示的字符。")
-                             .arg(encodingName(opts.textEncoding));
-            }
-            return false;
-        }
+        if (!representable)
+            literal->clear(); // decoded-projection search remains meaningful
     }
-    if (pattern.isEmpty() || (!*usePcre2 && literal->isEmpty())) {
+    if (pattern.isEmpty()) {
         if (error)
             *error = QStringLiteral("查找文本为空。");
         return false;
+    }
+    return true;
+}
+
+bool usesProjectedLiteral(const QString &pattern,
+                          const LargeFileSearch::Options &opts,
+                          const QByteArray &literal, bool usePcre2)
+{
+    if (usePcre2 || opts.hexBytesMode || opts.byteContextMode)
+        return false;
+    const bool asciiPattern = std::all_of(
+        pattern.cbegin(), pattern.cend(),
+        [](QChar ch) { return ch.unicode() <= 0x7f; });
+    if (literal.isEmpty() || pattern.contains(QChar::ReplacementCharacter)) {
+        return true;
+    }
+    // Binary Text can apply an ASCII word boundary directly to source bytes;
+    // this is both meaningful for its replacement-character projection and
+    // much cheaper than decoding a PE/log image solely to reject "catalog".
+    if (opts.wholeWord && !(opts.tolerateInvalidEncoding && asciiPattern))
+        return true;
+    if (!opts.caseSensitive) {
+        return std::any_of(pattern.cbegin(), pattern.cend(),
+                           [](QChar ch) { return ch.unicode() > 0x7f; });
+    }
+    return false;
+}
+
+bool requiresMultibyteCharacterBoundaries(
+    const LargeFileSearch::Options &opts)
+{
+    return !opts.byteContextMode
+        && opts.textEncoding != TextEncoding::Windows1252
+        && !EncodedRegexCompiler::isUtf8SubjectEncoding(opts.textEncoding);
+}
+
+bool asciiWholeWordAt(const std::function<QByteArray(qint64, qint64)> &read,
+                      qint64 virtualSize, qint64 offset, qint64 length)
+{
+    const auto isWord = [](uchar value) {
+        return value == '_' || (value >= '0' && value <= '9')
+            || (value >= 'A' && value <= 'Z')
+            || (value >= 'a' && value <= 'z');
+    };
+    if (offset > 0) {
+        const QByteArray before = read(offset - 1, offset);
+        if (!before.isEmpty() && isWord(uchar(before.at(0))))
+            return false;
+    }
+    if (offset + length < virtualSize) {
+        const QByteArray after = read(offset + length, offset + length + 1);
+        if (!after.isEmpty() && isWord(uchar(after.at(0))))
+            return false;
     }
     return true;
 }
@@ -792,51 +1026,69 @@ QByteArray LargeFileSearch::readVirtualBytes(qint64 start, qint64 end) const {
     return QByteArray((const char*)(mmapBase_ + start), int(end - start));
 }
 
-void LargeFileSearch::fillLineContext(LargeFileSearchMatch& m) const {
+void LargeFileSearch::fillLineContext(LargeFileSearchMatch& m,
+                                      TextEncoding encoding) const {
     const qint64 originalMatch = patchList_
         ? patchList_->virtToOrig(m.byteOffset) : m.byteOffset;
     const bool indexed = lineIndex_ && lineIndexCompleteAtSnapshot_;
+    const qint64 virtualSize = patchList_
+        ? patchList_->virtualSize(mmapSize_) : mmapSize_;
+    constexpr qint64 SideBytes = OVERRUN_CTX_MAX / 2;
+    constexpr qint64 DecoderOverlap = 8;
+    constexpr qint64 MaxVisibleMatchBytes = 64 * 1024;
+
+    const auto assignContext = [&](qint64 allowedStart, qint64 allowedEnd,
+                                   qint64 desiredStart, qint64 desiredEnd) {
+        allowedStart = qBound<qint64>(0, allowedStart, virtualSize);
+        allowedEnd = qBound<qint64>(allowedStart, allowedEnd, virtualSize);
+        desiredStart = qBound(allowedStart, desiredStart, allowedEnd);
+        desiredEnd = qBound(desiredStart, desiredEnd, allowedEnd);
+        const qint64 rawStart = qMax(allowedStart,
+                                     desiredStart - DecoderOverlap);
+        const qint64 rawEnd = qMin(allowedEnd, desiredEnd + DecoderOverlap);
+        const QByteArray raw = readVirtualBytes(rawStart, rawEnd);
+        const DecodedTextProjection projection = decodeTextProjection(
+            raw, encoding, rawStart == 0, false);
+        if (projection.sourceBoundaries.isEmpty()) {
+            m.contextByteOffset = desiredStart;
+            m.lineContext = readVirtualBytes(desiredStart, desiredEnd);
+            return;
+        }
+        const qint32 relativeStart = qint32(qBound<qint64>(
+            0, desiredStart - rawStart, raw.size()));
+        const qint32 relativeEnd = qint32(qBound<qint64>(
+            relativeStart, desiredEnd - rawStart, raw.size()));
+        auto startIt = std::upper_bound(
+            projection.sourceBoundaries.cbegin(),
+            projection.sourceBoundaries.cend(), relativeStart);
+        if (startIt != projection.sourceBoundaries.cbegin())
+            --startIt;
+        auto endIt = std::lower_bound(
+            projection.sourceBoundaries.cbegin(),
+            projection.sourceBoundaries.cend(), relativeEnd);
+        const qint32 alignedStart = startIt == projection.sourceBoundaries.cend()
+            ? projection.sourceBoundaries.constLast() : *startIt;
+        const qint32 alignedEnd = endIt == projection.sourceBoundaries.cend()
+            ? projection.sourceBoundaries.constLast() : *endIt;
+        m.contextByteOffset = rawStart + alignedStart;
+        m.lineContext = raw.mid(alignedStart,
+                                qMax(0, alignedEnd - alignedStart));
+    };
+
     if (!indexed) {
-        // Search correctness and first results must not wait for the full-file
-        // line index. Build an exact, bounded context around the authoritative
-        // virtual byte range; the row is displayed by byte offset until line
-        // decoration becomes available.
-        constexpr qint64 lookBehind = 64 * 1024;
-        constexpr qint64 lookAhead = 4 * 1024;
-        constexpr qint64 prefixBytes = 64;
-        const qint64 virtualSize = patchList_
-            ? patchList_->virtualSize(mmapSize_) : mmapSize_;
-        const qint64 scanStart = qMax<qint64>(0, m.byteOffset - lookBehind);
-        const qint64 scanEnd = qMin(virtualSize,
-            m.byteOffset + qint64(m.length) + lookAhead);
-        const QByteArray raw = readVirtualBytes(scanStart, scanEnd);
-        const int relative = int(qBound<qint64>(0, m.byteOffset - scanStart,
-                                                raw.size()));
-        const int matchEnd = qMin(raw.size(), relative + int(m.length));
-        const int previousLf = raw.lastIndexOf('\n', relative - 1);
-        const int previousCr = raw.lastIndexOf('\r', relative - 1);
-        const int lineStart = qMax(previousLf, previousCr) + 1;
-        const int nextLf = raw.indexOf('\n', matchEnd);
-        const int nextCr = raw.indexOf('\r', matchEnd);
-        int lineEnd = raw.size();
-        if (nextLf >= 0) lineEnd = qMin(lineEnd, nextLf);
-        if (nextCr >= 0) lineEnd = qMin(lineEnd, nextCr);
-        int contextStart = qMax(lineStart, relative - int(prefixBytes));
-        int contextEnd = qMin(lineEnd, contextStart + OVERRUN_CTX_MAX);
-        if (contextEnd < matchEnd) {
-            contextEnd = qMin(lineEnd, matchEnd + int(prefixBytes));
-            contextStart = qMax(lineStart, contextEnd - OVERRUN_CTX_MAX);
-        }
-        while (contextStart < raw.size()
-               && (static_cast<unsigned char>(raw.at(contextStart)) & 0xc0) == 0x80) {
-            ++contextStart;
-        }
+        // Binary/mixed data has no trustworthy global line. Build one stable,
+        // centered byte window and align its ends with the frozen encoding.
+        const qint64 visibleMatchEnd = qMin(
+            virtualSize, m.byteOffset
+                + qMin<qint64>(qMax<qint32>(0, m.length),
+                               MaxVisibleMatchBytes));
+        assignContext(0, virtualSize,
+                      qMax<qint64>(0, m.byteOffset - SideBytes),
+                      qMin(virtualSize, visibleMatchEnd + SideBytes));
         m.line = -1;
-        m.col = qint32(qBound<qint64>(qint64(0),
-                                      m.byteOffset - (scanStart + lineStart),
-                                      qint64(INT32_MAX)));
-        m.contextByteOffset = scanStart + contextStart;
-        m.lineContext = raw.mid(contextStart, contextEnd - contextStart);
+        m.col = qint32(qBound<qint64>(
+            qint64(0), m.byteOffset - m.contextByteOffset,
+            qint64(INT32_MAX)));
         return;
     }
     int line = 0;
@@ -852,60 +1104,30 @@ void LargeFileSearch::fillLineContext(LargeFileSearchMatch& m) const {
     m.line = line;
     m.col = qint32(qBound<qint64>(qint64(0), m.byteOffset - lineStart,
                                   qint64(INT32_MAX)));
-    const qint64 matchEnd = m.byteOffset + m.length;
-    // Keep a compact prefix so the highlighted token is visible without
-    // horizontal scrolling in a typical dock width, while preserving ample
-    // trailing log context for diagnosis.
-    constexpr qint64 prefixBytes = 64;
-    qint64 desiredStart = qMax(lineStart, m.byteOffset - prefixBytes);
-    qint64 end = qMin(lineEnd, desiredStart + OVERRUN_CTX_MAX);
-    if (end < matchEnd) {
-        end = qMin(lineEnd, matchEnd + prefixBytes);
-        desiredStart = qMax(lineStart, end - OVERRUN_CTX_MAX);
-    }
-
-    // Include at most 3 bytes before the desired start, then advance over UTF-8
-    // continuation bytes. This prevents a centered context from beginning in the
-    // middle of a code point without ever reading an unbounded long line.
-    const qint64 rawStart = qMax(lineStart, desiredStart - 3);
-    QByteArray raw = readVirtualBytes(rawStart, end);
-    int trim = int(desiredStart - rawStart);
-    while (trim < raw.size()
-           && (static_cast<unsigned char>(raw[trim]) & 0xc0) == 0x80) {
-        ++trim;
-    }
-    qint64 start = rawStart + trim;
-    QByteArray lineBytes = raw.mid(trim);
-    // 去掉行尾 \r\n / \n
-    while (end >= lineEnd && !lineBytes.isEmpty()
-           && (lineBytes.endsWith('\n') || lineBytes.endsWith('\r')))
-        lineBytes.chop(1);
-    if (lineBytes.size() > OVERRUN_CTX_MAX) lineBytes.truncate(OVERRUN_CTX_MAX);
-    m.contextByteOffset = start;
-    m.lineContext = lineBytes;
+    const qint64 visibleMatchEnd = qMin(
+        lineEnd, m.byteOffset
+            + qMin<qint64>(qMax<qint32>(0, m.length), MaxVisibleMatchBytes));
+    assignContext(lineStart, lineEnd,
+                  qMax(lineStart, m.byteOffset - SideBytes),
+                  qMin(lineEnd, visibleMatchEnd + SideBytes));
 }
 
 void LargeFileSearch::fillByteContext(LargeFileSearchMatch& m) const
 {
     constexpr qint64 BytesPerRow = 16;
-    constexpr qint64 SideContext = 8;
+    constexpr qint64 SideContext = OVERRUN_CTX_MAX / 4;
     const qint64 virtualSize = patchList_ ? patchList_->virtualSize(mmapSize_) : mmapSize_;
     const qint64 rowStart = (m.byteOffset / BytesPerRow) * BytesPerRow;
     const qint64 matchEnd = qMin(virtualSize,
         m.byteOffset + qMax<qint64>(0, m.length));
     qint64 contextStart = qMax<qint64>(0, m.byteOffset - SideContext);
     qint64 contextEnd = qMin(virtualSize,
-        qMax(contextStart + BytesPerRow, matchEnd + SideContext));
+        qMax(contextStart + OVERRUN_CTX_MAX / 2, matchEnd + SideContext));
     if (contextEnd - contextStart > OVERRUN_CTX_MAX) {
         contextEnd = qMin(virtualSize, matchEnd + SideContext);
         contextStart = qMax<qint64>(0, contextEnd - OVERRUN_CTX_MAX);
     }
     QByteArray preview = readVirtualBytes(contextStart, contextEnd);
-    for (char &value : preview) {
-        const uchar byte = uchar(value);
-        if (byte < 0x20 || byte > 0x7e)
-            value = '.';
-    }
     m.line = qint32(qMin<qint64>(rowStart / BytesPerRow, INT32_MAX));
     m.col = qint32(m.byteOffset - rowStart);
     m.contextByteOffset = contextStart;
@@ -940,23 +1162,63 @@ bool LargeFileSearch::scanAllBounded(
     if (!prepareSearchPattern(pattern, opts, &literalBytes, &usePcre2, &scanError_))
         return false;
 
+    const bool multibyteLiteral = !usePcre2
+        && requiresMultibyteCharacterBoundaries(opts);
+    const bool projectedLiteral = usesProjectedLiteral(
+        pattern, opts, literalBytes, usePcre2)
+        || (multibyteLiteral && patchList_ && patchList_->isModified());
+    if (!usePcre2 && opts.reportPhase)
+        opts.reportPhase(QObject::tr("扫描字面值"), 1, 1, 0, virtualSize);
+    if (projectedLiteral) {
+        const auto projected = scanProjectedLiteralRange(
+            virtualSize, 0, virtualSize, pattern, opts, false,
+            [this](qint64 start, qint64 end) {
+                return readVirtualBytes(start, end);
+            }, isCancelled, reportProgress,
+            [&](qint64 offset, qint32 length) {
+                LargeFileSearchMatch match;
+                match.byteOffset = offset;
+                match.length = length;
+                fillLineContext(match, opts.textEncoding);
+                pending.append(std::move(match));
+                const bool firstVisibleResult = memMatches_.isEmpty()
+                    && overrunCount_ == 0 && pending.size() == 1;
+                return (!firstVisibleResult && pending.size() < PublishBatchSize)
+                    || publish();
+            }, &scanError_);
+        if (!projected.ok)
+            return false;
+        return publish();
+    }
+
     if (!usePcre2) {
         if (literalBytes.isEmpty())
             return true;
         const bool caseSensitive = opts.hexBytesMode ? true : opts.caseSensitive;
         if ((!patchList_ || !patchList_->isModified()) && mmapBase_) {
+            const auto normalizeStart = multibyteLiteral
+                ? makeEncodedBoundaryNormalizer(
+                    mmapBase_, virtualSize, opts.textEncoding)
+                : std::function<qint64(qint64)>();
             const auto nextCandidate = makeByteCandidateFinder(
                 mmapBase_, virtualSize, literalBytes, caseSensitive, 0,
-                isCancelled, reportProgress, {});
+                isCancelled, reportProgress, normalizeStart);
             qint64 candidate = nextCandidate ? nextCandidate(0) : virtualSize + 1;
             while (candidate >= 0 && candidate <= virtualSize - literalBytes.size()) {
+                if (opts.wholeWord && !asciiWholeWordAt(
+                        [this](qint64 start, qint64 end) {
+                            return readVirtualBytes(start, end);
+                        }, virtualSize, candidate, literalBytes.size())) {
+                    candidate = nextCandidate(candidate + 1);
+                    continue;
+                }
                 LargeFileSearchMatch match;
                 match.byteOffset = candidate;
                 match.length = literalBytes.size();
                 if (opts.byteContextMode)
                     fillByteContext(match);
                 else
-                    fillLineContext(match);
+                    fillLineContext(match, opts.textEncoding);
                 pending.append(std::move(match));
                 const bool firstVisibleResult = memMatches_.isEmpty()
                     && overrunCount_ == 0 && pending.size() == 1;
@@ -991,13 +1253,21 @@ bool LargeFileSearch::scanAllBounded(
                 if (foldCaseAscii(uchar(literalBytes.at(matched)), caseSensitive) == value)
                     ++matched;
                 if (matched == needleSize) {
+                    const qint64 offset = start + index + 1 - needleSize;
+                    if (opts.wholeWord && !asciiWholeWordAt(
+                            [this](qint64 from, qint64 to) {
+                                return readVirtualBytes(from, to);
+                            }, virtualSize, offset, needleSize)) {
+                        matched = failure.at(matched - 1);
+                        continue;
+                    }
                     LargeFileSearchMatch match;
-                    match.byteOffset = start + index + 1 - needleSize;
+                    match.byteOffset = offset;
                     match.length = needleSize;
                     if (opts.byteContextMode)
                         fillByteContext(match);
                     else
-                        fillLineContext(match);
+                        fillLineContext(match, opts.textEncoding);
                     pending.append(std::move(match));
                     const bool firstVisibleResult = memMatches_.isEmpty()
                         && overrunCount_ == 0 && pending.size() == 1;
@@ -1052,7 +1322,7 @@ bool LargeFileSearch::scanAllBounded(
         const bool validatesUtf8 = !encodedByteRegex && !binaryWholeWord
             && !invalidUtfText;
         RegexProgressPhases progressPhases(
-            virtualSize, validatesUtf8, reportProgress);
+            virtualSize, validatesUtf8, reportProgress, opts.reportPhase);
         const auto regexProgress = progressPhases.searchReporter();
         const auto validationProgress = progressPhases.validationReporter();
 
@@ -1105,7 +1375,7 @@ bool LargeFileSearch::scanAllBounded(
                 if (opts.byteContextMode)
                     fillByteContext(match);
                 else
-                    fillLineContext(match);
+                    fillLineContext(match, opts.textEncoding);
                 pending.append(std::move(match));
                 const bool firstVisibleResult = memMatches_.isEmpty()
                     && overrunCount_ == 0 && pending.size() == 1;
@@ -1181,16 +1451,81 @@ bool LargeFileSearch::scanOneBounded(
     if (!prepareSearchPattern(pattern, opts, &literalBytes, &usePcre2, error))
         return false;
 
+    const bool multibyteLiteral = !usePcre2
+        && requiresMultibyteCharacterBoundaries(opts);
+    const bool projectedLiteral = usesProjectedLiteral(
+        pattern, opts, literalBytes, usePcre2)
+        || (multibyteLiteral
+            && (!forward || (patchList_ && patchList_->isModified())));
+    if (!usePcre2 && opts.reportPhase)
+        opts.reportPhase(QObject::tr("定向扫描字面值"), 1, 1, 0, virtualSize);
+    if (projectedLiteral) {
+        qint64 scanned = 0;
+        const auto runRange = [&](qint64 start, qint64 end, bool reverse,
+                                  LargeFileSearchMatch *accepted) {
+            const auto projected = scanProjectedLiteralRange(
+                virtualSize, start, end, pattern, opts, reverse,
+                [this](qint64 from, qint64 to) {
+                    return readVirtualBytes(from, to);
+                }, isCancelled,
+                [&](qint64 done) {
+                    if (reportProgress)
+                        reportProgress(scanned + done);
+                },
+                [&](qint64 offset, qint32 length) {
+                    accepted->byteOffset = offset;
+                    accepted->length = length;
+                    return false;
+                }, error);
+            scanned += qMax<qint64>(0, end - start);
+            return projected.ok;
+        };
+        LargeFileSearchMatch found;
+        found.byteOffset = -1;
+        bool ok = true;
+        if (forward) {
+            const qint64 start = fromByte < 0 ? 0
+                : (fromByte >= virtualSize ? virtualSize : fromByte + 1);
+            ok = runRange(start, virtualSize, false, &found);
+            if (ok && found.byteOffset < 0 && wrap && start > 0)
+                ok = runRange(0, start, false, &found);
+        } else {
+            const qint64 end = fromByte == std::numeric_limits<qint64>::max()
+                ? virtualSize : qBound<qint64>(0, fromByte, virtualSize);
+            ok = runRange(0, end, true, &found);
+            if (ok && found.byteOffset < 0 && wrap && end < virtualSize)
+                ok = runRange(end, virtualSize, true, &found);
+        }
+        if (!ok)
+            return false;
+        if (found.byteOffset >= 0) {
+            fillLineContext(found, opts.textEncoding);
+            if (match)
+                *match = std::move(found);
+        }
+        return true;
+    }
+
     if (!usePcre2 && (!patchList_ || !patchList_->isModified()) && mmapBase_) {
         const bool caseSensitive = opts.hexBytesMode ? true : opts.caseSensitive;
         const auto findFirstInRange = [&](qint64 start, qint64 end,
                                           LargeFileSearchMatch *accepted) {
+            const auto normalizeStart = multibyteLiteral
+                ? makeEncodedBoundaryNormalizer(
+                    mmapBase_, virtualSize, opts.textEncoding)
+                : std::function<qint64(qint64)>();
             const auto next = makeByteCandidateFinder(
                 mmapBase_, virtualSize, literalBytes, caseSensitive, start,
-                isCancelled, reportProgress, {}, end);
-            const qint64 candidate = next ? next(start) : virtualSize + 1;
-            if (candidate < 0)
-                return false;
+                isCancelled, reportProgress, normalizeStart, end);
+            qint64 candidate = next ? next(start) : virtualSize + 1;
+            while (candidate >= 0 && candidate < end
+                   && opts.wholeWord && !asciiWholeWordAt(
+                       [this](qint64 from, qint64 to) {
+                           return readVirtualBytes(from, to);
+                       }, virtualSize, candidate, literalBytes.size())) {
+                candidate = next(candidate + 1);
+            }
+            if (candidate < 0) return false;
             if (candidate < end) {
                 accepted->byteOffset = candidate;
                 accepted->length = literalBytes.size();
@@ -1199,14 +1534,22 @@ bool LargeFileSearch::scanOneBounded(
         };
         const auto findLastInRange = [&](qint64 start, qint64 end,
                                          LargeFileSearchMatch *accepted) {
-            const auto next = makeByteCandidateFinder(
-                mmapBase_, virtualSize, literalBytes, caseSensitive, start,
-                isCancelled, reportProgress, {}, end);
-            qint64 candidate = next ? next(start) : virtualSize + 1;
-            while (candidate >= 0 && candidate < end) {
+            qint64 searchEnd = end;
+            qint64 candidate = virtualSize + 1;
+            do {
+                candidate = findPreviousByteLiteral(
+                    mmapBase_, virtualSize, literalBytes, caseSensitive,
+                    start, searchEnd, isCancelled, reportProgress);
+                if (candidate < 0 || candidate > virtualSize - literalBytes.size())
+                    break;
+                searchEnd = candidate;
+            } while (opts.wholeWord && !asciiWholeWordAt(
+                [this](qint64 from, qint64 to) {
+                    return readVirtualBytes(from, to);
+                }, virtualSize, candidate, literalBytes.size()));
+            if (candidate >= 0 && candidate <= virtualSize - literalBytes.size()) {
                 accepted->byteOffset = candidate;
                 accepted->length = literalBytes.size();
-                candidate = next(candidate + 1);
             }
             return candidate >= 0;
         };
@@ -1232,7 +1575,7 @@ bool LargeFileSearch::scanOneBounded(
             if (opts.byteContextMode)
                 fillByteContext(found);
             else
-                fillLineContext(found);
+                fillLineContext(found, opts.textEncoding);
             if (match)
                 *match = std::move(found);
         }
@@ -1280,7 +1623,7 @@ bool LargeFileSearch::scanOneBounded(
     const bool validatesUtf8 = usePcre2 && !encodedByteRegex
         && !binaryWholeWord && !invalidUtfText;
     RegexProgressPhases progressPhases(
-        virtualSize, validatesUtf8, reportProgress);
+        virtualSize, validatesUtf8, reportProgress, opts.reportPhase);
     const auto regexProgress = progressPhases.searchReporter();
     const auto validationProgress = progressPhases.validationReporter();
 
@@ -1467,7 +1810,7 @@ bool LargeFileSearch::scanOneBounded(
             if (opts.byteContextMode)
                 fillByteContext(found);
             else
-                fillLineContext(found);
+                fillLineContext(found, opts.textEncoding);
             if (match) *match = std::move(found);
         }
         return true;
@@ -1603,7 +1946,7 @@ bool LargeFileSearch::scanOneBounded(
         if (opts.byteContextMode)
             fillByteContext(found);
         else
-            fillLineContext(found);
+            fillLineContext(found, opts.textEncoding);
         if (match) *match = std::move(found);
     }
     return true;
@@ -1622,7 +1965,7 @@ void LargeFileSearch::findAll(const QString& pattern, const Options& opts) {
 qint64 LargeFileSearch::findAllViaTaskManager(const QString& pattern, const Options& opts,
                                               const QString& fileDisplayName)
 {
-    if (!mmapBase_ || (!lineIndex_ && !opts.byteContextMode)) {
+    if (!mmapBase_) {
         emit failed(QStringLiteral("数据源未设置。"));
         return -1;
     }
@@ -1678,7 +2021,7 @@ qint64 LargeFileSearch::findAllViaTaskManager(const QString& pattern, const Opti
         title,
         desc,
         /* workerFn = */ [this, virtualSize, pattern, opts]
-        (qint64 /*taskId*/, AsyncCancelPtr cancel,
+        (qint64 taskId, AsyncCancelPtr cancel,
          std::function<void(qint64,qint64)> reportProgress,
          std::function<void(const AsyncErrorInfo&)> reportError)
         {
@@ -1688,8 +2031,15 @@ qint64 LargeFileSearch::findAllViaTaskManager(const QString& pattern, const Opti
                 return (cancel && cancel->load(std::memory_order_acquire))
                     || cancel_.load(std::memory_order_relaxed);
             };
+            Options taskOptions = opts;
+            taskOptions.reportPhase = [taskId](
+                const QString &phase, int index, int count,
+                qint64 done, qint64 total) {
+                AsyncTaskManager::instance().updateTaskPhase(
+                    taskId, phase, index, count, done, total);
+            };
             const bool ok = scanAllBounded(
-                virtualSize, pattern, opts, isCancelled,
+                virtualSize, pattern, taskOptions, isCancelled,
                 [this, reportProgress, virtualSize](qint64 done) {
                     reportProgress(done, virtualSize);
                     QMetaObject::invokeMethod(this, "progress", Qt::QueuedConnection,
@@ -1731,7 +2081,7 @@ qint64 LargeFileSearch::findOneViaTaskManager(
     bool forward, bool wrap, const QString &fileDisplayName,
     QObject *callbackContext, OneMatchCallback callback)
 {
-    if (!mmapBase_ || (!lineIndex_ && !opts.byteContextMode)) {
+    if (!mmapBase_) {
         if (callback)
             callback(false, {}, QObject::tr("数据源未就绪。"));
         return -1;
@@ -1764,7 +2114,7 @@ qint64 LargeFileSearch::findOneViaTaskManager(
         QObject::tr("定向扫描，找到一处即返回"),
         [this, virtualSize, pattern, opts, fromByte, forward, wrap,
          guard, callback = std::move(callback)]
-        (qint64, AsyncCancelPtr cancel,
+        (qint64 taskId, AsyncCancelPtr cancel,
          std::function<void(qint64, qint64)> reportProgress,
          std::function<void(const AsyncErrorInfo &)> reportError) mutable {
             auto release = qScopeGuard([this] { releaseWorker(); });
@@ -1775,8 +2125,15 @@ qint64 LargeFileSearch::findOneViaTaskManager(
             LargeFileSearchMatch found;
             found.byteOffset = -1;
             QString error;
+            Options taskOptions = opts;
+            taskOptions.reportPhase = [taskId](
+                const QString &phase, int index, int count,
+                qint64 done, qint64 total) {
+                AsyncTaskManager::instance().updateTaskPhase(
+                    taskId, phase, index, count, done, total);
+            };
             const bool ok = scanOneBounded(
-                virtualSize, pattern, opts, fromByte, forward, wrap,
+                virtualSize, pattern, taskOptions, fromByte, forward, wrap,
                 isCancelled,
                 [reportProgress, virtualSize](qint64 done) {
                     reportProgress(qMin(done, virtualSize), virtualSize);

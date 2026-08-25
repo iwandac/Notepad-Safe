@@ -61,6 +61,7 @@ namespace {
 constexpr int EntryIdRole = Qt::UserRole + 1;
 constexpr int EntryRecycledRole = Qt::UserRole + 2;
 constexpr int ProtectedClipboardLifetimeMs = 30 * 1000;
+constexpr int RecoveryClipboardLifetimeMs = 60 * 1000;
 constexpr int PasswordRevealLifetimeMs = 30 * 1000;
 constexpr qsizetype SecureNoteMaximumBytes = 32 * 1024 * 1024;
 
@@ -141,7 +142,7 @@ void showRecoveryKey(QWidget *parent, const QString &recoveryKey)
     keyText->setLineWrapMode(QPlainTextEdit::WidgetWidth);
     layout->addWidget(keyText);
     auto *actions = new QHBoxLayout();
-    auto *copy = new QPushButton(QObject::tr("复制恢复密钥"), &dialog);
+    auto *copy = new QPushButton(QObject::tr("复制（60 秒后清除）"), &dialog);
     auto *save = new QPushButton(QObject::tr("保存到文件…"), &dialog);
     actions->addWidget(copy);
     actions->addWidget(save);
@@ -154,10 +155,25 @@ void showRecoveryKey(QWidget *parent, const QString &recoveryKey)
     buttons->button(QDialogButtonBox::Ok)->setText(QObject::tr("完成"));
     buttons->button(QDialogButtonBox::Ok)->setEnabled(false);
     layout->addWidget(buttons);
-    QObject::connect(copy, &QPushButton::clicked, &dialog, [recoveryKey]() {
+    QObject::connect(copy, &QPushButton::clicked, &dialog, [&recoveryKey]() {
+        QByteArray keyBytes = recoveryKey.toUtf8();
+        const QByteArray fingerprint = QCryptographicHash::hash(
+            keyBytes, QCryptographicHash::Sha256);
         QGuiApplication::clipboard()->setText(recoveryKey, QClipboard::Clipboard);
+        scrubByteArray(keyBytes);
+        QTimer::singleShot(RecoveryClipboardLifetimeMs, qApp, [fingerprint]() {
+            QClipboard *clipboard = QGuiApplication::clipboard();
+            if (!clipboard)
+                return;
+            QByteArray current = clipboard->text(QClipboard::Clipboard).toUtf8();
+            const QByteArray currentFingerprint = QCryptographicHash::hash(
+                current, QCryptographicHash::Sha256);
+            scrubByteArray(current);
+            if (currentFingerprint == fingerprint)
+                clipboard->clear(QClipboard::Clipboard);
+        });
     });
-    QObject::connect(save, &QPushButton::clicked, &dialog, [&dialog, recoveryKey]() {
+    QObject::connect(save, &QPushButton::clicked, &dialog, [&dialog, &recoveryKey]() {
         const QString path = QFileDialog::getSaveFileName(
             &dialog, QObject::tr("保存恢复密钥"), QStringLiteral("NotepadSafe-Recovery-Key.txt"),
             QObject::tr("文本文件 (*.txt)"));
@@ -165,11 +181,17 @@ void showRecoveryKey(QWidget *parent, const QString &recoveryKey)
             return;
         QSaveFile output(path);
         output.setDirectWriteFallback(false);
-        if (!output.open(QIODevice::WriteOnly)
-            || output.write(recoveryKey.toUtf8()) < 0 || !output.commit()) {
+        QByteArray bytes = recoveryKey.toUtf8();
+        const qint64 expected = bytes.size();
+        const bool opened = output.open(QIODevice::WriteOnly);
+        const qint64 written = opened ? output.write(bytes) : -1;
+        scrubByteArray(bytes);
+        if (!opened || written != expected || !output.commit()) {
             QMessageBox::critical(&dialog, QObject::tr("保存失败"),
                                   QObject::tr("无法保存恢复密钥文件。"));
+            return;
         }
+        QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
     });
     QObject::connect(confirmed, &QCheckBox::toggled,
                      buttons->button(QDialogButtonBox::Ok), &QPushButton::setEnabled);

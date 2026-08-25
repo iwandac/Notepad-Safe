@@ -55,13 +55,33 @@ bool readRecord(QDataStream &stream, quint32 version, LargeFileSearchMatch *matc
     return true;
 }
 
-QString decodeContext(const QByteArray &bytes, TextEncoding encoding)
+void prepareDisplayContext(GroupedSearchLine *group, TextEncoding encoding)
 {
-    return decodeTextFragment(bytes, encoding);
+    if (!group)
+        return;
+    const DecodedTextProjection projection = decodeTextProjection(
+        group->lineContext, encoding, false, false);
+    group->displayContext = projection.text;
+    group->sourceBoundaries = projection.sourceBoundaries;
+    group->utf16Boundaries.clear();
+    group->utf16Boundaries.reserve(group->sourceBoundaries.size());
+    int utf16 = 0;
+    group->utf16Boundaries.append(0);
+    while (utf16 < group->displayContext.size()
+           && group->utf16Boundaries.size() < group->sourceBoundaries.size()) {
+        const int units = group->displayContext.at(utf16).isHighSurrogate()
+                && utf16 + 1 < group->displayContext.size()
+                && group->displayContext.at(utf16 + 1).isLowSurrogate()
+            ? 2 : 1;
+        utf16 += units;
+        group->utf16Boundaries.append(utf16);
+    }
+    while (group->utf16Boundaries.size() < group->sourceBoundaries.size())
+        group->utf16Boundaries.append(group->displayContext.size());
 }
 
-QPair<qint32, qint32> displayRange(const LargeFileSearchMatch &match,
-                                   TextEncoding encoding)
+QPair<qint32, qint32> displayRange(const GroupedSearchLine &group,
+                                   const LargeFileSearchMatch &match)
 {
     const qint64 relative64 = match.contextByteOffset >= 0
         ? match.byteOffset - match.contextByteOffset : match.col;
@@ -69,9 +89,20 @@ QPair<qint32, qint32> displayRange(const LargeFileSearchMatch &match,
                                             match.lineContext.size()));
     const int byteLength = qBound(0, int(match.length),
                                   match.lineContext.size() - relative);
-    const int charStart = decodeContext(match.lineContext.left(relative), encoding).size();
-    const int charLength = decodeContext(
-        match.lineContext.mid(relative, byteLength), encoding).size();
+    const auto boundaryIndex = [&group](int byteOffset) {
+        const auto found = std::lower_bound(
+            group.sourceBoundaries.cbegin(), group.sourceBoundaries.cend(),
+            qint32(byteOffset));
+        return found == group.sourceBoundaries.cend()
+            ? qMax(0, int(group.sourceBoundaries.size()) - 1)
+            : int(found - group.sourceBoundaries.cbegin());
+    };
+    const int startIndex = boundaryIndex(relative);
+    const int endIndex = boundaryIndex(relative + byteLength);
+    const int charStart = group.utf16Boundaries.value(startIndex, 0);
+    const int charEnd = group.utf16Boundaries.value(
+        endIndex, group.displayContext.size());
+    const int charLength = qMax(0, charEnd - charStart);
     return qMakePair(qint32(charStart), qint32(charLength));
 }
 
@@ -85,10 +116,11 @@ void appendMatch(GroupedSearchLine *group, const LargeFileSearchMatch &match,
         group->contextByteOffset = match.contextByteOffset >= 0
             ? match.contextByteOffset : qMax<qint64>(0, match.byteOffset - match.col);
         group->lineContext = match.lineContext;
+        prepareDisplayContext(group, encoding);
         group->firstByteOffset = match.byteOffset;
         group->firstLength = match.length;
     }
-    group->matchPositions.append(displayRange(match, encoding));
+    group->matchPositions.append(displayRange(*group, match));
     group->matchByteRanges.append(qMakePair(match.byteOffset, match.length));
 }
 } // namespace
@@ -98,6 +130,20 @@ SearchResultsModel::SearchResultsModel(QObject* parent)
 {}
 
 SearchResultsModel::~SearchResultsModel() = default;
+
+void SearchResultsModel::setTextEncoding(TextEncoding encoding)
+{
+    if (textEncoding_ == encoding)
+        return;
+    textEncoding_ = encoding;
+    if (!memoryMatches_.isEmpty()) {
+        beginResetModel();
+        buildGrouped(memoryMatches_);
+        cachedOverrunRow_ = -1;
+        cachedOverrunLine_ = {};
+        endResetModel();
+    }
+}
 
 void SearchResultsModel::clear() {
     beginResetModel();
@@ -380,7 +426,7 @@ int SearchResultsModel::hitTestMatchIndex(int row, int xInColumn, int columnWidt
     int x = xInColumn - pad;
     if (x < 0) return -1;
 
-    QString text = decodeContext(g.lineContext, textEncoding_);
+    const QString &text = g.displayContext;
     if (text.isEmpty()) return -1;
 
     // 直接用实际字体宽度计算每个 UTF-16 命中范围的像素区间；中文、emoji
@@ -477,7 +523,7 @@ QVariant SearchResultsModel::data(const QModelIndex& idx, int role) const {
     if (role == LineRole)
         return g.line;
     if (role == ContextRole)
-        return decodeContext(g.lineContext, textEncoding_);
+        return g.displayContext;
     if (role == MatchPositionsRole) {
         QVariantList list;
         for (const auto &range : g.matchPositions) {
@@ -495,9 +541,9 @@ QVariant SearchResultsModel::data(const QModelIndex& idx, int role) const {
                 ? QObject::tr("偏移 0x%1")
                       .arg(QString::number(quint64(g.firstByteOffset), 16).toUpper())
                 : QObject::tr("第 %1 行").arg(g.line + 1);
-            const QString context = decodeContext(g.lineContext, textEncoding_);
             return QObject::tr("%1 · %2 处匹配\n%3\n双击跳转")
-                .arg(location).arg(g.matchPositions.size()).arg(context);
+                .arg(location).arg(g.matchPositions.size())
+                .arg(g.displayContext);
         }
         case COL_MATCHCOUNT:
             return QObject::tr("该行有 %1 处匹配").arg(g.matchPositions.size());
@@ -521,7 +567,7 @@ QVariant SearchResultsModel::data(const QModelIndex& idx, int role) const {
                   QString::number(quint64(g.firstByteOffset), 16).toUpper())
             : QString::number(g.line + 1);  // UI 1-based
     case COL_CONTEXT:
-        return decodeContext(g.lineContext, textEncoding_);
+        return g.displayContext;
     case COL_MATCHCOUNT:
         return QString::number(g.matchPositions.size());
     default:

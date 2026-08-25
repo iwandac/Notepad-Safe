@@ -21,34 +21,25 @@
 
 namespace {
 constexpr int TargetRole = Qt::UserRole + 20;
-constexpr int L2Role = Qt::UserRole + 21;
-constexpr int PositionRole = Qt::UserRole + 22;
-constexpr int IndexRole = Qt::UserRole + 23;
-constexpr int MatchLengthRole = Qt::UserRole + 24;
 constexpr int StaleRole = Qt::UserRole + 25;
 
-struct GroupedL1Line {
-    int line = 0;
-    QString context;
-    QVector<QPair<int, int>> matches;
-    QVector<QPair<qint64, int>> byteRanges;
-};
-
-QVector<GroupedL1Line> groupL1Matches(const QVector<SearchMatch> &matches)
+QVector<LargeFileSearchMatch> canonicalResults(
+    const QVector<SearchMatch> &matches)
 {
-    QVector<GroupedL1Line> grouped;
-    for (const SearchMatch &match : matches) {
-        if (grouped.isEmpty() || grouped.constLast().line != match.line) {
-            GroupedL1Line line;
-            line.line = match.line;
-            line.context = match.context;
-            grouped.append(std::move(line));
-        }
-        grouped.last().matches.append(qMakePair(match.index, match.length));
-        grouped.last().byteRanges.append(qMakePair(match.byteOffset,
-                                                    int(match.byteLength)));
+    QVector<LargeFileSearchMatch> results;
+    results.reserve(matches.size());
+    for (const SearchMatch &source : matches) {
+        LargeFileSearchMatch result;
+        result.byteOffset = source.byteOffset;
+        result.length = source.byteLength;
+        result.line = source.line;
+        result.col = source.index;
+        result.lineContext = source.context.toUtf8();
+        const qint64 prefixBytes = source.context.left(source.index).toUtf8().size();
+        result.contextByteOffset = qMax<qint64>(0, source.byteOffset - prefixBytes);
+        results.append(std::move(result));
     }
-    return grouped;
+    return results;
 }
 
 struct VisualMatchRange {
@@ -198,8 +189,7 @@ public:
         QPointer<EditorTab> tab;
         QString targetId;
         QString displayName;
-        QVector<GroupedL1Line> l1;
-        QPointer<SearchResultsModel> l2;
+        QPointer<SearchResultsModel> results;
         QVector<LargeFileSearchMatch> preview;
         qint64 totalMatches = 0;
         QString incompleteReason;
@@ -300,54 +290,10 @@ public:
 
         if (group->stale) return {};
         if (role == TargetRole) return group->targetId;
-        if (role == L2Role) return bool(group->l2);
         if (role == StaleRole) return false;
-        if (group->l2) {
-            const QModelIndex source = group->l2->index(index.row(), index.column());
-            return group->l2->data(source, role);
-        }
-        if (index.row() < 0 || index.row() >= group->l1.size()) return {};
-        const GroupedL1Line &line = group->l1.at(index.row());
-        if (role == PositionRole || role == SearchResultsModel::LineRole)
-            return line.line;
-        if (role == IndexRole)
-            return line.matches.isEmpty() ? 0 : line.matches.constFirst().first;
-        if (role == MatchLengthRole || role == SearchResultsModel::LengthRole)
-            return line.matches.isEmpty() ? 0 : line.matches.constFirst().second;
-        if (role == SearchResultsModel::ByteOffsetRole)
-            return line.byteRanges.isEmpty() ? QVariant{} : line.byteRanges.first().first;
-        if (role == SearchResultsModel::MatchByteRangesRole) {
-            QVariantList ranges;
-            for (const auto &match : line.byteRanges) {
-                if (match.first < 0 || match.second < 0) continue;
-                QVariantMap range;
-                range.insert(QStringLiteral("byteOffset"), match.first);
-                range.insert(QStringLiteral("length"), match.second);
-                ranges.append(range);
-            }
-            return ranges;
-        }
-        if (role == SearchResultsModel::ContextRole) return line.context;
-        if (role == SearchResultsModel::MatchCountInLineRole) return line.matches.size();
-        if (role == SearchResultsModel::MatchPositionsRole) {
-            QVariantList ranges;
-            for (const auto &match : line.matches) {
-                QVariantMap range;
-                range.insert(QStringLiteral("start"), match.first);
-                range.insert(QStringLiteral("length"), match.second);
-                ranges.append(range);
-            }
-            return ranges;
-        }
-        if (role == Qt::DisplayRole) {
-            switch (index.column()) {
-            case SearchResultsModel::COL_LINE: return line.line + 1;
-            case SearchResultsModel::COL_CONTEXT: return line.context;
-            case SearchResultsModel::COL_MATCHCOUNT: return line.matches.size();
-            default: return {};
-            }
-        }
-        return {};
+        if (!group->results) return {};
+        const QModelIndex source = group->results->index(index.row(), index.column());
+        return group->results->data(source, role);
     }
 
     void addL1(EditorTab *tab, const QString &targetId,
@@ -357,23 +303,27 @@ public:
         group->tab = tab;
         group->targetId = targetId;
         group->displayName = tab ? tab->fileName() : QString();
-        group->l1 = groupL1Matches(matches);
+        auto *model = new SearchResultsModel(this);
+        model->setTextEncoding(TextEncoding::Utf8);
+        model->setResults(canonicalResults(matches), {}, 0);
+        group->results = model;
         group->totalMatches = matches.size();
         if (incomplete)
-            group->incompleteReason = QStringLiteral("结果达到 200,000 处安全上限");
+            group->incompleteReason = QStringLiteral("结果未完整生成");
         const int row = groups_.size();
         beginInsertRows({}, row, row);
         groups_.append(group);
         endInsertRows();
     }
 
-    void addL2(EditorTab *tab, const QString &targetId, SearchResultsModel *model)
+    void addModel(EditorTab *tab, const QString &targetId,
+                  SearchResultsModel *model)
     {
         auto *group = new Group;
         group->tab = tab;
         group->targetId = targetId;
         group->displayName = tab ? tab->fileName() : QString();
-        group->l2 = model;
+        group->results = model;
         group->totalMatches = model ? model->totalMatches() : 0;
         group->incompleteReason = model ? model->incompleteReason() : QString();
         if (model) model->setParent(this);
@@ -383,35 +333,40 @@ public:
         endInsertRows();
     }
 
-    void addL2Preview(EditorTab *tab, const QString &targetId,
-                      SearchResultsModel *model)
+    void addPreview(EditorTab *tab, const QString &targetId,
+                    SearchResultsModel *model)
     {
-        addL2(tab, targetId, model);
+        addModel(tab, targetId, model);
     }
 
-    bool appendL2Preview(const QString &targetId,
-                         const QVector<LargeFileSearchMatch> &batch)
+    bool appendPreview(const QString &targetId,
+                       const QVector<LargeFileSearchMatch> &batch,
+                       TextEncoding encoding, bool bytePositionMode)
     {
         Group *group = findGroup(targetId);
-        if (!group || !group->l2 || group->stale || batch.isEmpty()) return false;
+        if (!group || !group->results || group->stale || batch.isEmpty()
+            || group->results->textEncoding() != encoding
+            || group->results->bytePositionMode() != bytePositionMode) {
+            return false;
+        }
         const int remaining = 5000 - group->preview.size();
         if (remaining <= 0) return true;
         const int take = qMin(remaining, batch.size());
         for (int i = 0; i < take; ++i) group->preview.append(batch.at(i));
-        group->l2->setResults(group->preview, {}, 0);
+        group->results->setResults(group->preview, {}, 0);
         group->totalMatches = group->preview.size();
         const int row = groups_.indexOf(group);
         emit dataChanged(index(row, 0), index(row, SearchResultsModel::COL_COUNT - 1));
         return true;
     }
 
-    bool finishL2(const QString &targetId, SearchResultsModel *model)
+    bool finish(const QString &targetId, SearchResultsModel *model)
     {
         Group *group = findGroup(targetId);
         if (!group || !model) return false;
-        SearchResultsModel *oldModel = group->l2;
+        SearchResultsModel *oldModel = group->results;
         beginResetModel();
-        group->l2 = model;
+        group->results = model;
         group->preview.clear();
         group->totalMatches = model->totalMatches();
         group->incompleteReason = model->incompleteReason();
@@ -421,15 +376,15 @@ public:
         return true;
     }
 
-    bool decorateL2(const QString &targetId, const LineIndex &lineIndex)
+    bool decorate(const QString &targetId, const LineIndex &lineIndex)
     {
         Group *group = findGroup(targetId);
-        if (!group || !group->l2 || group->stale
-            || !group->l2->hasUnknownLineNumbers()) {
+        if (!group || !group->results || group->stale
+            || !group->results->hasUnknownLineNumbers()) {
             return false;
         }
         beginResetModel();
-        const bool changed = group->l2->decorateLineNumbers(lineIndex);
+        const bool changed = group->results->decorateLineNumbers(lineIndex);
         endResetModel();
         return changed;
     }
@@ -481,74 +436,8 @@ private:
     static int childCount(const Group *group)
     {
         if (!group || group->stale) return 0;
-        return group->l2 ? group->l2->groupedCount() : group->l1.size();
+        return group->results ? group->results->groupedCount() : 0;
     }
-};
-
-class FlatL1SearchResultsModel final : public QAbstractTableModel {
-public:
-    explicit FlatL1SearchResultsModel(const QVector<SearchMatch> &matches,
-                                      QObject *parent = nullptr)
-        : QAbstractTableModel(parent), lines_(groupL1Matches(matches)) {}
-
-    int rowCount(const QModelIndex &parent = QModelIndex()) const override
-    { return parent.isValid() ? 0 : lines_.size(); }
-    int columnCount(const QModelIndex &parent = QModelIndex()) const override
-    { return parent.isValid() ? 0 : SearchResultsModel::COL_COUNT; }
-    QVariant headerData(int section, Qt::Orientation orientation,
-                        int role = Qt::DisplayRole) const override
-    {
-        if (orientation != Qt::Horizontal || role != Qt::DisplayRole) return {};
-        switch (section) {
-        case SearchResultsModel::COL_LINE: return QStringLiteral("行");
-        case SearchResultsModel::COL_CONTEXT: return QStringLiteral("内容");
-        case SearchResultsModel::COL_MATCHCOUNT: return QStringLiteral("匹配数");
-        default: return {};
-        }
-    }
-    QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override
-    {
-        if (!index.isValid() || index.row() < 0 || index.row() >= lines_.size()) return {};
-        const GroupedL1Line &line = lines_.at(index.row());
-        if (role == PositionRole || role == SearchResultsModel::LineRole) return line.line;
-        if (role == IndexRole) return line.matches.isEmpty() ? 0 : line.matches.first().first;
-        if (role == MatchLengthRole || role == SearchResultsModel::LengthRole)
-            return line.matches.isEmpty() ? 0 : line.matches.first().second;
-        if (role == SearchResultsModel::ByteOffsetRole)
-            return line.byteRanges.isEmpty() ? QVariant{} : line.byteRanges.first().first;
-        if (role == SearchResultsModel::MatchByteRangesRole) {
-            QVariantList ranges;
-            for (const auto &match : line.byteRanges) {
-                if (match.first < 0 || match.second < 0) continue;
-                QVariantMap range;
-                range.insert(QStringLiteral("byteOffset"), match.first);
-                range.insert(QStringLiteral("length"), match.second);
-                ranges.append(range);
-            }
-            return ranges;
-        }
-        if (role == SearchResultsModel::ContextRole) return line.context;
-        if (role == SearchResultsModel::MatchCountInLineRole) return line.matches.size();
-        if (role == SearchResultsModel::MatchPositionsRole) {
-            QVariantList ranges;
-            for (const auto &match : line.matches) {
-                QVariantMap range;
-                range.insert(QStringLiteral("start"), match.first);
-                range.insert(QStringLiteral("length"), match.second);
-                ranges.append(range);
-            }
-            return ranges;
-        }
-        if (role != Qt::DisplayRole) return {};
-        switch (index.column()) {
-        case SearchResultsModel::COL_LINE: return line.line + 1;
-        case SearchResultsModel::COL_CONTEXT: return line.context;
-        case SearchResultsModel::COL_MATCHCOUNT: return line.matches.size();
-        default: return {};
-        }
-    }
-private:
-    QVector<GroupedL1Line> lines_;
 };
 
 // ============================================================================
@@ -743,33 +632,12 @@ void SearchResultsDock::setResults(const QVector<SearchMatch> &matches,
                                    EditorTab *target,
                                    bool incomplete)
 {
-    setRerunAvailable(false);
-    SearchResultsModel *oldModel = m_model;
-    m_model = nullptr;
-    resetTargetWatches();
-    m_multiFileMode = false;
-    m_multiTargets.clear();
-    m_multiTargetRevisions.clear();
-    m_singleTarget.clear();
-    m_singleTargetRevision = 0;
-    watchTarget(target);
-    // L1 and L2 now share the same virtual view/delegate/navigation path.
-    m_stack->setCurrentIndex(0);
-    m_treeView->setModel(nullptr);
-    if (oldModel && oldModel->QObject::parent() == this)
-        delete oldModel;
-    delete m_multiModel;
-    m_multiModel = nullptr;
-    delete m_singleL1Model;
-    m_singleL1Model = new FlatL1SearchResultsModel(matches, this);
-    m_treeView->setModel(m_singleL1Model);
-    m_treeView->setRootIsDecorated(false);
-    if (incomplete) {
-        m_summary->setText(QStringLiteral("%1 · “%2” · 至少 %3 处（已截断）")
-                               .arg(fileName, pattern).arg(matches.size()));
-    } else {
-        updateSummary(pattern, fileName, qint64(matches.size()));
-    }
+    auto *model = new SearchResultsModel(this);
+    model->setTextEncoding(TextEncoding::Utf8);
+    model->setResults(canonicalResults(matches), {}, 0);
+    if (incomplete)
+        model->setIncompleteReason(QStringLiteral("结果未完整生成"));
+    setResultsModel(model, pattern, fileName, target);
 }
 
 void SearchResultsDock::clearResults()
@@ -798,8 +666,6 @@ void SearchResultsDock::clearResults()
     m_model = nullptr;
     if (m_treeView)
         m_treeView->setModel(nullptr);
-    delete m_singleL1Model;
-    m_singleL1Model = nullptr;
     if (oldSingleModel && oldSingleModel->QObject::parent() == this)
         delete oldSingleModel;
     delete m_multiModel;
@@ -825,8 +691,6 @@ void SearchResultsDock::setResultsModel(SearchResultsModel *model,
     m_singlePreviewMatches.clear();
     SearchResultsModel *oldModel = m_model;
     m_model = model;
-    delete m_singleL1Model;
-    m_singleL1Model = nullptr;
     // 切到 L2 视图
     m_stack->setCurrentIndex(0);
     m_treeView->setModel(model);  // nullptr 时会清空
@@ -868,12 +732,13 @@ void SearchResultsDock::setResultsModel(SearchResultsModel *model,
 
 void SearchResultsDock::beginSingleFileResults(const QString &pattern,
                                                 const QString &fileName,
-                                                EditorTab *target)
+                                                EditorTab *target,
+                                                TextEncoding encoding,
+                                                bool bytePositionMode)
 {
     auto *preview = new SearchResultsModel(this);
-    preview->setBytePositionMode(target && target->isBinaryDocument());
-    if (target)
-        preview->setTextEncoding(target->displayEncoding());
+    preview->setBytePositionMode(bytePositionMode);
+    preview->setTextEncoding(encoding);
     setResultsModel(preview, pattern, fileName, target);
     m_summary->setText(QStringLiteral("%1 · 正在搜索 “%2”…")
                            .arg(fileName, pattern));
@@ -882,10 +747,13 @@ void SearchResultsDock::beginSingleFileResults(const QString &pattern,
 }
 
 void SearchResultsDock::appendSingleFilePreview(
-    EditorTab *target, const QVector<LargeFileSearchMatch> &batch)
+    EditorTab *target, const QVector<LargeFileSearchMatch> &batch,
+    TextEncoding encoding, bool bytePositionMode)
 {
     if (m_multiFileMode || !target || target != m_singleTarget || !m_model
-        || !targetRevisionIsCurrent(target) || batch.isEmpty()) {
+        || !targetRevisionIsCurrent(target) || batch.isEmpty()
+        || m_model->textEncoding() != encoding
+        || m_model->bytePositionMode() != bytePositionMode) {
         return;
     }
     const int remaining = 5000 - m_singlePreviewMatches.size();
@@ -957,8 +825,6 @@ void SearchResultsDock::watchTarget(EditorTab *tab, const QString &targetId)
                 m_singleTargetRevision = 0;
                 m_model = nullptr;
                 m_treeView->setModel(nullptr);
-                delete m_singleL1Model;
-                m_singleL1Model = nullptr;
                 if (oldModel && oldModel->QObject::parent() == this)
                     oldModel->deleteLater();
                 m_summary->setText(QStringLiteral("源文档已关闭，搜索结果已失效。"));
@@ -983,7 +849,7 @@ void SearchResultsDock::decorateResultsFor(EditorTab *tab)
         return;
     for (auto it = m_multiTargets.cbegin(); it != m_multiTargets.cend(); ++it) {
         if (it.value() == tab) {
-            m_multiModel->decorateL2(it.key(), index);
+            m_multiModel->decorate(it.key(), index);
             return;
         }
     }
@@ -1035,8 +901,6 @@ void SearchResultsDock::invalidateResultsFor(EditorTab *tab)
     SearchResultsModel *oldModel = m_model;
     m_model = nullptr;
     m_treeView->setModel(nullptr);
-    delete m_singleL1Model;
-    m_singleL1Model = nullptr;
     if (oldModel && oldModel->QObject::parent() == this)
         delete oldModel;
     m_multiFileMode = false;
@@ -1082,22 +946,26 @@ void SearchResultsDock::beginMultiFileResults(const QString &pattern, int target
     raise();
 }
 
-void SearchResultsDock::beginMultiFileTarget(EditorTab *tab)
+void SearchResultsDock::beginMultiFileTarget(EditorTab *tab,
+                                              TextEncoding encoding,
+                                              bool bytePositionMode)
 {
     if (!m_multiFileMode || !m_multiModel || !tab) return;
     const QString targetId = registerTarget(tab);
     auto *preview = new SearchResultsModel(m_multiModel);
-    preview->setBytePositionMode(tab->isBinaryDocument());
-    preview->setTextEncoding(tab->displayEncoding());
-    m_multiModel->addL2Preview(tab, targetId, preview);
+    preview->setBytePositionMode(bytePositionMode);
+    preview->setTextEncoding(encoding);
+    m_multiModel->addPreview(tab, targetId, preview);
 }
 
 void SearchResultsDock::appendMultiFilePreview(
-    EditorTab *tab, const QVector<LargeFileSearchMatch> &batch)
+    EditorTab *tab, const QVector<LargeFileSearchMatch> &batch,
+    TextEncoding encoding, bool bytePositionMode)
 {
     if (!m_multiFileMode || !m_multiModel || !tab || batch.isEmpty()) return;
     const QString targetId = registerTarget(tab);
-    if (m_multiModel->appendL2Preview(targetId, batch)) {
+    if (m_multiModel->appendPreview(targetId, batch, encoding,
+                                    bytePositionMode)) {
         m_summary->setText(QStringLiteral("正在全部打开文件中搜索 “%1”…")
                                .arg(m_multiPattern));
     }
@@ -1131,8 +999,8 @@ void SearchResultsDock::appendMultiFileResults(EditorTab *tab,
         return;
     const QString targetId = registerTarget(tab);
     if (m_multiModel) {
-        if (!m_multiModel->finishL2(targetId, model))
-            m_multiModel->addL2(tab, targetId, model);
+        if (!m_multiModel->finish(targetId, model))
+            m_multiModel->addModel(tab, targetId, model);
         for (int row = 0; row < m_multiModel->rowCount(); ++row) {
             const QModelIndex group = m_multiModel->index(row, 0);
             if (group.data(TargetRole).toString() == targetId) {
@@ -1176,7 +1044,7 @@ void SearchResultsDock::finishMultiFileResults(bool cancelled)
 bool SearchResultsDock::eventFilter(QObject *watched, QEvent *event)
 {
     if (watched == m_treeView->viewport()
-        && (m_model || m_multiModel || m_singleL1Model)) {
+        && (m_model || m_multiModel)) {
         if (event->type() == QEvent::MouseMove
             || event->type() == QEvent::HoverMove) {
             const QPoint position = event->type() == QEvent::MouseMove
@@ -1223,7 +1091,7 @@ bool SearchResultsDock::eventFilter(QObject *watched, QEvent *event)
 
 void SearchResultsDock::onModelDoubleClicked(const QModelIndex &index)
 {
-    if ((!m_model && !m_multiModel && !m_singleL1Model) || !index.isValid()) return;
+    if ((!m_model && !m_multiModel) || !index.isValid()) return;
     if (m_multiFileMode && m_multiModel) {
         MultiSearchResultsModel::Group *group = m_multiModel->groupFor(index);
         if (!group || !index.parent().isValid() || group->stale)
@@ -1233,75 +1101,16 @@ void SearchResultsDock::onModelDoubleClicked(const QModelIndex &index)
             invalidateResultsFor(tab);
             return;
         }
-        if (index.data(L2Role).toBool()) {
-            const QVariantList ranges =
-                index.data(SearchResultsModel::MatchByteRangesRole).toList();
-            if (ranges.isEmpty()) return;
-            int chosen = (m_lastHitRow == index.row() && m_lastHitMatchIdx >= 0)
-                ? m_lastHitMatchIdx : 0;
-            chosen = qBound(0, chosen, ranges.size() - 1);
-            const QVariantMap range = ranges.at(chosen).toMap();
-            emit jumpToTabByteOffset(
-                tab, range.value(QStringLiteral("byteOffset")).toULongLong(),
-                range.value(QStringLiteral("length")).toInt());
-        } else {
-            const QVariantList byteRanges =
-                index.data(SearchResultsModel::MatchByteRangesRole).toList();
-            int chosen = (m_lastHitRow == index.row() && m_lastHitMatchIdx >= 0)
-                ? m_lastHitMatchIdx : 0;
-            if (!byteRanges.isEmpty()) {
-                chosen = qBound(0, chosen, byteRanges.size() - 1);
-                const QVariantMap byteRange = byteRanges.at(chosen).toMap();
-                emit jumpToTabByteOffset(
-                    tab, byteRange.value(QStringLiteral("byteOffset")).toLongLong(),
-                    byteRange.value(QStringLiteral("length")).toInt());
-                return;
-            }
-            const QVariantList ranges =
-                index.data(SearchResultsModel::MatchPositionsRole).toList();
-            chosen = ranges.isEmpty() ? 0 : qBound(0, chosen, ranges.size() - 1);
-            const QVariantMap range = ranges.isEmpty() ? QVariantMap{} : ranges.at(chosen).toMap();
-            emit jumpToTab(tab, index.data(PositionRole).toInt(),
-                           ranges.isEmpty() ? index.data(IndexRole).toInt()
-                                            : range.value(QStringLiteral("start")).toInt(),
-                           ranges.isEmpty() ? index.data(MatchLengthRole).toInt()
-                                            : range.value(QStringLiteral("length")).toInt());
-        }
-        return;
-    }
-    if (m_singleL1Model) {
-        if (m_singleTarget && !targetRevisionIsCurrent(m_singleTarget)) {
-            invalidateResultsFor(m_singleTarget);
-            return;
-        }
-        const QVariantList byteRanges =
+        const QVariantList ranges =
             index.data(SearchResultsModel::MatchByteRangesRole).toList();
+        if (ranges.isEmpty()) return;
         int chosen = (m_lastHitRow == index.row() && m_lastHitMatchIdx >= 0)
             ? m_lastHitMatchIdx : 0;
-        if (!byteRanges.isEmpty()) {
-            chosen = qBound(0, chosen, byteRanges.size() - 1);
-            const QVariantMap byteRange = byteRanges.at(chosen).toMap();
-            if (m_singleTarget) {
-                emit jumpToTabByteOffset(
-                    m_singleTarget,
-                    byteRange.value(QStringLiteral("byteOffset")).toLongLong(),
-                    byteRange.value(QStringLiteral("length")).toInt());
-            }
-            return;
-        }
-        const int line = index.data(PositionRole).toInt();
-        const QVariantList ranges =
-            index.data(SearchResultsModel::MatchPositionsRole).toList();
-        chosen = ranges.isEmpty() ? 0 : qBound(0, chosen, ranges.size() - 1);
-        const QVariantMap range = ranges.isEmpty() ? QVariantMap{} : ranges.at(chosen).toMap();
-        const int column = ranges.isEmpty() ? index.data(IndexRole).toInt()
-                                            : range.value(QStringLiteral("start")).toInt();
-        const int length = ranges.isEmpty() ? index.data(MatchLengthRole).toInt()
-                                            : range.value(QStringLiteral("length")).toInt();
-        if (m_singleTarget)
-            emit jumpToTab(m_singleTarget, line, column, length);
-        else
-            emit jumpTo(line, column, length);
+        chosen = qBound(0, chosen, ranges.size() - 1);
+        const QVariantMap range = ranges.at(chosen).toMap();
+        emit jumpToTabByteOffset(
+            tab, range.value(QStringLiteral("byteOffset")).toULongLong(),
+            range.value(QStringLiteral("length")).toInt());
         return;
     }
     if (!m_model) return;

@@ -210,8 +210,9 @@ public:
     bool findNext(const QString &pattern, bool regex, bool caseSensitive,
                   bool wholeWord, bool forward, bool wrap,
                   bool hexBytes = false);
-    // Directional navigation runs in AsyncTaskManager for every text tier and
-    // calls back as soon as one match is available; it never builds Find All.
+    // Directional navigation reuses a matching result cache first. Small S1
+    // documents use an inline first-hit scan; larger uncached documents run in
+    // AsyncTaskManager. It never builds Find All merely to navigate.
     bool findNextL2Async(const QString &pattern, bool regex,
                          bool caseSensitive, bool wholeWord,
                          bool forward, bool wrap, bool hexBytes,
@@ -436,7 +437,9 @@ signals:
     void findAllL2Progress(int percent, qint64 done, qint64 total);
     void findAllL2Partial(const QVector<LargeFileSearchMatch>& batch,
                           const QString& pattern,
-                          const QString& fileName);
+                          const QString& fileName,
+                          TextEncoding encoding,
+                          bool bytePositionMode);
     void findAllL2Finished(class SearchResultsModel* model,
                            const QString& pattern,
                            const QString& fileName);
@@ -545,6 +548,8 @@ private:
     bool               m_l2NavigationCaseSensitive = true;
     bool               m_l2NavigationWholeWord = false;
     bool               m_l2NavigationHexBytes = false;
+    TextEncoding       m_l2NavigationEncoding = TextEncoding::Utf8;
+    bool               m_l2NavigationByteContext = false;
     bool               m_l2NavigationHitValid = false;
     quint64            m_l2NavigationRevision = 0;
     qint64             m_l1FindAllTaskId = 0;
@@ -554,6 +559,8 @@ private:
     bool               m_l2SearchCacheCaseSensitive = true;
     bool               m_l2SearchCacheWholeWord = false;
     bool               m_l2SearchCacheHexBytes = false;
+    TextEncoding       m_l2SearchCacheEncoding = TextEncoding::Utf8;
+    bool               m_l2SearchCacheByteContext = false;
     bool               m_l2SearchCacheValid = false;
     quint64            m_l2SearchCacheRevision = 0;
     bool               m_lastFindAllTruncated = false;
@@ -566,6 +573,13 @@ private:
         bool caseSensitive = true;
         bool wholeWord = false;
         bool hexBytes = false;
+        TextEncoding encodingAtStart = TextEncoding::Utf8;
+        bool byteContextModeAtStart = false;
+        bool bytePositionModeAtStart = false;
+        bool tolerateInvalidEncodingAtStart = false;
+        QString sourcePathAtStart;
+        qint64 sourceSizeAtStart = -1;
+        DiskFileVersion diskVersionAtStart;
         quint64 contentRevision = 0;
         QPointer<QObject> parentForModel;
         QMetaObject::Connection waitLineBuildConn;
@@ -586,10 +600,14 @@ private:
     bool ensureWindowedSearchSource(QString *error = nullptr);
     // findAllL2Async 的内部启动：LineIndex 已完整 → 实际调 LargeFileSearch::findAllViaTaskManager
     void startPendingL2Search();
+    bool pendingL2SearchSourceIsCurrent() const;
     // 清理 m_pendingL2Search 所有连接并重置为 inactive
     void resetPendingL2Search();
     void advanceContentRevision();
     void cancelPendingL2SearchForContentChange();
+    void invalidateL2ProjectionSearchState();
+    bool l2ProjectionMatches(TextEncoding encoding,
+                             bool byteContextMode) const;
 
     // ============================================================================
     //  L2ScintillaBridge —— VFV 不做任何绘制；Scintilla overlay 盖满 VFV viewport，
@@ -608,6 +626,7 @@ private:
         qint64    windowLen   = 0;  // 窗口长度（= W_active）
         QTimer    syncVfvDebounce;  // 桥 3 Scintilla→VFV 防抖（250ms single-shot）
         bool      applying = false; // 桥 1/3 灌 Scintilla 时抑制 SCN_UPDATEUI 递归
+        bool      installingText = false; // 同步 setText 事务；绝不能算作源字节修改
         bool      viewportNavigationPending = false; // 仅真实编辑器导航可反向更新全局视口
         quint64   projectionGeneration = 0; // 丢弃上一轮 setText 遗留的延迟 UI 通知
     };

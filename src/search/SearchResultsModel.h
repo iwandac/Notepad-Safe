@@ -32,6 +32,9 @@ struct GroupedSearchLine {
     qint32 line = 0;                    // 0-based 行号
     qint64 contextByteOffset = 0;       // lineContext 起点的全局字节位置
     QByteArray lineContext;             // 整行文本
+    QString displayContext;             // 按搜索快照编码一次性解码的稳定预览
+    QVector<qint32> sourceBoundaries;   // lineContext 内编码单元的字节边界
+    QVector<qint32> utf16Boundaries;    // 与 sourceBoundaries 对应的 UI 边界
     QVector<QPair<qint32, qint32>> matchPositions; // (UTF-16 start, length)，用于精确绘制/点击
     QVector<QPair<qint64, qint32>> matchByteRanges; // (byteOffset, length) 每个匹配的字节范围（用于按"指定匹配"跳转）
     qint64 firstByteOffset = 0;         // 第一个匹配的字节偏移（双击跳转用，保持兼容）
@@ -74,7 +77,8 @@ public:
     bool isIncomplete() const { return !incompleteReason_.isEmpty(); }
     void setBytePositionMode(bool enabled) { bytePositionMode_ = enabled; }
     bool bytePositionMode() const { return bytePositionMode_; }
-    void setTextEncoding(TextEncoding encoding) { textEncoding_ = encoding; }
+    void setTextEncoding(TextEncoding encoding);
+    TextEncoding textEncoding() const { return textEncoding_; }
     bool hasUnknownLineNumbers() const;
 
     // Search is allowed to publish byte-offset results before the background

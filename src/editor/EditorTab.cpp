@@ -1,5 +1,6 @@
 #include "EditorTab.h"
 #include "EditorSurfaceStyle.h"
+// Hex character rows use the shared measured Scintilla-authoritative grid.
 #include "ByteClipboard.h"
 #include "VirtualFileView.h"
 #include "WindowedReadOnlyProvider.h"
@@ -91,6 +92,122 @@
 
 namespace {
 
+// Below this budget, queueing and exposing a background task costs more than a
+// bounded first-hit scan of the in-memory UTF-8 document. This is deliberately
+// much smaller than the 32 MiB S1 product boundary: tier and work scheduling
+// answer different questions.
+constexpr qint64 L1InlineNavigationBudgetBytes = 256LL * 1024;
+
+struct LiteralUtf8Hit {
+    qint64 byteOffset = -1;
+    qint32 byteLength = 0;
+    int utf16Offset = -1;
+    int utf16Length = 0;
+};
+
+bool l1WordCharacter(const QString &text, int index)
+{
+    if (index < 0 || index >= text.size()) return false;
+    uint scalar = text.at(index).unicode();
+    if (text.at(index).isLowSurrogate() && index > 0
+        && text.at(index - 1).isHighSurrogate()) {
+        scalar = QChar::surrogateToUcs4(text.at(index - 1), text.at(index));
+    } else if (text.at(index).isHighSurrogate() && index + 1 < text.size()
+               && text.at(index + 1).isLowSurrogate()) {
+        scalar = QChar::surrogateToUcs4(text.at(index), text.at(index + 1));
+    }
+    return scalar == uint('_') || QChar::isLetterOrNumber(scalar);
+}
+
+bool l1WholeWordAccepted(const QString &text, int start, int length)
+{
+    return (start == 0 || !l1WordCharacter(text, start - 1))
+        && (start + length >= text.size()
+            || !l1WordCharacter(text, start + length));
+}
+
+QVector<qint32> utf16ToUtf8Boundaries(const QString &text)
+{
+    QVector<qint32> mapping(text.size() + 1, 0);
+    qint32 bytes = 0;
+    for (int index = 0; index < text.size();) {
+        mapping[index] = bytes;
+        const int units = text.at(index).isHighSurrogate()
+                && index + 1 < text.size()
+                && text.at(index + 1).isLowSurrogate()
+            ? 2 : 1;
+        if (units == 2)
+            mapping[index + 1] = bytes;
+        bytes += QStringView(text).mid(index, units).toString().toUtf8().size();
+        index += units;
+        mapping[index] = bytes;
+    }
+    return mapping;
+}
+
+QVector<LiteralUtf8Hit> findUtf8LiteralHits(
+    const QByteArray &subject, const QString &pattern, bool caseSensitive,
+    bool wholeWord, const std::function<bool()> &cancelled = {},
+    const std::function<void(qint64)> &progress = {}, bool firstOnly = false,
+    bool reverse = false, qint64 byteBoundary = -1,
+    qsizetype maximumHits = std::numeric_limits<qsizetype>::max())
+{
+    QVector<LiteralUtf8Hit> hits;
+    if (pattern.isEmpty()) return hits;
+    const QString text = QString::fromUtf8(subject);
+    const QVector<qint32> bytesAt = utf16ToUtf8Boundaries(text);
+    const Qt::CaseSensitivity sensitivity = caseSensitive
+        ? Qt::CaseSensitive : Qt::CaseInsensitive;
+    int from = reverse ? text.size() : 0;
+    if (byteBoundary >= 0) {
+        const auto boundary = std::lower_bound(
+            bytesAt.cbegin(), bytesAt.cend(), qint32(qMin<qint64>(
+                byteBoundary, std::numeric_limits<qint32>::max())));
+        from = int(std::distance(bytesAt.cbegin(), boundary));
+    }
+    int hit = -1;
+    if (reverse) {
+        // QString::lastIndexOf(..., -1) means "start at the end", not
+        // "the range before byte 0 is empty".  Handle BOF explicitly so a
+        // non-wrapping Find Previous cannot silently wrap to the last hit.
+        if (from > 0)
+            hit = text.lastIndexOf(pattern, qMin(from - 1, text.size()),
+                                   sensitivity);
+    } else {
+        hit = text.indexOf(pattern, qBound(0, from, text.size()), sensitivity);
+    }
+    qint64 lastReported = 0;
+    while (hit >= 0) {
+        if (cancelled && cancelled()) {
+            hits.clear();
+            return hits;
+        }
+        const int end = qMin(text.size(), hit + pattern.size());
+        if (!wholeWord || l1WholeWordAccepted(text, hit, end - hit)) {
+            LiteralUtf8Hit value;
+            value.byteOffset = bytesAt.at(hit);
+            value.byteLength = bytesAt.at(end) - bytesAt.at(hit);
+            value.utf16Offset = hit;
+            value.utf16Length = end - hit;
+            hits.append(value);
+            if (firstOnly || hits.size() >= maximumHits)
+                break;
+        }
+        const qint64 examined = reverse
+            ? qint64(subject.size()) - bytesAt.at(hit) : bytesAt.at(hit);
+        if (progress && examined >= lastReported + 256 * 1024) {
+            lastReported = examined;
+            progress(qMin<qint64>(examined, subject.size()));
+        }
+        hit = reverse
+            ? text.lastIndexOf(pattern, hit - 1, sensitivity)
+            : text.indexOf(pattern, hit + 1, sensitivity);
+    }
+    if (progress)
+        progress(subject.size());
+    return hits;
+}
+
 QsciScintilla::EolMode detectLineEndingMode(const QString &text)
 {
     qsizetype crlf = 0;
@@ -134,22 +251,6 @@ QString formatHexBytes(const QByteArray &bytes, int bytesPerRow = 16)
         const bool endOfLine = ((i + 1) % bytesPerRow) == 0;
         if (i + 1 < bytes.size())
             text.append(endOfLine ? QLatin1Char('\n') : QLatin1Char(' '));
-    }
-    return text;
-}
-
-QString formatAsciiBytes(const QByteArray &bytes, int bytesPerRow = 16)
-{
-    bytesPerRow = qMax(1, bytesPerRow);
-    QString text;
-    text.reserve(bytes.size() + bytes.size() / bytesPerRow + 1);
-    for (qsizetype i = 0; i < bytes.size(); ++i) {
-        const auto value = static_cast<unsigned char>(bytes.at(i));
-        text.append(value >= 0x20 && value <= 0x7e
-                        ? QChar::fromLatin1(char(value))
-                        : QLatin1Char('.'));
-        if ((i + 1) % bytesPerRow == 0 && i + 1 < bytes.size())
-            text.append(QLatin1Char('\n'));
     }
     return text;
 }
@@ -534,7 +635,7 @@ void EditorTab::setupEditor()
         // Navigating to a search hit rebuilds that projection with setText(); it
         // must never advance the source revision or invalidate search results.
         // Real external source changes are reported by the provider below.
-        if (isReadOnlyByPolicy())
+        if (m_bridge.installingText || isReadOnlyByPolicy())
             return;
         // A projection rebuild holds m_bridge.applying through one queued
         // paint turn. Keyboard input can legitimately arrive in that narrow
@@ -1523,19 +1624,8 @@ QVector<SearchMatch> EditorTab::findAll(const QString &pattern, bool regex,
         return matches;
     }
 
-    Pcre2Regex compiled;
-    QString compileError;
-    if (!compiled.compile(pattern, !regex, caseSensitive, wholeWord, &compileError)) {
-        m_lastSearchError = compileError;
-        return matches;
-    }
-
     const QByteArray subject = m_editor->text().toUtf8();
-    QString scanError;
-    const Pcre2Regex::ScanResult scanResult = compiled.scan(
-        reinterpret_cast<const uchar *>(subject.constData()), subject.size(),
-        {}, {},
-        [&](qint64 byteOffset, qint64 byteLength) {
+    const auto recordMatch = [&](qint64 byteOffset, qint64 byteLength) {
             const int lineNum = int(m_editor->SendScintilla(
                 QsciScintillaBase::SCI_LINEFROMPOSITION, long(byteOffset)));
             const qint64 lineByteStart = m_editor->SendScintilla(
@@ -1561,16 +1651,44 @@ QVector<SearchMatch> EditorTab::findAll(const QString &pattern, bool regex,
                 return false;
             }
             return true;
-        }, &scanError);
-    if (scanResult == Pcre2Regex::ScanResult::Failed) {
-        m_lastSearchError = scanError;
-        matches.clear();
-        m_l1SearchCache.clear();
-        return matches;
+        };
+    if (regex) {
+        Pcre2Regex compiled;
+        QString scanError;
+        if (!compiled.compile(pattern, false, caseSensitive, wholeWord,
+                              &scanError)) {
+            m_lastSearchError = scanError;
+            return matches;
+        }
+        const Pcre2Regex::ScanResult scanResult = compiled.scan(
+            reinterpret_cast<const uchar *>(subject.constData()), subject.size(),
+            {}, {}, recordMatch, &scanError);
+        if (scanResult == Pcre2Regex::ScanResult::Failed) {
+            m_lastSearchError = scanError;
+            matches.clear();
+            m_l1SearchCache.clear();
+            return matches;
+        }
+        if (scanResult == Pcre2Regex::ScanResult::Cancelled
+            && !m_lastFindAllTruncated) {
+            m_lastSearchError = QObject::tr("搜索已取消。");
+            matches.clear();
+            m_l1SearchCache.clear();
+            return matches;
+        }
+    } else {
+        const QVector<LiteralUtf8Hit> literalHits = findUtf8LiteralHits(
+            subject, pattern, caseSensitive, wholeWord, {}, {}, false, false,
+            -1, 200000);
+        for (const LiteralUtf8Hit &hit : literalHits) {
+            if (!recordMatch(hit.byteOffset, hit.byteLength))
+                break;
+        }
     }
-    if (scanResult == Pcre2Regex::ScanResult::Cancelled
-        && !m_lastFindAllTruncated) {
-        m_lastSearchError = QObject::tr("搜索已取消。");
+    if (m_lastFindAllTruncated) {
+        m_lastFindAllTruncated = false;
+        m_lastSearchError = QObject::tr(
+            "匹配结果超过 200,000 处，当前文档无法在可用内存内完整保存结果。");
         matches.clear();
         m_l1SearchCache.clear();
         return matches;
@@ -1622,24 +1740,19 @@ bool EditorTab::findAllL1Async(
             hits.reserve(256);
             bool truncated = false;
             QString error;
-            Pcre2Regex compiled;
             const auto cancelled = [&] {
                 return cancel && cancel->load(std::memory_order_acquire);
             };
-            bool ok = compiled.compile(pattern, !regex, caseSensitive,
-                                       wholeWord, &error);
+            AsyncTaskManager::instance().updateTaskPhase(
+                taskId, regex ? QObject::tr("执行正则匹配")
+                              : QObject::tr("扫描字面值"),
+                1, 1, 0, subject.size());
+            bool ok = true;
             int lineNumber = 0;
             qint64 lineStart = 0;
             qint64 cachedContextStart = -1;
             QString cachedContext;
-            if (ok) {
-                const auto scanResult = compiled.scan(
-                    reinterpret_cast<const uchar *>(subject.constData()),
-                    subject.size(), cancelled,
-                    [reportProgress, total = qint64(subject.size())](qint64 done) {
-                        reportProgress(done, total);
-                    },
-                    [&](qint64 byteOffset, qint64 byteLength) {
+            const auto recordMatch = [&](qint64 byteOffset, qint64 byteLength) {
                         if (byteLength < 0
                             || byteLength > std::numeric_limits<qint32>::max()) {
                             error = QObject::tr("单个匹配过长。");
@@ -1684,15 +1797,44 @@ bool EditorTab::findAllL1Async(
                         hits.push_back({byteOffset, qint32(byteLength)});
                         matches.push_back(std::move(match));
                         if (matches.size() >= 200000) {
-                            truncated = true;
+                            error = QObject::tr(
+                                "匹配结果超过 200,000 处，当前文档无法在可用内存内完整保存结果。");
                             return false;
                         }
                         return true;
-                    }, &error);
+                    };
+            if (regex) {
+                Pcre2Regex compiled;
+                ok = compiled.compile(pattern, false, caseSensitive,
+                                      wholeWord, &error);
+                if (ok) {
+                const auto scanResult = compiled.scan(
+                    reinterpret_cast<const uchar *>(subject.constData()),
+                    subject.size(), cancelled,
+                    [reportProgress, total = qint64(subject.size())](qint64 done) {
+                        reportProgress(done, total);
+                    },
+                    recordMatch, &error);
                 ok = scanResult != Pcre2Regex::ScanResult::Failed
-                    && (scanResult != Pcre2Regex::ScanResult::Cancelled
-                        || truncated)
+                    && scanResult != Pcre2Regex::ScanResult::Cancelled
                     && !cancelled() && error.isEmpty();
+                }
+            } else {
+                const QVector<LiteralUtf8Hit> literalHits = findUtf8LiteralHits(
+                    subject, pattern, caseSensitive, wholeWord, cancelled,
+                    [reportProgress, total = qint64(subject.size())](qint64 done) {
+                        reportProgress(done, total);
+                    }, false, false, -1, 200000);
+                if (cancelled()) {
+                    ok = false;
+                } else {
+                    for (const LiteralUtf8Hit &hit : literalHits) {
+                        if (!recordMatch(hit.byteOffset, hit.byteLength)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
             }
             if (!ok && error.isEmpty() && cancelled())
                 error = QObject::tr("已取消。");
@@ -2250,6 +2392,8 @@ void EditorTab::setSplitView(bool enabled, Qt::Orientation orientation)
 void EditorTab::setDisplayEncoding(TextEncoding enc)
 {
     if (isL2Mode() && m_l2View) {
+        if (m_encoding == enc)
+            return;
         QString error;
         if (!bridgeFlushOverlayToPatches(&error)) {
             if (auto *window = qobject_cast<QMainWindow *>(this->window()))
@@ -2263,8 +2407,14 @@ void EditorTab::setDisplayEncoding(TextEncoding enc)
         m_encodingConfidence = EncodingConfidence::Certain;
         m_encodingDecodeErrors = false;
         m_l2View->setDisplayEncoding(enc);
+        invalidateL2ProjectionSearchState();
         if (m_windowedReadOnlyProvider)
             m_windowedReadOnlyProvider->setTextEncoding(enc);
+        if (windowedReadOnlyActive()) {
+            clearL2BridgeBaseline();
+            emit encodingChanged(m_encoding);
+            return;
+        }
         const qint64 start = m_l2View->activeWindowByteStart();
         const qint64 end = m_l2View->activeWindowByteEnd();
         clearL2BridgeBaseline();
@@ -2319,6 +2469,7 @@ void EditorTab::setViewModeL2(ViewMode mode)
     }
 
     m_l2View->setViewMode(mode);
+    invalidateL2ProjectionSearchState();
     if (windowedReadOnlyActive()) {
         m_windowedReadOnlyProvider->setPresentation(
             mode == ViewMode::Hex ? WindowedReadOnlyProvider::Presentation::Hex
@@ -2328,8 +2479,10 @@ void EditorTab::setViewModeL2(ViewMode mode)
         // provider owns the visible projection. Keep its gutter semantics in
         // sync so Binary->Text never reports hexadecimal addresses as lines.
         m_editor->SendScintilla(QsciScintillaBase::SCI_MARGINTEXTCLEARALL);
-        m_editor->setMarginLineNumbers(0, mode == ViewMode::Text);
-        m_editor->setMarginType(0, mode == ViewMode::Text
+        const bool trustedTextLines = mode == ViewMode::Text
+            && !m_binaryDocument;
+        m_editor->setMarginLineNumbers(0, trustedTextLines);
+        m_editor->setMarginType(0, trustedTextLines
                                       ? QsciScintilla::NumberMargin
                                       : QsciScintilla::TextMargin);
         return;
@@ -2527,6 +2680,12 @@ qint64 EditorTab::contentSizeBytes() const
         return m_windowedReadOnlyProvider->fileSize();
     if (m_l2Mode && m_l2View && m_l2View->isOpen())
         return m_l2View->virtualFileSize();
+    // For a saved ordinary text file the user-visible size is the source file
+    // on disk, not Scintilla's internal UTF-8 buffer length. Modified content
+    // remains a separate editor state until the next successful save refreshes
+    // this bounded disk-version snapshot.
+    if (!isSecureDocument() && m_diskVersion.valid)
+        return m_diskVersion.size;
     return m_editor ? static_cast<qint64>(m_editor->length()) : 0;
 }
 
@@ -2614,16 +2773,16 @@ void EditorTab::ensureHexAsciiPreview(QWidget *parent)
     if (!m_hexAsciiPreview) {
         m_hexAsciiPreview = new QPlainTextEdit(parent);
         m_hexAsciiPreview->setObjectName(QStringLiteral("HexAsciiPreview"));
-        m_hexAsciiPreview->setAccessibleName(QStringLiteral("ASCII 字节预览"));
+        m_hexAsciiPreview->setAccessibleName(QStringLiteral("编码字符预览"));
         m_hexAsciiPreview->setToolTip(
-            QStringLiteral("字符栏（不可打印字节显示为 .；可直接编辑原始字节）"));
+            QStringLiteral("字符栏（按当前编码进行多字节解码；编辑仍作用于原始字节）"));
         m_hexAsciiPreview->setFont(m_editor->font());
         m_hexAsciiPreview->setReadOnly(isReadOnlyByPolicy());
-        // A byte pane is not a Unicode text editor. Disable native composition
-        // so Chinese/Japanese IMEs cannot inject preedit text into the visual
-        // projection; eventFilter still validates any commit event that a
-        // platform plugin delivers despite this attribute.
-        m_hexAsciiPreview->setAttribute(Qt::WA_InputMethodEnabled, false);
+        // The character pane accepts text through the selected encoding. Its
+        // event filter consumes preedit and applies each complete IME commit as
+        // one byte transaction, so native composition can stay available
+        // without letting temporary preedit mutate the fixed byte grid.
+        m_hexAsciiPreview->setAttribute(Qt::WA_InputMethodEnabled, true);
         m_hexAsciiPreview->setLineWrapMode(QPlainTextEdit::NoWrap);
         m_hexAsciiPreview->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         m_hexAsciiPreview->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -2824,6 +2983,31 @@ void EditorTab::refreshTextProjectionMargin()
     if (!m_l2Mode || !m_l2View || !m_editor
         || m_l2View->viewMode() != ViewMode::Text
         || m_bridge.windowStart < 0) {
+        return;
+    }
+
+    if (m_binaryDocument) {
+        // Binary CR/LF bytes do not establish a trustworthy whole-file line
+        // model. Show each projected row's authoritative source byte offset;
+        // this is bounded to the active window and never scans the prefix.
+        m_editor->SendScintilla(QsciScintillaBase::SCI_MARGINTEXTCLEARALL);
+        m_editor->setMarginLineNumbers(0, false);
+        m_editor->setMarginType(0, QsciScintilla::TextMargin);
+        const int lines = qMax(1, m_editor->lines());
+        const int digits = qMax(
+            8, QString::number(
+                qMax<qint64>(0, m_l2View->virtualFileSize() - 1), 16).size());
+        m_editor->setMarginWidth(0, QString(digits + 2, QLatin1Char('0')));
+        for (int localLine = 0; localLine < lines; ++localLine) {
+            const long position = m_editor->SendScintilla(
+                QsciScintillaBase::SCI_POSITIONFROMLINE,
+                static_cast<unsigned long>(localLine));
+            const qint64 offset = m_bridge.windowStart
+                + bridgeSourceOffsetForProjectedPosition(qMax<long>(0, position));
+            m_editor->setMarginText(
+                localLine, QString::number(offset, 16)
+                               .rightJustified(digits, QLatin1Char('0')).toUpper(), 0);
+        }
         return;
     }
 
@@ -3049,6 +3233,7 @@ void EditorTab::bridgePopulateScintilla(qint64 s, qint64 e)
     m_bridge.projectedBoundaries.clear();
     // 走 SCI_SETTEXT（setText），对于 W_active 上限 8MB，主线程 setText 约 100ms 内完成，
     // 不会触发"UI 线程卡死"；甩滚时 bridge 不频繁触发（VFV debounce 已节流）。
+    m_bridge.installingText = true;
     m_editor->setReadOnly(false);
     if (m_l2View->viewMode() == ViewMode::Hex) {
         m_editor->setAttribute(Qt::WA_InputMethodEnabled, false);
@@ -3059,7 +3244,8 @@ void EditorTab::bridgePopulateScintilla(qint64 s, qint64 e)
         // otherwise hide the first bytes while the absolute offset still says 0.
         m_editor->SendScintilla(QsciScintillaBase::SCI_SETXOFFSET, 0);
         ensureHexAsciiPreview(m_l2View->viewport());
-        QString ascii = formatAsciiBytes(bytes, m_hexBytesPerRow);
+        QString ascii = decodeByteGridText(bytes, m_l2View->displayEncoding(),
+                                           m_hexBytesPerRow);
         const int oldPreviewLength = qMax(0,
             m_hexAsciiPreview->document()->characterCount() - 1);
         if (m_secureBinaryDocument && oldPreviewLength > 0) {
@@ -3069,10 +3255,11 @@ void EditorTab::bridgePopulateScintilla(qint64 s, qint64 e)
         m_hexAsciiPreview->setPlainText(ascii);
         alignPlainTextRowsToScintilla(m_hexAsciiPreview, m_editor);
         m_hexAsciiPreview->setReadOnly(isReadOnlyByPolicy());
-        // QPlainTextEdit::setReadOnly(false) re-enables native input methods.
-        // Apply the byte-surface policy after the editability policy every
-        // time a projected window is repopulated.
-        m_hexAsciiPreview->setAttribute(Qt::WA_InputMethodEnabled, false);
+        // QPlainTextEdit can recalculate input-method support when editability
+        // changes. The character pane remains an encoding-aware input surface;
+        // its event filter owns preedit and commit atomically.
+        m_hexAsciiPreview->setAttribute(Qt::WA_InputMethodEnabled,
+                                        !isReadOnlyByPolicy());
         if (m_secureBinaryDocument && !ascii.isEmpty())
             ascii.fill(QChar(0));
         m_editor->setWrapMode(QsciScintilla::WrapNone);
@@ -3113,6 +3300,7 @@ void EditorTab::bridgePopulateScintilla(qint64 s, qint64 e)
         m_editor->setWrapMode(m_l2View->wordWrap() ? QsciScintilla::WrapWord
                                                    : QsciScintilla::WrapNone);
     }
+    m_bridge.installingText = false;
     m_editor->setModified(false);
     // The L2 overlay is a projection of VirtualFileView, not a second document.
     // setText/SCI_ADDTEXT can leave native Scintilla undo records behind on
@@ -3149,8 +3337,9 @@ void EditorTab::bridgePopulateScintilla(qint64 s, qint64 e)
     // turn. The generation check prevents an older queued release from opening
     // the gate while a newer projection is still being built.
     QTimer::singleShot(0, this, [this, projectionGeneration]() {
-        if (m_bridge.projectionGeneration == projectionGeneration)
+        if (m_bridge.projectionGeneration == projectionGeneration) {
             m_bridge.applying = false;
+        }
     });
 }
 
@@ -3644,6 +3833,11 @@ void EditorTab::setAsciiCaret(qint64 globalByte)
         return;
     globalByte = qBound<qint64>(0, globalByte, m_l2View->virtualFileSize());
     m_l2View->syncActiveWindowToCursor(globalByte);
+    // The byte provider is the source of truth for navigation and subsequent
+    // edits. Rebuilding a decoded Hex character row can temporarily mirror
+    // the old Scintilla caret back into it, so restore the requested collapsed
+    // byte selection before positioning either visual caret.
+    m_l2View->selectBytes(globalByte, globalByte);
     const qint64 local = qBound<qint64>(0, globalByte - m_bridge.windowStart,
                                         m_bridge.windowLen);
     const int line = int(local / m_hexBytesPerRow);
@@ -3832,7 +4026,9 @@ void EditorTab::refreshHexAsciiProjectionFromEditor()
     QString previewError;
     if (!parseHexBytes(m_editor->text(), &previewBytes, &previewError))
         return;
-    QString ascii = formatAsciiBytes(previewBytes, m_hexBytesPerRow);
+    QString ascii = decodeByteGridText(previewBytes,
+                                       m_l2View->displayEncoding(),
+                                       m_hexBytesPerRow);
     m_adjustingAsciiCaret = true;
     m_hexAsciiPreview->setPlainText(ascii);
     alignPlainTextRowsToScintilla(m_hexAsciiPreview, m_editor);
@@ -3884,27 +4080,50 @@ bool EditorTab::updateFixedHexProjection(qint64 globalStart, qint32 oldLength,
                                 static_cast<uintptr_t>(2),
                                 static_cast<const char *>(hex));
 
-        const QTextBlock block =
-            m_hexAsciiPreview->document()->findBlockByNumber(line);
-        if (block.isValid() && byteColumn < block.text().size()) {
-            QTextCursor cursor(m_hexAsciiPreview->document());
-            cursor.setPosition(block.position() + byteColumn);
-            cursor.movePosition(QTextCursor::NextCharacter,
-                                QTextCursor::KeepAnchor);
-            cursor.insertText(QString(value >= 0x20 && value <= 0x7e
-                                          ? QChar::fromLatin1(char(value))
-                                          : QLatin1Char('.')));
-        }
     }
     m_editor->SendScintilla(QsciScintillaBase::SCI_SETUNDOCOLLECTION, 1UL);
     m_editor->SendScintilla(QsciScintillaBase::SCI_EMPTYUNDOBUFFER);
     m_editor->SendScintilla(QsciScintillaBase::SCI_SETSAVEPOINT);
     m_editor->setModified(false);
+    m_bridge.baseline.replace(int(localStart), replacement.size(), replacement);
+
+    // Multibyte decoding means one edited byte can change the character that
+    // begins a few bytes earlier. Rebuild only the affected rows plus one
+    // bounded neighbor on each side instead of decoding the whole active
+    // window after every Hex keystroke.
+    const qint64 totalRows = (m_bridge.baseline.size() + m_hexBytesPerRow - 1)
+        / m_hexBytesPerRow;
+    const qint64 firstRow = qMax<qint64>(
+        0, localStart / m_hexBytesPerRow - 1);
+    const qint64 lastRowExclusive = qMin<qint64>(
+        totalRows,
+        (localStart + replacement.size() + m_hexBytesPerRow - 1)
+                / m_hexBytesPerRow + 1);
+    const qint64 segmentStart = firstRow * m_hexBytesPerRow;
+    const qint64 segmentEnd = qMin<qint64>(
+        m_bridge.baseline.size(), lastRowExclusive * m_hexBytesPerRow);
+    const QString characterRows = decodeByteGridText(
+        m_bridge.baseline.mid(segmentStart, segmentEnd - segmentStart),
+        m_l2View->displayEncoding(), m_hexBytesPerRow);
+    const QTextBlock firstBlock =
+        m_hexAsciiPreview->document()->findBlockByNumber(int(firstRow));
+    const QTextBlock afterBlock =
+        m_hexAsciiPreview->document()->findBlockByNumber(int(lastRowExclusive));
+    if (firstBlock.isValid()) {
+        QTextCursor cursor(m_hexAsciiPreview->document());
+        cursor.setPosition(firstBlock.position());
+        const int endPosition = afterBlock.isValid()
+            ? afterBlock.position()
+            : qMax(0, m_hexAsciiPreview->document()->characterCount() - 1);
+        cursor.setPosition(endPosition, QTextCursor::KeepAnchor);
+        cursor.insertText(characterRows
+            + (afterBlock.isValid() ? QString(QLatin1Char('\n')) : QString()));
+    }
     m_hexAsciiPreview->verticalScrollBar()->setValue(asciiVertical);
     m_hexAsciiPreview->horizontalScrollBar()->setValue(asciiHorizontal);
     m_adjustingAsciiCaret = false;
-    m_bridge.baseline.replace(int(localStart), replacement.size(), replacement);
     m_bridge.applying = previousApplying;
+    syncAsciiSelectionFromHex();
     applyL2SearchHighlightsToOverlay();
     return true;
 }
@@ -3974,7 +4193,7 @@ bool EditorTab::handleHexAsciiKeyPress(QKeyEvent *event)
         if (!selected)
             return true;
         QByteArray bytes = m_l2View->readByteRange(start, end);
-        ByteClipboard::setAsciiSelection(bytes);
+        ByteClipboard::setCharacterSelection(bytes, m_l2View->displayEncoding());
         if (m_secureBinaryDocument && !bytes.isEmpty())
             bytes.fill(0);
         if (event->matches(QKeySequence::Cut))
@@ -3982,14 +4201,17 @@ bool EditorTab::handleHexAsciiKeyPress(QKeyEvent *event)
         return true;
     }
     if (event->matches(QKeySequence::Paste)) {
-        const QString text = QGuiApplication::clipboard()->text();
-        for (const QChar ch : text) {
-            if (ch.unicode() > 0xff) {
-                showError(QObject::tr("字符栏粘贴只接受单字节 Latin-1 字符。"));
+        QByteArray pasted;
+        if (!ByteClipboard::rawClipboardBytes(&pasted)) {
+            bool representable = true;
+            pasted = encodeTextFragment(QGuiApplication::clipboard()->text(),
+                                        m_l2View->displayEncoding(),
+                                        &representable);
+            if (!representable) {
+                showError(QObject::tr("剪贴板文本无法用当前字符栏编码无损表示。"));
                 return true;
             }
         }
-        QByteArray pasted = text.toLatin1();
         qint64 overwriteEnd = end;
         if (!selected && m_hexOverwriteMode) {
             const qint64 available = m_l2View->virtualFileSize() - start;
@@ -4021,14 +4243,18 @@ bool EditorTab::handleHexAsciiKeyPress(QKeyEvent *event)
         return true;
     }
     const QString typed = event->text();
-    if (typed.size() == 1
+    if (!typed.isEmpty()
         && !(event->modifiers() & (Qt::ControlModifier | Qt::AltModifier
                                   | Qt::MetaModifier))) {
-        const uint value = typed.at(0).unicode();
-        if (value > 0xff || value < 0x20
-            || (value >= 0x7f && value <= 0x9f)) {
-            showError(QObject::tr(
-                "字符栏直接输入只接受可打印单字节 Latin-1 字符；控制字节请使用十六进制粘贴。"));
+        const bool hasControl = std::any_of(
+            typed.cbegin(), typed.cend(), [](QChar ch) {
+                return ch.category() == QChar::Other_Control;
+            });
+        bool representable = true;
+        QByteArray encoded = encodeTextFragment(
+            typed, m_l2View->displayEncoding(), &representable);
+        if (hasControl || !representable || encoded.isEmpty()) {
+            showError(QObject::tr("输入字符无法用当前字符栏编码无损表示。"));
             return true;
         }
         if (!selected && m_hexOverwriteMode
@@ -4036,8 +4262,8 @@ bool EditorTab::handleHexAsciiKeyPress(QKeyEvent *event)
             return true;
         }
         const qint64 overwriteEnd = selected || !m_hexOverwriteMode
-            ? end : qMin(m_l2View->virtualFileSize(), start + 1);
-        replace(start, overwriteEnd, typed.toLatin1());
+            ? end : qMin(m_l2View->virtualFileSize(), start + encoded.size());
+        replace(start, overwriteEnd, std::move(encoded));
         return true;
     }
     return false;
@@ -4064,18 +4290,10 @@ bool EditorTab::handleHexInputMethodEvent(QInputMethodEvent *event,
         QApplication::beep();
     };
 
-    // Validate the entire commit before changing one byte. This prevents a
-    // mixed commit such as "D8中" from applying D8 and rejecting only the tail.
+    // Validate the complete commit before changing one byte. The character
+    // pane uses its selected encoding; the Hex pane still accepts nibbles only.
     for (const QChar ch : committed) {
-        if (asciiSurface) {
-            const uint value = ch.unicode();
-            if (value > 0xff || value < 0x20
-                || (value >= 0x7f && value <= 0x9f)) {
-                showError(QObject::tr(
-                    "字符栏输入法提交只接受可打印单字节 Latin-1 字符。"));
-                return true;
-            }
-        } else if (hexNibble(ch) < 0) {
+        if (!asciiSurface && hexNibble(ch) < 0) {
             showError(QObject::tr(
                 "十六进制视图只接受 0–9、A–F；输入法候选文本未写入文件。"));
             return true;
@@ -4089,7 +4307,17 @@ bool EditorTab::handleHexInputMethodEvent(QInputMethodEvent *event,
             showError(QObject::tr("无法把输入法提交定位到源字节。"));
             return true;
         }
-        QByteArray replacement = committed.toLatin1();
+        const bool hasControl = std::any_of(
+            committed.cbegin(), committed.cend(), [](QChar ch) {
+                return ch.category() == QChar::Other_Control;
+            });
+        bool representable = true;
+        QByteArray replacement = encodeTextFragment(
+            committed, m_l2View->displayEncoding(), &representable);
+        if (hasControl || !representable || replacement.isEmpty()) {
+            showError(QObject::tr("输入法文本无法用当前字符栏编码无损表示。"));
+            return true;
+        }
         if (start == end && m_hexOverwriteMode) {
             const qint64 available = m_l2View->virtualFileSize() - start;
             if (available <= 0) {
@@ -4698,7 +4926,18 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
     m_secureBinaryDocument = false;
     const bool binaryHex = presentation == L2Presentation::Hex;
     m_binaryDocument = contentKind == L2ContentKind::Binary;
-    if (!m_binaryDocument) {
+    if (m_binaryDocument) {
+        // Binary and mixed-byte documents have one predictable default text
+        // projection: UTF-8 multibyte decoding with U+FFFD for malformed
+        // units. A previous document's selected codec must never leak into a
+        // newly opened binary source.
+        m_encoding = forcedEncoding.value_or(TextEncoding::Utf8);
+        m_encodingOrigin = forcedEncoding ? EncodingOrigin::UserSelected
+                                          : EncodingOrigin::Fallback;
+        m_encodingConfidence = forcedEncoding ? EncodingConfidence::Certain
+                                               : EncodingConfidence::Low;
+        m_encodingDecodeErrors = true;
+    } else {
         if (forcedEncoding) {
             m_encoding = *forcedEncoding;
             m_encodingOrigin = EncodingOrigin::UserSelected;
@@ -4720,15 +4959,14 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
     const bool useWindowedReadOnly = readOnlyByPolicy;
 
     VirtualFileView *v = ensureL2View();
-    v->setFullLineIndexBuildEnabled(!useWindowedReadOnly);
+    v->setFullLineIndexBuildEnabled(!useWindowedReadOnly && !m_binaryDocument);
     v->setWordWrap(readOnlyByPolicy ? false : inheritedWordWrap);
     setSecurePayloadLimitExclusive(0);
     // Select the representation before openFile starts emitting progress.  A
     // binary document never needs the text line-index pipeline, even when it
     // is only a few bytes long and is routed through the mmap/Hex editor.
     v->setViewMode(binaryHex ? ViewMode::Hex : ViewMode::Text);
-    if (!binaryHex)
-        v->setDisplayEncoding(m_encoding);
+    v->setDisplayEncoding(m_encoding);
     // 确保 VirtualFileView 已加入 stack（ensureL2View 会 addWidget 到 index=1）
     QString localErr;
     if (!useWindowedReadOnly && !v->openFile(path, &localErr)) {
@@ -4749,6 +4987,7 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
     m_lastL2Byte = 0;
     if (useWindowedReadOnly) {
         WindowedReadOnlyProvider *provider = ensureWindowedReadOnlyProvider();
+        provider->setBinaryContent(m_binaryDocument);
         QString providerError;
         const auto providerPresentation = binaryHex
             ? WindowedReadOnlyProvider::Presentation::Hex
@@ -4761,8 +5000,8 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
                 *errMsg = providerError;
             return false;
         }
+        provider->setTextEncoding(m_encoding);
         if (!binaryHex) {
-            provider->setTextEncoding(m_encoding);
             provider->setWordWrap(inheritedWordWrap);
         }
         m_stack->setCurrentWidget(provider);
@@ -4842,7 +5081,7 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
             0, m_l2View->virtualFileSize());
         if (snapshot.size() != m_l2View->virtualFileSize()) {
             if (errMsg)
-                *errMsg = QObject::tr("无法生成完整的 B1 保存快照。");
+                *errMsg = QObject::tr("无法生成完整的 Binary 保存快照。");
             if (!snapshot.isEmpty()) snapshot.fill(0);
             return false;
         }
@@ -4851,7 +5090,7 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
         if (!output.open(QIODevice::WriteOnly)
             || output.write(snapshot) != snapshot.size()) {
             if (errMsg)
-                *errMsg = QObject::tr("无法写入 B1 原子保存数据：%1")
+                *errMsg = QObject::tr("无法写入 Binary 原子保存数据：%1")
                               .arg(output.errorString());
             output.cancelWriting();
             if (!snapshot.isEmpty()) snapshot.fill(0);
@@ -4865,7 +5104,7 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
             m_l2View->setViewMode(presentation);
             m_l2View->openFile(path, &reopenError);
             if (errMsg)
-                *errMsg = QObject::tr("B1 原子保存失败：%1").arg(commitError);
+                *errMsg = QObject::tr("Binary 原子保存失败：%1").arg(commitError);
             if (!snapshot.isEmpty()) snapshot.fill(0);
             return false;
         }
@@ -4989,7 +5228,7 @@ bool EditorTab::exportRecoveryPayload(QByteArray *data, QString *error) const
     if (exportSnapshotBytes(data))
         return true;
     if (error)
-        *error = QObject::tr("S2/S3 为只读分析模式，不生成大文件编辑恢复日志。");
+        *error = QObject::tr("只读分析文档不生成编辑恢复日志。");
     return false;
 }
 
@@ -5008,7 +5247,7 @@ bool EditorTab::restoreRecoveryPayload(const QByteArray &data,
     Q_UNUSED(version)
     if (error) {
         *error = QObject::tr(
-            "旧版 S2 大文件编辑恢复日志已禁用；当前 32 MiB 以上文件只能只读打开。");
+            "旧版大文件编辑恢复日志已禁用；当前大文件只能以只读分析方式打开。");
     }
     return false;
 }
@@ -5017,7 +5256,7 @@ bool EditorTab::exportRecoveryCheckpoint(QIODevice *output, QString *error) cons
 {
     Q_UNUSED(output)
     if (error)
-        *error = QObject::tr("S2/S3 为只读分析模式，不生成大文件编辑检查点。");
+        *error = QObject::tr("只读分析文档不生成编辑检查点。");
     return false;
 }
 
@@ -5033,7 +5272,7 @@ bool EditorTab::restoreRecoveryCheckpoint(const QString &checkpointPath,
     Q_UNUSED(plaintextBytes)
     if (error) {
         *error = QObject::tr(
-            "S2 大文件编辑与后台完整加载已禁用，不能恢复旧的大文件编辑检查点。");
+            "旧版大文件编辑与后台完整加载已禁用，不能恢复旧的编辑检查点。");
     }
     return false;
 }
@@ -5610,6 +5849,9 @@ SearchResultsModel* EditorTab::findAllL2(const QString& pattern, bool regex,
         return nullptr;
     }
     const quint64 searchRevision = m_contentRevision;
+    const TextEncoding searchEncoding = displayEncoding();
+    const bool searchByteContext = isHexPresentation();
+    const bool searchBytePosition = isBinaryDocument() || searchByteContext;
 
     // Byte offsets are authoritative. An incomplete LineIndex may postpone the
     // row label, but must never postpone scanning or exact navigation.
@@ -5620,12 +5862,12 @@ SearchResultsModel* EditorTab::findAllL2(const QString& pattern, bool regex,
     LargeFileSearch::Options opts;
     opts.regexMode     = regex;
     opts.hexBytesMode  = hexBytes;
-    opts.byteContextMode = isHexPresentation();
+    opts.byteContextMode = searchByteContext;
     opts.tolerateInvalidEncoding = !opts.byteContextMode
         && (isBinaryDocument() || encodingHasDecodeErrors());
     opts.caseSensitive = hexBytes ? true : caseSensitive;
     opts.wholeWord     = hexBytes ? false : wholeWord;
-    opts.textEncoding  = displayEncoding();
+    opts.textEncoding  = searchEncoding;
 
     // 非模态：进度显示在 MainWindow 状态栏（若有）；不再弹 WindowModal QProgressDialog
     auto *mw = qobject_cast<QMainWindow*>(this->window());
@@ -5661,8 +5903,8 @@ SearchResultsModel* EditorTab::findAllL2(const QString& pattern, bool regex,
         // 0 匹配也返回空的 model（Dock 可以显示 0 结果）
     }
     auto *model = new SearchResultsModel(parentForModel);
-    model->setBytePositionMode(isHexPresentation());
-    model->setTextEncoding(displayEncoding());
+    model->setBytePositionMode(searchBytePosition);
+    model->setTextEncoding(searchEncoding);
     model->setResults(s->memoryMatches(), s->overrunFilePath(), s->overrunCount(),
                       s->overrunCheckpoints(), s->overrunGroupedCount(), 2);
     if (!aw.err.isEmpty())
@@ -5673,6 +5915,8 @@ SearchResultsModel* EditorTab::findAllL2(const QString& pattern, bool regex,
     m_l2SearchCacheCaseSensitive = caseSensitive;
     m_l2SearchCacheWholeWord = wholeWord;
     m_l2SearchCacheHexBytes = hexBytes;
+    m_l2SearchCacheEncoding = searchEncoding;
+    m_l2SearchCacheByteContext = searchByteContext;
     m_l2SearchCacheRevision = m_contentRevision;
     m_l2SearchCacheValid = aw.err.isEmpty();
     m_l2SearchHighlights.clear();
@@ -5698,13 +5942,44 @@ void EditorTab::resetPendingL2Search()
     m_pendingL2Search = PendingL2Search{};
 }
 
+void EditorTab::invalidateL2ProjectionSearchState()
+{
+    m_l2SearchCacheValid = false;
+    m_l2NavigationHitValid = false;
+    clearSearchHighlights();
+}
+
+bool EditorTab::l2ProjectionMatches(TextEncoding encoding,
+                                    bool byteContextMode) const
+{
+    return displayEncoding() == encoding
+        && isHexPresentation() == byteContextMode;
+}
+
+bool EditorTab::pendingL2SearchSourceIsCurrent() const
+{
+    if (!m_pendingL2Search.active
+        || m_contentRevision != m_pendingL2Search.contentRevision
+        || m_filePath != m_pendingL2Search.sourcePathAtStart
+        || contentSizeBytes() != m_pendingL2Search.sourceSizeAtStart) {
+        return false;
+    }
+    if (m_pendingL2Search.diskVersionAtStart.valid
+        && compareDiskFileVersion(m_pendingL2Search.sourcePathAtStart,
+                                  m_pendingL2Search.diskVersionAtStart)
+               != ExternalFileState::Unchanged) {
+        return false;
+    }
+    return true;
+}
+
 void EditorTab::startPendingL2Search()
 {
     if (!m_pendingL2Search.active || !m_l2View) {
         resetPendingL2Search();
         return;
     }
-    if (m_contentRevision != m_pendingL2Search.contentRevision) {
+    if (!pendingL2SearchSourceIsCurrent()) {
         const QString pattern = m_pendingL2Search.pattern;
         const QString name = fileName();
         resetPendingL2Search();
@@ -5718,7 +5993,8 @@ void EditorTab::startPendingL2Search()
     LargeFileSearch *s = m_l2View->searchEngine();
     if (!s) {
         auto *empty = new SearchResultsModel(m_pendingL2Search.parentForModel);
-        empty->setBytePositionMode(isHexPresentation());
+        empty->setBytePositionMode(m_pendingL2Search.bytePositionModeAtStart);
+        empty->setTextEncoding(m_pendingL2Search.encodingAtStart);
         emit findAllL2Finished(empty, m_pendingL2Search.pattern, fileName());
         resetPendingL2Search();
         return;
@@ -5727,14 +6003,14 @@ void EditorTab::startPendingL2Search()
     LargeFileSearch::Options opts;
     opts.regexMode     = m_pendingL2Search.regex;
     opts.hexBytesMode  = m_pendingL2Search.hexBytes;
-    opts.byteContextMode = isHexPresentation();
-    opts.tolerateInvalidEncoding = !opts.byteContextMode
-        && (isBinaryDocument() || encodingHasDecodeErrors());
+    opts.byteContextMode = m_pendingL2Search.byteContextModeAtStart;
+    opts.tolerateInvalidEncoding =
+        m_pendingL2Search.tolerateInvalidEncodingAtStart;
     opts.caseSensitive = m_pendingL2Search.hexBytes
         ? true : m_pendingL2Search.caseSensitive;
     opts.wholeWord     = m_pendingL2Search.hexBytes
         ? false : m_pendingL2Search.wholeWord;
-    opts.textEncoding  = displayEncoding();
+    opts.textEncoding  = m_pendingL2Search.encodingAtStart;
 
     // 先把之前可能残留的连接断开
     QObject::disconnect(m_pendingL2Search.searchProgressConn);
@@ -5747,6 +6023,9 @@ void EditorTab::startPendingL2Search()
     QString patternCopy    = m_pendingL2Search.pattern;
     QString fileNameCopy   = fileName();
     const quint64 revisionCopy = m_pendingL2Search.contentRevision;
+    const TextEncoding encodingCopy = m_pendingL2Search.encodingAtStart;
+    const bool bytePositionCopy = m_pendingL2Search.bytePositionModeAtStart;
+    const bool byteContextCopy = m_pendingL2Search.byteContextModeAtStart;
 
     m_pendingL2Search.searchProgressConn = QObject::connect(
         s, &LargeFileSearch::progress, this,
@@ -5758,9 +6037,11 @@ void EditorTab::startPendingL2Search()
 
     m_pendingL2Search.searchPartialConn = QObject::connect(
         s, &LargeFileSearch::partialBatch, this,
-        [this, that, patternCopy, fileNameCopy](
+        [this, that, patternCopy, fileNameCopy, encodingCopy,
+         bytePositionCopy](
             const QVector<LargeFileSearchMatch> &batch) {
             if (!that || !that->m_pendingL2Search.active
+                || !that->pendingL2SearchSourceIsCurrent()
                 || that->m_pendingL2Search.previewMatchesPublished >= 5000) {
                 return;
             }
@@ -5768,23 +6049,26 @@ void EditorTab::startPendingL2Search()
             const QVector<LargeFileSearchMatch> preview = batch.size() <= remaining
                 ? batch : batch.mid(0, remaining);
             that->m_pendingL2Search.previewMatchesPublished += preview.size();
-            emit that->findAllL2Partial(preview, patternCopy, fileNameCopy);
+            emit that->findAllL2Partial(preview, patternCopy, fileNameCopy,
+                                       encodingCopy, bytePositionCopy);
         });
 
     m_pendingL2Search.searchFinishedConn = QObject::connect(
         s, &LargeFileSearch::finished, this,
         [this, that, s, parentForModel, patternCopy, fileNameCopy,
-         revisionCopy](qint64 /*total*/) {
+         revisionCopy, encodingCopy, bytePositionCopy,
+         byteContextCopy](qint64 /*total*/) {
             if (!that) return;
-            if (that->m_contentRevision != revisionCopy) {
+            if (!that->pendingL2SearchSourceIsCurrent()
+                || that->m_contentRevision != revisionCopy) {
                 that->clearSearchHighlights();
                 that->resetPendingL2Search();
                 emit that->findAllL2Finished(nullptr, patternCopy, fileNameCopy);
                 return;
             }
             auto *model = new SearchResultsModel(parentForModel);
-            model->setBytePositionMode(that->isHexPresentation());
-            model->setTextEncoding(that->displayEncoding());
+            model->setBytePositionMode(bytePositionCopy);
+            model->setTextEncoding(encodingCopy);
             model->setResults(s->memoryMatches(), s->overrunFilePath(), s->overrunCount(),
                               s->overrunCheckpoints(), s->overrunGroupedCount(), 2);
             that->m_l2SearchCachePattern = patternCopy;
@@ -5792,11 +6076,15 @@ void EditorTab::startPendingL2Search()
             that->m_l2SearchCacheCaseSensitive = that->m_pendingL2Search.caseSensitive;
             that->m_l2SearchCacheWholeWord = that->m_pendingL2Search.wholeWord;
             that->m_l2SearchCacheHexBytes = that->m_pendingL2Search.hexBytes;
+            that->m_l2SearchCacheEncoding = encodingCopy;
+            that->m_l2SearchCacheByteContext = byteContextCopy;
             that->m_l2SearchCacheRevision = revisionCopy;
             that->m_l2SearchCacheValid = true;
             that->m_lastSearchError.clear();
             // 把匹配位置传给 VirtualFileView 用于正文区域染色
-            if (that->m_l2View) {
+            if (that->m_l2View
+                && that->l2ProjectionMatches(encodingCopy,
+                                             byteContextCopy)) {
                 QVector<QPair<qint64, qint32>> highlights;
                 const auto& memMatches = s->memoryMatches();
                 highlights.reserve(memMatches.size());
@@ -5806,6 +6094,8 @@ void EditorTab::startPendingL2Search()
                 that->m_l2SearchHighlights = highlights;
                 that->m_l2View->setSearchHighlights(highlights);
                 that->applyL2SearchHighlightsToOverlay();
+            } else {
+                that->clearSearchHighlights();
             }
             emit findAllL2Finished(model, patternCopy, fileNameCopy);
             that->resetPendingL2Search();
@@ -5814,9 +6104,10 @@ void EditorTab::startPendingL2Search()
     m_pendingL2Search.searchFailedConn = QObject::connect(
         s, &LargeFileSearch::failed, this,
         [this, that, s, parentForModel, patternCopy, fileNameCopy,
-         revisionCopy](const QString& msg) {
+         revisionCopy, encodingCopy, bytePositionCopy](const QString& msg) {
             if (!that) return;
-            if (that->m_contentRevision != revisionCopy) {
+            if (!that->pendingL2SearchSourceIsCurrent()
+                || that->m_contentRevision != revisionCopy) {
                 that->clearSearchHighlights();
                 that->resetPendingL2Search();
                 emit that->findAllL2Finished(nullptr, patternCopy, fileNameCopy);
@@ -5829,8 +6120,8 @@ void EditorTab::startPendingL2Search()
             that->m_l2SearchCacheValid = false;
             that->m_lastSearchError = msg;
             auto *partial = new SearchResultsModel(parentForModel);
-            partial->setBytePositionMode(that->isHexPresentation());
-            partial->setTextEncoding(that->displayEncoding());
+            partial->setBytePositionMode(bytePositionCopy);
+            partial->setTextEncoding(encodingCopy);
             partial->setResults(s->memoryMatches(), s->overrunFilePath(), s->overrunCount(),
                                 s->overrunCheckpoints(), s->overrunGroupedCount(), 2);
             partial->setIncompleteReason(msg);
@@ -5877,6 +6168,16 @@ bool EditorTab::findAllL2Async(const QString& pattern, bool regex,
     m_pendingL2Search.caseSensitive = caseSensitive;
     m_pendingL2Search.wholeWord     = wholeWord;
     m_pendingL2Search.hexBytes      = hexBytes;
+    m_pendingL2Search.encodingAtStart = displayEncoding();
+    m_pendingL2Search.byteContextModeAtStart = isHexPresentation();
+    m_pendingL2Search.bytePositionModeAtStart =
+        isBinaryDocument() || m_pendingL2Search.byteContextModeAtStart;
+    m_pendingL2Search.tolerateInvalidEncodingAtStart =
+        !m_pendingL2Search.byteContextModeAtStart
+        && (isBinaryDocument() || encodingHasDecodeErrors());
+    m_pendingL2Search.sourcePathAtStart = m_filePath;
+    m_pendingL2Search.sourceSizeAtStart = contentSizeBytes();
+    m_pendingL2Search.diskVersionAtStart = m_diskVersion;
     m_pendingL2Search.contentRevision = m_contentRevision;
     m_pendingL2Search.parentForModel = parentForModel;
 
@@ -5914,7 +6215,9 @@ bool EditorTab::findAllL2Async(const QString& pattern, bool regex,
             const QString message = QObject::tr("无法建立大文件搜索映射。");
             m_lastSearchError = message;
             auto *partial = new SearchResultsModel(parentForModel);
-            partial->setBytePositionMode(isHexPresentation());
+            partial->setBytePositionMode(
+                m_pendingL2Search.bytePositionModeAtStart);
+            partial->setTextEncoding(m_pendingL2Search.encodingAtStart);
             partial->setIncompleteReason(message);
             resetPendingL2Search();
             emit findAllL2Finished(partial, patternCopy, fileNameCopy);
@@ -5943,7 +6246,9 @@ void EditorTab::cancelFindAllL2()
         const QString fileNameCopy = fileName();
         QObject *parentForModel = m_pendingL2Search.parentForModel;
         auto *partial = new SearchResultsModel(parentForModel);
-        partial->setBytePositionMode(isHexPresentation());
+        partial->setBytePositionMode(
+            m_pendingL2Search.bytePositionModeAtStart);
+        partial->setTextEncoding(m_pendingL2Search.encodingAtStart);
         partial->setIncompleteReason(QObject::tr("搜索已取消。"));
         resetPendingL2Search();
         emit findAllL2Finished(partial, patternCopy, fileNameCopy);
@@ -5969,17 +6274,132 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
             && m_l1SearchCacheRegex == regex
             && m_l1SearchCacheCaseSensitive == caseSensitive
             && m_l1SearchCacheWholeWord == wholeWord;
-        if (!cacheMatches)
-            findAll(pattern, regex, caseSensitive, wholeWord);
-        if (!m_l1SearchCacheValid || !m_lastSearchError.isEmpty()
-            || m_l1SearchCache.isEmpty()) {
-            return false;
-        }
-
         const qint64 selectionStart = m_editor->SendScintilla(
             QsciScintillaBase::SCI_GETSELECTIONSTART);
         const qint64 selectionEnd = m_editor->SendScintilla(
             QsciScintillaBase::SCI_GETSELECTIONEND);
+        if (!cacheMatches) {
+            const QByteArray subject = m_editor->text().toUtf8();
+            qint64 boundary = forward
+                ? qMax(selectionStart, selectionEnd)
+                : qMin(selectionStart, selectionEnd);
+            const bool currentZeroLengthHit = m_l1NavigationHitValid
+                && m_l1NavigationRevision == m_contentRevision
+                && m_l1NavigationPattern == pattern
+                && m_l1NavigationRegex == regex
+                && m_l1NavigationCaseSensitive == caseSensitive
+                && m_l1NavigationWholeWord == wholeWord
+                && m_l1NavigationHit.byteLength == 0
+                && m_l1NavigationHit.byteOffset == boundary;
+            const bool currentZeroLengthHitAtEnd = currentZeroLengthHit
+                && boundary >= subject.size();
+            if (forward && currentZeroLengthHit && boundary < subject.size()) {
+                // PCRE2 start offsets must remain on a UTF-8 code-point
+                // boundary. Advance past the current zero-width hit so F3
+                // cannot select it forever.
+                ++boundary;
+                while (boundary < subject.size()
+                       && (uchar(subject.at(boundary)) & 0xC0) == 0x80) {
+                    ++boundary;
+                }
+            }
+
+            QString error;
+            qint64 foundOffset = -1;
+            qint64 foundLength = 0;
+            const auto remember = [&](qint64 offset, qint64 length) {
+                foundOffset = offset;
+                foundLength = length;
+            };
+            bool ok = true;
+            if (!regex) {
+                auto literal = findUtf8LiteralHits(
+                    subject, pattern, caseSensitive, wholeWord, {}, {}, true,
+                    !forward, boundary);
+                if (literal.isEmpty() && wrap) {
+                    literal = findUtf8LiteralHits(
+                        subject, pattern, caseSensitive, wholeWord, {}, {}, true,
+                        !forward, forward ? 0 : subject.size() + 1);
+                }
+                if (!literal.isEmpty()) {
+                    foundOffset = literal.first().byteOffset;
+                    foundLength = literal.first().byteLength;
+                }
+            } else {
+                Pcre2Regex compiled;
+                if (!compiled.compile(pattern, false, caseSensitive, wholeWord,
+                                      &error)) {
+                    m_lastSearchError = error;
+                    return false;
+                }
+                const auto scanForward = [&](qint64 start) {
+                    const auto result = compiled.scan(
+                        reinterpret_cast<const uchar *>(subject.constData()),
+                        subject.size(), {}, {},
+                        [&](qint64 offset, qint64 length) {
+                            remember(offset, length);
+                            return false;
+                        }, &error, {}, {}, start);
+                    return result != Pcre2Regex::ScanResult::Failed;
+                };
+                if (forward) {
+                    if (!currentZeroLengthHitAtEnd) {
+                        ok = scanForward(qBound<qint64>(0, boundary,
+                                                       subject.size()));
+                    }
+                    if (ok && foundOffset < 0 && wrap && boundary > 0)
+                        ok = scanForward(0);
+                } else {
+                    const auto result = compiled.scan(
+                        reinterpret_cast<const uchar *>(subject.constData()),
+                        subject.size(), {}, {},
+                        [&](qint64 offset, qint64 length) {
+                            if (offset >= boundary)
+                                return false;
+                            remember(offset, length);
+                            return true;
+                        }, &error);
+                    ok = result != Pcre2Regex::ScanResult::Failed;
+                    if (ok && foundOffset < 0 && wrap && boundary < subject.size()) {
+                        const auto wrapped = compiled.scan(
+                            reinterpret_cast<const uchar *>(subject.constData()),
+                            subject.size(), {}, {},
+                            [&](qint64 offset, qint64 length) {
+                                remember(offset, length);
+                                return true;
+                            }, &error, {}, {}, boundary);
+                        ok = wrapped != Pcre2Regex::ScanResult::Failed;
+                    }
+                }
+            }
+            if (!ok) {
+                m_lastSearchError = error;
+                return false;
+            }
+            if (foundOffset < 0)
+                return false;
+
+            m_l1NavigationHit = {foundOffset, qint32(foundLength)};
+            m_l1NavigationPattern = pattern;
+            m_l1NavigationRegex = regex;
+            m_l1NavigationCaseSensitive = caseSensitive;
+            m_l1NavigationWholeWord = wholeWord;
+            m_l1NavigationRevision = m_contentRevision;
+            m_l1NavigationHitValid = true;
+            m_lastL1MatchIndex = -1;
+            m_editor->SendScintilla(QsciScintillaBase::SCI_SETSEL,
+                                    long(foundOffset),
+                                    long(foundOffset + foundLength));
+            const int line = int(m_editor->SendScintilla(
+                QsciScintillaBase::SCI_LINEFROMPOSITION, long(foundOffset)));
+            m_editor->ensureLineVisible(line);
+            m_editor->ensureCursorVisible();
+            m_editor->setFocus();
+            return true;
+        }
+        if (m_l1SearchCache.isEmpty())
+            return false;
+
         int chosen = -1;
         const bool lastStillSelected = m_lastL1MatchIndex >= 0
             && m_lastL1MatchIndex < m_l1SearchCache.size()
@@ -6034,7 +6454,9 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
         && m_l2SearchCacheRegex == regex
         && m_l2SearchCacheCaseSensitive == caseSensitive
         && m_l2SearchCacheWholeWord == wholeWord
-        && m_l2SearchCacheHexBytes == hexBytes;
+        && m_l2SearchCacheHexBytes == hexBytes
+        && l2ProjectionMatches(m_l2SearchCacheEncoding,
+                               m_l2SearchCacheByteContext);
     if (!cacheMatches) {
         auto *model = findAllL2(pattern, regex, caseSensitive, wholeWord,
                                 nullptr, hexBytes);
@@ -6051,7 +6473,9 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
         && m_l2NavigationRegex == regex
         && m_l2NavigationCaseSensitive == caseSensitive
         && m_l2NavigationWholeWord == wholeWord
-        && m_l2NavigationHexBytes == hexBytes;
+        && m_l2NavigationHexBytes == hexBytes
+        && l2ProjectionMatches(m_l2NavigationEncoding,
+                               m_l2NavigationByteContext);
     qint64 from = m_lastL2Byte;
     if (navigationHitMatches) {
         from = forward
@@ -6125,16 +6549,48 @@ bool EditorTab::findNextL2Async(
             if (callback) callback(false, m_lastSearchError);
             return false;
         }
+        const bool cacheMatches = m_l1SearchCacheValid
+            && m_l1SearchCacheRevision == m_contentRevision
+            && m_l1SearchCachePattern == pattern
+            && m_l1SearchCacheRegex == regex
+            && m_l1SearchCacheCaseSensitive == caseSensitive
+            && m_l1SearchCacheWholeWord == wholeWord;
+        if (cacheMatches
+            || m_editor->length() <= L1InlineNavigationBudgetBytes) {
+            const bool found = findNext(pattern, regex, caseSensitive,
+                                        wholeWord, forward, wrap, false);
+            if (callback)
+                callback(found, m_lastSearchError);
+            return true;
+        }
+
         const qint64 selectionStart = m_editor->SendScintilla(
             QsciScintillaBase::SCI_GETSELECTIONSTART);
         const qint64 selectionEnd = m_editor->SendScintilla(
             QsciScintillaBase::SCI_GETSELECTIONEND);
-        const qint64 boundary = forward
+        qint64 boundary = forward
             ? qMax(selectionStart, selectionEnd)
             : qMin(selectionStart, selectionEnd);
         const quint64 revision = m_contentRevision;
         const bool wipeSnapshot = isSecureDocument();
         QByteArray subject = m_editor->text().toUtf8();
+        const bool currentZeroLengthHit = m_l1NavigationHitValid
+            && m_l1NavigationRevision == revision
+            && m_l1NavigationPattern == pattern
+            && m_l1NavigationRegex == regex
+            && m_l1NavigationCaseSensitive == caseSensitive
+            && m_l1NavigationWholeWord == wholeWord
+            && m_l1NavigationHit.byteLength == 0
+            && m_l1NavigationHit.byteOffset == boundary;
+        const bool currentZeroLengthHitAtEnd = currentZeroLengthHit
+            && boundary >= subject.size();
+        if (forward && currentZeroLengthHit && boundary < subject.size()) {
+            ++boundary;
+            while (boundary < subject.size()
+                   && (uchar(subject.at(boundary)) & 0xC0) == 0x80) {
+                ++boundary;
+            }
+        }
         const qint64 snapshotSize = subject.size();
         QPointer<EditorTab> that(this);
         QPointer<QObject> guard(callbackContext);
@@ -6146,25 +6602,51 @@ bool EditorTab::findNextL2Async(
                     : QObject::tr("查找上一个: %1").arg(displayName),
             QObject::tr("找到一处即返回"),
             [that, guard, subject = std::move(subject), pattern, regex,
-             caseSensitive, wholeWord, forward, wrap, boundary, revision,
+             caseSensitive, wholeWord, forward, wrap, boundary,
+             currentZeroLengthHitAtEnd, revision,
              wipeSnapshot, callback = std::move(callback)]
-            (qint64, AsyncCancelPtr cancel,
+            (qint64 taskId, AsyncCancelPtr cancel,
              std::function<void(qint64, qint64)> reportProgress,
              std::function<void(const AsyncErrorInfo &)> reportError) mutable {
                 const auto wipe = qScopeGuard([&] {
                     if (wipeSnapshot && !subject.isEmpty())
                         subject.fill(0);
                 });
-                Pcre2Regex compiled;
                 QString error;
                 qint64 foundOffset = -1;
                 qint64 foundLength = 0;
                 const auto cancelled = [&] {
                     return cancel && cancel->load(std::memory_order_acquire);
                 };
-                bool ok = compiled.compile(pattern, !regex, caseSensitive,
-                                           wholeWord, &error);
-                const auto scanForward = [&](qint64 start) {
+                AsyncTaskManager::instance().updateTaskPhase(
+                    taskId, regex ? QObject::tr("执行正则匹配")
+                                  : QObject::tr("定向扫描字面值"),
+                    1, 1, 0, subject.size());
+                bool ok = true;
+                if (!regex) {
+                    auto literal = findUtf8LiteralHits(
+                        subject, pattern, caseSensitive, wholeWord, cancelled,
+                        [reportProgress, total = qint64(subject.size())](qint64 done) {
+                            reportProgress(done, total);
+                        }, true, !forward, boundary);
+                    if (literal.isEmpty() && !cancelled() && wrap) {
+                        literal = findUtf8LiteralHits(
+                            subject, pattern, caseSensitive, wholeWord, cancelled,
+                            [reportProgress, total = qint64(subject.size())](qint64 done) {
+                                reportProgress(done, total);
+                            }, true, !forward,
+                            forward ? 0 : subject.size() + 1);
+                    }
+                    if (!literal.isEmpty()) {
+                        foundOffset = literal.first().byteOffset;
+                        foundLength = literal.first().byteLength;
+                    }
+                    ok = !cancelled();
+                } else {
+                    Pcre2Regex compiled;
+                    ok = compiled.compile(pattern, false, caseSensitive,
+                                          wholeWord, &error);
+                    const auto scanForward = [&](qint64 start) {
                     const auto result = compiled.scan(
                         reinterpret_cast<const uchar *>(subject.constData()),
                         subject.size(), cancelled,
@@ -6178,12 +6660,15 @@ bool EditorTab::findNextL2Async(
                         }, &error, {}, {}, start);
                     return result != Pcre2Regex::ScanResult::Failed
                         && !cancelled();
-                };
-                if (ok && forward) {
-                    ok = scanForward(qBound<qint64>(0, boundary, subject.size()));
+                    };
+                    if (ok && forward) {
+                    if (!currentZeroLengthHitAtEnd) {
+                        ok = scanForward(qBound<qint64>(0, boundary,
+                                                       subject.size()));
+                    }
                     if (ok && foundOffset < 0 && wrap && boundary > 0)
                         ok = scanForward(0);
-                } else if (ok) {
+                    } else if (ok) {
                     const auto result = compiled.scan(
                         reinterpret_cast<const uchar *>(subject.constData()),
                         subject.size(), cancelled,
@@ -6209,6 +6694,7 @@ bool EditorTab::findNextL2Async(
                             }, &error, {}, {}, boundary);
                         ok = wrapped != Pcre2Regex::ScanResult::Failed
                             && !cancelled();
+                    }
                     }
                 }
                 if (!ok && error.isEmpty() && cancelled())
@@ -6269,7 +6755,9 @@ bool EditorTab::findNextL2Async(
         && m_l2SearchCacheRegex == regex
         && m_l2SearchCacheCaseSensitive == caseSensitive
         && m_l2SearchCacheWholeWord == wholeWord
-        && m_l2SearchCacheHexBytes == hexBytes;
+        && m_l2SearchCacheHexBytes == hexBytes
+        && l2ProjectionMatches(m_l2SearchCacheEncoding,
+                               m_l2SearchCacheByteContext);
     if (cacheMatches) {
         const bool found = findNext(pattern, regex, caseSensitive, wholeWord,
                                     forward, wrap, hexBytes);
@@ -6355,7 +6843,20 @@ bool EditorTab::findNextL2Async(
     }
 
     qint64 from = m_lastL2Byte;
-    if (windowedReadOnlyActive()
+    const bool navigationHitMatches = m_l2NavigationHitValid
+        && m_l2NavigationRevision == m_contentRevision
+        && m_l2NavigationPattern == pattern
+        && m_l2NavigationRegex == regex
+        && m_l2NavigationCaseSensitive == caseSensitive
+        && m_l2NavigationWholeWord == wholeWord
+        && m_l2NavigationHexBytes == hexBytes
+        && l2ProjectionMatches(m_l2NavigationEncoding,
+                               m_l2NavigationByteContext);
+    if (navigationHitMatches) {
+        from = forward
+            ? m_l2NavigationHit.byteOffset + m_l2NavigationHit.byteLength - 1
+            : m_l2NavigationHit.byteOffset;
+    } else if (windowedReadOnlyActive()
         && m_windowedReadOnlyProvider->selectionEndOffset()
                > m_windowedReadOnlyProvider->selectionStartOffset()) {
         const qint64 selectionStart =
@@ -6383,17 +6884,24 @@ bool EditorTab::findNextL2Async(
     opts.wholeWord = hexBytes ? false : wholeWord;
     opts.textEncoding = displayEncoding();
     const quint64 revision = m_contentRevision;
+    const TextEncoding searchEncoding = opts.textEncoding;
+    const bool searchByteContext = opts.byteContextMode;
     QPointer<EditorTab> guard(this);
     const qint64 taskId = search->findOneViaTaskManager(
         pattern, opts, from, forward, wrap, fileName(),
         callbackContext ? callbackContext : this,
-        [guard, revision, pattern, regex, caseSensitive, wholeWord, hexBytes,
+        [guard, revision, searchEncoding, searchByteContext,
+         pattern, regex, caseSensitive, wholeWord, hexBytes,
          callback = std::move(callback)](
             bool found, LargeFileSearchMatch match, QString error) mutable {
             if (!guard)
                 return;
             if (guard->m_contentRevision != revision) {
                 error = QObject::tr("文档已变化，请重新查找。");
+                found = false;
+            } else if (!guard->l2ProjectionMatches(searchEncoding,
+                                                   searchByteContext)) {
+                error = QObject::tr("显示编码或呈现方式已变化，请重新查找。");
                 found = false;
             }
             guard->m_lastSearchError = error;
@@ -6404,6 +6912,8 @@ bool EditorTab::findNextL2Async(
                 guard->m_l2NavigationCaseSensitive = caseSensitive;
                 guard->m_l2NavigationWholeWord = wholeWord;
                 guard->m_l2NavigationHexBytes = hexBytes;
+                guard->m_l2NavigationEncoding = searchEncoding;
+                guard->m_l2NavigationByteContext = searchByteContext;
                 guard->m_l2NavigationRevision = revision;
                 guard->m_l2NavigationHitValid = true;
                 guard->gotoByteOffset(match.byteOffset, match.length);
@@ -6416,7 +6926,10 @@ bool EditorTab::findNextL2Async(
                        && guard->m_l2NavigationRegex == regex
                        && guard->m_l2NavigationCaseSensitive == caseSensitive
                        && guard->m_l2NavigationWholeWord == wholeWord
-                       && guard->m_l2NavigationHexBytes == hexBytes) {
+                       && guard->m_l2NavigationHexBytes == hexBytes
+                       && guard->l2ProjectionMatches(
+                              guard->m_l2NavigationEncoding,
+                              guard->m_l2NavigationByteContext)) {
                 // A boundary miss must leave the current match selected, as
                 // mature editors do.  The windowed projection may have been
                 // reloaded while the asynchronous scan ran, so restore from
@@ -6529,6 +7042,8 @@ bool EditorTab::currentSelectionMatchesSearch(
         && m_l2NavigationCaseSensitive == caseSensitive
         && m_l2NavigationWholeWord == wholeWord
         && m_l2NavigationHexBytes == hexBytes
+        && l2ProjectionMatches(m_l2NavigationEncoding,
+                               m_l2NavigationByteContext)
         && m_l2NavigationHit.byteOffset == start
         && m_l2NavigationHit.byteLength == end - start) {
         return true;
@@ -6539,7 +7054,9 @@ bool EditorTab::currentSelectionMatchesSearch(
         || m_l2SearchCacheRegex != regex
         || m_l2SearchCacheCaseSensitive != caseSensitive
         || m_l2SearchCacheWholeWord != wholeWord
-        || m_l2SearchCacheHexBytes != hexBytes) {
+        || m_l2SearchCacheHexBytes != hexBytes
+        || !l2ProjectionMatches(m_l2SearchCacheEncoding,
+                                m_l2SearchCacheByteContext)) {
         return false;
     }
     LargeFileSearch *search = m_l2View->searchEngine();

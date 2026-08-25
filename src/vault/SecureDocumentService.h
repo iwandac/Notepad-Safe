@@ -90,6 +90,7 @@ private:
                        const QString &text, const QByteArray &binary,
                        const QString &title, const QString &targetPath);
     QString draftPath(const QUuid &documentId) const;
+    bool isManagedDraftPath(const QString &path, const QUuid &documentId) const;
     static VaultError validatePayload(const QString &text);
     static VaultError validatePayload(const QByteArray &binary);
 

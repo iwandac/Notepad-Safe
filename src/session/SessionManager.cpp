@@ -24,6 +24,9 @@
 
 namespace {
 
+constexpr qint64 MaximumSessionFileBytes = 4LL * 1024 * 1024;
+constexpr qsizetype MaximumSessionTabs = 256;
+
 void scrubSnapshot(QByteArray &bytes)
 {
     if (bytes.isEmpty())
@@ -36,6 +39,19 @@ void scrubSnapshot(QByteArray &bytes)
         cursor[i] = 0;
 #endif
     bytes.clear();
+}
+
+bool isSameOrChildPath(const QString &rootPath, const QString &candidatePath)
+{
+    const QString root = QDir::cleanPath(QFileInfo(rootPath).absoluteFilePath());
+    const QString candidate = QDir::cleanPath(QFileInfo(candidatePath).absoluteFilePath());
+#ifdef Q_OS_WIN
+    constexpr Qt::CaseSensitivity sensitivity = Qt::CaseInsensitive;
+#else
+    constexpr Qt::CaseSensitivity sensitivity = Qt::CaseSensitive;
+#endif
+    return candidate.compare(root, sensitivity) == 0
+           || candidate.startsWith(root + QLatin1Char('/'), sensitivity);
 }
 
 } // namespace
@@ -97,16 +113,44 @@ QString SessionManager::generateAutosavePath() const
     return m_autosaveDir + QString("/autosave_%1.ndraft").arg(uuid);
 }
 
-void SessionManager::removeAutosaveFile(const QString &path)
+bool SessionManager::isManagedAutosavePath(const QString &path) const
 {
-    if (!path.isEmpty() && QFile::exists(path))
+    if (path.isEmpty() || !QFileInfo(path).isAbsolute()
+        || !QDir::match({QStringLiteral("autosave_*.ndraft"),
+                         QStringLiteral("autosave_*.tmp"),
+                         QStringLiteral("tab_*.tmp")},
+                        QFileInfo(path).fileName())
+        || !isSameOrChildPath(m_autosaveDir, path)) {
+        return false;
+    }
+
+    // A directory junction inside autosave must not turn cleanup into deletion
+    // outside the application data tree. Existing files can be checked by their
+    // resolved target; non-existing targets are safe to create only by lexical
+    // containment above.
+    const QFileInfo candidate(path);
+    if (candidate.exists()) {
+        const QString resolvedRoot = QFileInfo(m_autosaveDir).canonicalFilePath();
+        const QString resolvedCandidate = candidate.canonicalFilePath();
+        if (resolvedRoot.isEmpty() || resolvedCandidate.isEmpty()
+            || !isSameOrChildPath(resolvedRoot, resolvedCandidate)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void SessionManager::removeAutosaveFile(const QString &path) const
+{
+    if (isManagedAutosavePath(path) && QFile::exists(path))
         QFile::remove(path);
 }
 
 bool SessionManager::restoreAutosave(EditorTab *tab, const QString &autosavePath,
                                      const QString &realFilePath) const
 {
-    if (!tab || autosavePath.isEmpty() || !QFileInfo::exists(autosavePath))
+    if (!tab || !isManagedAutosavePath(autosavePath)
+        || !QFileInfo::exists(autosavePath))
         return false;
     bool loaded = false;
     if (DraftStore::isEncryptedDraft(autosavePath)) {
@@ -215,7 +259,8 @@ bool SessionManager::saveSession(const QVector<EditorTab *> &tabs, int activeInd
                 st.autosavePath.clear();
             } else {
             const bool largeDocument = tab->isLargeDocument();
-            const QString previousPath = tab->autosavePath();
+            const QString previousPath = isManagedAutosavePath(tab->autosavePath())
+                ? tab->autosavePath() : QString();
             const bool previousExists = !previousPath.isEmpty()
                                         && QFileInfo::exists(previousPath);
             QString ap = previousPath;
@@ -452,7 +497,8 @@ std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSave(
             continue;
         }
 
-        item.previousPath = tab->autosavePath();
+        item.previousPath = isManagedAutosavePath(tab->autosavePath())
+            ? tab->autosavePath() : QString();
         item.previousExists = !item.previousPath.isEmpty()
                               && QFileInfo::exists(item.previousPath);
         item.targetPath = item.previousPath;
@@ -649,27 +695,34 @@ SessionData SessionManager::loadSession() const
 {
     SessionData data;
     QFile f(sessionFilePath());
-    if (!f.open(QIODevice::ReadOnly))
+    if (!f.open(QIODevice::ReadOnly) || f.size() <= 0
+        || f.size() > MaximumSessionFileBytes)
         return data;
 
     QJsonParseError err;
     QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
-    if (err.error != QJsonParseError::NoError)
+    if (err.error != QJsonParseError::NoError || !doc.isObject())
         return data;
 
     QJsonObject root = doc.object();
     data.version = root["version"].toInt(1);
-    data.activeTab = root["activeTab"].toInt(0);
+    if (data.version < 1 || data.version > 2)
+        return SessionData{};
 
     QJsonArray tabsArray = root["tabs"].toArray();
-    for (const QJsonValue &v : tabsArray) {
+    const qsizetype tabCount = qMin<qsizetype>(tabsArray.size(), MaximumSessionTabs);
+    data.tabs.reserve(tabCount);
+    for (qsizetype i = 0; i < tabCount; ++i) {
+        const QJsonValue &v = tabsArray.at(i);
+        if (!v.isObject())
+            continue;
         QJsonObject obj = v.toObject();
         SessionTab st;
         st.filePath = obj["filePath"].toString();
         st.encoding = obj["encoding"].toString();
-        st.syntax = obj["syntax"].toInt(0);
-        st.cursorLine = obj["cursorLine"].toInt(0);
-        st.cursorIndex = obj["cursorIndex"].toInt(0);
+        st.syntax = qBound(0, obj["syntax"].toInt(0), int(Syntax::Asm));
+        st.cursorLine = qMax(0, obj["cursorLine"].toInt(0));
+        st.cursorIndex = qMax(0, obj["cursorIndex"].toInt(0));
         bool cursorOk = false;
         st.cursorByteOffset = obj["cursorByteOffset"].toString().toLongLong(&cursorOk);
         if (!cursorOk) st.cursorByteOffset = -1;
@@ -684,12 +737,16 @@ SessionData SessionManager::loadSession() const
         st.modified = obj["modified"].toBool(false);
         st.autosavePath = obj["autosavePath"].toString();
         st.secureDocument = obj["secureDocument"].toBool(false);
+        if (!st.secureDocument && !isManagedAutosavePath(st.autosavePath))
+            st.autosavePath.clear();
         st.splitView = obj["splitView"].toBool(false);
         st.splitOrientation = obj["splitOrientation"].toString();
         st.documentId = obj["documentId"].toString();
         st.presentation = obj["presentation"].toString();
         data.tabs.append(st);
     }
+    data.activeTab = data.tabs.isEmpty()
+        ? 0 : qBound(0, root["activeTab"].toInt(0), data.tabs.size() - 1);
     return data;
 }
 

@@ -742,10 +742,11 @@ private slots:
         QCOMPARE(first->editor()->text(), QStringLiteral("FOREIGN_RECOVERY_ONE"));
         auto *payloadSize = window->findChild<QLabel *>(QStringLiteral("status.size"));
         QVERIFY(payloadSize);
-        QCOMPARE(payloadSize->text(), QStringLiteral("20 B · S1"));
+        QCOMPARE(payloadSize->text(), QStringLiteral("20 B · Text · Text · 可编辑"));
         QVERIFY(QFileInfo(firstPath).size() > first->editor()->length());
         first->editor()->append(QStringLiteral("!"));
-        QTRY_COMPARE_WITH_TIMEOUT(payloadSize->text(), QStringLiteral("21 B · S1"), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            payloadSize->text(), QStringLiteral("21 B · Text · Text · 可编辑"), 1000);
 
         // The recovery secret is remembered by identityId + keyVersion in the
         // device session. A second document from that identity must therefore

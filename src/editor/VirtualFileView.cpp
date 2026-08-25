@@ -188,12 +188,17 @@ bool VirtualFileView::openFile(const QString& filePath, QString* errMsg)
     QPointer<VirtualFileView> that(this);
     QString pathCopy = filePath;
 
+    // Mapping is source preparation, not a line-index task. Binary/Hex paths
+    // must not appear to users as if they are interpreting arbitrary bytes as
+    // a text line model.
+    const bool buildQuickIndex = m_fullLineIndexBuildEnabled
+        && m_viewMode == ViewMode::Text;
     m_mmapTaskId = AsyncTaskManager::instance().submit(
-        AsyncTaskType::LineIndexBuild,
+        AsyncTaskType::Other,
         AsyncTaskPriority::High,
         QObject::tr("映射文件: %1").arg(QFileInfo(filePath).fileName()),
         QObject::tr("正在将文件映射到内存..."),
-        [that, size, pathCopy](qint64, AsyncCancelPtr cancel,
+        [that, size, pathCopy, buildQuickIndex](qint64, AsyncCancelPtr cancel,
                                std::function<void(qint64,qint64)> reportProgress,
                                std::function<void(const AsyncErrorInfo&)> reportError)
         {
@@ -207,21 +212,30 @@ bool VirtualFileView::openFile(const QString& filePath, QString* errMsg)
                 reportError(e);
                 return;
             }
-            // 2) quickBuildFirstRange — 扫前 1MB 建首屏锚点（覆盖 bigtestfile 215KB 第1行+多行）
+            // 2) Trusted Text may build one bounded first-screen anchor.
+            // Binary/Hex skips this scan entirely; source bytes alone are the
+            // authority and switching presentation cannot justify a global
+            // line model.
             if (cancel && cancel->load(std::memory_order_acquire)) {
                 that->file_.unmap(p);
                 return;
             }
             LineIndex quickIndex;
             quickIndex.setIncompleteWithFileSize(size);
-            quickIndex.quickBuildFirstRange(p, size, 1024 * 1024);
-            if (reportProgress) reportProgress(1024 * 1024, size);
+            if (buildQuickIndex)
+                quickIndex.quickBuildFirstRange(p, size, 1024 * 1024);
+            if (reportProgress)
+                reportProgress(buildQuickIndex
+                                   ? qMin<qint64>(size, 1024 * 1024)
+                                   : size,
+                               size);
 
             // 3) 通知 UI 线程：mmap + quickBuild 完成
             QMetaObject::invokeMethod(that, "onMmapReady", Qt::QueuedConnection,
                                       Q_ARG(quintptr, reinterpret_cast<quintptr>(p)),
                                       Q_ARG(qint64, size),
-                                      Q_ARG(LineIndex, quickIndex));
+                                      Q_ARG(LineIndex, quickIndex),
+                                      Q_ARG(bool, buildQuickIndex));
         },
         0, QLatin1String("Mmap"), size
     );
@@ -280,7 +294,8 @@ bool VirtualFileView::openMemory(QByteArray bytes, ViewMode mode, QString* errMs
     return true;
 }
 
-void VirtualFileView::onMmapReady(quintptr ptr, qint64 size, LineIndex quickIndex) {
+void VirtualFileView::onMmapReady(quintptr ptr, qint64 size,
+                                  LineIndex quickIndex, bool quickIndexBuilt) {
     m_loading = false;
     m_mmapTaskId = -1;
 
@@ -295,7 +310,8 @@ void VirtualFileView::onMmapReady(quintptr ptr, qint64 size, LineIndex quickInde
     lineIndex_ = quickIndex;
 
     bookmarks_.clear();
-    m_buildProgressBytes = 1024 * 1024;  // quickBuild 已扫描前 1MB
+    m_buildProgressBytes = quickIndexBuilt
+        ? qMin<qint64>(size, 1024 * 1024) : 0;
     cursorByte_ = 0;
     selStartByte_ = selEndByte_ = 0;
     patches_.resetAfterSave();

@@ -73,6 +73,8 @@
 #include <QtWidgets/QSplitter>
 #include <QtWidgets/QStyle>
 #include <QtWidgets/QStyleOptionSlider>
+#include <atomic>
+#include <memory>
 #include <stdexcept>
 
 #ifdef Q_OS_WIN
@@ -84,6 +86,7 @@
 
 #include "MainWindow.h"
 #include "EditorTab.h"
+#include "ByteClipboard.h"
 #include "VirtualFileView.h"
 #include "WindowedReadOnlyProvider.h"
 #include "FindReplaceDialog.h"
@@ -618,11 +621,11 @@ private slots:
         QVERIFY2(sizeStatus->text().contains(QStringLiteral("40.00 MB")),
                  qPrintable(QStringLiteral("窗口化 mmap 打开后状态栏必须显示真实文件大小，实际：%1")
                                 .arg(sizeStatus->text())));
-        QVERIFY2(sizeStatus->text().contains(QStringLiteral("B2")),
-                 qPrintable(QStringLiteral("大文件状态栏必须显示分级，实际：%1")
+        QVERIFY2(sizeStatus->text().contains(QStringLiteral("Binary · Hex")),
+                 qPrintable(QStringLiteral("状态栏必须显示文档类型与呈现方式，实际：%1")
                                 .arg(sizeStatus->text())));
         QVERIFY2(sizeStatus->text().contains(QStringLiteral("只读分析")),
-                 qPrintable(QStringLiteral("B2 Hex 回退必须明确显示运行态，实际：%1")
+                 qPrintable(QStringLiteral("Binary Hex 必须明确显示只读能力，实际：%1")
                                 .arg(sizeStatus->text())));
         auto* sortAsc = findMenuActionByExactDisplay(mw_, QStringLiteral("行升序排序"));
         auto* sortDesc = findMenuActionByExactDisplay(mw_, QStringLiteral("行降序排序"));
@@ -638,7 +641,7 @@ private slots:
         QCOMPARE(tabCount(mw_), 0);
     }
 
-    // ========== D003：L2 Hex 禁用编码；切换 Text 后仅“以编码显示”可用 ==========
+    // ========== D003：L2 禁止转码；Hex/Text 均允许选择投影编码 ==========
     void tc_d003_l2_disables_convert_enc_but_not_display_enc() {
         // D003 完全独立：不依赖 D001 留下的 L2 tab（避免 D001 FAIL 时 D003 假 FAIL 连带）。
         closeAllEditorTabs(mw_);
@@ -657,23 +660,18 @@ private slots:
                 .arg(encs.convert.size())));
         QVERIFY2(encs.display.size() >= 5, qPrintable(
             QStringLiteral("D003 找到「以编码显示...」动作数量=%1，少于 5，识别失败").arg(encs.display.size())));
-        // Hex 是原始字节呈现，转换和文本重新解释都不可用。
+        // Hex 数据面始终是原始字节，不能转码；右侧字符投影与 Text
+        // 使用同一解码器，所以“以编码显示”在两种呈现中都必须可用。
         QStringList failConvert;
         for (int i = 0; i < encs.convert.size(); ++i) {
             QAction* a = encs.convert[i];
             if (a->isEnabled()) failConvert.push_back(QStringLiteral("[%1]=%2").arg(i).arg(a->text()));
         }
-        QStringList failDisplay;
-        for (int i = 0; i < encs.display.size(); ++i) {
-            QAction* a = encs.display[i];
-            if (a->isEnabled()) failDisplay.push_back(QStringLiteral("[%1]=%2").arg(i).arg(a->text()));
-        }
         QVERIFY2(failConvert.isEmpty(), qPrintable(
             QStringLiteral("D003 FAIL：L2 下「转为...」这些动作仍 enabled=true → %1")
                 .arg(failConvert.join("、"))));
-        QVERIFY2(failDisplay.isEmpty(), qPrintable(
-            QStringLiteral("D003 FAIL：L2 Hex 下「以编码显示...」仍可点击 → %1")
-                .arg(failDisplay.join("、"))));
+        for (QAction *action : encs.display)
+            QVERIFY(action->isEnabled());
         QAction *textPresentation = mw_->findChild<QAction *>(
             QStringLiteral("view.presentation.text"));
         QAction *hexPresentation = mw_->findChild<QAction *>(
@@ -776,10 +774,10 @@ private slots:
                     QStringLiteral("D007 阶段2 L2：转为[%1] %2 应该 enabled=false，实际 true（D004 切 tab 同步失败）")
                         .arg(i).arg(e.convert[i]->text())));
             }
-            // Hex 下文本编码重新解释没有意义，显示组也应禁用。
+            // Hex 右侧字符栏按所选编码投影；只有会改写源字节的转换禁用。
             for (int i = 0; i < e.display.size(); ++i) {
-                QVERIFY2(!e.display[i]->isEnabled(), qPrintable(
-                    QStringLiteral("D007 阶段2 L2 Hex：显示[%1] %2 应该 disabled").arg(i).arg(e.display[i]->text())));
+                QVERIFY2(e.display[i]->isEnabled(), qPrintable(
+                    QStringLiteral("D007 阶段2 L2 Hex：显示[%1] %2 应该 enabled").arg(i).arg(e.display[i]->text())));
             }
         }
 
@@ -869,7 +867,8 @@ private slots:
         QVERIFY(asciiPreview != nullptr);
         QTRY_VERIFY_WITH_TIMEOUT(asciiPreview->isVisible(), 1000);
         QVERIFY(!asciiPreview->isReadOnly());
-        QVERIFY(asciiPreview->toPlainText().startsWith(QStringLiteral("................")));
+        QVERIFY(asciiPreview->toPlainText().startsWith(
+            decodeByteGridText(expected.left(16), TextEncoding::Utf8, 16)));
 
         QAction *hexAction = mw_->findChild<QAction *>(
             QStringLiteral("view.presentation.hex"));
@@ -877,7 +876,8 @@ private slots:
         bool rawByteStatus = false;
         bool hexStatus = false;
         for (QLabel *label : mw_->findChildren<QLabel *>()) {
-            rawByteStatus |= label->text() == QStringLiteral("原始字节");
+            rawByteStatus |= label->text().startsWith(
+                QStringLiteral("原始字节 · 字符区 UTF-8"));
             hexStatus |= label->text() == QStringLiteral("十六进制");
         }
         QVERIFY(rawByteStatus);
@@ -919,10 +919,12 @@ private slots:
         tab->editor()->setSelection(0, 3, 0, 5);
         QTest::keyClicks(tab->editor(), QStringLiteral("41"));
         expected[1] = 'A';
+        const QByteArray afterHexEdit = expected;
         QTRY_VERIFY_WITH_TIMEOUT(tab->editor()->text().startsWith(
                                      QStringLiteral("FF 41 02 03")), 1000);
         QTRY_VERIFY_WITH_TIMEOUT(asciiPreview->toPlainText().startsWith(
-                                     QStringLiteral(".A.")), 1000);
+            decodeByteGridText(expected.left(3), TextEncoding::Utf8,
+                               tab->l2View()->hexBytesPerRow())), 1000);
 
         // The character column is a second input surface for the same bytes,
         // not a decorative preview. Editing byte 2 must update the Hex grid,
@@ -936,7 +938,8 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(tab->editor()->text().left(11),
                                   QStringLiteral("FF 41 5A 03"), 1000);
         QTRY_VERIFY_WITH_TIMEOUT(asciiPreview->toPlainText().startsWith(
-                                     QStringLiteral(".AZ")), 1000);
+            decodeByteGridText(expected.left(3), TextEncoding::Utf8,
+                               tab->l2View()->hexBytesPerRow())), 1000);
         bool byteOffsetStatus = false;
         for (QLabel *label : mw_->findChildren<QLabel *>())
             byteOffsetStatus |= label->text() == QStringLiteral("偏移: 0x00000003");
@@ -948,12 +951,14 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(tab->editor()->text().left(11),
                                   QStringLiteral("FF 41 02 03"), 1000);
         QTRY_VERIFY_WITH_TIMEOUT(asciiPreview->toPlainText().startsWith(
-                                     QStringLiteral(".A.")), 1000);
+            decodeByteGridText(afterHexEdit.left(3), TextEncoding::Utf8,
+                               tab->l2View()->hexBytesPerRow())), 1000);
         tab->redo();
         QTRY_COMPARE_WITH_TIMEOUT(tab->editor()->text().left(11),
                                   QStringLiteral("FF 41 5A 03"), 1000);
         QTRY_VERIFY_WITH_TIMEOUT(asciiPreview->toPlainText().startsWith(
-                                     QStringLiteral(".AZ")), 1000);
+            decodeByteGridText(expected.left(3), TextEncoding::Utf8,
+                               tab->l2View()->hexBytesPerRow())), 1000);
 
         QTRY_VERIFY_WITH_TIMEOUT(saveAction->isEnabled(), 1000);
         saveAction->trigger();
@@ -993,7 +998,9 @@ private slots:
         asciiPreview = tab->findChild<QPlainTextEdit *>(
             QStringLiteral("HexAsciiPreview"));
         QVERIFY(asciiPreview && asciiPreview->isVisible());
-        QVERIFY(asciiPreview->toPlainText().startsWith(QStringLiteral(".AZ")));
+        QVERIFY(asciiPreview->toPlainText().startsWith(
+            decodeByteGridText(expected.left(3), TextEncoding::Utf8,
+                               tab->l2View()->hexBytesPerRow())));
         QCOMPARE(tab->editor()->SendScintilla(QsciScintillaBase::SCI_GETXOFFSET), 0L);
 
         // Selection in either visual column represents one half-open source
@@ -1001,7 +1008,8 @@ private slots:
         tab->editor()->setFocus(Qt::OtherFocusReason);
         tab->editor()->setSelection(0, 0, 0, 5); // bytes [0, 2)
         QTRY_COMPARE_WITH_TIMEOUT(asciiPreview->textCursor().selectedText(),
-                                  QStringLiteral(".A"), 1000);
+            decodeByteGridText(expected.left(2), TextEncoding::Utf8,
+                               tab->l2View()->hexBytesPerRow()), 1000);
         QTextCursor asciiSelection(asciiPreview->document());
         asciiSelection.setPosition(1);
         asciiSelection.setPosition(3, QTextCursor::KeepAnchor); // bytes [1, 3)
@@ -1019,7 +1027,8 @@ private slots:
 
         bool restoredSizeStatus = false;
         for (QLabel *label : mw_->findChildren<QLabel *>())
-            restoredSizeStatus |= label->text() == QStringLiteral("512 B · B1");
+            restoredSizeStatus |= label->text()
+                == QStringLiteral("512 B · Binary · Hex · 可编辑");
         QVERIFY(restoredSizeStatus);
         auto *hexModeStatus = mw_->findChild<QToolButton *>(
             QStringLiteral("status.hexEditMode"));
@@ -1035,10 +1044,13 @@ private slots:
         QTest::keyClick(asciiPreview, Qt::Key_Insert);
         QVERIFY(!tab->hexOverwriteMode());
         QTest::keyClicks(asciiPreview, QStringLiteral("Q"));
+        QByteArray insertedExpected = expected;
+        insertedExpected.insert(3, 'Q');
         QTRY_COMPARE_WITH_TIMEOUT(tab->editor()->text().left(14),
                                   QStringLiteral("FF 41 5A 51 03"), 1000);
         QTRY_VERIFY_WITH_TIMEOUT(asciiPreview->toPlainText().startsWith(
-                                     QStringLiteral(".AZQ")), 1000);
+            decodeByteGridText(insertedExpected.left(4), TextEncoding::Utf8,
+                               tab->l2View()->hexBytesPerRow())), 1000);
         tab->undo();
         QTRY_VERIFY_WITH_TIMEOUT(tab->editor()->text().startsWith(
                                      QStringLiteral("FF 41 5A 03")), 1000);
@@ -1067,7 +1079,8 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(tab->editor()->text().startsWith(
                                      QStringLiteral("FF 41 5A 03")), 2000);
         QTRY_VERIFY_WITH_TIMEOUT(asciiPreview->toPlainText().startsWith(
-                                     QStringLiteral(".AZ")), 2000);
+            decodeByteGridText(expected.left(3), TextEncoding::Utf8,
+                               tab->l2View()->hexBytesPerRow())), 2000);
         QCOMPARE(tab->editor()->SendScintilla(QsciScintillaBase::SCI_GETXOFFSET), 0L);
         const QString narrowScreenshot = QCoreApplication::applicationDirPath()
                                          + QStringLiteral("/gui-hex-roundtrip-narrow.png");
@@ -1522,7 +1535,7 @@ private slots:
         auto *sizeStatus = mw_->findChild<QLabel *>(QStringLiteral("status.size"));
         QVERIFY(sizeStatus);
         QTRY_VERIFY_WITH_TIMEOUT(sizeStatus->text().startsWith(
-                                     QStringLiteral("5 B · B1")), 1000);
+                                     QStringLiteral("5 B · Binary · Hex · 可编辑")), 1000);
         QVERIFY(mw_->grab().save(QCoreApplication::applicationDirPath()
                                  + QStringLiteral("/gui-hex-insert-mode.png")));
         closeAllEditorTabs(mw_);
@@ -1615,15 +1628,7 @@ private slots:
             return text;
         };
         const auto formattedAscii = [](const QByteArray &bytes, int row) {
-            QString text;
-            for (int i = 0; i < bytes.size(); ++i) {
-                if (i > 0 && i % row == 0)
-                    text.append(QLatin1Char('\n'));
-                const uchar value = uchar(bytes.at(i));
-                text.append(value >= 0x20 && value <= 0x7e
-                                ? QChar(value) : QLatin1Char('.'));
-            }
-            return text;
+            return decodeByteGridText(bytes, TextEncoding::Utf8, row);
         };
 
         for (int caseIndex = 0; caseIndex < cases.size(); ++caseIndex) {
@@ -1925,7 +1930,8 @@ private slots:
             const bool valid = contract.value(QStringLiteral("payload"))
                                == QStringLiteral("valid");
             const QByteArray inserted = surface == tab->editor()
-                ? QByteArray::fromHex("AABB") : QByteArray("XY");
+                ? QByteArray::fromHex("AABB")
+                : (valid ? QByteArray("XY") : QStringLiteral("中").toUtf8());
             QGuiApplication::clipboard()->setText(valid
                 ? (surface == tab->editor() ? QStringLiteral("AA BB")
                                             : QStringLiteral("XY"))
@@ -1933,7 +1939,11 @@ private slots:
                                             : QStringLiteral("中")));
 
             QByteArray expected = original;
-            if (valid) {
+            // Hex digits still reject malformed input. The character pane is
+            // the encoded-text surface, so representable multibyte text is a
+            // valid payload rather than an "ASCII-only" rejection case.
+            const bool accepted = valid || surface != tab->editor();
+            if (accepted) {
                 if (selection != QStringLiteral("none")) {
                     expected.replace(rangeStart, rangeEnd - rangeStart, inserted);
                 } else if (!overwrite) {
@@ -1975,14 +1985,15 @@ private slots:
             {QStringLiteral("surface"), {QStringLiteral("hex"), QStringLiteral("ascii")}},
             {QStringLiteral("mode"), {QStringLiteral("OVR"), QStringLiteral("INS")}},
             {QStringLiteral("input"), {QStringLiteral("G"), QStringLiteral("space"),
-                                         QStringLiteral("enter"), QStringLiteral("unicode")}},
+                                         QStringLiteral("enter"), QStringLiteral("control"),
+                                         QStringLiteral("unicode")}},
             {QStringLiteral("boundary"), {QStringLiteral("start"), QStringLiteral("end")}},
         };
         const Constraint validCase = [](const Assignment &row) {
             if (row.value(QStringLiteral("surface")) == QStringLiteral("hex"))
                 return true;
             const QString input = row.value(QStringLiteral("input"));
-            return input == QStringLiteral("enter") || input == QStringLiteral("unicode");
+            return input == QStringLiteral("enter") || input == QStringLiteral("control");
         };
         const QVector<Assignment> cases = pairwise(dimensions, validCase);
         QVERIFY(!cases.isEmpty());
@@ -2035,6 +2046,11 @@ private slots:
                 QTest::keyClick(surface, Qt::Key_Space);
             else if (input == QStringLiteral("enter"))
                 QTest::keyClick(surface, Qt::Key_Return);
+            else if (input == QStringLiteral("control")) {
+                QKeyEvent controlEvent(QEvent::KeyPress, Qt::Key_unknown,
+                                       Qt::NoModifier, QString(QChar(1)));
+                QApplication::sendEvent(surface, &controlEvent);
+            }
             else {
                 QKeyEvent unicodeEvent(QEvent::KeyPress, Qt::Key_unknown,
                                        Qt::NoModifier, QStringLiteral("中"));
@@ -2089,10 +2105,10 @@ private slots:
             QVERIFY2(ascii && ascii->isVisibleTo(tab), qPrintable(mode));
 
             // Native composition must never be rendered into either fixed
-            // byte projection. Directly dispatched events below reproduce the
-            // route used by Chinese IMEs even on a non-Chinese CI machine.
+            // byte projection. The Hex pane rejects non-nibbles; the character
+            // pane consumes a complete commit through the selected encoding.
             QVERIFY(!tab->editor()->testAttribute(Qt::WA_InputMethodEnabled));
-            QVERIFY(!ascii->testAttribute(Qt::WA_InputMethodEnabled));
+            QVERIFY(ascii->testAttribute(Qt::WA_InputMethodEnabled));
             tab->editor()->setFocus(Qt::OtherFocusReason);
             if (!overwrite)
                 QTest::keyClick(tab->editor(), Qt::Key_Insert);
@@ -2137,15 +2153,54 @@ private slots:
                 tab->l2View()->readByteRange(0, expected.size()), expected, 1000);
             QVERIFY(tab->isModified());
 
-            const QString committedProjection = tab->editor()->text();
-            const QString committedAscii = ascii->toPlainText();
-            QInputMethodEvent invalidAsciiCommit;
-            invalidAsciiCommit.setCommitString(QStringLiteral("中"));
-            QApplication::sendEvent(ascii, &invalidAsciiCommit);
+            // A multibyte character commit is one byte transaction in the
+            // character pane. OVR consumes its encoded byte count; INS inserts
+            // it. No partial character or Unicode re-encoding reaches disk.
+            QTextCursor characterCaret(ascii->document());
+            characterCaret.setPosition(3);
+            ascii->setTextCursor(characterCaret);
+            ascii->setFocus(Qt::OtherFocusReason);
+            QInputMethodEvent characterCommit;
+            characterCommit.setCommitString(QStringLiteral("中"));
+            QApplication::sendEvent(ascii, &characterCommit);
             QApplication::processEvents(QEventLoop::AllEvents, 30);
-            QCOMPARE(tab->editor()->text(), committedProjection);
-            QCOMPARE(ascii->toPlainText(), committedAscii);
-            QCOMPARE(tab->l2View()->readByteRange(0, expected.size()), expected);
+            const QByteArray chinese = QStringLiteral("中").toUtf8();
+            if (overwrite)
+                expected.replace(3, chinese.size(), chinese);
+            else
+                expected.insert(3, chinese);
+            QTRY_COMPARE_WITH_TIMEOUT(
+                tab->l2View()->readByteRange(0, expected.size()), expected, 1000);
+            QVERIFY(tab->editor()->text().contains(
+                QStringLiteral("E4 B8 AD")));
+
+            // Copy exposes the same decoded text externally and retains an
+            // authoritative private raw-byte flavor for lossless in-app paste.
+            QTextCursor chineseSelection(ascii->document());
+            chineseSelection.setPosition(3);
+            chineseSelection.setPosition(6, QTextCursor::KeepAnchor);
+            ascii->setTextCursor(chineseSelection);
+            QTest::keyClick(ascii, Qt::Key_C, Qt::ControlModifier);
+            QCOMPARE(QGuiApplication::clipboard()->text(), QStringLiteral("中"));
+            const QMimeData *mime = QGuiApplication::clipboard()->mimeData();
+            QVERIFY(mime && mime->hasFormat(
+                QString::fromLatin1(ByteClipboard::RawBytesMime)));
+            QCOMPARE(mime->data(QString::fromLatin1(ByteClipboard::RawBytesMime)),
+                     chinese);
+
+            tab->undo();
+            QByteArray beforeCharacterCommit = expected;
+            if (overwrite)
+                beforeCharacterCommit.replace(3, chinese.size(),
+                                              original.mid(3, chinese.size()));
+            else
+                beforeCharacterCommit.remove(3, chinese.size());
+            QTRY_COMPARE_WITH_TIMEOUT(
+                tab->l2View()->readByteRange(0, beforeCharacterCommit.size()),
+                beforeCharacterCommit, 1000);
+            tab->redo();
+            QTRY_COMPARE_WITH_TIMEOUT(
+                tab->l2View()->readByteRange(0, expected.size()), expected, 1000);
 
             if (overwrite) {
                 const QString screenshot = QCoreApplication::applicationDirPath()
@@ -2168,6 +2223,21 @@ private slots:
             QFile saved(path);
             QVERIFY(saved.open(QIODevice::ReadOnly));
             QCOMPARE(saved.readAll(), expected);
+            saved.close();
+
+            closeAllEditorTabs(mw_);
+            mw_->openFilesFromExternal(QStringList{path});
+            QVERIFY2(waitForTabCountAndL2(mw_, 1, true, 5000), qPrintable(mode));
+            EditorTab *reopened = currentEditorTab(mw_);
+            QVERIFY(reopened && reopened->l2View());
+            QTRY_VERIFY_WITH_TIMEOUT(reopened->l2View()->isOpen(), 5000);
+            QCOMPARE(reopened->l2View()->readByteRange(
+                         0, reopened->l2View()->virtualFileSize()), expected);
+            auto *reopenedCharacter = reopened->findChild<QPlainTextEdit *>(
+                QStringLiteral("HexAsciiPreview"));
+            QVERIFY(reopenedCharacter);
+            QVERIFY(reopenedCharacter->toPlainText().contains(
+                QStringLiteral("中")));
             closeAllEditorTabs(mw_);
         }
     }
@@ -2576,7 +2646,7 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(source->viewModeL2(), ViewMode::Text, 2000);
         QVERIFY(source->isBinaryDocument());
         QTRY_COMPARE_WITH_TIMEOUT(source->editor()->marginType(0),
-                                  QsciScintilla::NumberMargin, 2000);
+                                  QsciScintilla::TextMargin, 2000);
 
         SessionManager session(dataDir);
         QVERIFY(session.saveSession({source}, 0, false));
@@ -2599,7 +2669,7 @@ private slots:
                                  && restored->l2View()->isOpen(), 5000);
         QCOMPARE(restored->viewModeL2(), ViewMode::Text);
         QVERIFY(restored->isBinaryDocument());
-        QCOMPARE(restored->editor()->marginType(0), QsciScintilla::NumberMargin);
+        QCOMPARE(restored->editor()->marginType(0), QsciScintilla::TextMargin);
         QVERIFY(restored->editor()->text().startsWith(
             QStringLiteral("BINARY-AS-TEXT")));
         QVERIFY(!restored->editor()->text().startsWith(
@@ -3661,7 +3731,6 @@ private slots:
             context.data(SearchResultsModel::MatchByteRangesRole).toList();
         QCOMPARE(ranges.size(), 1);
 
-        QSignalSpy jumpPositionSpy(dock, &SearchResultsDock::jumpToTab);
         QSignalSpy jumpByteSpy(dock, &SearchResultsDock::jumpToTabByteOffset);
         switchToTab(mw_, 0);
         const QModelIndex jumpIndex = tree->model()->index(
@@ -3676,7 +3745,7 @@ private slots:
                           Qt::NoModifier, rect.center());
         QTest::mouseDClick(tree->viewport(), Qt::LeftButton,
                            Qt::NoModifier, rect.center());
-        QTRY_COMPARE_WITH_TIMEOUT(jumpPositionSpy.count() + jumpByteSpy.count(), 1, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(jumpByteSpy.count(), 1, 2000);
         QTRY_COMPARE_WITH_TIMEOUT(tabs->currentIndex(), 1, 2000);
         QTRY_COMPARE_WITH_TIMEOUT(second->editor()->selectedText(),
                                   QStringLiteral("TOKEN"), 2000);
@@ -3690,6 +3759,80 @@ private slots:
                                    + QStringLiteral("/gui-mainwindow-search-utf16-dock-jump.png");
         QVERIFY2(mw_->grab().save(screenshot), qPrintable(screenshot));
         closeAllEditorTabs(mw_);
+    }
+
+    void tc_background_task_phased_progress_contract() {
+        auto &manager = AsyncTaskManager::instance();
+        manager.cancelAllByType();
+        QTRY_COMPARE_WITH_TIMEOUT(manager.cancellableCount(), 0, 3000);
+        manager.clearHistory();
+
+        const auto release = std::make_shared<std::atomic_bool>(false);
+        const qint64 taskId = manager.submit(
+            AsyncTaskType::Other, AsyncTaskPriority::Normal,
+            QStringLiteral("分段进度契约"), QStringLiteral("验证精确进度和阶段历史"),
+            [release](qint64, AsyncCancelPtr cancel,
+                      const std::function<void(qint64, qint64)> &,
+                      const std::function<void(const AsyncErrorInfo &)> &) {
+                while (!release->load(std::memory_order_acquire)
+                       && !(cancel && cancel->load(std::memory_order_acquire))) {
+                    QThread::msleep(10);
+                }
+            });
+        QTRY_VERIFY_WITH_TIMEOUT(
+            manager.taskById(taskId).state == AsyncTaskState::Running, 3000);
+
+        manager.updateTaskPhase(taskId, QStringLiteral("扫描源数据"),
+                                1, 2, 1234, 10000);
+        QTRY_COMPARE_WITH_TIMEOUT(manager.taskById(taskId).percentHundredths(),
+                                  1234, 1000);
+        AsyncTask phaseOne = manager.taskById(taskId);
+        QCOMPARE(phaseOne.progressPhase, QStringLiteral("扫描源数据"));
+        QCOMPARE(phaseOne.progressPhaseIndex, 1);
+        QCOMPARE(phaseOne.progressPhaseCount, 2);
+        QCOMPARE(phaseOne.estimatedRemainingMs(), qint64(-1));
+
+        // A late report in the same phase cannot make visible progress regress.
+        manager.updateTaskProgress(taskId, 1000, 10000);
+        QCOMPARE(manager.taskById(taskId).percentHundredths(), 1234);
+
+        manager.updateTaskPhase(taskId, QStringLiteral("整理结果"),
+                                2, 2, 1, 3);
+        QTRY_COMPARE_WITH_TIMEOUT(manager.taskById(taskId).progressPhaseIndex,
+                                  2, 1000);
+        const AsyncTask phaseTwo = manager.taskById(taskId);
+        QCOMPARE(phaseTwo.percentHundredths(), 3333);
+        QVERIFY(phaseTwo.completedPhases.contains(QStringLiteral("扫描源数据")));
+        QCOMPARE(phaseTwo.estimatedRemainingMs(), qint64(-1));
+
+        AsyncTaskPanelDialog panel(mw_);
+        panel.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&panel));
+        auto *list = panel.findChild<QListView *>();
+        auto *details = panel.findChild<QPlainTextEdit *>();
+        QVERIFY(list && details);
+        QModelIndex taskIndex;
+        for (int row = 0; row < manager.rowCount(); ++row) {
+            const QModelIndex candidate = manager.index(row, 0);
+            if (candidate.data(AsyncTaskManager::TaskIdRole).toLongLong()
+                == taskId) {
+                taskIndex = candidate;
+                break;
+            }
+        }
+        QVERIFY(taskIndex.isValid());
+        list->setCurrentIndex(taskIndex);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            details->toPlainText().contains(QStringLiteral("当前阶段: 2/2  整理结果")),
+            1000);
+        QVERIFY(details->toPlainText().contains(QStringLiteral("已完成阶段: 扫描源数据")));
+        QVERIFY(details->toPlainText().contains(QStringLiteral("33.33%")));
+        panel.close();
+
+        release->store(true, std::memory_order_release);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            manager.taskById(taskId).state == AsyncTaskState::Finished, 3000);
+        manager.clearHistory();
     }
 
     void tc_background_task_center_lifecycle() {

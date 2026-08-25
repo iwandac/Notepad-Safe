@@ -12,7 +12,6 @@ class QPushButton;
 class QStackedWidget;
 class QMouseEvent;
 class MultiSearchResultsModel;
-class FlatL1SearchResultsModel;
 
 // 搜索结果 Dock 窗口
 class SearchResultsDock : public QDockWidget {
@@ -20,23 +19,27 @@ class SearchResultsDock : public QDockWidget {
 public:
     explicit SearchResultsDock(QWidget *parent = nullptr);
 
-    // ---- L1（QsciScintilla）路径：QVector<SearchMatch> → flat virtual model
+    // ---- Editable Text results are adapted to the canonical result model.
     void setResults(const QVector<SearchMatch> &matches, const QString &pattern,
                     const QString &fileName, EditorTab *target = nullptr,
                     bool incomplete = false);
 
-    // ---- L2 虚拟化路径：SearchResultsModel（内存 + overrun.bin 二分读取）→ QTreeView
+    // ---- Canonical result path: SearchResultsModel -> QTreeView.
     // model 通常以 Dock 为 QObject parent；多文件路径会显式接管所有权。
     void setResultsModel(SearchResultsModel *model, const QString &pattern,
                          const QString &fileName, EditorTab *target = nullptr);
     void beginSingleFileResults(const QString &pattern, const QString &fileName,
-                                EditorTab *target);
+                                EditorTab *target, TextEncoding encoding,
+                                bool bytePositionMode);
     void appendSingleFilePreview(EditorTab *target,
-                                 const QVector<LargeFileSearchMatch> &batch);
+                                 const QVector<LargeFileSearchMatch> &batch,
+                                 TextEncoding encoding, bool bytePositionMode);
     void beginMultiFileResults(const QString &pattern, int targetCount);
-    void beginMultiFileTarget(EditorTab *tab);
+    void beginMultiFileTarget(EditorTab *tab, TextEncoding encoding,
+                              bool bytePositionMode);
     void appendMultiFilePreview(EditorTab *tab,
-                                const QVector<LargeFileSearchMatch> &batch);
+                                const QVector<LargeFileSearchMatch> &batch,
+                                TextEncoding encoding, bool bytePositionMode);
     void appendMultiFileResults(EditorTab *tab, const QVector<SearchMatch> &matches,
                                 bool incomplete = false);
     // Transfers model ownership to the dock's virtual multi-file model.
@@ -48,11 +51,8 @@ public:
 
 signals:
     void rerunRequested(EditorTab *preferredTarget);
-    // L1 跳转（line, index：Scintilla 的 0-based 行/列）
-    void jumpTo(int line, int index, int length);
-    // L2 跳转（byteOffset：虚拟字节偏移；length：匹配长度用于定位选中）
+    // All result rows use source byte offsets as the navigation authority.
     void jumpToByteOffset(qint64 byteOffset, int length);
-    void jumpToTab(EditorTab *tab, int line, int index, int length);
     void jumpToTabByteOffset(EditorTab *tab, qint64 byteOffset, int length);
 
 protected:
@@ -65,9 +65,8 @@ private slots:
 private:
     QStackedWidget *m_stack   = nullptr;
     QTreeView      *m_treeView = nullptr; // 全部结果共用的虚拟化控件
-    SearchResultsModel *m_model = nullptr; // 当前绑定的 L2 模型（非 owning）
+    SearchResultsModel *m_model = nullptr; // 当前绑定的统一结果模型（非 owning）
     MultiSearchResultsModel *m_multiModel = nullptr;
-    FlatL1SearchResultsModel *m_singleL1Model = nullptr;
     QLabel         *m_summary = nullptr;
     QPushButton    *m_rerunButton = nullptr;
 

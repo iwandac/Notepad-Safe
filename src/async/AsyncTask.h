@@ -4,6 +4,7 @@
 #include <QString>
 #include <QDateTime>
 #include <QVector>
+#include <QStringList>
 #include <QMetaType>
 #include <atomic>
 #include <memory>
@@ -67,10 +68,22 @@ struct AsyncTask {
 
     qint64  progressDone = 0;        // 进度：分子
     qint64  progressTotal = 0;       // 进度：分母；-1 表示未知（显示忙状态）
-    int     percent() const {
+    QString progressPhase;           // 当前真实工作阶段
+    int     progressPhaseIndex = 0;  // 1-based；0 表示未分段
+    int     progressPhaseCount = 0;
+    QStringList completedPhases;
+    QDateTime phaseStartedAt;
+    int     progressSamples = 0;
+    int percentHundredths() const {
         if (progressTotal <= 0 || progressDone < 0) return -1;
-        if (progressDone >= progressTotal) return 100;
-        return int((progressDone * 100LL) / progressTotal);
+        if (progressDone >= progressTotal) return 10000;
+        const long double scaled = static_cast<long double>(progressDone)
+            * 10000.0L / static_cast<long double>(progressTotal);
+        return int(scaled);
+    }
+    int     percent() const {
+        const int precise = percentHundredths();
+        return precise < 0 ? -1 : precise / 100;
     }
 
     QDateTime createdAt;

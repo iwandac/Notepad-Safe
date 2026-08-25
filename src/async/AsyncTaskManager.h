@@ -25,6 +25,11 @@ public:
         TaskProgressDoneRole,
         TaskProgressTotalRole,
         TaskPercentRole,
+        TaskPercentHundredthsRole,
+        TaskProgressPhaseRole,
+        TaskProgressPhaseIndexRole,
+        TaskProgressPhaseCountRole,
+        TaskCompletedPhasesRole,
         TaskCreatedAtRole,
         TaskStartedAtRole,
         TaskFinishedAtRole,
@@ -84,6 +89,11 @@ public:
     /** 公开进度更新（主线程调用，同步写入 tasks_/history_） */
     Q_INVOKABLE void updateTaskProgress(qint64 taskId, qint64 done, qint64 total);
 
+    /** Start/update one real phase. Each phase owns a fresh 0..total scale. */
+    Q_INVOKABLE void updateTaskPhase(qint64 taskId, const QString &phase,
+                                     int phaseIndex, int phaseCount,
+                                     qint64 done, qint64 total);
+
     /** 批量取消：按类型；若 type==Unknown 则取消当前所有 Queued/Running */
     Q_INVOKABLE void cancelAllByType(AsyncTaskType type = AsyncTaskType::Unknown);
 
@@ -93,6 +103,9 @@ public:
 signals:
     void taskAdded(qint64 taskId);
     void taskProgressChanged(qint64 taskId, qint64 done, qint64 total);
+    void taskPhaseChanged(qint64 taskId, const QString &phase,
+                          int phaseIndex, int phaseCount,
+                          qint64 done, qint64 total);
     void taskFinished(qint64 taskId, AsyncTaskState finalState);  // Finished / Failed / Canceled
     void threadCountChanged(int running, int maxThreads);         // 每秒推送：当前活跃线程/并发上限
     void summaryChanged(int queued, int running, int finishedRecent);
@@ -108,6 +121,9 @@ private:
 
     // 仅由内部 QueuedConnection 调用，保证不跨线程直接改模型索引
     Q_INVOKABLE void updateTaskProgressImpl(qint64 taskId, qint64 done, qint64 total);
+    Q_INVOKABLE void updateTaskPhaseImpl(qint64 taskId, const QString &phase,
+                                         int phaseIndex, int phaseCount,
+                                         qint64 done, qint64 total);
     Q_INVOKABLE void markTaskRunningImpl(qint64 taskId);
     Q_INVOKABLE void finishTaskImpl(qint64 taskId, AsyncTaskState finalState, const AsyncErrorInfo &err);
 

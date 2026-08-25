@@ -110,9 +110,7 @@ private slots:
     void syncCommandStates(EditorTab *tab = nullptr);
 
     // 搜索结果
-    void onJumpTo(int line, int index, int length);
     void onJumpToByteOffset(qint64 byteOffset, int length);
-    void onJumpToTab(EditorTab *tab, int line, int index, int length);
     void onJumpToTabByteOffset(EditorTab *tab, qint64 byteOffset, int length);
     void openSecureNote(const QUuid &id);
     void lockSecureDocuments();

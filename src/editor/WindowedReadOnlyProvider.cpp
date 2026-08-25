@@ -1,5 +1,6 @@
 #include "WindowedReadOnlyProvider.h"
 #include "EditorSurfaceStyle.h"
+// Windowed Hex character rows use the measured B1 Hex grid.
 #include "ByteClipboard.h"
 
 #include <algorithm>
@@ -156,8 +157,9 @@ WindowedReadOnlyProvider::WindowedReadOnlyProvider(QWidget *parent)
 
     m_asciiPreview = new QPlainTextEdit(this);
     m_asciiPreview->setObjectName(QStringLiteral("HexAsciiPreview"));
-    m_asciiPreview->setAccessibleName(tr("ASCII 字节预览"));
-    m_asciiPreview->setToolTip(tr("字符栏（不可打印字节显示为 .；只读）"));
+    m_asciiPreview->setAccessibleName(tr("编码字符预览"));
+    m_asciiPreview->setToolTip(
+        tr("字符栏（按当前编码进行多字节解码；只读）"));
     m_asciiPreview->setFont(m_editor->font());
     m_asciiPreview->setReadOnly(true);
     m_asciiPreview->setAttribute(Qt::WA_InputMethodEnabled, false);
@@ -299,7 +301,7 @@ bool WindowedReadOnlyProvider::openFile(const QString &path, Presentation presen
     m_observedSize = observed.size();
     m_observedModified = observed.lastModified();
     m_filePoll->start();
-    if (presentation == Presentation::Text) {
+    if (presentation == Presentation::Text && !m_binaryContent) {
         startLineNumberIndex();
         startCharacterCount();
     }
@@ -412,7 +414,7 @@ bool WindowedReadOnlyProvider::refreshFileMapping(QString *error)
         m_updatingScrollBar = false;
     }
     emit sourceFileChanged(previousSize, m_fileSize);
-    if (m_presentation == Presentation::Text) {
+    if (m_presentation == Presentation::Text && !m_binaryContent) {
         startLineNumberIndex();
         startCharacterCount();
     }
@@ -438,7 +440,7 @@ void WindowedReadOnlyProvider::setPresentation(Presentation presentation)
     m_globalScrollBar->setPageStep(std::max(
         1, int((static_cast<long double>(m_windowSpan) * kSliderMaximum) / m_fileSize)));
     reloadWindow(m_globalOffset, 0);
-    if (presentation == Presentation::Text) {
+    if (presentation == Presentation::Text && !m_binaryContent) {
         if (m_lineBreakPrefix.isEmpty() && !m_lineNumberPending)
             startLineNumberIndex();
         if (m_characterCount < 0 && !m_characterCountPending)
@@ -446,15 +448,37 @@ void WindowedReadOnlyProvider::setPresentation(Presentation presentation)
     }
 }
 
+void WindowedReadOnlyProvider::setBinaryContent(bool binary)
+{
+    if (m_binaryContent == binary)
+        return;
+    m_binaryContent = binary;
+    if (binary) {
+        cancelLineNumberIndex();
+        cancelCharacterCount();
+        m_lineBreakPrefix.clear();
+        m_lineBreakPrefixEndsWithCr.clear();
+        m_characterCount = -1;
+        emit characterCountChanged(-1, false);
+    } else if (m_presentation == Presentation::Text && !m_path.isEmpty()) {
+        startLineNumberIndex();
+        startCharacterCount();
+    }
+    if (!m_path.isEmpty())
+        reloadWindow(m_globalOffset, 0, visibleTopOffset(), true);
+}
+
 void WindowedReadOnlyProvider::setTextEncoding(TextEncoding encoding)
 {
     if (m_textEncoding == encoding)
         return;
     m_textEncoding = encoding;
-    if (m_presentation == Presentation::Text && !m_path.isEmpty()) {
+    if (!m_path.isEmpty()) {
         reloadWindow(m_globalOffset, 0, visibleTopOffset(), true);
-        startLineNumberIndex();
-        startCharacterCount();
+        if (m_presentation == Presentation::Text && !m_binaryContent) {
+            startLineNumberIndex();
+            startCharacterCount();
+        }
     }
 }
 
@@ -470,7 +494,7 @@ void WindowedReadOnlyProvider::cancelCharacterCount()
 void WindowedReadOnlyProvider::startCharacterCount()
 {
     cancelCharacterCount();
-    if (m_path.isEmpty() || m_fileSize <= 0)
+    if (m_binaryContent || m_path.isEmpty() || m_fileSize <= 0)
         return;
 
     m_characterCount = -1;
@@ -594,7 +618,7 @@ void WindowedReadOnlyProvider::cancelLineNumberIndex()
 void WindowedReadOnlyProvider::startLineNumberIndex()
 {
     cancelLineNumberIndex();
-    if (m_path.isEmpty() || m_fileSize <= 0)
+    if (m_binaryContent || m_path.isEmpty() || m_fileSize <= 0)
         return;
 
     m_lineBreakPrefix.clear();
@@ -862,10 +886,10 @@ bool WindowedReadOnlyProvider::copySelection(QString *error) const
     if (m_presentation == Presentation::Hex && !asciiFocused) {
         ByteClipboard::setHexSelection(selected);
     } else if (m_presentation == Presentation::Hex) {
-        ByteClipboard::setAsciiSelection(selected);
+        ByteClipboard::setCharacterSelection(selected, m_textEncoding);
     } else {
         QGuiApplication::clipboard()->setText(
-            decodeTextFragment(selected, m_textEncoding));
+            decodeTextProjection(selected, m_textEncoding, false, false).text);
     }
     return true;
 }
@@ -1231,6 +1255,15 @@ void WindowedReadOnlyProvider::reloadWindow(qint64 anchorOffset, qint64 selectio
 
     if (m_presentation == Presentation::Hex) {
         start -= start % m_hexBytesPerRow;
+    } else if (m_binaryContent) {
+        // Binary Text has no global line authority. Keep only a tiny decoder
+        // overlap at the window boundary; never scan backwards for a
+        // synthetic newline.
+        start = std::max<qint64>(0, start - 8);
+        if (m_textEncoding == TextEncoding::Utf16LE
+            || m_textEncoding == TextEncoding::Utf16BE) {
+            start -= start % 2;
+        }
     } else if (m_textEncoding == TextEncoding::Utf16LE
                || m_textEncoding == TextEncoding::Utf16BE) {
         start -= start % 2;
@@ -1273,7 +1306,15 @@ void WindowedReadOnlyProvider::reloadWindow(qint64 anchorOffset, qint64 selectio
         && end < m_fileSize && end % 2 != 0) {
         ++end;
     }
-    if (m_presentation == Presentation::Text && end < m_fileSize
+    if (m_presentation == Presentation::Text && m_binaryContent
+        && end < m_fileSize) {
+        end = std::min(m_fileSize, end + 8);
+        if ((m_textEncoding == TextEncoding::Utf16LE
+             || m_textEncoding == TextEncoding::Utf16BE)
+            && end < m_fileSize && end % 2 != 0) {
+            ++end;
+        }
+    } else if (m_presentation == Presentation::Text && end < m_fileSize
         && end - start < kMaxTextProjectionBytes) {
         const qint64 scanBytes = std::min(kMaxTextProjectionBytes - (end - start),
                                           m_fileSize - end);
@@ -1584,6 +1625,28 @@ void WindowedReadOnlyProvider::configureProjectionMargin()
         return;
     }
 
+    if (m_binaryContent) {
+        // Binary line breaks are display artifacts, not global document
+        // structure. Label visible rows with source byte offsets and avoid
+        // the full-file line-prefix and character-count tasks entirely.
+        directScintilla(m_editor, QsciScintillaBase::SCI_MARGINTEXTCLEARALL);
+        m_editor->setMarginLineNumbers(0, false);
+        m_editor->setMarginType(0, QsciScintilla::TextMargin);
+        const int lines = std::max(1, static_cast<int>(directScintilla(
+            m_editor, QsciScintillaBase::SCI_GETLINECOUNT)));
+        const int digits = std::max(
+            8, static_cast<int>(QString::number(
+                std::max<qint64>(0, m_fileSize - 1), 16).size()));
+        m_editor->setMarginWidth(0, QString(digits + 2, QLatin1Char('0')));
+        for (int line = 0; line < lines; ++line) {
+            const qint64 offset = sourceOffsetForProjectedLine(line);
+            m_editor->setMarginText(
+                line, QString::number(offset, 16)
+                          .rightJustified(digits, QLatin1Char('0')).toUpper(), 0);
+        }
+        return;
+    }
+
     // A bounded projection must not expose Scintilla's local 1..N line numbers:
     // they restart after every mmap window and make S2/S3 appear to loop. The
     // character-count pass also builds tiny 1 MiB prefix checkpoints, so the
@@ -1794,19 +1857,8 @@ void WindowedReadOnlyProvider::populateAsciiProjection(const QByteArray &source)
 {
     if (!m_asciiPreview)
         return;
-    QString ascii;
-    ascii.reserve(source.size() + source.size() / std::max(1, m_hexBytesPerRow));
-    for (qsizetype row = 0; row < source.size(); row += m_hexBytesPerRow) {
-        if (row > 0)
-            ascii.append(QLatin1Char('\n'));
-        const qsizetype count = std::min<qsizetype>(m_hexBytesPerRow,
-                                                     source.size() - row);
-        for (qsizetype column = 0; column < count; ++column) {
-            const uchar byte = uchar(source.at(row + column));
-            ascii.append(byte >= 0x20 && byte <= 0x7e
-                             ? QChar(byte) : QLatin1Char('.'));
-        }
-    }
+    QString ascii = decodeByteGridText(source, m_textEncoding,
+                                       m_hexBytesPerRow);
     m_syncingAsciiSelection = true;
     m_asciiPreview->setPlainText(ascii);
     alignPlainTextRowsToScintilla(m_asciiPreview, m_editor);

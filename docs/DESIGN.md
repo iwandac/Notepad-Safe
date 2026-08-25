@@ -1867,6 +1867,19 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
 4. 对安全保存、密钥、恢复和迁移执行 fault injection；对大文件/搜索执行资源与取消基线。
 5. 只有构建、测试、GUI 和数据兼容全部通过才标记阶段完成并提交；失败则在当前边界内继续诊断，不把普通工程问题上升为产品询问。
 
+状态恢复采用前向合并，而不是把源码退回历史版本。目标状态固定为“接受的新能力 + 修改前仍
+有效的能力 - 已确认旧缺陷”。实现者必须先沿事实来源到用户结果建立影响契约：
+`Document/SourceBytes → Projection/Provider → Input/Clipboard → Search/Dock → Save → Session restore`。
+测试范围按这条影响链决定，不能按本次碰过哪些文件决定。任何一环发生语义变化，都要验证显示、
+选择、直接输入、IME、复制/粘贴、Undo/Redo、搜索跳转、保存和关闭重开中实际受影响的项目；
+只读路径另加 resize、编码切换、取消和异步完成后的快照稳定性。
+
+旧测试失败时必须先分类：它保护的是仍有效能力、已废止缺陷，还是与新目标冲突的旧断言。
+只有后两类允许更新，并必须增加新目标的正向断言。修改 QObject 信号、MOC 输入、公共内联头文件
+或其他 ABI/广泛依赖边界后，增量构建只用于快速反馈；最终证据必须来自清理可再生对象后的完整
+重建，避免新测试与旧对象混合产生假通过或假崩溃。先运行最小定向测试定位，再串行运行受影响的
+完整 GUI 旅程；并发压力下的固定超时失败必须单独复跑并核对真实耗时，不能直接放宽阈值。
+
 只有下列事项必须停止并请求产品决定或额外授权：
 
 - 需要改变本文固定的用户可见边界：默认加密、严格小于 32 MiB 的安全 payload、32 MiB/2 GiB 分级、S3/B3 只读、七天绝对会话、当前文件默认搜索或普通保存保持类型。
@@ -1922,10 +1935,9 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
    独立 ASCII pane”的可见契约；内部实现仍不相同。禁止重新引入地址/Hex/ASCII 拼接投影、
    外层与内核双滚动或靠双向同步两个 scrollbar 修补。后续抽取统一 HexEditorProvider 属于
    架构清债，任何迁移都必须先保持当前动态契约不退化。
-4. **gutter 必须服从当前呈现语义**。Hex 呈现显示全局十六进制 byte address；Text 呈现
-   必须显示十进制文本行号，不能残留二进制地址。Windowed Provider 在完整 SparseLineIndex
-   未就绪时先显示当前有界文本投影的行号；索引就绪后可补上全局 line base，但不得在 Text
-   模式退回 Hex address，也不得为了计算全局行号阻塞文件首屏或随机跳转。
+4. **gutter 必须服从内容事实**。可信 Text 呈现显示十进制文本行号；Binary 的 Hex 呈现显示
+   全局十六进制 byte address，Binary Text 显示全局十进制 byte offset。Binary 不再为了伪造
+   全局文本行号建立 `LineIndex` 或字符统计；窗口内换行只服务阅读，不成为全文坐标真值。
 5. **状态栏临时消息与文档元数据不能争夺布局**。`showMessage()` 独占左侧弹性区域；光标/
    offset、编码与 EOL、语法/呈现、大小与 tier、dirty 和 task chip 均为 permanent segment。
 6. **Save 的前置条件是 dirty，而不是“当前有文件”**。已命名未修改文档普通 Save 必须严格
@@ -1996,13 +2008,12 @@ KeePassXC Core、Botan、Argon2、PCRE2、GPLv3 和上游链接。正式 GUI 门
   并把 B1 跨投影 wheel 从 120/250ms 旧防抖改为手势内即时切换 active window。
   `windowedHexBothPanesWheelInLockstep` 同时检查两栏屏幕首行、angle/pixel wheel 与跨窗口连续性；
   9MiB B1、228MB B2、4.9GB B3 邻接用例均通过。
-- `tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers` 直接使用保留的 `tinytestfile`：
+- `tinyBinaryHexRowsReverseSelectionRawSearchAndTextByteOffsets` 直接使用保留的 `tinytestfile`：
   Hex/ASCII 第 0–1000 行的实际像素高度严格一致；ASCII 右→左鼠标拖选 Hex 地址
   `0x416–0x418`，得到 source `[0x416,0x419)`；原始 `01 E9 24` 经剪贴板粘贴后自动成为
   Hex bytes 查询并精确回到同一范围。
-  同一标签跳到 75% 后切换 Text，首行 margin 为根据源前缀换行数计算的绝对十进制 64591，
-  不再显示窗口局部 1 或 Hex 地址。视觉证据为 `build/gui-tiny-hex-aligned-reverse-selection.png`、
-  `build/gui-tiny-hex-raw-byte-search.png` 和 `build/gui-tiny-binary-text-absolute-lines.png`。
+  同一标签切换 Text 后，margin 显示当前窗口的全局十进制 byte offset，不启动全文行索引或
+  字符统计。视觉证据为 `build-nmake-searchfix/gui-tiny-hex-aligned-reverse-selection.png`。
 
 自动回归 `windowedTextWrapReachesPhysicalEofAndKeepsGutter` 和
 `tc_hex_binary_open_edit_save_as_reopen_roundtrip`、
@@ -2111,8 +2122,8 @@ Hex 与 S2/S3 不显示可执行的伪入口。账户实现通过 `VaultService/
    可跳转的过期结果。
 4. S2/S3 Unicode 总字符数改为短期开/读/关的 1 MiB 分块，并提供启动宽限和块间取消点；后台
    统计不再长期占用 Windows 源文件句柄、阻止 `QSaveFile`/外部工具原子替换。
-5. B1 Binary→Text 完整投影使用原生行号 margin；只有有界窗口投影显示绝对文本行，消除切换
-   后把 byte 地址误当文本行号的回退。
+5. B1/B2/B3 Binary→Text 都使用全局十进制 byte-offset margin，不构建全文行号；可信普通
+   Text 仍使用原生行号，二者不再因 32 MiB 路由边界产生不同语义。
 6. 编辑器从 `QStackedWidget` 重挂到分屏后显式显示两个视图，并按当前方向的真实像素 50/50
    分配；GUI 门禁要求两个窗格同时可见，不能只凭隐藏 widget 的共享文档断言通过。
 7. 账户健康检查只在内部保留稳定 issue code，用户界面显示“已到期/弱密码/重复使用/未设置
@@ -2128,3 +2139,91 @@ Hex 与 S2/S3 不显示可执行的伪入口。账户实现通过 `VaultService/
 最终应用与这些用例从同一源码和锁定依赖重新链接；截图证据包括
 `build-slice/gui-native-editor-commands.png`、`build-slice/gui-s1-shared-split-view.png`、
 `gui-account-extended-fields.png` 和 `gui-account-health.png`。
+
+## 20. Binary Text 与搜索成本路由（2026-08-25 当前权威）
+
+本章覆盖第 18、19 章中与 Binary Text 行号、ASCII 默认投影和搜索成本冲突的历史表述。
+
+### 20.1 一个 byte 事实，两种编码文本投影
+
+Binary/混合文件的选择、复制、搜索、Dock 结果与跳转只以半开源 byte range
+`[byteStart, byteEnd)` 为身份。Binary Text 是只读的连续编码文本投影；Hex 右侧字符区是保持
+每个源 byte 可定位的固定字节格。二者与 Dock 共用 `TextEncoding` 有界解码基础，默认 UTF-8，
+也允许用户明确选择 UTF-16、GB18030、Windows-1252 等已支持编码；不存在平行的“默认逐 byte
+ASCII 解码”路径。
+
+合法序列优先完整还原，非法序列显示 `�`，真实 U+FFFD 与非法 byte 的显示投影在 UI 中不作
+低价值区分，但内部 byte range 必须准确。Hex 字节格中的补充平面、组合、双向或格式控制字符
+可能没有稳定的一源 byte 一光标边界；仅该字节格用单个 `�` 加续 byte 空单元保持选择拓扑。
+连续 Binary Text 仍显示正常 Unicode 标量。
+
+B1 Hex 左侧只接受明确的 Hex nibble/byte 输入；右侧字符区按当前显示编码严格编码键盘文本和
+IME commit，合法多字节字符作为一个原子 byte patch 进入 INS/OVR 与 Undo/Redo，不可表示文本
+原子拒绝且不改变文件。复制字符区时，系统 `text/plain` 使用同一编码投影，应用私有 MIME 同时
+保存真实 bytes：普通粘贴优先恢复真实 bytes，粘贴到 Find 则转成 Hex 精确查询，避免多个 `�`
+投影对应不同源序列时误命中。显示字符串从不成为保存事实来源。
+
+### 20.2 路由与大小真值
+
+只保留三种用户可解释的成本行为：
+
+1. 已加载的普通可编辑 Text，简单 Literal Next/Previous 在交互预算内直接找首个结果；
+2. Binary/Hex、大文件、Find All 或全部打开文件使用有界后台字节扫描；
+3. 只有用户显式勾选 Regex 才进入 PCRE2，整词只是 Literal 候选的边界验证，循环只改变区间。
+
+匹配语义不因同步/后台或 S1/S2/S3 改变。B1 是实际 byte size `<32 MiB` 的 Binary 路由，并不
+等于普通 S1 Text：Binary Text 即使小于 32 MiB 也不构建全文 `LineIndex`。B2/B3 使用同一窗口化
+只读语义。路由和状态栏显示始终使用源文件实际 byte size；Scintilla UTF-8 内部缓冲长度不得
+影响层级或用户看到的文件大小。
+
+### 20.3 有限搜索、快照和进度
+
+Literal 查询能严格编码时先扫描低成本源 byte 候选；大小写/整词只对候选附近做有界解码验证。
+查询包含 `�` 时扫描有界解码投影，显示出来的真实或替代 U+FFFD 都可命中并映射回源 byte。
+不得把无法编码、非法 UTF-8、整词或循环静默升级为正则，也不得以“无价值”为由拒绝搜索。
+
+每个搜索目标冻结查询选项、编码、呈现类型、源身份、实际大小和 revision。扫描、结果上下文、
+高亮和跳转只读该快照；内容 revision 变化使该目标结果失效，resize、活动标签或之后的编码菜单
+变化不重新解释已有结果。Dock Model 保存有界原始上下文、一次性解码文本、显示高亮与 byte range；
+Delegate 只负责像素裁剪，因此不同编码目标和不同宽度下结果稳定。
+
+L2 的 Find Next/Previous 导航状态、Find All 缓存和异步完成回调都把编码与 Text/Hex byte-context
+作为查询身份的一部分；切换编码或呈现立即清空当前投影的缓存和高亮。已启动 Find All 可以按
+冻结快照有限完成并保留可解释结果，但旧投影的定向查找回调不得选中当前正文。渐进 Dock preview
+和最终 Model 使用同一个 per-target 快照，禁止在追加批次时读取活动标签的当前编码。
+
+后台任务按已扫描 byte 或可计量阶段工作量报告线性进度；阶段内保留两位小数，阶段切换不倒退。
+ETA 只有在采样充分、速度有效时显示，否则为“正在计算”。无命中和命中密集路径都必须按最大
+字节/时间间隔更新，可取消并有结果数量上限，禁止以近似无限 ETA 掩盖无意义工作。
+
+### 20.4 Binary Text 显示边界
+
+Binary 无论 B1/B2/B3 和 Hex/Text 呈现，都禁止全文行索引与全字符统计。Hex gutter 显示十六进制
+byte address；Binary Text gutter 显示十进制 byte offset。窗口局部换行可改善阅读，但不是可信
+全局行号。窗口解码保留最大编码单元所需的有界重叠；切换编码或呈现不得修改原始 bytes。
+
+Binary Text 保持只读。本轮不解析 PE/ELF/压缩包/Office 等格式，不猜测文件内分区编码，也不
+提取或评分“有意义字符串”。这些属于新的高成本产品功能，必须单独证明用户价值和维护 ROI。
+
+B1 Hex 的编辑与保存以原始 byte/patch model 为唯一权威；字符区编码只影响投影。投影中出现
+`�` 不得触发普通文本的重编码覆盖确认，也不得改变未编辑 byte。普通 Text 在非法编码状态下的
+破坏性重编码确认仍保留，两条保存路径不能混用。
+
+### 20.5 永久回归哨兵
+
+- `test_textencoding`：多字节、非法序列、U+FFFD 和 Hex 字节格光标拓扑；
+- `test_largefile_encoded_search`：原编码、跨块、无 LineIndex 与投影 Literal；
+- `tc_fr_037_replacement_character_projection_literal_reverse`：`�` 正反向精确导航；
+- `tc_fr_038_real_tinytestfile_replacement_literal_user_flow`：真实 `tinytestfile`、`H�T$`、仅循环、
+  Previous/Next/Find All、进度、Dock resize 与编码切换；
+- `tc_fr_039_multi_encoding_dock_models_are_independent`：UTF-8/UTF-16LE/GB18030/Binary 各自解码；
+- `tc_fr_040_l2_search_identity_includes_projection_snapshot`：缓存、导航和异步回调绑定编码/呈现快照；
+- `tc_hex_paste_pairwise_contract`、`tc_hex_invalid_direct_input_contract` 与
+  `tc_hex_ime_commit_preserves_byte_grid_contract`：多字节输入、私有原始 bytes、Undo/Redo、保存和重开；
+- `tinyBinaryHexRowsReverseSelectionRawSearchAndTextByteOffsets` 与
+  `windowedBinaryTextPresentationUsesByteOffsetGutterWithoutGlobalScans`：B1/B2/B3 字节位置和零全文扫描。
+
+2026-08-25 在清理可再生 NMake 对象后，完整搜索 GUI 42/42、大文件/Binary GUI 24/24、
+主窗口/Hex/保存/会话 GUI 53/53，以及编码、搜索、PCRE2、大文件编码搜索和文件分级 CTest 5/5
+通过；正式 `notepad-safe.exe` 从同一干净对象集合重新链接。本章只宣告上述架构切片完成；
+Vault/KDBX、安全身份、安装包、签名和人工视觉发布矩阵仍按各自门禁执行。

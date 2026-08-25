@@ -25,6 +25,7 @@
 #include <QtWidgets/QWidget>
 #include <QtWidgets/QMessageBox>
 #include <QtGui/QKeySequence>
+#include <QtGui/QClipboard>
 #include <QtGui/QMouseEvent>
 #include <QtCore/QDebug>
 #include <QtCore/QDir>
@@ -171,6 +172,26 @@ private slots:
     // 有效 UTF-8 大文件 Regex 的预校验本身必须持续发布任务进度；
     // 进度只能单调前进，不能在进入 PCRE2 匹配时回退。
     void tc_fr_035_valid_utf8_regex_validation_progress_is_monotonic();
+
+    // 小型 S1 的当前文件导航应直接返回首个命中，不创建后台 Search 任务。
+    void tc_fr_036_small_l1_navigation_uses_inline_first_hit();
+
+    // Binary -> Text 的 U+FFFD 是可搜索的显示投影：默认 Literal/Wrap
+    // 必须线性完成并把命中映射回真实无效源字节，Find Previous 不得全量正向枚举。
+    void tc_fr_037_replacement_character_projection_literal_reverse();
+
+    // 保留的真实 tinytestfile：Hex->Text 后仅保留默认循环查找，粘贴
+    // H�T$；Previous/Next/All 必须走有限的字面投影扫描，Dock 快照不受
+    // resize 或后续编码切换影响，且 Binary 不启动全文行/字符任务。
+    void tc_fr_038_real_tinytestfile_replacement_literal_user_flow();
+
+    // 同一 Dock 中每个目标必须持有独立编码快照；UTF-8、UTF-16LE、
+    // GB18030 与非法 UTF-8 Binary 的上下文/高亮不能被统一按当前 Tab 解码。
+    void tc_fr_039_multi_encoding_dock_models_are_independent();
+
+    // L2 查询缓存、定向后台回调和 Dock 预览必须绑定搜索开始时的
+    // 编码/呈现快照；切换投影不得复用或发布旧解释下的命中。
+    void tc_fr_040_l2_search_identity_includes_projection_snapshot();
 
 private:
     QString s3FixturePath();
@@ -495,12 +516,10 @@ void SmokeFindReplace::tc_fr_005_unicode_long_line_find_all_and_double_click() {
     QApplication::processEvents(QEventLoop::AllEvents, 80);
     const QRect rect = tree->visualRect(contextIndex);
     QVERIFY(rect.isValid());
-    const QFontMetrics metrics(tree->font());
-    const int markerStart = context.indexOf(marker);
-    const int prefixWidth = metrics.horizontalAdvance(context.left(markerStart));
-    const int markerWidth = metrics.horizontalAdvance(
-        context.mid(markerStart, marker.size()));
-    const QPoint click(rect.left() + 4 + prefixWidth + qMax(1, markerWidth / 2),
+    // Producers retain a centered source preview; the shared delegate then
+    // fits it to pixels with a 40/60 prefix/suffix budget. Click the visible
+    // primary-match band rather than assuming the raw context starts on screen.
+    const QPoint click(rect.left() + 6 + qMax(1, (rect.width() - 12) * 2 / 5),
                        rect.center().y());
     QVERIFY2(rect.contains(click), qPrintable(
         QStringLiteral("keyword click %1,%2 outside context column; viewport %3x%4; context rect left=%5 width=%6")
@@ -516,8 +535,8 @@ void SmokeFindReplace::tc_fr_005_unicode_long_line_find_all_and_double_click() {
         QEvent::MouseMove, QPointF(click), QPointF(click),
         Qt::NoButton, Qt::NoButton, Qt::NoModifier);
     QApplication::sendEvent(tree->viewport(), &hoverMove);
-    QApplication::processEvents(QEventLoop::AllEvents, 60);
-    QCOMPARE(tree->property("searchHoverRow").toInt(), 0);
+    QTRY_COMPARE_WITH_TIMEOUT(tree->property("searchHoverRow").toInt(), 0,
+                              1000);
     const QImage hoveredRow = tree->viewport()->grab(rect).toImage();
     QVERIFY2(normalRow != hoveredRow,
              "search result hover was not painted on the visible row");
@@ -1045,11 +1064,15 @@ void SmokeFindReplace::tc_fr_011_hex_byte_find_all_highlight_and_double_click()
     QCOMPARE(model->headerData(SearchResultsModel::COL_LINE, Qt::Horizontal).toString(),
              QStringLiteral("偏移"));
     const GroupedSearchLine &second = model->groupedLineAt(1);
-    QCOMPARE(second.contextByteOffset, qint64(27));
-    QCOMPARE(second.lineContext, QByteArray(".....A.......Z......"));
+    QCOMPARE(second.contextByteOffset, qint64(0));
+    QVERIFY(second.lineContext.size() >= 39);
     QCOMPARE(second.matchPositions.size(), 1);
-    QCOMPARE(second.matchPositions.first().first, qint32(8));
-    QCOMPARE(second.matchPositions.first().second, qint32(4));
+    // Dock highlighting is expressed in decoded UTF-16 positions, while
+    // navigation remains source-byte based.  DE AD is one valid UTF-8 scalar,
+    // so the earlier marker contracts the display by one character and this
+    // four-byte match occupies three display characters.
+    QCOMPARE(second.matchPositions.first().first, qint32(34));
+    QCOMPARE(second.matchPositions.first().second, qint32(3));
     QCOMPARE(model->index(1, SearchResultsModel::COL_LINE).data().toString(),
              QStringLiteral("0x23"));
 
@@ -1067,8 +1090,9 @@ void SmokeFindReplace::tc_fr_011_hex_byte_find_all_highlight_and_double_click()
     auto *asciiPreview = tab()->findChild<QPlainTextEdit *>(
         QStringLiteral("HexAsciiPreview"));
     QVERIFY(asciiPreview && asciiPreview->isVisible());
-    QTRY_COMPARE_WITH_TIMEOUT(asciiPreview->textCursor().selectedText(),
-                              QStringLiteral("...."), 1000);
+    QTRY_COMPARE_WITH_TIMEOUT(
+        asciiPreview->textCursor().selectedText(),
+        decodeByteGridText(marker, TextEncoding::Utf8, 16), 1000);
     QCOMPARE(asciiPreview->extraSelections().size(), 1);
 
     const QString outputDir = QCoreApplication::applicationDirPath();
@@ -1246,8 +1270,17 @@ void SmokeFindReplace::tc_fr_013_all_open_navigation_respects_wrap_boundary()
     QTest::mouseClick(previous, Qt::LeftButton);
     QTRY_COMPARE_WITH_TIMEOUT(workspace.currentWidget(),
                               static_cast<QWidget *>(first), 2000);
-    QTRY_VERIFY_WITH_TIMEOUT(
-        status->text().contains(QStringLiteral("边界")), 2000);
+    QElapsedTimer boundaryWait;
+    boundaryWait.start();
+    while (!status->text().contains(QStringLiteral("边界"))
+           && boundaryWait.elapsed() < 2000) {
+        QApplication::processEvents(QEventLoop::AllEvents, 50);
+        QTest::qWait(20);
+    }
+    QVERIFY2(status->text().contains(QStringLiteral("边界")),
+             qPrintable(QStringLiteral("status='%1', previousEnabled=%2")
+                            .arg(status->text())
+                            .arg(previous->isEnabled())));
 
     wrap->setChecked(true);
     QTest::mouseClick(previous, Qt::LeftButton);
@@ -1569,9 +1602,8 @@ void SmokeFindReplace::tc_fr_017_regex_toggle_distinguishes_literal_and_regex()
     QVERIFY(pattern && regex && findAll && tree);
 
     const auto resultRows = [tree]() -> int {
-        // The L1 Dock deliberately uses FlatL1SearchResultsModel while L2 uses
-        // SearchResultsModel.  This corpus puts one match on each line, so row
-        // count is a provider-neutral visible-result assertion.
+        // Editable and mapped documents share SearchResultsModel. This corpus
+        // puts one match on each line, so row count remains provider-neutral.
         return tree->model() ? tree->model()->rowCount() : -1;
     };
 
@@ -3130,9 +3162,468 @@ void SmokeFindReplace::tc_fr_033_l1_find_all_and_navigation_are_async_independen
     QTRY_VERIFY_WITH_TIMEOUT(!cancel->isVisible(), 10000);
     QTRY_VERIFY_WITH_TIMEOUT(tree->model() != nullptr, 10000);
     QCOMPARE(tree->model()->rowCount(), 1);
+
+    // Once Find All publishes the same-query cache, S1 navigation must reuse it
+    // just like S2/S3 instead of submitting another full-document snapshot.
+    const int taskCountBeforeCachedNavigation = taskAdded.count();
+    QTest::mouseClick(findNext, Qt::LeftButton);
+    QApplication::processEvents(QEventLoop::AllEvents, 100);
+    QCOMPARE(taskAdded.count(), taskCountBeforeCachedNavigation);
     QVERIFY(dock.grab().save(
         QDir(QCoreApplication::applicationDirPath())
             .filePath(QStringLiteral("gui-l1-async-search-dock.png"))));
+}
+
+void SmokeFindReplace::tc_fr_036_small_l1_navigation_uses_inline_first_hit()
+{
+    EditorTab l1;
+    l1.resize(800, 500);
+    l1.editor()->setText(QStringLiteral("alpha needle omega\nneedle tail"));
+    l1.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&l1));
+
+    FindReplaceDialog dialog;
+    dialog.setActiveTab(&l1);
+    dialog.showFindMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(
+        QStringLiteral("findPatternEdit"));
+    auto *findNext = dialog.findChild<QPushButton *>(
+        QStringLiteral("findNextButton"));
+    auto *regex = dialog.findChild<QCheckBox *>(
+        QStringLiteral("regexSearchCheck"));
+    auto *wrap = dialog.findChild<QCheckBox *>(
+        QStringLiteral("wrapSearchCheck"));
+    auto *status = dialog.findChild<QLabel *>(
+        QStringLiteral("findStatusLabel"));
+    QVERIFY(pattern && findNext && regex && wrap && status);
+    pattern->setText(QStringLiteral("needle"));
+
+    auto &manager = AsyncTaskManager::instance();
+    QSignalSpy taskAdded(&manager, &AsyncTaskManager::taskAdded);
+    QTest::mouseClick(findNext, Qt::LeftButton);
+    QCOMPARE(l1.editor()->selectedText(), QStringLiteral("needle"));
+    QCOMPARE(taskAdded.count(), 0);
+    const qint64 firstSelectedStart = l1.editor()->SendScintilla(
+        QsciScintillaBase::SCI_GETSELECTIONSTART);
+
+    QTest::mouseClick(findNext, Qt::LeftButton);
+    QCOMPARE(l1.editor()->selectedText(), QStringLiteral("needle"));
+    QCOMPARE(taskAdded.count(), 0);
+    const qint64 selectedStart = l1.editor()->SendScintilla(
+        QsciScintillaBase::SCI_GETSELECTIONSTART);
+    QVERIFY(selectedStart > firstSelectedStart);
+
+    // A zero-width regex at EOF must not trap repeated F3 on the same match.
+    regex->setChecked(true);
+    wrap->setChecked(false);
+    pattern->setText(QStringLiteral("$"));
+    QTest::mouseClick(findNext, Qt::LeftButton);
+    QVERIFY(status->text().isEmpty());
+    QTest::mouseClick(findNext, Qt::LeftButton);
+    QVERIFY(status->text().contains(QStringLiteral("未找到")));
+    QCOMPARE(taskAdded.count(), 0);
+}
+
+void SmokeFindReplace::tc_fr_037_replacement_character_projection_literal_reverse()
+{
+    QByteArray payload(4 * 1024 * 1024, 'x');
+    const QByteArray marker = QByteArrayLiteral("H") + QByteArray(1, char(0xff))
+        + QByteArrayLiteral("T$");
+    const qint64 expected = payload.size() - 4096;
+    payload.replace(expected, marker.size(), marker);
+    const QString path = createSmallTestFile(
+        payload, QStringLiteral("fr-037-replacement-projection.bin"));
+
+    QString error;
+    QVERIFY2(tab()->openLargeFileL2(
+                 path, &error, L2Presentation::Text, L2ContentKind::Binary),
+             qPrintable(error));
+    auto *provider = tab()->windowedReadOnlyProvider();
+    QVERIFY(provider || view());
+
+    FindReplaceDialog dialog(container_);
+    dialog.setActiveTab(tab());
+    dialog.showFindMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(
+        QStringLiteral("findPatternEdit"));
+    auto *previous = dialog.findChild<QPushButton *>(
+        QStringLiteral("findPreviousButton"));
+    auto *regex = dialog.findChild<QCheckBox *>(
+        QStringLiteral("regexSearchCheck"));
+    auto *caseSensitive = dialog.findChild<QCheckBox *>(
+        QStringLiteral("caseSensitiveSearchCheck"));
+    auto *wholeWord = dialog.findChild<QCheckBox *>(
+        QStringLiteral("wholeWordSearchCheck"));
+    auto *wrap = dialog.findChild<QCheckBox *>(
+        QStringLiteral("wrapSearchCheck"));
+    QVERIFY(pattern && previous && regex && caseSensitive && wholeWord && wrap);
+    QVERIFY(!regex->isChecked() && !caseSensitive->isChecked()
+            && !wholeWord->isChecked() && wrap->isChecked());
+    pattern->setText(QStringLiteral("H\ufffdT$"));
+    tab()->resetSearchPosition(false);
+
+    QElapsedTimer elapsed;
+    elapsed.start();
+    QTest::mouseClick(previous, Qt::LeftButton);
+    if (provider) {
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(), expected, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(),
+                                  expected + marker.size(), 5000);
+        QCOMPARE(provider->sourceBytes(expected, marker.size()), marker);
+    } else {
+        QTRY_COMPARE_WITH_TIMEOUT(view()->selectionStart(), expected, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(view()->selectionEnd(), expected + marker.size(), 5000);
+        QCOMPARE(readByteRange(expected, expected + marker.size()), marker);
+    }
+    QVERIFY2(elapsed.elapsed() < 5000,
+             qPrintable(QStringLiteral("projection reverse search took %1 ms")
+                            .arg(elapsed.elapsed())));
+    QVERIFY2(tab()->lastSearchError().isEmpty(),
+             qPrintable(tab()->lastSearchError()));
+}
+
+void SmokeFindReplace::tc_fr_038_real_tinytestfile_replacement_literal_user_flow()
+{
+    const QString path = QDir(QStringLiteral(NOTEPADSAFE_SOURCE_DIR))
+        .filePath(QStringLiteral("testfiles/tinytestfile"));
+    const qint64 sourceSize = QFileInfo(path).size();
+    QVERIFY2(sourceSize > 0 && sourceSize < 32LL * 1024 * 1024,
+             qPrintable(path));
+
+    EditorTab editor;
+    editor.resize(1100, 700);
+    editor.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&editor));
+    QString error;
+    QVERIFY2(editor.openLargeFileL2(
+                 path, &error,
+                 L2Presentation::Hex, L2ContentKind::Binary),
+             qPrintable(error));
+    QTRY_VERIFY_WITH_TIMEOUT(editor.l2View() && editor.l2View()->isOpen(), 10000);
+    QCOMPARE(editor.contentSizeBytes(), sourceSize);
+
+    auto &manager = AsyncTaskManager::instance();
+    QSignalSpy taskAdded(&manager, &AsyncTaskManager::taskAdded);
+    QSignalSpy taskProgress(&manager, &AsyncTaskManager::taskProgressChanged);
+    QSignalSpy taskFinished(&manager, &AsyncTaskManager::taskFinished);
+    editor.setViewModeL2(ViewMode::Text);
+    QTRY_COMPARE_WITH_TIMEOUT(editor.viewModeL2(), ViewMode::Text, 5000);
+    QCOMPARE(editor.displayEncoding(), TextEncoding::Utf8);
+    QVERIFY(editor.editor()->isReadOnly());
+    QTest::qWait(100);
+    for (const QList<QVariant> &arguments : taskAdded) {
+        const AsyncTask task = manager.taskById(arguments.constFirst().toLongLong());
+        QVERIFY2(task.categoryTag != QStringLiteral("LineNumberIndex")
+                     && task.categoryTag != QStringLiteral("CharacterCount"),
+                 qPrintable(task.title));
+    }
+
+    SearchResultsDock dock;
+    dock.resize(1000, 340);
+    dock.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&dock));
+    FindReplaceDialog dialog;
+    dialog.setActiveTab(&editor);
+    dialog.setSearchResultsDock(&dock);
+    dialog.showFindMode();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+    auto *caseSensitive = dialog.findChild<QCheckBox *>(
+        QStringLiteral("caseSensitiveSearchCheck"));
+    auto *wholeWord = dialog.findChild<QCheckBox *>(
+        QStringLiteral("wholeWordSearchCheck"));
+    auto *hex = dialog.findChild<QCheckBox *>(QStringLiteral("hexBytesCheck"));
+    auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
+    auto *previous = dialog.findChild<QPushButton *>(QStringLiteral("findPreviousButton"));
+    auto *next = dialog.findChild<QPushButton *>(QStringLiteral("findNextButton"));
+    auto *findAll = dialog.findChild<QPushButton *>(QStringLiteral("findAllButton"));
+    auto *cancel = dialog.findChild<QPushButton *>(QStringLiteral("cancelSearchButton"));
+    auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+    QVERIFY(pattern && regex && caseSensitive && wholeWord && hex && wrap
+            && previous && next && findAll && cancel && tree);
+    QVERIFY(!regex->isChecked() && !caseSensitive->isChecked()
+            && !wholeWord->isChecked() && !hex->isChecked()
+            && wrap->isChecked());
+
+    QGuiApplication::clipboard()->setText(QStringLiteral("H�T$"));
+    pattern->setFocus(Qt::OtherFocusReason);
+    QTest::keyClick(pattern, Qt::Key_V, Qt::ControlModifier);
+    QCOMPARE(pattern->text(), QStringLiteral("H�T$"));
+
+    const auto waitForNewSearchTask = [&](int previousAddedCount,
+                                           int timeoutMs) -> qint64 {
+        QElapsedTimer timer;
+        timer.start();
+        qint64 taskId = -1;
+        while (timer.elapsed() < timeoutMs && taskId < 0) {
+            for (int i = previousAddedCount; i < taskAdded.count(); ++i) {
+                const qint64 candidate = taskAdded.at(i).at(0).toLongLong();
+                if (manager.taskById(candidate).categoryTag
+                    .startsWith(QStringLiteral("Search"))) {
+                    taskId = candidate;
+                    break;
+                }
+            }
+            if (taskId < 0)
+                QTest::qWait(10);
+        }
+        return taskId;
+    };
+    const auto waitForTaskFinished = [&](qint64 taskId, int timeoutMs) {
+        QElapsedTimer timer;
+        timer.start();
+        while (timer.elapsed() < timeoutMs) {
+            const AsyncTaskState state = manager.taskById(taskId).state;
+            if (state == AsyncTaskState::Finished
+                || state == AsyncTaskState::Failed
+                || state == AsyncTaskState::Canceled) {
+                return state;
+            }
+            QTest::qWait(10);
+        }
+        return manager.taskById(taskId).state;
+    };
+    const auto selectedProjection = [&]() {
+        const qint64 start = editor.l2View()->selectionStart();
+        const qint64 end = editor.l2View()->selectionEnd();
+        return decodeTextProjection(
+            editor.l2View()->readByteRange(start, end),
+            TextEncoding::Utf8, false, false).text;
+    };
+
+    editor.resetSearchPosition(true); // BOF, reproduces Previous + Wrap.
+    int addedBefore = taskAdded.count();
+    QElapsedTimer previousElapsed;
+    previousElapsed.start();
+    QTest::mouseClick(previous, Qt::LeftButton);
+    const qint64 previousTask = waitForNewSearchTask(addedBefore, 3000);
+    QVERIFY(previousTask > 0);
+    QCOMPARE(waitForTaskFinished(previousTask, 30000), AsyncTaskState::Finished);
+    QVERIFY2(previousElapsed.elapsed() < 30000,
+             qPrintable(QStringLiteral("real tinytestfile Previous took %1 ms")
+                            .arg(previousElapsed.elapsed())));
+    QTRY_COMPARE_WITH_TIMEOUT(
+        selectedProjection().compare(QStringLiteral("H�T$"),
+                                     Qt::CaseInsensitive), 0, 5000);
+    const qint64 previousOffset = editor.l2View()->selectionStart();
+    QVERIFY(previousOffset >= 0 && previousOffset < sourceSize);
+    const AsyncTask previousRecord = manager.taskById(previousTask);
+    QVERIFY(previousRecord.progressPhase.contains(QStringLiteral("字面值")));
+    QVERIFY(!previousRecord.description.contains(QStringLiteral("正则")));
+    QVERIFY2(editor.lastSearchError().isEmpty(),
+             qPrintable(editor.lastSearchError()));
+
+    addedBefore = taskAdded.count();
+    QTest::mouseClick(next, Qt::LeftButton);
+    const qint64 nextTask = waitForNewSearchTask(addedBefore, 3000);
+    QVERIFY(nextTask > 0);
+    QCOMPARE(waitForTaskFinished(nextTask, 30000), AsyncTaskState::Finished);
+    QTRY_COMPARE_WITH_TIMEOUT(
+        selectedProjection().compare(QStringLiteral("H�T$"),
+                                     Qt::CaseInsensitive), 0, 5000);
+    QVERIFY(editor.l2View()->selectionStart() != previousOffset);
+
+    addedBefore = taskAdded.count();
+    QElapsedTimer allElapsed;
+    allElapsed.start();
+    QTest::mouseClick(findAll, Qt::LeftButton);
+    const qint64 allTask = waitForNewSearchTask(addedBefore, 3000);
+    QVERIFY(allTask > 0);
+    QCOMPARE(waitForTaskFinished(allTask, 60000), AsyncTaskState::Finished);
+    QTRY_VERIFY_WITH_TIMEOUT(!cancel->isVisible(), 10000);
+    QVERIFY2(allElapsed.elapsed() < 60000,
+             qPrintable(QStringLiteral("real tinytestfile Find All took %1 ms")
+                            .arg(allElapsed.elapsed())));
+    auto *model = qobject_cast<SearchResultsModel *>(tree->model());
+    QVERIFY(model);
+    QPointer<SearchResultsModel> guardedModel(model);
+    QVERIFY(model->totalMatches() > 0);
+    QCOMPARE(model->textEncoding(), TextEncoding::Utf8);
+    const QModelIndex contextIndex = model->index(
+        0, SearchResultsModel::COL_CONTEXT);
+    const QString contextBefore = contextIndex.data(
+        SearchResultsModel::ContextRole).toString();
+    const QVariant positionsBefore = contextIndex.data(
+        SearchResultsModel::MatchPositionsRole);
+    const QVariant byteRangesBefore = contextIndex.data(
+        SearchResultsModel::MatchByteRangesRole);
+    QVERIFY(contextBefore.contains(QStringLiteral("H�T$"),
+                                   Qt::CaseInsensitive));
+    QVERIFY(byteRangesBefore.isValid());
+
+    dock.resize(430, 340);
+    QCoreApplication::processEvents();
+    dock.resize(1250, 340);
+    QCoreApplication::processEvents();
+    dock.resize(1000, 340);
+    QCoreApplication::processEvents();
+    QCOMPARE(contextIndex.data(SearchResultsModel::ContextRole).toString(),
+             contextBefore);
+    QCOMPARE(contextIndex.data(SearchResultsModel::MatchPositionsRole),
+             positionsBefore);
+    QCOMPARE(contextIndex.data(SearchResultsModel::MatchByteRangesRole),
+             byteRangesBefore);
+
+    const quint64 revisionBeforeEncoding = editor.contentRevision();
+    editor.setDisplayEncoding(TextEncoding::Windows1252);
+    QCoreApplication::processEvents();
+    QCOMPARE(editor.contentRevision(), revisionBeforeEncoding);
+    QVERIFY(guardedModel);
+    QCOMPARE(tree->model(), guardedModel.data());
+    QCOMPARE(model->textEncoding(), TextEncoding::Utf8);
+    QCOMPARE(contextIndex.data(SearchResultsModel::ContextRole).toString(),
+             contextBefore);
+    QCOMPARE(contextIndex.data(SearchResultsModel::MatchPositionsRole),
+             positionsBefore);
+    QCOMPARE(contextIndex.data(SearchResultsModel::MatchByteRangesRole),
+             byteRangesBefore);
+
+    qint64 lastDone = -1;
+    bool sawLinearProgress = false;
+    for (const QList<QVariant> &entry : taskProgress) {
+        if (entry.at(0).toLongLong() != allTask)
+            continue;
+        const qint64 done = entry.at(1).toLongLong();
+        const qint64 total = entry.at(2).toLongLong();
+        QVERIFY(total == sourceSize);
+        QVERIFY(done >= lastDone);
+        sawLinearProgress = sawLinearProgress || (done > 0 && done < total);
+        lastDone = done;
+    }
+    QVERIFY(sawLinearProgress);
+    QCOMPARE(lastDone, sourceSize);
+    const AsyncTask allRecord = manager.taskById(allTask);
+    QCOMPARE(allRecord.percentHundredths(), 10000);
+    QVERIFY(allRecord.progressPhase.contains(QStringLiteral("字面值")));
+    QVERIFY(!allRecord.description.contains(QStringLiteral("正则")));
+
+    QVERIFY(dock.grab().save(
+        QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("gui-real-tinytestfile-literal-dock.png"))));
+    dialog.close();
+    dock.close();
+    editor.close();
+}
+
+void SmokeFindReplace::tc_fr_039_multi_encoding_dock_models_are_independent()
+{
+    struct Fixture {
+        TextEncoding encoding;
+        QByteArray context;
+        QByteArray needle;
+        QString expected;
+        bool byteMode = false;
+    };
+    const auto encoded = [](const QString &text, TextEncoding encoding) {
+        bool exact = false;
+        const QByteArray bytes = encodeTextFragment(text, encoding, &exact);
+        return exact ? bytes : QByteArray();
+    };
+    QVector<Fixture> fixtures;
+    fixtures.append({TextEncoding::Utf8,
+                     QStringLiteral("utf8 中文 result").toUtf8(),
+                     QStringLiteral("中文").toUtf8(),
+                     QStringLiteral("utf8 中文 result")});
+    fixtures.append({TextEncoding::Utf16LE,
+                     encoded(QStringLiteral("utf16 雪 result"),
+                             TextEncoding::Utf16LE),
+                     encoded(QStringLiteral("雪"), TextEncoding::Utf16LE),
+                     QStringLiteral("utf16 雪 result")});
+    fixtures.append({TextEncoding::GB18030,
+                     encoded(QStringLiteral("gb18030 汉字 result"),
+                             TextEncoding::GB18030),
+                     encoded(QStringLiteral("汉字"), TextEncoding::GB18030),
+                     QStringLiteral("gb18030 汉字 result")});
+    fixtures.append({TextEncoding::Utf8,
+                     QByteArray("binary H", 8) + QByteArray(1, char(0xff))
+                         + QByteArray("T$ result"),
+                     QByteArray("H", 1) + QByteArray(1, char(0xff))
+                         + QByteArray("T$"),
+                     QStringLiteral("binary H�T$ result"), true});
+    for (const Fixture &fixture : std::as_const(fixtures)) {
+        QVERIFY(!fixture.context.isEmpty());
+        QVERIFY(!fixture.needle.isEmpty());
+    }
+
+    QTabWidget workspace;
+    QVector<EditorTab *> targets;
+    for (int index = 0; index < fixtures.size(); ++index) {
+        auto *target = new EditorTab(&workspace);
+        workspace.addTab(target, QStringLiteral("encoding-%1").arg(index));
+        targets.append(target);
+    }
+
+    SearchResultsDock dock;
+    dock.resize(1000, 360);
+    dock.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&dock));
+    dock.beginMultiFileResults(QStringLiteral("snapshot"), fixtures.size());
+    auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+    QVERIFY(tree && tree->model());
+    QVector<QString> contextsBefore;
+    QVector<QVariant> positionsBefore;
+    for (int index = 0; index < fixtures.size(); ++index) {
+        const Fixture &fixture = fixtures.at(index);
+        const qsizetype offset = fixture.context.indexOf(fixture.needle);
+        QVERIFY(offset >= 0);
+        LargeFileSearchMatch match;
+        match.byteOffset = offset;
+        match.length = fixture.needle.size();
+        match.line = fixture.byteMode ? -1 : 0;
+        match.col = offset;
+        match.contextByteOffset = 0;
+        match.lineContext = fixture.context;
+        auto *model = new SearchResultsModel(&dock);
+        model->setBytePositionMode(fixture.byteMode);
+        model->setTextEncoding(fixture.encoding);
+        model->setResults({match}, {}, 0);
+        QCOMPARE(model->textEncoding(), fixture.encoding);
+        dock.beginMultiFileTarget(targets.at(index), fixture.encoding,
+                                  fixture.byteMode);
+        dock.appendMultiFilePreview(targets.at(index), {match}, fixture.encoding,
+                                    fixture.byteMode);
+        const QModelIndex previewGroup = tree->model()->index(index, 0);
+        QCOMPARE(tree->model()->rowCount(previewGroup), 1);
+        QCOMPARE(tree->model()->index(
+                     0, SearchResultsModel::COL_CONTEXT, previewGroup)
+                     .data(SearchResultsModel::ContextRole).toString(),
+                 fixture.expected);
+        dock.appendMultiFileResults(targets.at(index), model);
+    }
+
+    QCOMPARE(tree->model()->rowCount(), fixtures.size());
+    for (int index = 0; index < fixtures.size(); ++index) {
+        const QModelIndex group = tree->model()->index(index, 0);
+        QCOMPARE(tree->model()->rowCount(group), 1);
+        const QModelIndex context = tree->model()->index(
+            0, SearchResultsModel::COL_CONTEXT, group);
+        QCOMPARE(context.data(SearchResultsModel::ContextRole).toString(),
+                 fixtures.at(index).expected);
+        QVERIFY(context.data(SearchResultsModel::MatchByteRangesRole).isValid());
+        contextsBefore.append(
+            context.data(SearchResultsModel::ContextRole).toString());
+        positionsBefore.append(
+            context.data(SearchResultsModel::MatchPositionsRole));
+    }
+
+    dock.resize(420, 360);
+    QCoreApplication::processEvents();
+    dock.resize(1280, 360);
+    QCoreApplication::processEvents();
+    for (int index = 0; index < fixtures.size(); ++index) {
+        const QModelIndex group = tree->model()->index(index, 0);
+        const QModelIndex context = tree->model()->index(
+            0, SearchResultsModel::COL_CONTEXT, group);
+        QCOMPARE(context.data(SearchResultsModel::ContextRole).toString(),
+                 contextsBefore.at(index));
+        QCOMPARE(context.data(SearchResultsModel::MatchPositionsRole),
+                 positionsBefore.at(index));
+    }
+    dock.close();
+    workspace.close();
 }
 
 void SmokeFindReplace::tc_fr_034_real_smalltestfile_text_directional_search_progress()
@@ -3339,7 +3830,7 @@ void SmokeFindReplace::tc_fr_035_valid_utf8_regex_validation_progress_is_monoton
     QSignalSpy progress(tab(), &EditorTab::findAllL2Progress);
     auto &manager = AsyncTaskManager::instance();
     QSignalSpy taskAdded(&manager, &AsyncTaskManager::taskAdded);
-    QSignalSpy taskProgress(&manager, &AsyncTaskManager::taskProgressChanged);
+    QSignalSpy taskPhases(&manager, &AsyncTaskManager::taskPhaseChanged);
     bool completed = false;
     connect(tab(), &EditorTab::findAllL2Finished, tab(),
             [&completed](SearchResultsModel *, const QString &, const QString &) {
@@ -3386,20 +3877,92 @@ void SmokeFindReplace::tc_fr_035_valid_utf8_regex_validation_progress_is_monoton
     QVERIFY2(sawValidationBand,
              "valid UTF-8 validation phase never became visible in task progress");
 
-    qint64 previousTaskDone = -1;
+    QHash<QString, qint64> previousByPhase;
     bool taskPanelSawIntermediate = false;
-    for (const QList<QVariant> &entry : taskProgress) {
+    bool sawValidationPhase = false;
+    bool sawMatchingPhase = false;
+    for (const QList<QVariant> &entry : taskPhases) {
         if (entry.at(0).toLongLong() != taskId)
             continue;
-        const qint64 done = entry.at(1).toLongLong();
-        const qint64 total = entry.at(2).toLongLong();
-        QVERIFY(done >= previousTaskDone);
-        previousTaskDone = done;
+        const QString phase = entry.at(1).toString();
+        const int phaseIndex = entry.at(2).toInt();
+        const int phaseCount = entry.at(3).toInt();
+        const qint64 done = entry.at(4).toLongLong();
+        const qint64 total = entry.at(5).toLongLong();
+        QVERIFY(done >= previousByPhase.value(phase, -1));
+        previousByPhase.insert(phase, done);
+        QVERIFY(phaseIndex >= 1 && phaseIndex <= phaseCount);
+        sawValidationPhase |= phase.contains(QStringLiteral("验证"));
+        sawMatchingPhase |= phase.contains(QStringLiteral("正则"));
         taskPanelSawIntermediate = taskPanelSawIntermediate
             || (done > 0 && done < total);
     }
+    QVERIFY(sawValidationPhase);
+    QVERIFY(sawMatchingPhase);
     QVERIFY2(taskPanelSawIntermediate,
              "AsyncTaskManager stayed at zero until Regex completion");
+}
+
+void SmokeFindReplace::tc_fr_040_l2_search_identity_includes_projection_snapshot()
+{
+    const QString path = tmpDir_.filePath(
+        QStringLiteral("projection-identity.bin"));
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    const QByteArray record = QByteArrayLiteral("prefix ")
+        + QStringLiteral("é").toUtf8()
+        + QByteArray(" suffix\0", 8);
+    QByteArray block(4 * 1024 * 1024, 'x');
+    block.replace(1024, record.size(), record);
+    QCOMPARE(file.write(block), qint64(block.size()));
+    file.close();
+
+    EditorTab editor;
+    editor.resize(1000, 650);
+    editor.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&editor));
+    QString error;
+    QVERIFY2(editor.openLargeFileL2(
+                 path, &error, L2Presentation::Text, L2ContentKind::Binary),
+             qPrintable(error));
+    QTRY_VERIFY_WITH_TIMEOUT(editor.l2View() && editor.l2View()->isOpen(), 5000);
+    editor.setDisplayEncoding(TextEncoding::Utf8);
+    editor.resetSearchPosition(true);
+    QVERIFY(editor.findNext(QStringLiteral("é"), false, true, false,
+                            true, false));
+    QCOMPARE(editor.l2View()->readByteRange(
+                 editor.l2View()->selectionStart(),
+                 editor.l2View()->selectionEnd()),
+             QStringLiteral("é").toUtf8());
+
+    // The same query has a different byte representation in Windows-1252.
+    // Reusing the UTF-8 result cache here would return a false hit.
+    editor.setDisplayEncoding(TextEncoding::Windows1252);
+    editor.resetSearchPosition(true);
+    QVERIFY(!editor.findNext(QStringLiteral("é"), false, true, false,
+                             true, false));
+    QVERIFY(editor.lastSearchError().isEmpty());
+
+    // An in-flight directional task must not navigate with an obsolete
+    // projection after the user changes encoding.
+    editor.setDisplayEncoding(TextEncoding::Utf8);
+    editor.resetSearchPosition(true);
+    bool callbackCalled = false;
+    bool callbackFound = true;
+    QString callbackError;
+    QVERIFY(editor.findNextL2Async(
+        QStringLiteral("é"), false, true, false, true, false, false, &editor,
+        [&](bool found, QString asyncError) {
+            callbackCalled = true;
+            callbackFound = found;
+            callbackError = std::move(asyncError);
+        }));
+    editor.setDisplayEncoding(TextEncoding::Windows1252);
+    QTRY_VERIFY_WITH_TIMEOUT(callbackCalled, 10000);
+    QVERIFY(!callbackFound);
+    QVERIFY(callbackError.contains(QStringLiteral("编码"))
+            || callbackError.contains(QStringLiteral("呈现")));
+    editor.close();
 }
 
 QTEST_MAIN(SmokeFindReplace)

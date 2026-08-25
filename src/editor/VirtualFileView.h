@@ -386,7 +386,8 @@ private:
     // ---- 异步 mmap（首次打开不阻塞 UI 线程）----
     qint64 m_mmapTaskId = -1;  // AsyncTaskManager 的 mmap 任务 ID
     bool   m_loading = false;  // 正在异步 mmap 加载中
-    Q_INVOKABLE void onMmapReady(quintptr ptr, qint64 size, LineIndex quickIndex);
+    Q_INVOKABLE void onMmapReady(quintptr ptr, qint64 size,
+                                 LineIndex quickIndex, bool quickIndexBuilt);
 
     // ---- 成员 ----
     SharedReadOnlyFile file_;

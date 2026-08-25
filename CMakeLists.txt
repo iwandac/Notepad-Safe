@@ -540,6 +540,15 @@ if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     set_tests_properties(kdbx_backend PROPERTIES LABELS "vault;integration" TIMEOUT 120)
     add_test(NAME security_identity COMMAND test_security_identity)
     set_tests_properties(security_identity PROPERTIES LABELS "vault;security" TIMEOUT 120)
+    add_test(NAME security_identity_rotation
+        COMMAND test_security_identity --master-password-rotation)
+    add_test(NAME security_recovery_verification
+        COMMAND test_security_identity --recovery-verification)
+    set_tests_properties(
+        security_identity_rotation
+        security_recovery_verification
+        PROPERTIES LABELS "vault;security" TIMEOUT 120
+    )
 endif()
 if(WIN32)
     add_test(NAME supply_chain_lock

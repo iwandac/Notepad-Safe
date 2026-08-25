@@ -105,7 +105,17 @@ struct DecodedTextProjection {
 };
 DecodedTextProjection decodeTextProjection(const QByteArray &bytes,
                                            TextEncoding encoding,
-                                           bool stripLeadingBom = false);
+                                           bool stripLeadingBom = false,
+                                           bool buildProjectedMap = true);
+
+// Encoding-aware character cells for the right side of a Hex view. The
+// returned text has exactly one UTF-16 cell per source byte (plus row breaks):
+// a decoded scalar occupies the first cell(s) of its encoded byte range and
+// the remaining continuation cells are blank. Invalid input is U+FFFD. This
+// keeps byte hit-testing stable while using the same multibyte decoder as the
+// flowing Binary Text projection.
+QString decodeByteGridText(const QByteArray &bytes, TextEncoding encoding,
+                           int bytesPerRow);
 
 // True for encodings whose characters are represented by a stateless Windows
 // byte code page. The number is explicit so the machine ANSI setting can never

@@ -139,7 +139,7 @@
 | `tc_fr_030` | 2 GiB 后的稀疏有效 UTF-8 marker；S3 Text 大小写不敏感 Regex 命中精确 64 位 range，Dock/正文双击正确，替换控件全程禁用且正文单滚动 |
 | `tc_fr_031` | 保留的 4.9 GB Binary S3 中模拟从 ASCII 面板复制文本；默认仅勾选循环查找时按原始字节 Literal 搜索，不进入 PCRE2/UTF-8 错误路径，正文精确选中 64 位 byte range |
 | `tc_fr_032` | 含 `FF FE 80/C0` 的小型 Binary；默认 Literal 以不同字母大小写命中 ASCII token；勾选整词后只命中独立 `cat`/`cat!`，跳过 `catalog`/`_cat`，且无效 UTF-8 不产生正则错误 |
-| `tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers` | 从保留的 `tinytestfile` ASCII 区真实反向拖选 Hex 地址 `0x416–0x418`、source `[0x416,0x419)`=`01 E9 24`；剪贴板显示安全 Hex 文本并保留 raw bytes；粘贴到查找框自动启用 Hex bytes；Find Next 跳过当前匹配并命中下一处同 bytes，重置到 BOF 后精确选中原三字节 |
+| `tinyBinaryHexRowsReverseSelectionRawSearchAndTextByteOffsets` | 从保留的 `tinytestfile` 字符区真实反向拖选并保留 raw bytes；粘贴到查找框自动启用 Hex bytes；Find Next 精确选中源 byte range；切换 Binary Text 后显示 byte-offset gutter 且不启动全文行索引 |
 | `tc_mainwindow_find_shortcuts_preserve_query_scope_and_tab_order` | 正式 MainWindow 中关闭查找框后以真实 F3/Shift+F3 保留查询；当前文件正反向、全部打开文件按标签跨越/返回；范围项显示可搜索目标数 |
 | `tc_mainwindow_all_open_find_all_utf8_utf16_dock_jump` | 正式 MainWindow 的 UTF-8/UTF-16LE + 中文/emoji/CRLF；全部打开 Find All 两组结果、Dock Unicode 高亮、真实双击、标签激活、正文精确选区与 indicator |
 
@@ -151,7 +151,7 @@ init/cleanup），`tc_fr_030` 为 **3 passed / 0 failed**。两轮完整运行�
 `build/gui-search-result-spool-tail.png`。2 GiB 后 S3 Text Regex 优化后耗时 59.2 s，证据为
 `build/gui-s3-text-regex-after-2g-dock.png` 与 `build/gui-s3-text-regex-after-2g-editor.png`。
 针对默认 Binary Literal 分流新增的 `tc_fr_031/032` 已单独通过；`tc_fr_032` 同时证明整词只是
-字面查询的边界约束，并未变成用户正则。不可见 byte 的剪贴板往返由 `tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers`
+字面查询的边界约束，并未变成用户正则。不可见 byte 的剪贴板往返由 `tinyBinaryHexRowsReverseSelectionRawSearchAndTextByteOffsets`
 通过真实 fixture 补充。视觉证据为
 `build/gui-s3-default-literal-copied-text.png`；同时复跑 `tc_fr_017/019/021/022`，确认
 Literal/Regex 状态、合法组合、文本语义和 Hex 语义没有退化。
@@ -210,3 +210,21 @@ Next/Previous、任务进度与正文选区。专项运行结果为 3 passed / 0
 无命中 Regex，分别断言 `EditorTab::findAllL2Progress` 与后台任务栏数据源
 `AsyncTaskManager::taskProgressChanged` 均出现非零中间值且全程单调。专项运行结果为
 3 passed / 0 failed / 0 skipped；只运行这一新增用例，未用既有测试套件代替本次验证。
+
+## 12. Binary Text 有限搜索与 Dock 快照补充验收（2026-08-24）
+
+- `tc_fr_037_replacement_character_projection_literal_reverse`：查询 `�` 可命中真实 U+FFFD 与
+  非法编码投影，并在 Previous/Next 中保持准确源 byte range；
+- `tc_fr_038_real_tinytestfile_replacement_literal_user_flow`：按用户路径打开真实
+  `testfiles/tinytestfile`、切换 Text、粘贴 `H�T$`、只勾选循环，依次执行 Previous、Next、
+  Find All；52,893 个结果有限完成，Literal 不进入 PCRE2，Search 任务有中间线性进度并到
+  `100.00%`，不产生 LineIndex/字符统计任务；Dock resize 与之后切换编码不改变结果；
+- `tc_fr_039_multi_encoding_dock_models_are_independent`：同一 Dock 中 UTF-8、UTF-16LE、
+  GB18030 和 Binary 四个模型分别按自己的搜索快照解码；窄宽 resize 后 Context、高亮和位置不变；
+- `tc_fr_007_all_open_files_incremental_results_and_target_jump` 邻接复跑通过，证明全部打开文件的
+  增量结果与目标跳转没有因模型收敛而回退。
+
+专项运行均为 3 passed / 0 failed；真实 `tinytestfile` 用例 7.306 s，多编码 Dock 428 ms。
+最终完整 `gui_smoke_findreplace` 为 41 passed / 0 failed；大文件/Binary GUI 为 24/24，
+主窗口/进度/Hex 编辑与会话 GUI 为 53/53。上述证据覆盖本轮实现，但不替代安装包、签名和
+人工视觉发布矩阵。

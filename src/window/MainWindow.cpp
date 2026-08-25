@@ -470,11 +470,8 @@ MainWindow::MainWindow(QWidget *parent)
     m_searchDock->setObjectName(QStringLiteral("SearchResultsDock"));
     addDockWidget(Qt::BottomDockWidgetArea, m_searchDock);
     m_searchDock->hide();
-    connect(m_searchDock, &SearchResultsDock::jumpTo, this, &MainWindow::onJumpTo);
     connect(m_searchDock, &SearchResultsDock::jumpToByteOffset,
             this, &MainWindow::onJumpToByteOffset);
-    connect(m_searchDock, &SearchResultsDock::jumpToTab,
-            this, &MainWindow::onJumpToTab);
     connect(m_searchDock, &SearchResultsDock::jumpToTabByteOffset,
             this, &MainWindow::onJumpToTabByteOffset);
 
@@ -3324,7 +3321,11 @@ bool MainWindow::saveFile()
         return saveSecureTab(tab, true);
     if (tab->isUntitled())
         return saveAsFile();
-    if (tab->encodingHasDecodeErrors()) {
+    // Binary documents are saved from their authoritative byte/patch model.
+    // U+FFFD in a Hex character pane or Binary Text projection is display
+    // state and does not imply that Save will re-encode untouched bytes.
+    // Keep this destructive re-encoding confirmation only for ordinary text.
+    if (tab->encodingHasDecodeErrors() && !tab->isBinaryDocument()) {
         QMessageBox box(QMessageBox::Warning, QStringLiteral("编码需要确认"),
                         QStringLiteral("源文件包含不符合当前 %1 解释的字节。"
                                        "继续保存会用当前显示文本覆盖这些原始字节。")
@@ -4361,8 +4362,7 @@ void MainWindow::displayEncodingFromAction()
     auto enc = static_cast<TextEncoding>(act->data().toInt());
     auto *tab = currentTab();
     if (!tab) return;
-    if (tab->isSecureDocument() || tab->isUntitled()
-        || (tab->isL2Active() && tab->viewModeL2() == ViewMode::Hex)) {
+    if (tab->isSecureDocument() || tab->isUntitled()) {
         syncEncodingMenuTo(m_displayEncodingMenu, tab->displayEncoding());
         return;
     }
@@ -4619,7 +4619,7 @@ void MainWindow::syncCommandStates(EditorTab *tab)
     // 无 tab 时：所有这些动作一律禁用，避免误点
     const bool textPresentation = hasDocument
         && (!tab->isL2Active() || tab->viewModeL2() == ViewMode::Text);
-    const bool displayEncodingAvailable = textPresentation
+    const bool displayEncodingAvailable = hasDocument
         && !tab->isSecureDocument() && !tab->isUntitled();
     const bool conversionAvailable = displayEncodingAvailable
         && !tab->isBinaryDocument();
@@ -4962,39 +4962,12 @@ void MainWindow::onTabEncodingChanged(TextEncoding encoding)
     syncEncodingMenuTo(m_encodingMenu, encoding);
 }
 
-void MainWindow::onJumpTo(int line, int index, int length)
-{
-    auto *tab = currentTab();
-    if (!tab)
-        return;
-    tab->selectSearchMatch(line, index, length);
-    tab->setFocusEditor();
-}
-
 void MainWindow::onJumpToByteOffset(qint64 byteOffset, int length)
 {
     auto *tab = currentTab();
     if (!tab) return;
     tab->gotoByteOffset(byteOffset, length);
     tab->setFocusEditor();
-}
-
-void MainWindow::onJumpToTab(EditorTab *tab, int line, int index, int length)
-{
-    if (!tab)
-        return;
-    const int tabIndex = m_tabs->indexOf(tab);
-    if (tabIndex < 0)
-        return;
-    showDocumentWorkspace();
-    m_tabs->setCurrentIndex(tabIndex);
-    QPointer<EditorTab> target(tab);
-    QTimer::singleShot(0, tab, [target, line, index, length]() {
-        if (!target)
-            return;
-        target->selectSearchMatch(line, index, length);
-        target->setFocusEditor();
-    });
 }
 
 void MainWindow::onJumpToTabByteOffset(EditorTab *tab, qint64 byteOffset, int length)
@@ -5070,7 +5043,9 @@ void MainWindow::updateStatusBar()
         ? QStringLiteral(" · 包含非法字节")
         : tab->encodingOrigin() == EncodingOrigin::Fallback
             ? QStringLiteral(" · 默认假设") : QString();
-    m_statusEncoding->setText(hexMode ? QStringLiteral("原始字节")
+    m_statusEncoding->setText(hexMode
+                                     ? QStringLiteral("原始字节 · 字符区 %1")
+                                           .arg(encodingName(tab->displayEncoding()))
                                      : QStringLiteral("%1%2 · %3")
                                            .arg(encodingName(tab->encoding()), origin,
                                                 tab->lineEndingName()));
@@ -5109,41 +5084,29 @@ void MainWindow::updateStatusBar()
     else
         sizeStr = QStringLiteral("%1 GB").arg(size / (1024.0 * 1024 * 1024), 0, 'f', 2);
 
-    const FileTierDecision tier = FileTierPolicy::classify(size);
-    QString tierName;
-    switch (tier.tier) {
-    case FileTier::StandardEdit:
-        tierName = hexMode ? QStringLiteral("B1") : QStringLiteral("S1");
-        break;
-    case FileTier::LargeReadOnly:
-        tierName = hexMode ? QStringLiteral("B2") : QStringLiteral("S2");
-        break;
-    case FileTier::HugeReadOnly:
-        tierName = hexMode ? QStringLiteral("B3") : QStringLiteral("S3");
-        break;
-    case FileTier::Invalid: break;
-    }
-    QString capability = tierName;
-    switch (tab->largeDocumentRuntimeState()) {
-    case EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis:
-        capability += QStringLiteral(" · 只读分析");
-        break;
-    case EditorTab::LargeDocumentRuntimeState::None:
-        if (tab->isReadOnlyByPolicy())
-            capability += QStringLiteral(" · 只读");
-        break;
-    }
-    m_statusSize->setText(capability.isEmpty()
-                              ? sizeStr
-                              : QStringLiteral("%1 · %2").arg(sizeStr, capability));
+    const QString documentType = tab->isBinaryDocument()
+        ? QStringLiteral("Binary") : QStringLiteral("Text");
+    const QString presentation = hexMode
+        ? QStringLiteral("Hex") : QStringLiteral("Text");
+    const bool readOnlyAnalysis = tab->isReadOnlyByPolicy()
+        || tab->largeDocumentRuntimeState()
+               == EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis;
+    const QString capability = readOnlyAnalysis
+        ? QStringLiteral("只读分析") : QStringLiteral("可编辑");
+    m_statusSize->setText(QStringLiteral("%1 · %2 · %3 · %4")
+                              .arg(sizeStr, documentType, presentation, capability));
     m_statusSize->setToolTip(
-        QStringLiteral("当前文档内容大小；S1 直接编辑，S2/S3 均为 mmap 只读分析"));
+        QStringLiteral("源文件实际字节大小 · 文档类型 · 呈现方式 · 当前能力"));
 
     const qint64 characters = tab->contentCharacterCount();
     if (hexMode) {
         m_statusCharacters->setText(
             QStringLiteral("字节数: %1").arg(QLocale().toString(characters)));
         m_statusCharacters->setToolTip(QStringLiteral("十六进制文档的原始字节总数"));
+    } else if (tab->isBinaryDocument()) {
+        m_statusCharacters->setText(QStringLiteral("字符数: 不做全文统计"));
+        m_statusCharacters->setToolTip(
+            QStringLiteral("Binary Text 仅按当前窗口解码，避免低价值全文扫描"));
     } else if (characters >= 0) {
         m_statusCharacters->setText(
             QStringLiteral("字符数: %1").arg(QLocale().toString(characters)));

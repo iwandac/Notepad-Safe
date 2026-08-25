@@ -46,7 +46,14 @@ public:
         const QString typeT     = index.data(AsyncTaskManager::TaskTypeTextRole).toString();
         const QString stateT    = index.data(AsyncTaskManager::TaskStateTextRole).toString();
         const QString prioT     = index.data(AsyncTaskManager::TaskPriorityTextRole).toString();
-        const int percent       = index.data(AsyncTaskManager::TaskPercentRole).toInt();
+        const int precisePercent =
+            index.data(AsyncTaskManager::TaskPercentHundredthsRole).toInt();
+        const QString phase =
+            index.data(AsyncTaskManager::TaskProgressPhaseRole).toString();
+        const int phaseIndex =
+            index.data(AsyncTaskManager::TaskProgressPhaseIndexRole).toInt();
+        const int phaseCount =
+            index.data(AsyncTaskManager::TaskProgressPhaseCountRole).toInt();
         const qint64 done       = index.data(AsyncTaskManager::TaskProgressDoneRole).toLongLong();
         const qint64 total      = index.data(AsyncTaskManager::TaskProgressTotalRole).toLongLong();
         const int state         = index.data(AsyncTaskManager::TaskStateRole).toInt();
@@ -105,11 +112,18 @@ public:
         pbar.minimum = 0;
         const bool active = taskState == AsyncTaskState::Queued
                             || taskState == AsyncTaskState::Running;
-        const bool knownProgress = total > 0 && percent >= 0;
+        const bool knownProgress = total > 0 && precisePercent >= 0;
         if (knownProgress) {
-            pbar.maximum = 100;
-            pbar.progress = qBound(0, percent, 100);
-            pbar.text = tr("%1%  %2 / %3").arg(percent).arg(done).arg(total);
+            pbar.maximum = 10000;
+            pbar.progress = qBound(0, precisePercent, 10000);
+            const QString phasePrefix = phase.isEmpty() ? QString()
+                : phaseCount > 0
+                    ? tr("%1/%2 %3 · ").arg(phaseIndex).arg(phaseCount).arg(phase)
+                    : phase + QStringLiteral(" · ");
+            pbar.text = tr("%1%2%  %3 / %4")
+                .arg(phasePrefix)
+                .arg(QString::number(precisePercent / 100.0, 'f', 2))
+                .arg(done).arg(total);
         } else if (active) {
             pbar.maximum = 0;
             pbar.progress = 0;
@@ -326,9 +340,17 @@ void AsyncTaskPanelDialog::onCurrentRowChanged(const QModelIndex &current, const
     auto fmt = [](const QDateTime &dt){ return dt.isValid() ? dt.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz")) : QStringLiteral("-"); };
     out += tr("创建: %1   启动: %2   结束: %3   耗时: %4ms\n")
         .arg(fmt(t.createdAt), fmt(t.startedAt), fmt(t.finishedAt)).arg(t.elapsedMs());
+    if (!t.progressPhase.isEmpty()) {
+        out += tr("当前阶段: %1/%2  %3\n")
+            .arg(t.progressPhaseIndex).arg(t.progressPhaseCount)
+            .arg(t.progressPhase);
+    }
+    if (!t.completedPhases.isEmpty())
+        out += tr("已完成阶段: %1\n").arg(t.completedPhases.join(QStringLiteral(" -> ")));
     out += tr("进度: %1 / %2  (%3%)\n")
         .arg(t.progressDone).arg(t.progressTotal)
-        .arg(t.percent() < 0 ? QStringLiteral("-") : QString::number(t.percent()));
+        .arg(t.percentHundredths() < 0 ? QStringLiteral("-")
+             : QString::number(t.percentHundredths() / 100.0, 'f', 2));
     const qint64 remainingMs = t.estimatedRemainingMs();
     if (remainingMs >= 0)
         out += tr("预计剩余: %1\n").arg(taskDuration(remainingMs));

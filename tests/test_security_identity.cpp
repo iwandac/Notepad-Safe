@@ -1,5 +1,6 @@
 #include "SecurityIdentity.h"
 #include "SecuritySessionService.h"
+#include "SecureDocumentService.h"
 #include "VaultBackendFactory.h"
 #include "VaultService.h"
 
@@ -385,6 +386,30 @@ int main(int argc, char **argv)
 
     check(!session.unlockIdentity(sessionPassphrase).isError(),
           "master password can establish a fresh session after capsule loss");
+
+    // Only the exact app-owned drafts/<document-id>.nsafe-draft path is an
+    // internal disposable backing file. A user file elsewhere may share the
+    // suffix and must remain a normal named document across Save As.
+    SecureDocumentService documents(&session,
+        temporary.filePath(QStringLiteral("document-data")));
+    SecureDocumentSnapshot draft;
+    check(!documents.newDraft(&draft).isError(),
+          "secure document boundary fixture creates an internal draft");
+    const QString externalDraft = temporary.filePath(
+        QStringLiteral("user-owned.nsafe-draft"));
+    const QString finalDocument = temporary.filePath(
+        QStringLiteral("saved-as.nsafe"));
+    check(!documents.save(draft.documentId, QStringLiteral("first body"),
+                          QStringLiteral("User file"), externalDraft).isError()
+              && QFileInfo::exists(externalDraft),
+          "a user-selected .nsafe-draft path is saved as a named document");
+    check(!documents.save(draft.documentId, QStringLiteral("second body"),
+                          QStringLiteral("Saved As"), finalDocument).isError(),
+          "external same-suffix document can be saved elsewhere");
+    check(QFileInfo::exists(externalDraft),
+          "Save As never deletes an external file merely because of its suffix");
+    documents.closeAll();
+
     session.endSession(true);
     check(!QFile::exists(session.capsulePath()),
           "explicit lock removes the seven-day device capsule");

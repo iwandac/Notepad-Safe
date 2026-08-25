@@ -28,6 +28,8 @@ public:
     bool openFile(const QString &path, Presentation presentation, QString *error = nullptr);
     void closeFile();
     void setPresentation(Presentation presentation);
+    void setBinaryContent(bool binary);
+    bool binaryContent() const { return m_binaryContent; }
     void setTextEncoding(TextEncoding encoding);
     TextEncoding textEncoding() const { return m_textEncoding; }
     void setWordWrap(bool enabled);
@@ -119,6 +121,7 @@ private:
     QVector<qint32> m_projectedBoundaries;
     qint64 m_windowSpan = 2LL * 1024 * 1024;
     Presentation m_presentation = Presentation::Text;
+    bool m_binaryContent = false;
     QsciScintilla *m_editor = nullptr;
     QPlainTextEdit *m_asciiPreview = nullptr;
     QScrollBar *m_globalScrollBar = nullptr;

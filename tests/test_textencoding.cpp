@@ -191,6 +191,46 @@ void test_encoding_name()
     CHECK(encodingName(TextEncoding::GBK) == QStringLiteral("GBK"), "GBK 名称");
 }
 
+void test_multibyte_byte_grid_projection()
+{
+    TEST("Hex 字符区使用多字节投影并保持字节网格");
+    const QByteArray bytes = QStringLiteral("A中B").toUtf8();
+    const QString grid = decodeByteGridText(bytes, TextEncoding::Utf8, 16);
+    CHECK(grid.size() == bytes.size(), "字符区每个源字节保留一个可定位单元");
+    CHECK(grid == QStringLiteral("A中  B"), "UTF-8 中文只显示一次且续字节保留为空位");
+    const QByteArray supplementary = QStringLiteral("A😀B").toUtf8();
+    CHECK(decodeByteGridText(supplementary, TextEncoding::Utf8, 16)
+              == QStringLiteral("A�   B"),
+          "补充平面字符不能用代理对吞掉一个可定位字节边界");
+    CHECK(decodeByteGridText(QByteArray::fromHex("DEADBE"),
+                             TextEncoding::Utf8, 16)
+              == QStringLiteral("� �"),
+          "RTL 多字节标量不能用双向排版破坏字节光标拓扑");
+}
+
+void test_replacement_character_projection_truth()
+{
+    TEST("真实与投影 U+FFFD 统一显示但保留字节边界");
+    QByteArray bytes("H", 1);
+    bytes.append(char(0xff));
+    bytes.append("T$");
+    bytes.append("\xef\xbf\xbd", 3);
+    const DecodedTextProjection projection = decodeTextProjection(
+        bytes, TextEncoding::Utf8, false, false);
+    CHECK(projection.text == QStringLiteral("H\ufffdT$\ufffd"),
+          "非法字节与真实 U+FFFD 使用相同 UI 字符");
+    CHECK(projection.decodeErrors, "非法 UTF-8 在内部仍有解码错误事实");
+    CHECK(projection.sourceBoundaries
+              == QVector<qint32>({0, 1, 2, 3, 4, 7}),
+          "两种 U+FFFD 的源字节边界保持精确");
+    CHECK(projection.projectedToSource.isEmpty()
+              && projection.projectedBoundaries.isEmpty(),
+          "只需文本/源边界时不分配高成本投影映射");
+    CHECK(decodeByteGridText(bytes, TextEncoding::Utf8, 16)
+              == QStringLiteral("H\ufffdT$\ufffd  "),
+          "固定字节网格同样不暴露低价值的 U+FFFD 来源差异");
+}
+
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
@@ -212,6 +252,8 @@ int main(int argc, char *argv[])
     test_encode_decode_roundtrip_utf16le();
     test_encode_decode_roundtrip_utf16be();
     test_encoding_name();
+    test_multibyte_byte_grid_projection();
+    test_replacement_character_projection_truth();
 
     fprintf(stderr, "\n=== Result: %d/%d passed ===\n\n", test_passed, test_count);
     return (test_passed == test_count) ? 0 : 1;

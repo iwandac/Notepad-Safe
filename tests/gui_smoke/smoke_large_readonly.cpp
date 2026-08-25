@@ -315,7 +315,7 @@ private slots:
                  sci(s1, QsciScintillaBase::SCI_GETWRAPINDENTMODE));
     }
 
-    void tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers()
+    void tinyBinaryHexRowsReverseSelectionRawSearchAndTextByteOffsets()
     {
         const QString path = portableTinyBinaryPath();
         QVERIFY2(QFileInfo::exists(path), qPrintable(path));
@@ -350,15 +350,19 @@ private slots:
         QVERIFY(hex && ascii && ascii->isVisibleTo(&window));
         const int bytesPerRow = tab->l2View()->hexBytesPerRow();
         QVERIFY(bytesPerRow >= 8);
+        const QTextBlock firstAsciiBlock =
+            ascii->document()->findBlockByNumber(0);
+        QVERIFY(firstAsciiBlock.isValid());
         const int sciRowHeight = int(hex->SendScintilla(
             QsciScintillaBase::SCI_TEXTHEIGHT, 0UL));
         QVERIFY(sciRowHeight > 0);
         for (int row = 0; row <= 1000; ++row) {
             const QTextBlock block = ascii->document()->findBlockByNumber(row);
             QVERIFY2(block.isValid(), qPrintable(QStringLiteral("row=%1").arg(row)));
-            const QRectF bounds = ascii->document()->documentLayout()
-                                      ->blockBoundingRect(block);
-            QCOMPARE(qRound(bounds.height()), sciRowHeight);
+            const QTextBlockFormat format = block.blockFormat();
+            QCOMPARE(format.lineHeightType(),
+                     int(QTextBlockFormat::FixedHeight));
+            QCOMPARE(qRound(format.lineHeight()), sciRowHeight);
         }
 
         QFile source(path);
@@ -372,6 +376,8 @@ private slots:
         QVERIFY(expectedFirstOffset >= 0);
         const QString expectedHexText = QString::fromLatin1(
             expectedBytes.toHex(' ').toUpper());
+        const QString expectedCharacterText = decodeTextProjection(
+            expectedBytes, tab->displayEncoding(), false, false).text;
         source.close();
 
         // Physically drag the ASCII pane from the right boundary back to the
@@ -386,8 +392,21 @@ private slots:
         leftCursor.setPosition(block.position() + column);
         QTextCursor rightCursor(ascii->document());
         rightCursor.setPosition(block.position() + column + 3);
-        const QPoint left = ascii->cursorRect(leftCursor).center();
-        const QPoint right = ascii->cursorRect(rightCursor).center();
+        const auto hitPointForCursor = [ascii](const QTextCursor &cursor) {
+            const QPoint caret = ascii->cursorRect(cursor).center();
+            for (int x = 0; x < ascii->viewport()->width(); ++x) {
+                const QPoint candidate(x, caret.y());
+                if (ascii->cursorForPosition(candidate).position()
+                    == cursor.position()) {
+                    return candidate;
+                }
+            }
+            return caret;
+        };
+        const QPoint left = hitPointForCursor(leftCursor);
+        const QPoint right = hitPointForCursor(rightCursor);
+        QCOMPARE(ascii->cursorForPosition(left).position(), leftCursor.position());
+        QCOMPARE(ascii->cursorForPosition(right).position(), rightCursor.position());
         QVERIFY(ascii->viewport()->rect().contains(left));
         QVERIFY(ascii->viewport()->rect().contains(right));
         QTest::mousePress(ascii->viewport(), Qt::LeftButton,
@@ -408,7 +427,7 @@ private slots:
         QVERIFY(mime);
         QCOMPARE(mime->data(QString::fromLatin1(ByteClipboard::RawBytesMime)),
                  expectedBytes);
-        QCOMPARE(QGuiApplication::clipboard()->text(), expectedHexText);
+        QCOMPARE(QGuiApplication::clipboard()->text(), expectedCharacterText);
 
         FindReplaceDialog dialog(&window);
         dialog.setActiveTab(tab);
@@ -421,6 +440,8 @@ private slots:
         QVERIFY(pattern && hexMode && findNext);
         pattern->setFocus(Qt::OtherFocusReason);
         QTest::keyClick(pattern, Qt::Key_V, Qt::ControlModifier);
+        // Find consumes the private bytes, because projected replacement
+        // characters can represent more than one underlying byte sequence.
         QCOMPARE(pattern->text(), expectedHexText);
         QVERIFY(hexMode->isChecked());
         QTest::mouseClick(findNext, Qt::LeftButton);
@@ -440,35 +461,39 @@ private slots:
             QDir(QCoreApplication::applicationDirPath()).filePath(
                 QStringLiteral("gui-tiny-hex-raw-byte-search.png"))));
 
-        // Switch at a non-zero projected window. The gutter must be the real
-        // absolute decimal text line, not stale Hex addresses or local 1..N.
+        // Switch at a non-zero projected window. Binary CR/LF bytes are not a
+        // trustworthy line model: the gutter must keep authoritative source
+        // byte offsets and switching presentation must not launch a global
+        // line/character scan.
         const qint64 textTarget = QFileInfo(path).size() * 3 / 4;
         tab->gotoByteOffset(textTarget, 0);
         const qint64 windowStart = tab->l2View()->activeWindowByteStart();
-        QFile prefix(path);
-        QVERIFY(prefix.open(QIODevice::ReadOnly));
-        qint64 expectedFirstLine = 0;
-        constexpr qint64 CountChunk = 4LL * 1024 * 1024;
-        for (qint64 offset = 0; offset < windowStart; offset += CountChunk) {
-            const QByteArray bytes = prefix.read(
-                qMin(CountChunk, windowStart - offset));
-            QVERIFY(!bytes.isEmpty());
-            expectedFirstLine += bytes.count('\n');
-        }
-        prefix.close();
+        QSignalSpy taskAdded(&AsyncTaskManager::instance(),
+                             &AsyncTaskManager::taskAdded);
         tab->setViewModeL2(ViewMode::Text);
         QTRY_COMPARE_WITH_TIMEOUT(tab->viewModeL2(), ViewMode::Text, 3000);
+        QTest::qWait(200);
+        for (const QList<QVariant> &arguments : taskAdded) {
+            const AsyncTask task = AsyncTaskManager::instance().taskById(
+                arguments.constFirst().toLongLong());
+            QVERIFY2(task.categoryTag != QStringLiteral("LineNumberIndex")
+                         && task.categoryTag != QStringLiteral("CharacterCount"),
+                     qPrintable(task.title));
+        }
+        const int digits = qMax(
+            8, QString::number(QFileInfo(path).size() - 1, 16).size());
+        const QString expectedFirstMargin = QString::number(windowStart, 16)
+            .rightJustified(digits, QLatin1Char('0')).toUpper();
         QTRY_COMPARE_WITH_TIMEOUT(marginText(tab->editor(), 0),
-                                  QString::number(expectedFirstLine + 1), 3000);
-        bool decimalOk = false;
-        QCOMPARE(marginText(tab->editor(), 0).toLongLong(&decimalOk),
-                 qint64(expectedFirstLine + 1));
-        QVERIFY(decimalOk);
-        QCOMPARE(marginText(tab->editor(), 1),
-                 QString::number(expectedFirstLine + 2));
+                                  expectedFirstMargin, 3000);
+        bool hexOk = false;
+        const qint64 secondOffset = marginText(tab->editor(), 1)
+            .toLongLong(&hexOk, 16);
+        QVERIFY(hexOk);
+        QVERIFY(secondOffset > windowStart);
         QVERIFY(window.grab().save(
             QDir(QCoreApplication::applicationDirPath()).filePath(
-                QStringLiteral("gui-tiny-binary-text-absolute-lines.png"))));
+                QStringLiteral("gui-tiny-binary-text-byte-offsets.png"))));
         window.close();
     }
 
@@ -761,7 +786,9 @@ private slots:
         QVERIFY(hex->text(0).startsWith(QStringLiteral("00 01 02 03")));
         QVERIFY(!hex->text(0).contains(QLatin1Char('|')));
         QVERIFY(!hex->text(0).startsWith(QStringLiteral("00000000")));
-        QCOMPARE(ascii->toPlainText().left(4), QStringLiteral("...."));
+        QCOMPARE(ascii->toPlainText().left(4),
+                 decodeByteGridText(sourceBytes.left(4),
+                                    TextEncoding::Utf8, 16));
         QVERIFY(hex->geometry().right() <= ascii->geometry().left());
         QVERIFY(!hex->verticalScrollBar()->isVisibleTo(provider));
         QVERIFY(!ascii->verticalScrollBar()->isVisibleTo(provider));
@@ -933,7 +960,7 @@ private slots:
         window.close();
     }
 
-    void windowedBinaryTextPresentationUsesTextLineNumberGutter()
+    void windowedBinaryTextPresentationUsesByteOffsetGutterWithoutGlobalScans()
     {
         QTemporaryDir temporary;
         QVERIFY(temporary.isValid());
@@ -947,9 +974,12 @@ private slots:
         window.resize(800, 500);
         auto *layout = new QVBoxLayout(&window);
         auto *provider = new WindowedReadOnlyProvider(&window);
+        provider->setBinaryContent(true);
         layout->addWidget(provider);
         window.show();
         QVERIFY(QTest::qWaitForWindowExposed(&window));
+        QSignalSpy taskAdded(&AsyncTaskManager::instance(),
+                             &AsyncTaskManager::taskAdded);
         QString error;
         QVERIFY2(provider->openFile(path,
                                     WindowedReadOnlyProvider::Presentation::Hex,
@@ -962,8 +992,17 @@ private slots:
         QCOMPARE(provider->editor()->marginType(0), QsciScintilla::TextMargin);
         QVERIFY(!provider->asciiPreview()->isVisibleTo(provider));
         QVERIFY(provider->editor()->marginWidth(0) > 0);
-        QCOMPARE(marginText(provider->editor(), 0), QStringLiteral("1"));
-        QCOMPARE(marginText(provider->editor(), 1), QStringLiteral("2"));
+        QCOMPARE(marginText(provider->editor(), 0), QStringLiteral("00000000"));
+        QCOMPARE(marginText(provider->editor(), 1), QStringLiteral("00000006"));
+        QVERIFY(!provider->characterCountPending());
+        QTest::qWait(100);
+        for (const QList<QVariant> &arguments : taskAdded) {
+            const AsyncTask task = AsyncTaskManager::instance().taskById(
+                arguments.constFirst().toLongLong());
+            QVERIFY2(task.categoryTag != QStringLiteral("LineNumberIndex")
+                         && task.categoryTag != QStringLiteral("CharacterCount"),
+                     qPrintable(task.title));
+        }
 
         provider->setPresentation(WindowedReadOnlyProvider::Presentation::Hex);
         QCoreApplication::processEvents();

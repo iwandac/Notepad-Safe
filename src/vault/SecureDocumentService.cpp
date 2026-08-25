@@ -133,6 +133,21 @@ QString SecureDocumentService::draftPath(const QUuid &documentId) const
             .arg(documentId.toString(QUuid::WithoutBraces)));
 }
 
+bool SecureDocumentService::isManagedDraftPath(const QString &path,
+                                               const QUuid &documentId) const
+{
+    if (path.isEmpty() || documentId.isNull())
+        return false;
+    const QString actual = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+    const QString expected = QDir::cleanPath(
+        QFileInfo(draftPath(documentId)).absoluteFilePath());
+#ifdef Q_OS_WIN
+    return actual.compare(expected, Qt::CaseInsensitive) == 0;
+#else
+    return actual == expected;
+#endif
+}
+
 SecureDocumentService::Handle *SecureDocumentService::find(const QUuid &documentId) const
 {
     for (const auto &handle : handles_) {
@@ -413,8 +428,7 @@ VaultError SecureDocumentService::openWithCredential(
         return error;
     }
     handle->persisted = true;
-    handle->draft = handle->filePath.endsWith(QStringLiteral(".nsafe-draft"),
-                                               Qt::CaseInsensitive);
+    handle->draft = isManagedDraftPath(handle->filePath, handle->documentId);
     handle->payloadKind = payloadKind;
     service.lock();
     captureDiskFileVersion(handle->filePath, &handle->diskVersion);
@@ -509,8 +523,7 @@ VaultError SecureDocumentService::reload(const QUuid &documentId,
     handle->title = entry->title;
     handle->publicCustomData = std::move(publicData);
     handle->persisted = true;
-    handle->draft = handle->filePath.endsWith(QStringLiteral(".nsafe-draft"),
-                                              Qt::CaseInsensitive);
+    handle->draft = isManagedDraftPath(handle->filePath, handle->documentId);
     handle->payloadKind = payloadKind;
     handle->diskVersion = {};
     service.lock();
@@ -638,14 +651,13 @@ VaultError SecureDocumentService::persist(Handle *handle,
     handle->filePath = destination;
     handle->title = title;
     handle->persisted = true;
-    handle->draft = destination.endsWith(QStringLiteral(".nsafe-draft"),
-                                         Qt::CaseInsensitive);
+    handle->draft = isManagedDraftPath(destination, handle->documentId);
     handle->payloadKind = payloadKind;
     handle->diskVersion = {};
     service.lock();
     captureDiskFileVersion(destination, &handle->diskVersion);
     if (!oldPath.isEmpty() && oldPath != destination
-        && oldPath.endsWith(QStringLiteral(".nsafe-draft"), Qt::CaseInsensitive)) {
+        && isManagedDraftPath(oldPath, handle->documentId)) {
         QFile::remove(oldPath);
     }
     return VaultError::success();

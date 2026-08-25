@@ -26,7 +26,7 @@
 | 2026-08-14 `1aaa5fe` | Text/Binary 分级路由和 KDBX/会话骨架进入同一 Qt 产品 | Secure 文档/账户代表 GUI；S2/S3 垂直切片 | `OpenDispatcher`、会话、KDBX 保存或 Provider 路由变化 | 无感安全完整失败路径；成熟 Hex/Search |
 | 2026-08-17 `8b5b2d7` | 0.3.1 收敛：统一打开、默认安全草稿、会话、账户工作区、窗口化大文件 Provider、正式发布门禁 | Shell 代表矩阵；安全草稿重启；外来凭据恢复；S2/S3 真实文件 | MainWindow、SaveRouter、Session、SecurityIdentity、Windowed Provider 变化 | 统一搜索动态竞态；接近 2 GiB 编辑；全部 Hex 细节 |
 | 2026-08-17 `55fcad6` | B1/B2/B3 可见 Hex 三栏、单滚动、ASCII 同步和交互契约 | `windowedHexUsesUnifiedThreeColumnByteContract`、`windowedHexBothPanesWheelInLockstep`、真实 B2/B3 | Hex 布局、选择、滚轮、bytes-per-row 或 Provider 变化 | 跨窗口鼠标拖选、保存失败、全部搜索分支 |
-| 2026-08-18 `4e9159e` | Hex 输入/选择/IME/剪贴板成熟度；搜索三态、Literal/Regex/Hex、整词、替换模板、S3 真实搜索；不可见 byte 往返；B1 Text 行号 | H0/H1/S0/S1（见第 3 节）；`tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers` | `EditorTab`、Hex/ASCII 投影、FindReplaceDialog、LargeFileSearch、PCRE2 或搜索结果模型变化 | 全部打开文件的完整动态竞态；编码 PositionMapper；S2 真实资源门禁 |
+| 2026-08-18 `4e9159e` | 历史切片：Hex 输入/选择/IME/剪贴板；搜索三态、整词和 S3 搜索；当时的 B1 Text 行号已被 2026-08-24 byte-offset 契约取代 | H0/H1/S0/S1（见第 3 节） | `EditorTab`、Hex 字符投影、FindReplaceDialog、LargeFileSearch、PCRE2 或搜索结果模型变化 | 全部打开文件的完整动态竞态；编码 PositionMapper；S2 真实资源门禁 |
 | 2026-08-18 工作树 | 加密专项：胶囊丢失立即失效、Secure Text 复制条件清理、锁定态标题脱敏、编辑区快捷键/右键统一入口 | C0；`secureClipboardIsConditionalAndClearedOnLock`；完整 security unit/GUI slice | SecuritySessionService、MainWindow 剪贴板/锁定、EditorTab secure title、VaultDock 变化 | 抗同用户恶意进程；操作系统剪贴板历史/云同步中已经复制出去的历史副本 |
 | 2026-08-18 工作树 | 禁用未实现的 S2 编辑：S2/S3 capability 统一只读，删除 LargeFileLoad、ILoader 晋升、资源准入、编辑保存/恢复分支和独立 promotion target | `test_filetierpolicy`；40 MiB 动态浏览/输入/直调保存拒绝；`mmapS2RemainsReadOnlyAndStartsNoBackgroundLoad`、`s2DoesNotQueueBackgroundEditLoad`、`invalidEncodingDoesNotStartBackgroundLoader`、`nearTwoGiBReadOnlyReachesHeadMiddleAndTailWithoutEditLoad`；真实 `smalltestfile` 的 `realB2BinaryRemainsReadOnlyAndStartsNoBackgroundLoad`；恢复导出与旧日志拒绝；KDBX=ON 生产目标构建 | FileTierPolicy、EditorTab L2、Windowed Provider、任务类型或 capability 变化 | 本批不宣称 S2/S3 已具备成熟的全量搜索、wrap 和持续增长日志体验 |
 | 2026-08-19 工作树 | 运行时依赖源码全部迁入 `third_party/src`；移除 QScintilla 预编译库/生成物与嵌套 Git；统一离线准备、实树双摘要、工具链发现和缓存失效 | 六树/6608 文件、0 ignored；QScintilla `/MT` 源码构建；正式 KDBX=ON 167/167；非 GUI 10/10；增量 supply-chain target | lock、CMake/批处理、依赖源码/补丁、Qt/MSVC 版本、SBOM 或发布脚本变化 | 不改变产品 GUI/编辑行为，因此未重复 GUI 轨迹；Qt 仍是精确版本外部静态工具链 |
@@ -62,7 +62,7 @@
 - `windowedHexBothPanesWheelInLockstep`
 - `realB2BinaryRemainsReadOnlyAndStartsNoBackgroundLoad`
 - `s3ProductionProviderDragMatchesRenderedHex`
-- `tinyBinaryHexRowsReverseSelectionRawSearchAndTextLineNumbers`
+- `tinyBinaryHexRowsReverseSelectionRawSearchAndTextByteOffsets`
 
 触发：Windowed Provider、滚动、行高、ASCII pane、全局 offset 或真实文件路由变化。
 
@@ -248,10 +248,10 @@
   是唯一全局坐标源，只有 editor viewport 收到真实 Wheel/导航键时才开放一次反向同步；
   provider 也不再把程序化 `valueChanged` 误作新加载请求，只由 drag 和真实
   `actionTriggered` 换 mmap 窗口，普通 value change 最多在当前 Hex 投影内轻量对齐行。
-- 根因二：Binary 以 Hex 打开时按设计跳过 LineIndex，但切换 Text 后也没有补建，导致永久
-  混用“byte progress”和“logical line”坐标。现在切换即异步建索引；完成 swap 时先保存当前
-  byte anchor，再换算为真实行，禁止 range 改变把内容跳到另一位置。索引未完成时 thumb 目标
-  作为 viewport top byte，而不是误作 active-window center。
+- 根因二（当时方案，已被 2026-08-24 当前权威替代）：当时曾在 Binary 切换 Text 后异步补建
+  LineIndex，以换算 logical line。后续真实混合文件验证证明这是高成本且低价值的全文件预扫；
+  当前 Binary Hex/Text 均不建全文 LineIndex，导航、gutter 和 thumb 统一使用真实 byte offset。
+  本条只保留历史问题演进，不得作为恢复全文索引的依据。
 - 根因三：ASCII pane 每个键都重建 256 KiB raw、约 768 KiB Hex 文本及完整右栏文档；IME
   字符串还逐字符重复。现在同长 OVR 在 byte model 成功后原位更新 Hex/ASCII 两栏，IME commit
   合并为一个 byte transaction；INS/DEL 的结构性重排窗口降至 64 KiB，仍覆盖千行以上。

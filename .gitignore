@@ -68,3 +68,4 @@ __pycache__/
 tests/tmp_*
 tests/_tmp_*
 _temp_*
+/testfiles/

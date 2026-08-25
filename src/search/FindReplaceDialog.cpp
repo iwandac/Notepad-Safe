@@ -264,7 +264,12 @@ void FindReplaceDialog::buildUi()
         if (m_hexBytesCheck && !m_hexBytesCheck->isChecked()
             && m_hexBytesCheck->isEnabled()
             && ByteClipboard::clipboardHexSearch(&rawBytes, &clipboardText)
-            && text == clipboardText) {
+            && (text == clipboardText
+                || text == QGuiApplication::clipboard()->text())) {
+            if (text != clipboardText) {
+                const QSignalBlocker blockFind(m_findEdit);
+                m_findEdit->setText(clipboardText);
+            }
             m_hexBytesCheck->setChecked(true);
             recognizedRawBytes = true;
             if (!rawBytes.isEmpty())
@@ -273,7 +278,7 @@ void FindReplaceDialog::buildUi()
         updateQueryUi();
         if (recognizedRawBytes && m_statusLabel) {
             m_statusLabel->setText(QStringLiteral(
-                "已识别 Hex 字符栏中的不可打印字节，按原始字节搜索。"));
+                "已识别字符栏中的原始字节，按精确字节搜索。"));
         }
         emitFindParameters();
     });
@@ -342,9 +347,11 @@ void FindReplaceDialog::setActiveTab(EditorTab *tab)
         m_l2PartialConn = QObject::connect(
             m_tab, &EditorTab::findAllL2Partial, this,
             [this, tab](const QVector<LargeFileSearchMatch> &batch,
-                        const QString &, const QString &) {
+                        const QString &, const QString &,
+                        TextEncoding encoding, bool bytePositionMode) {
                 if (!allOpenScope() && m_resultsDock)
-                    m_resultsDock->appendSingleFilePreview(tab, batch);
+                    m_resultsDock->appendSingleFilePreview(
+                        tab, batch, encoding, bytePositionMode);
             });
         m_l2FinishedConn = QObject::connect(
             m_tab, &EditorTab::findAllL2Finished,
@@ -683,12 +690,16 @@ void FindReplaceDialog::updateQueryUi()
         && scopeHasReplaceableTarget;
     m_replaceEdit->setEnabled(replacementValueAllowed);
     if (!busy && m_statusLabel) {
+        const QString byteModeNotice = QStringLiteral(
+            "字节模式仅查找；编辑请回到 Hex 视图。");
+        const QString allOpenReplaceNotice = QStringLiteral(
+            "全部替换只修改可编辑文本；执行前列出跳过项。");
         if (hex && m_replaceMode)
-            m_statusLabel->setText(QStringLiteral("字节模式仅查找；编辑请回到 Hex 视图。"));
+            m_statusLabel->setText(byteModeNotice);
         else if (allOpenScope() && m_replaceMode)
-            m_statusLabel->setText(QStringLiteral(
-                "全部替换只修改可编辑文本；执行前列出跳过项。"));
-        else
+            m_statusLabel->setText(allOpenReplaceNotice);
+        else if (m_statusLabel->text() == byteModeNotice
+                 || m_statusLabel->text() == allOpenReplaceNotice)
             m_statusLabel->clear();
     }
 }
@@ -1058,7 +1069,14 @@ void FindReplaceDialog::onFindAll()
     if (hex) {
         valid = LargeFileSearch::parseHexBytePattern(
             pattern, &bytePattern, &validationError);
-    } else if (!allOpenScope() && m_regexCheck->isChecked()
+    } else if (!m_regexCheck->isChecked()) {
+        // Literal searches are not regular expressions. Case folding and
+        // whole-word checks are handled by the linear literal route, including
+        // decoded U+FFFD projection matches on malformed source bytes.
+        valid = !pattern.isEmpty();
+        if (!valid)
+            validationError = QObject::tr("查找文本为空。");
+    } else if (!allOpenScope()
                && m_tab->isL2Mode() && !m_tab->isHexPresentation()
                && !EncodedRegexCompiler::isUtf8SubjectEncoding(
                    m_tab->displayEncoding())) {
@@ -1068,7 +1086,7 @@ void FindReplaceDialog::onFindAll()
             &translated, &validationError);
     } else {
         Pcre2Regex validator;
-        valid = validator.compile(pattern, !m_regexCheck->isChecked(),
+        valid = validator.compile(pattern, false,
                                   m_caseCheck->isChecked(),
                                   m_wordCheck->isChecked(), &validationError);
     }
@@ -1092,6 +1110,9 @@ void FindReplaceDialog::onFindAll()
 
     if (m_tab->isL2Mode()) {
         // L2 大文件：纯异步 → 经 AsyncTaskManager 派发 → findAllL2Finished 设置 Dock
+        const TextEncoding encodingAtStart = m_tab->displayEncoding();
+        const bool bytePositionModeAtStart =
+            m_tab->isBinaryDocument() || m_tab->isHexPresentation();
         setL2SearchUiBusy(true, QObject::tr("准备搜索…"), true);
         bool started = m_tab->findAllL2Async(pattern, m_regexCheck->isChecked(),
                                              m_caseCheck->isChecked(),
@@ -1107,7 +1128,9 @@ void FindReplaceDialog::onFindAll()
         } else {
             // findAllL2Async has synchronously flushed the visible overlay and
             // captured the final revision. Bind the result group only now.
-            m_resultsDock->beginSingleFileResults(pattern, m_tab->fileName(), m_tab);
+            m_resultsDock->beginSingleFileResults(
+                pattern, m_tab->fileName(), m_tab, encodingAtStart,
+                bytePositionModeAtStart);
         }
         return;
     }
@@ -1235,13 +1258,19 @@ void FindReplaceDialog::dispatchNextMultiTarget(int generation)
     } else if (tab) {
         ++m_pendingMultiL2;
         QPointer<EditorTab> target(tab);
+        const TextEncoding encodingAtStart = tab->displayEncoding();
+        const bool bytePositionModeAtStart =
+            tab->isBinaryDocument() || tab->isHexPresentation();
         auto settled = QSharedPointer<bool>::create(false);
         const auto partialConnection = connect(
             tab, &EditorTab::findAllL2Partial, this,
             [this, target, generation](const QVector<LargeFileSearchMatch> &batch,
-                                       const QString &, const QString &) {
+                                       const QString &, const QString &,
+                                       TextEncoding encoding,
+                                       bool bytePositionMode) {
                 if (generation == m_multiSearchGeneration && target && m_resultsDock)
-                    m_resultsDock->appendMultiFilePreview(target, batch);
+                    m_resultsDock->appendMultiFilePreview(
+                        target, batch, encoding, bytePositionMode);
             });
         m_multiConnections.push_back(partialConnection);
         const auto finishedConnection = connect(
@@ -1280,7 +1309,8 @@ void FindReplaceDialog::dispatchNextMultiTarget(int generation)
                                 m_multiCaseSensitive, m_multiWholeWord,
                                 m_resultsDock, m_multiHexBytes)) {
             if (m_resultsDock)
-                m_resultsDock->beginMultiFileTarget(tab);
+                m_resultsDock->beginMultiFileTarget(
+                    tab, encodingAtStart, bytePositionModeAtStart);
         } else {
             *settled = true;
             m_pendingMultiL2 = qMax(0, m_pendingMultiL2 - 1);
@@ -1400,7 +1430,12 @@ void FindReplaceDialog::onL2FindAllProgress(int percent, qint64 done, qint64 tot
             totalStr = QString::number(total) + QObject::tr(" B");
             doneStr  = QString::number(done)  + QObject::tr(" B");
         }
-        msg = QObject::tr("搜索中 %1% · %2 / %3").arg(percent).arg(doneStr).arg(totalStr);
+        const QString precisePercent = total > 0
+            ? QString::number(qBound(0.0, double(done) * 100.0 / double(total),
+                                     100.0), 'f', 2)
+            : QString::number(qMax(0, percent), 'f', 2);
+        msg = QObject::tr("搜索中 %1% · %2 / %3")
+                  .arg(precisePercent, doneStr, totalStr);
     }
     if (m_statusLabel) m_statusLabel->setText(msg);
     // 同步刷新 MainWindow 状态栏（如果能拿到）

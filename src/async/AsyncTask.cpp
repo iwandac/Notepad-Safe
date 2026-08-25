@@ -30,10 +30,17 @@ qint64 AsyncTask::estimatedRemainingMs() const
         || progressDone <= 0 || progressDone >= progressTotal) {
         return -1;
     }
-    const qint64 elapsed = elapsedMs();
-    // 前几百毫秒的缓存/映射抖动不具备预测意义。
-    if (elapsed < 1000)
+    const QDateTime phaseStart = phaseStartedAt.isValid()
+        ? phaseStartedAt : startedAt;
+    const qint64 elapsed = phaseStart.isValid()
+        ? phaseStart.msecsTo(QDateTime::currentDateTime()) : elapsedMs();
+    // A single early sample produced absurd multi-year estimates for scans
+    // that had not yet left their setup phase. Require time, sample count and
+    // at least 1% of the current phase before publishing a linear ETA.
+    if (elapsed < 3000 || progressSamples < 3
+        || progressDone * 100 < progressTotal) {
         return -1;
+    }
     const long double remaining = static_cast<long double>(elapsed)
         * static_cast<long double>(progressTotal - progressDone)
         / static_cast<long double>(progressDone);

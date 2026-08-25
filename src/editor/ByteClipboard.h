@@ -6,6 +6,8 @@
 #include <QMimeData>
 #include <QString>
 
+#include "TextEncoding.h"
+
 namespace ByteClipboard {
 
 inline constexpr const char *RawBytesMime =
@@ -28,21 +30,33 @@ inline QString hexText(const QByteArray &bytes)
     return QString::fromLatin1(bytes.toHex(' ').toUpper());
 }
 
-// The ASCII pane is a lossy projection: every non-printable source byte is
-// painted as '.'.  Preserve the authoritative bytes in a private MIME flavor
-// and expose a safe visible representation to ordinary clipboard consumers.
-inline void setAsciiSelection(const QByteArray &bytes)
+// The character pane is an encoding projection of authoritative bytes. Keep
+// the raw range for lossless in-app paste while exposing exactly the same
+// decoded text contract as Binary Text to ordinary clipboard consumers. A
+// Find paste deliberately uses the private bytes: projected replacement
+// characters need not identify one unique source byte sequence.
+inline void setCharacterSelection(const QByteArray &bytes,
+                                  TextEncoding encoding)
 {
     auto *mime = new QMimeData;
     mime->setData(QString::fromLatin1(RawBytesMime), bytes);
-    if (isPrintableAscii(bytes)) {
-        mime->setText(QString::fromLatin1(bytes));
-        mime->setData(QString::fromLatin1(SearchModeMime), QByteArrayLiteral("literal"));
-    } else {
-        mime->setText(hexText(bytes));
-        mime->setData(QString::fromLatin1(SearchModeMime), QByteArrayLiteral("hex"));
-    }
+    mime->setText(decodeTextProjection(bytes, encoding, false, false).text);
+    mime->setData(QString::fromLatin1(SearchModeMime), QByteArrayLiteral("hex"));
     QGuiApplication::clipboard()->setMimeData(mime);
+}
+
+inline bool rawClipboardBytes(QByteArray *bytes)
+{
+    const QClipboard *clipboard = QGuiApplication::clipboard();
+    const QMimeData *mime = clipboard ? clipboard->mimeData() : nullptr;
+    if (!mime || !mime->hasFormat(QString::fromLatin1(RawBytesMime)))
+        return false;
+    const QByteArray raw = mime->data(QString::fromLatin1(RawBytesMime));
+    if (raw.isEmpty())
+        return false;
+    if (bytes)
+        *bytes = raw;
+    return true;
 }
 
 inline void setHexSelection(const QByteArray &bytes)

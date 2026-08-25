@@ -976,12 +976,16 @@ QString decodeTextFragment(const QByteArray &bytes, TextEncoding encoding)
 
 DecodedTextProjection decodeTextProjection(const QByteArray &bytes,
                                            TextEncoding encoding,
-                                           bool stripLeadingBom)
+                                           bool stripLeadingBom,
+                                           bool buildProjectedMap)
 {
     DecodedTextProjection projection;
-    projection.projectedToSource.reserve(bytes.size() + 1);
+    projection.text.reserve(bytes.size());
+    if (buildProjectedMap) {
+        projection.projectedToSource.reserve(bytes.size() + 1);
+        projection.projectedBoundaries.reserve(bytes.size() / 2 + 2);
+    }
     projection.sourceBoundaries.reserve(bytes.size() / 2 + 2);
-    projection.projectedBoundaries.reserve(bytes.size() / 2 + 2);
 
     qsizetype source = 0;
     if (stripLeadingBom) {
@@ -991,35 +995,195 @@ DecodedTextProjection decodeTextProjection(const QByteArray &bytes,
         else if (encoding == TextEncoding::Utf16BE && bytes.startsWith("\xfe\xff")) source = 2;
     }
     qint32 projected = 0;
-    projection.projectedToSource.append(qint32(source));
+    if (buildProjectedMap)
+        projection.projectedToSource.append(qint32(source));
     projection.sourceBoundaries.append(qint32(source));
-    projection.projectedBoundaries.append(0);
+    if (buildProjectedMap)
+        projection.projectedBoundaries.append(0);
     while (source < bytes.size()) {
         bool valid = false;
         const int length = encodedUnitLength(
             reinterpret_cast<const uchar *>(bytes.constData() + source),
             bytes.size() - source, encoding, &valid);
         const int consumed = qMax(1, length);
-        QString scalar;
+        uint codePoint = QChar::ReplacementCharacter;
         if (valid) {
-            scalar = decodeTextFragment(bytes.sliced(source, consumed), encoding);
-            if (scalar.isEmpty()) valid = false;
+            const auto *unit = reinterpret_cast<const uchar *>(
+                bytes.constData() + source);
+            switch (encoding) {
+            case TextEncoding::Utf8:
+            case TextEncoding::Utf8Bom: {
+                codePoint = unit[0];
+                if (consumed == 2) {
+                    codePoint = ((unit[0] & 0x1fu) << 6)
+                        | (unit[1] & 0x3fu);
+                } else if (consumed == 3) {
+                    codePoint = ((unit[0] & 0x0fu) << 12)
+                        | ((unit[1] & 0x3fu) << 6)
+                        | (unit[2] & 0x3fu);
+                } else if (consumed == 4) {
+                    codePoint = ((unit[0] & 0x07u) << 18)
+                        | ((unit[1] & 0x3fu) << 12)
+                        | ((unit[2] & 0x3fu) << 6)
+                        | (unit[3] & 0x3fu);
+                }
+                if (codePoint <= 0xffff) {
+                    projection.text.append(QChar(ushort(codePoint)));
+                } else {
+                    projection.text.append(QChar::highSurrogate(codePoint));
+                    projection.text.append(QChar::lowSurrogate(codePoint));
+                }
+                break;
+            }
+            case TextEncoding::Utf16LE:
+            case TextEncoding::Utf16BE: {
+                ushort first = 0;
+                ushort second = 0;
+                for (int offset = 0; offset + 1 < consumed; offset += 2) {
+                    const ushort value = encoding == TextEncoding::Utf16LE
+                        ? ushort(unit[offset] | (ushort(unit[offset + 1]) << 8))
+                        : ushort((ushort(unit[offset]) << 8) | unit[offset + 1]);
+                    if (offset == 0)
+                        first = value;
+                    else
+                        second = value;
+                    projection.text.append(QChar(value));
+                }
+                codePoint = consumed == 4
+                    ? QChar::surrogateToUcs4(
+                          QChar(first), QChar(second))
+                    : first;
+                break;
+            }
+            default: {
+                const QString scalar = decodeTextFragment(
+                    bytes.sliced(source, consumed), encoding);
+                if (scalar.isEmpty()) {
+                    valid = false;
+                    break;
+                }
+                projection.text += scalar;
+                codePoint = scalar.at(0).unicode();
+                if (scalar.size() >= 2 && scalar.at(0).isHighSurrogate()
+                    && scalar.at(1).isLowSurrogate()) {
+                    codePoint = QChar::surrogateToUcs4(
+                        scalar.at(0), scalar.at(1));
+                }
+                break;
+            }
+            }
         }
         if (!valid) {
-            scalar = QString(QChar::ReplacementCharacter);
+            projection.text.append(QChar::ReplacementCharacter);
+            codePoint = QChar::ReplacementCharacter;
             projection.decodeErrors = true;
         }
-        const QByteArray utf8 = scalar.toUtf8();
-        projection.text += scalar;
-        for (qsizetype index = 1; index < utf8.size(); ++index)
-            projection.projectedToSource.append(qint32(source));
+        const int projectedBytes = codePoint <= 0x7f ? 1
+            : codePoint <= 0x7ff ? 2
+            : codePoint <= 0xffff ? 3 : 4;
+        if (buildProjectedMap) {
+            for (int index = 1; index < projectedBytes; ++index)
+                projection.projectedToSource.append(qint32(source));
+        }
         source += consumed;
-        projected += qint32(utf8.size());
-        projection.projectedToSource.append(qint32(source));
+        projected += projectedBytes;
+        if (buildProjectedMap)
+            projection.projectedToSource.append(qint32(source));
         projection.sourceBoundaries.append(qint32(source));
-        projection.projectedBoundaries.append(projected);
+        if (buildProjectedMap)
+            projection.projectedBoundaries.append(projected);
     }
     return projection;
+}
+
+QString decodeByteGridText(const QByteArray &bytes, TextEncoding encoding,
+                           int bytesPerRow)
+{
+    bytesPerRow = qMax(1, bytesPerRow);
+    QString cells(bytes.size(), QLatin1Char(' '));
+    const DecodedTextProjection projection = decodeTextProjection(
+        bytes, encoding, false, false);
+    int utf16 = 0;
+    const int units = qMax(0, int(projection.sourceBoundaries.size()) - 1);
+    for (int unitIndex = 0; unitIndex < units; ++unitIndex) {
+        const int source = projection.sourceBoundaries.at(unitIndex);
+        const int consumed = projection.sourceBoundaries.at(unitIndex + 1)
+            - source;
+        const int scalarUnits = utf16 < projection.text.size()
+                && projection.text.at(utf16).isHighSurrogate()
+                && utf16 + 1 < projection.text.size()
+                && projection.text.at(utf16 + 1).isLowSurrogate()
+            ? 2 : 1;
+        QString scalar = projection.text.mid(utf16, scalarUnits);
+        utf16 += scalarUnits;
+
+        // Control characters must not create extra rows or tabs in the fixed
+        // byte grid. They remain exact raw bytes in the Hex pane and use a
+        // visible placeholder only for this character projection.
+        const bool layoutControl = scalar.contains(QLatin1Char('\r'))
+            || scalar.contains(QLatin1Char('\n'))
+            || scalar.contains(QLatin1Char('\t'))
+            || scalar.contains(QChar(0));
+        if (layoutControl)
+            scalar = QString(QLatin1Char('.'));
+
+        // Every raw byte boundary in a Hex character grid must remain a valid
+        // Qt cursor position. A UTF-16 surrogate pair has no legal cursor
+        // boundary between its two code units, so representing it directly
+        // would make one source byte unselectable. Keep the complete scalar in
+        // the flowing Text view and use the ordinary replacement projection in
+        // this byte-addressable pane.
+        bool unstableCursorTopology = scalar.size() == 2;
+        if (scalar.size() == 1) {
+            const QChar value = scalar.at(0);
+            switch (value.category()) {
+            case QChar::Mark_NonSpacing:
+            case QChar::Mark_SpacingCombining:
+            case QChar::Mark_Enclosing:
+            case QChar::Other_Format:
+            case QChar::Other_Surrogate:
+                unstableCursorTopology = true;
+                break;
+            default:
+                break;
+            }
+            switch (value.direction()) {
+            case QChar::DirR:
+            case QChar::DirAN:
+            case QChar::DirAL:
+            case QChar::DirRLE:
+            case QChar::DirRLO:
+            case QChar::DirRLI:
+            case QChar::DirLRE:
+            case QChar::DirLRO:
+            case QChar::DirPDF:
+            case QChar::DirNSM:
+            case QChar::DirBN:
+            case QChar::DirLRI:
+            case QChar::DirFSI:
+            case QChar::DirPDI:
+                unstableCursorTopology = true;
+                break;
+            default:
+                break;
+            }
+        }
+        if (unstableCursorTopology) {
+            scalar = QString(QChar::ReplacementCharacter);
+        }
+        const int units = qMin<int>(scalar.size(), consumed);
+        for (int unit = 0; unit < units; ++unit)
+            cells[source + unit] = scalar.at(unit);
+    }
+
+    QString result;
+    result.reserve(cells.size() + cells.size() / bytesPerRow);
+    for (qsizetype index = 0; index < cells.size(); ++index) {
+        result.append(cells.at(index));
+        if ((index + 1) % bytesPerRow == 0 && index + 1 < cells.size())
+            result.append(QLatin1Char('\n'));
+    }
+    return result;
 }
 
 TextEncoding defaultEncodingForFile(const QString &fileName)

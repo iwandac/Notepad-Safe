@@ -75,6 +75,10 @@ public:
         // Physical encoding of a text target. Regex over GBK is executed by
         // the raw code-page backend and keeps mmap byte offsets authoritative.
         TextEncoding textEncoding = TextEncoding::Utf8;
+        // Execution-only observer used by AsyncTaskManager. Each real phase
+        // owns an independent 0..total scale; it does not alter query meaning.
+        std::function<void(const QString &, int, int, qint64, qint64)>
+            reportPhase;
     };
 
     static bool parseHexBytePattern(const QString &pattern, QByteArray *bytes,
@@ -213,7 +217,8 @@ private:
     QByteArray readVirtualBytes(qint64 start, qint64 end) const;
 
     // 工具：给定虚拟偏移 → 填充 line/col + lineContext（512 字节以内行）
-    void fillLineContext(LargeFileSearchMatch& m) const;
+    void fillLineContext(LargeFileSearchMatch& m,
+                         TextEncoding encoding) const;
     void fillByteContext(LargeFileSearchMatch& m) const;
 
     // 字面值模式匹配（KMP 一次扫描，O(n+m) 最坏）

@@ -262,7 +262,9 @@ QString SmokeTestBase::defaultLargeFilePath() {
 
     const QDir appDir(QCoreApplication::applicationDirPath());
     const QStringList candidates = {
+        appDir.absoluteFilePath(QStringLiteral("../../testfiles/smalltestfile")),
         appDir.absoluteFilePath(QStringLiteral("../../smalltestfile")),
+        QStringLiteral("F:/projects/notepadsafe/testfiles/smalltestfile"),
         QStringLiteral("F:/projects/notepadsafe/smalltestfile")
     };
     for (const QString& candidate : candidates) {
@@ -271,7 +273,7 @@ QString SmokeTestBase::defaultLargeFilePath() {
         }
     }
 
-    // CI/新 clone 不应依赖开发者机器上的 228 MiB fixture。生成一个包含足够
+    // CI/新 clone 不应依赖开发者机器上的大文件 fixture。生成一个包含足够
     // 行数的确定性文件；openL2() 会显式走 mmap 路径，因此无需伪造巨大体积。
     const QString generated = QDir::temp().absoluteFilePath(
         QStringLiteral("notepadsafe-gui-smoke-default.txt"));

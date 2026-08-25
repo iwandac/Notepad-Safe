@@ -85,8 +85,9 @@ public:
     // 生成新的 autosave 文件名（使用 UUID 保证唯一性/稳定性）
     QString generateAutosavePath() const;
 
-    // 清理单个 autosave 文件（用户正式保存后调用）
-    static void removeAutosaveFile(const QString &path);
+    // 清理单个 autosave 文件（用户正式保存后调用）。仅允许删除本实例
+    // autosave 目录内、由 SessionManager 命名的恢复文件。
+    void removeAutosaveFile(const QString &path) const;
 
 private:
     QString m_dataDir;
@@ -95,4 +96,5 @@ private:
     QHash<QUuid, QDateTime> m_snapshotTimes;
 
     void ensureDirs();
+    bool isManagedAutosavePath(const QString &path) const;
 };
