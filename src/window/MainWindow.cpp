@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "EditorTab.h"
+#include "FileContentProbe.h"
 #include "FindReplaceDialog.h"
 #include "SearchResultsDock.h"
 #include "SessionManager.h"
@@ -286,41 +287,6 @@ private:
 };
 #endif
 
-// A bounded content probe keeps the unified Open action fast. Files with NULs or
-// a high density of non-text control bytes are routed to the existing mmap hex
-// view; everything else continues through the normal text tier policy.
-bool looksLikeBinaryFile(const QString &path)
-{
-    const EncodingDetection detection = detectFileEncoding(path);
-    if (detection.encoding == TextEncoding::Utf16LE
-        || detection.encoding == TextEncoding::Utf16BE) {
-        return false;
-    }
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly))
-        return false;
-    const QByteArray sample = file.read(64 * 1024);
-    if (sample.isEmpty())
-        return false;
-    if (sample.size() >= 2) {
-        const auto first = static_cast<unsigned char>(sample[0]);
-        const auto second = static_cast<unsigned char>(sample[1]);
-        if ((first == 0xff && second == 0xfe)
-            || (first == 0xfe && second == 0xff)) {
-            return false; // UTF-16 BOM is text even though every other byte may be NUL.
-        }
-    }
-
-    qsizetype controls = 0;
-    for (const unsigned char byte : sample) {
-        if (byte == 0)
-            return true;
-        if (byte < 0x20 && byte != '\n' && byte != '\r' && byte != '\t' && byte != '\f')
-            ++controls;
-    }
-    return controls * 100 > sample.size() * 3;
-}
-
 } // namespace
 
 // 前向：同步编码菜单勾选状态
@@ -348,9 +314,10 @@ static bool openTabAutoMode(EditorTab *tab, const QString &path,
                             std::optional<TextEncoding> forcedEncoding = std::nullopt)
 {
     if (!tab) return false;
+    const FileContentProbeResult probe = probeFileContent(path);
     // Binary routing belongs to the shared document opener so normal Open,
     // recent files, drag/drop and session restore cannot disagree.
-    if (!forcedEncoding && looksLikeBinaryFile(path)) {
+    if (!forcedEncoding && probe.contentKind == DocumentContentKind::Binary) {
         QString error;
         if (!tab->openLargeFileL2(path, &error,
                                   L2Presentation::Hex,
@@ -362,9 +329,7 @@ static bool openTabAutoMode(EditorTab *tab, const QString &path,
         tab->setViewModeL2(ViewMode::Hex);
         return true;
     }
-    QFileInfo fi(path);
-    qint64 size = fi.exists() ? fi.size() : 0;
-    const FileTierDecision decision = FileTierPolicy::classify(size);
+    const FileTierDecision decision = probe.tier;
     if (decision.usesMappedPreview()) {
         QString err;
         if (tab->openLargeFileL2(path, &err, L2Presentation::Text,
@@ -393,7 +358,8 @@ static bool openSessionFile(EditorTab *tab, const SessionTab &state)
         return true;
     }
     if (state.presentation == QLatin1String("text")
-        && looksLikeBinaryFile(state.filePath)) {
+        && probeFileContent(state.filePath).contentKind
+               == DocumentContentKind::Binary) {
         QString error;
         // The user explicitly overrode Binary/Unknown classification with a
         // text presentation. Preserve that choice across restart while keeping

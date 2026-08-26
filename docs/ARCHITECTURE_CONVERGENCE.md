@@ -139,6 +139,14 @@ AnalysisArtifact
 - 通过 target include/link 可见性形成单向依赖；补充轻量 forbidden-include 检查作为辅助。
 - 建立最小启动 composition：首帧前只创建 Shell、核心 command descriptor 和 lazy factory；counting factory 证明零重型实例。
 
+当前检查点（2026-08-26）：基线 revision 为 `9a80eec`；Editor/Search/Session/Async 已机械收敛到
+`notepadsafe_editor_runtime`，正式 EXE 与 GUI harness 链接同一静态组件，测试专属代码只保留
+`notepadsafe_gui_test_support` 和各测试入口，旧 `GUI_SMOKE_SHARED_SOURCES` 已删除。统一打开的
+有界文件探测已从 MainWindow 提取为 `FileContentProbe`，8 个本地 `testfiles` 样本覆盖
+11–108 MiB、Text/Binary、S1/S2、GBK、UTF-8/BOM、UTF-16LE/BE。此检查点不代表 R1 完成：
+MainWindow/Vault Shell 仍有重复源码，target 依赖仍未收敛为单向，逐函数 CTest、最小启动
+composition 和 counting factory 尚未实现。
+
 ### R2 状态所有权收敛
 
 - 先落地 DocumentState、Capabilities、typed positions 和单一 selection owner。

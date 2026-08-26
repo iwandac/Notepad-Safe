@@ -283,7 +283,7 @@ flowchart LR
 | 账号秘密隔离 | SecretLease、受控剪贴板和 AccountService 有部分基础；MainWindow/EditorTab 仍混有 Secure/Accounts 条件逻辑 | 账户结构化服务保持独立，普通加密文档回归 Document 路径，工具策略默认拒绝 secret | Accounts contract、KDBX ON 正式 GUI、Plain/Secure 文档工具等价共同通过 |
 | KDBX OFF 架构门禁 | CMake 选项存在，但当前 OFF 不是绿色基线，具体安全类型仍泄漏到 MainWindow 生命周期 | 以窄 port/unavailable adapter 代替具体类型和 UI 宏分支 | ON/OFF 都编译；OFF 不发布、不宣称验证加密；ON 完整安全旅程通过 |
 | 最小启动 | main.cpp 已先 show/processEvents 并延迟 session；但 MainWindow 首帧前仍创建 Accounts/Security 页面、VaultDock、Find dialog、Security 服务和计时器 | 保留已验证首帧顺序，把页面/服务改为 descriptor+lazy factory，并新增 first paint/input instrumentation | 外部 <1500 ms 与相对基线、内部 <500 ms、factory 零调用、扩展规模和渐进恢复全部通过 |
-| 同组件和分级测试 | QtTest/CTest、部分单元/GUI 哨兵已有基础；GUI 仍重复编译产品源码并按大型 exe 注册 | 先建立产品 libraries，再逐函数 CTest 注册 quick/adjacent/release | 两次历史回归证明会失败；默认 quick 可持续运行；无统一 3600 秒；正式 exe 旅程通过 |
+| 同组件和分级测试 | **部分实现**：`notepadsafe_editor_runtime` 已让正式 EXE 与 GUI 测试复用 Editor/Search/Session/Async 产品对象，`GUI_SMOKE_SHARED_SOURCES` 已删除；8 个本地真实样本由 `test_testfile_matrix` 做有界大小/类型/编码门禁。MainWindow/Vault Shell 仍有测试目标重复源码，CTest 仍按大型 exe 注册 | 继续拆分 Shell/Vault 产品 target，再逐函数 CTest 注册 quick/adjacent/release，并补历史哨兵失败有效性证据 | 两次历史回归证明会失败；默认 quick 可持续运行；无统一 3600 秒；正式 exe 旅程通过 |
 | 当前功能不回退 | 功能总账和大量历史测试存在，但两次用户发现的回归证明其尚未形成充分保护 | 冻结 FeatureId 基线，先失败测试，再 facade/differential/正式 GUI 迁移，最后删除旧路径 | 每个 FeatureId 有前后结果；任何未批准退化即整轮失败；不能承诺未来数学意义上的零缺陷 |
 
 因此，本方案在当前 Qt/C++/CMake 技术栈内可以实施，但不是小改动，也没有任何一项因写入本文就自动完成。本轮合理边界是完成模块、状态所有权、测试组合、启动 lazy seam 和未来工具合同；真实 AI 模型、远程服务、第三方插件和脚本执行明确不属于本轮实现或完成声明。

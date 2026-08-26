@@ -17,6 +17,10 @@ option(NOTEPADSAFE_BUILD_DIAGNOSTICS
     "Build developer-only diagnostics (requires NOTEPADSAFE_BUILD_TESTS)"
     OFF
 )
+option(NOTEPADSAFE_REQUIRE_TESTFILES
+    "Fail configuration unless the frozen local testfiles matrix is available"
+    OFF
+)
 if(NOTEPADSAFE_BUILD_DIAGNOSTICS AND NOT NOTEPADSAFE_BUILD_TESTS)
     message(FATAL_ERROR
         "NOTEPADSAFE_BUILD_DIAGNOSTICS requires NOTEPADSAFE_BUILD_TESTS=ON")
@@ -190,12 +194,13 @@ if(WIN32)
     add_custom_target(generate_sbom DEPENDS "${NOTEPADSAFE_SBOM}")
 endif()
 
-# ============ 主程序 ============
+# ============ 编辑器产品运行时 ============
 
-add_executable(notepad-safe WIN32
-    src/main.cpp
-    src/window/MainWindow.cpp
+# The application and GUI tests must execute the same product objects.  Keep
+# the test harness out of this target; everything below is production code.
+set(NOTEPADSAFE_EDITOR_RUNTIME_SOURCES
     src/editor/EditorTab.cpp
+    src/editor/FileContentProbe.cpp
     src/search/FindReplaceDialog.cpp
     src/search/SearchResultsDock.cpp
     src/session/SessionManager.cpp
@@ -210,6 +215,34 @@ add_executable(notepad-safe WIN32
     src/async/AsyncThreadPool.cpp
     src/async/AsyncTaskManager.cpp
     src/async/AsyncSerialQueue.cpp
+)
+
+add_library(notepadsafe_editor_runtime STATIC
+    ${NOTEPADSAFE_EDITOR_RUNTIME_SOURCES}
+)
+target_include_directories(notepadsafe_editor_runtime PUBLIC
+    ${APP_INCLUDE_DIRS}
+    ${QSCINTILLA_INCLUDE_DIR}
+)
+target_link_libraries(notepadsafe_editor_runtime PUBLIC
+    notepadsafe_domain
+    notepadsafe_search_runtime
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::PrintSupport
+    Qt6::Svg
+    Qt6::SvgWidgets
+    Qt6::TaskTree
+    ${QSCINTILLA_LIB}
+)
+
+# ============ 主程序 ============
+
+add_executable(notepad-safe WIN32
+    src/main.cpp
+    src/window/MainWindow.cpp
     src/async/StatusBarTaskWidget.cpp
     src/async/AsyncTaskPanelDialog.cpp
     src/vault/VaultDock.cpp
@@ -227,6 +260,7 @@ target_compile_definitions(notepad-safe PRIVATE
 )
 
 target_link_libraries(notepad-safe PRIVATE
+    notepadsafe_editor_runtime
     notepadsafe_domain
     notepadsafe_vault
     notepadsafe_search_runtime
@@ -446,6 +480,45 @@ if(WIN32)
     target_link_libraries(test_filetierpolicy PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
 
+# Frozen real-file matrix used by local adjacent/release validation. The files
+# are intentionally not source-controlled because they total about 310 MiB.
+set(NOTEPADSAFE_TESTFILE_NAMES
+    tinytextfile.txt
+    tinytextfile-utf-16be.txt
+    tinytextfile-utf-16be-utf-8-bom.txt
+    tinytestfile
+    smalltextfile.txt
+    smalltextfile-utf-8-utf-16le.txt
+    smalltextfile-utf-8.txt
+    smalltestfile
+)
+set(NOTEPADSAFE_TESTFILES_AVAILABLE TRUE)
+foreach(testfile_name IN LISTS NOTEPADSAFE_TESTFILE_NAMES)
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/testfiles/${testfile_name}")
+        set(NOTEPADSAFE_TESTFILES_AVAILABLE FALSE)
+    endif()
+endforeach()
+if(NOTEPADSAFE_TESTFILES_AVAILABLE)
+    add_executable(test_testfile_matrix tests/test_testfile_matrix.cpp)
+    target_include_directories(test_testfile_matrix PRIVATE ${APP_INCLUDE_DIRS})
+    target_compile_definitions(test_testfile_matrix PRIVATE
+        NOTEPADSAFE_TESTFILES_DIR="${CMAKE_SOURCE_DIR}/testfiles"
+    )
+    target_link_libraries(test_testfile_matrix PRIVATE
+        notepadsafe_editor_runtime
+        Qt6::Core
+    )
+    if(WIN32)
+        target_link_libraries(test_testfile_matrix PRIVATE ${WIN_SYSTEM_LIBS})
+    endif()
+elseif(NOTEPADSAFE_REQUIRE_TESTFILES)
+    message(FATAL_ERROR
+        "NOTEPADSAFE_REQUIRE_TESTFILES=ON but the eight-file testfiles matrix is incomplete")
+else()
+    message(STATUS
+        "Local testfiles matrix unavailable; test_testfile_matrix is not registered")
+endif()
+
 # Test 6: secret-memory/service-state contract plus pinned KeePassXC fixtures.
 add_executable(test_vault_contract
     tests/test_vault_contract.cpp
@@ -488,6 +561,9 @@ set(NOTEPADSAFE_NON_GUI_TEST_TARGETS
     test_filetierpolicy
     test_vault_contract
 )
+if(TARGET test_testfile_matrix)
+    list(APPEND NOTEPADSAFE_NON_GUI_TEST_TARGETS test_testfile_matrix)
+endif()
 if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     list(APPEND NOTEPADSAFE_NON_GUI_TEST_TARGETS
         test_kdbx_backend
@@ -537,6 +613,13 @@ add_test(NAME largefile_encoded_search COMMAND test_largefile_encoded_search)
 add_test(NAME session      COMMAND test_session)
 add_test(NAME settings_ui  COMMAND test_settings_ui)
 add_test(NAME filetierpolicy COMMAND test_filetierpolicy)
+if(TARGET test_testfile_matrix)
+    add_test(NAME testfile_matrix COMMAND test_testfile_matrix)
+    set_tests_properties(testfile_matrix PROPERTIES
+        LABELS "adjacent;release;testfiles;file-routing"
+        TIMEOUT 60
+    )
+endif()
 add_test(NAME vault_contract COMMAND test_vault_contract)
 if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     add_test(NAME kdbx_backend COMMAND test_kdbx_backend)
@@ -595,37 +678,33 @@ endif()
 # ============================================================================
 #  GUI 冒烟测试组件（tests/gui_smoke/）
 #  - 所有 target 走 Qt6 Test（QTEST_MAIN），真实 GUI 事件模拟（QTest::mouseClick 等）
-#  - 不直接 link MainWindow.cpp（避免 WinMain 与 QTEST_MAIN 的 main 冲突）
-#    所有场景直接实例化 EditorTab + FindReplaceDialog 驱动真实 L2 GUI 路径。
+#  - Editor/Search/Session/Async 链接正式 notepadsafe_editor_runtime；测试不再
+#    重编一套 GUI_SMOKE_SHARED_SOURCES。只有需要 Shell 旅程的目标额外编译
+#    MainWindow.cpp，测试入口仍由 QTEST_MAIN 提供。
 #  - 构建与执行由 run_all_gui_smoke.bat 统一管理
 # ============================================================================
-set(GUI_SMOKE_SHARED_SOURCES
+add_library(notepadsafe_gui_test_support STATIC
     tests/gui_smoke/SmokeTestBase.cpp
-    src/editor/VirtualFileView.cpp
-    src/editor/WindowedReadOnlyProvider.cpp
-    src/editor/PatchList.cpp
-    src/editor/LineIndex.cpp
-    src/search/LargeFileSearch.cpp
-    src/search/SearchResultsModel.cpp
-    src/search/SearchResultsDock.cpp
-    src/editor/EditorTab.cpp
-    src/search/FindReplaceDialog.cpp
-    src/session/SessionManager.cpp
-    src/editor/DynamicThresholds.cpp
-    src/async/AsyncTaskManager.cpp
-    src/async/AsyncTask.cpp
-    src/async/AsyncThreadPool.cpp
-    src/async/AsyncSerialQueue.cpp
-    ${APP_QRC_FILE}
+)
+target_include_directories(notepadsafe_gui_test_support PUBLIC
+    ${APP_INCLUDE_DIRS}
+    ${QSCINTILLA_INCLUDE_DIR}
+    ${CMAKE_SOURCE_DIR}/tests/gui_smoke
+)
+target_link_libraries(notepadsafe_gui_test_support PUBLIC
+    notepadsafe_editor_runtime
+    Qt6::Test
 )
 
 # —— smoke_coord_editops：坐标错乱 / 输入偏移 / 自动换行 / 光标 / 拖选 ——
 add_executable(gui_smoke_coord
     tests/gui_smoke/smoke_coord_editops.cpp
-    ${GUI_SMOKE_SHARED_SOURCES}
+    ${APP_QRC_FILE}
 )
 target_include_directories(gui_smoke_coord PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_coord PRIVATE
+    notepadsafe_gui_test_support
+    notepadsafe_editor_runtime
     notepadsafe_domain
     notepadsafe_search_runtime
     Qt6::Core
@@ -643,20 +722,22 @@ target_link_libraries(gui_smoke_coord PRIVATE
 # —— smoke_find_replace：Ctrl+H 快捷键 / 替换内容正确性 / 跳转 / 替换全部 ——
 add_executable(gui_smoke_findreplace
     tests/gui_smoke/smoke_find_replace.cpp
-    ${GUI_SMOKE_SHARED_SOURCES}
+    ${APP_QRC_FILE}
 )
 
 # Large-file acceptance: S2/S3 mmap browse/search/copy stay read-only and no
 # background task constructs a full Scintilla document.
 add_executable(gui_smoke_large_readonly
     tests/gui_smoke/smoke_large_readonly.cpp
-    ${GUI_SMOKE_SHARED_SOURCES}
+    ${APP_QRC_FILE}
 )
 target_compile_definitions(gui_smoke_large_readonly PRIVATE
     NOTEPADSAFE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
 target_include_directories(gui_smoke_large_readonly PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_large_readonly PRIVATE
+    notepadsafe_gui_test_support
+    notepadsafe_editor_runtime
     notepadsafe_domain
     notepadsafe_search_runtime
     Qt6::Core
@@ -673,6 +754,8 @@ target_link_libraries(gui_smoke_large_readonly PRIVATE
 
 target_include_directories(gui_smoke_findreplace PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_findreplace PRIVATE
+    notepadsafe_gui_test_support
+    notepadsafe_editor_runtime
     notepadsafe_domain
     notepadsafe_search_runtime
     Qt6::Core
@@ -688,21 +771,23 @@ target_link_libraries(gui_smoke_findreplace PRIVATE
 )
 
 # —— smoke_smallfixes_menu_ui：§16 组 1 · 小修复组（替换快捷键 Ctrl+R 一致性 + L2 菜单禁用 7 项 + lifecycle）——
-# 本目标是**唯一** link MainWindow.cpp 的 GUI smoke（其他 smoke 不 link 以避免 main 冲突）；
-# MainWindow 引用的 StatusBarTaskWidget / AsyncTaskPanelDialog 也在此单独列出来（不在 GUI_SMOKE_SHARED_SOURCES）。
+# MainWindow 引用的 StatusBarTaskWidget / AsyncTaskPanelDialog 仍在 Shell
+# 测试目标中单独列出；共享编辑器实现来自正式产品 runtime。
 add_executable(gui_smoke_smallfixes
     tests/gui_smoke/smoke_smallfixes_menu_ui.cpp
-    ${GUI_SMOKE_SHARED_SOURCES}
     src/window/MainWindow.cpp
     src/async/StatusBarTaskWidget.cpp
     src/async/AsyncTaskPanelDialog.cpp
     src/vault/VaultDock.cpp
+    ${APP_QRC_FILE}
 )
 target_compile_definitions(gui_smoke_smallfixes PRIVATE
     NOTEPADSAFE_VERSION="${PROJECT_VERSION}"
 )
 target_include_directories(gui_smoke_smallfixes PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_smallfixes PRIVATE
+    notepadsafe_gui_test_support
+    notepadsafe_editor_runtime
     notepadsafe_domain
     notepadsafe_vault
     notepadsafe_search_runtime
@@ -760,16 +845,18 @@ qt_import_plugins(gui_smoke_vault INCLUDE Qt6::QWindowsIntegrationPlugin)
 if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     add_executable(gui_smoke_secure_documents
         tests/gui_smoke/smoke_secure_documents.cpp
-        ${GUI_SMOKE_SHARED_SOURCES}
         src/window/MainWindow.cpp
         src/async/StatusBarTaskWidget.cpp
         src/async/AsyncTaskPanelDialog.cpp
         src/vault/VaultDock.cpp
+        ${APP_QRC_FILE}
     )
     target_include_directories(gui_smoke_secure_documents PRIVATE
         ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR}
     )
     target_link_libraries(gui_smoke_secure_documents PRIVATE
+        notepadsafe_gui_test_support
+        notepadsafe_editor_runtime
         notepadsafe_domain
         notepadsafe_vault
         notepadsafe_search_runtime
