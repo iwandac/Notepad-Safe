@@ -1006,7 +1006,9 @@ function(notepadsafe_register_qt_cases target source tier timeout feature)
         if(qt_case STREQUAL "initTestCase"
            OR qt_case STREQUAL "cleanupTestCase"
            OR qt_case STREQUAL "init"
-           OR qt_case STREQUAL "cleanup")
+           OR qt_case STREQUAL "cleanup"
+           OR qt_case STREQUAL "acceptNextQuestion"
+           OR qt_case STREQUAL "lock")
             continue()
         endif()
         set(test_name "${target}.${qt_case}")

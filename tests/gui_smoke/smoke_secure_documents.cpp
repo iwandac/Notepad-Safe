@@ -569,13 +569,13 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(restartedWindow.get()));
         auto *restartedStack = restartedWindow->findChild<QStackedWidget *>(
             QStringLiteral("WorkspaceStack"));
-        auto *restartedVault = restartedWindow->findChild<VaultDock *>(
-            QStringLiteral("VaultDock"));
-        auto *restartedTree = restartedWindow->findChild<QTreeWidget *>(
-            QStringLiteral("vaultEntryTree"));
         auto *restartedAccounts = restartedWindow->findChild<QAction *>(
             QStringLiteral("tools.accounts"));
-        QVERIFY(restartedStack && restartedVault && restartedTree && restartedAccounts);
+        QVERIFY(restartedStack && restartedAccounts);
+        // Accounts widgets are a first-use adapter and intentionally do not
+        // exist before the first-paint/startup boundary.
+        QVERIFY(restartedWindow->findChild<VaultDock *>(QStringLiteral("VaultDock"))
+                == nullptr);
 
         unexpectedDialog = false;
         QTimer restartedWindowWatchdog;
@@ -591,6 +591,11 @@ private slots:
         restartedWindowWatchdog.start(300);
         restartedAccounts->trigger();
         restartedWindowWatchdog.stop();
+        auto *restartedVault = restartedWindow->findChild<VaultDock *>(
+            QStringLiteral("VaultDock"));
+        auto *restartedTree = restartedWindow->findChild<QTreeWidget *>(
+            QStringLiteral("vaultEntryTree"));
+        QVERIFY(restartedVault && restartedTree);
         QVERIFY(!unexpectedDialog);
         QVERIFY(QApplication::activeModalWidget() == nullptr);
         QTRY_VERIFY_WITH_TIMEOUT(restartedStack->currentWidget()->objectName()

@@ -3207,6 +3207,10 @@ bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
 
         const bool managedAccounts = !probe.isError()
                                      && documentType == QStringLiteral("Accounts");
+        // Account KDBX routing needs its adapter before credentials are
+        // applied. The workspace remains lazy for ordinary startup/documents,
+        // but file-open is a legitimate first-use trigger.
+        ensureAccountsWorkspaceCreated();
         if (!ensureSecuritySessionInteractive())
             return false;
         if (managedAccounts) {

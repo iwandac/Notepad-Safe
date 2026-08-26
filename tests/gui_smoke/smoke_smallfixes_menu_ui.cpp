@@ -568,17 +568,17 @@ private slots:
         QCOMPARE(tabCount(mw_) >= 1, true);
         auto* actReplace = findMenuActionByExactDisplay(mw_, QStringLiteral("替换"));
         QVERIFY(actReplace != nullptr);
-        // 触发动作前：所有已存在的 FindReplaceDialog（MainWindow 构造时 new 的长期对象）must not be visible。
+        // FindReplaceDialog is intentionally lazy: an unused search surface must
+        // not add work before first paint. Existing instances, if any, are hidden.
         const auto before = mw_->findChildren<FindReplaceDialog*>();
-        QVERIFY2(!before.isEmpty(), "MainWindow 应该已经构造了 FindReplaceDialog（长期子对象），但 findChildren 为空——构造函数里 m_findDialog 没 new?");
         bool anyVisibleBefore = false;
         for (auto* d : before) if (d->isVisible()) { anyVisibleBefore = true; break; }
         QVERIFY2(!anyVisibleBefore, "触发替换动作前 FindReplaceDialog 已 visible（上一个 case 误 trigger 了 showReplaceDialog）");
-        FindReplaceDialog* expectDlg = before.front();
-        QVERIFY(expectDlg != nullptr);
         // 触发动作（等价于用户 Ctrl+R 触发）：trigger() 会经由 MainWindow::showReplaceDialog →
         // m_findDialog->showReplaceMode() → show() / raise() / activateWindow()
         actReplace->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(mw_->findChild<FindReplaceDialog *>() != nullptr, 1000);
+        FindReplaceDialog *expectDlg = mw_->findChild<FindReplaceDialog *>();
         // show() → native window 需要事件循环 + 系统 DWM 响应 map，给 2s 容忍度避免环境 flaky
         bool gotVisible = false;
         QElapsedTimer t; t.start();
@@ -3592,12 +3592,13 @@ private slots:
         auto *findAction = mw_->findChild<QAction *>(QStringLiteral("search.find"));
         auto *nextAction = mw_->findChild<QAction *>(QStringLiteral("search.next"));
         auto *previousAction = mw_->findChild<QAction *>(QStringLiteral("search.previous"));
-        auto *dialog = mw_->findChild<FindReplaceDialog *>();
-        QVERIFY(findAction && nextAction && previousAction && dialog);
+        QVERIFY(findAction && nextAction && previousAction);
         QCOMPARE(nextAction->shortcut(), QKeySequence(QStringLiteral("F3")));
         QCOMPARE(previousAction->shortcut(), QKeySequence(QStringLiteral("Shift+F3")));
 
         findAction->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(mw_->findChild<FindReplaceDialog *>() != nullptr, 1000);
+        auto *dialog = mw_->findChild<FindReplaceDialog *>();
         QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
         auto *scope = dialog->findChild<QComboBox *>(QStringLiteral("searchScopeCombo"));
@@ -3683,16 +3684,17 @@ private slots:
         mw_->openFilesFromExternal({firstPath, secondPath});
         QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 2, 3000);
         auto *tabs = mw_->findChild<QTabWidget *>();
-        auto *dialog = mw_->findChild<FindReplaceDialog *>();
         auto *findAction = mw_->findChild<QAction *>(QStringLiteral("search.find"));
         auto *dock = mw_->findChild<SearchResultsDock *>(QStringLiteral("SearchResultsDock"));
-        QVERIFY(tabs && dialog && findAction && dock);
+        QVERIFY(tabs && findAction && dock);
         switchToTab(mw_, 1);
         auto *second = currentEditorTab(mw_);
         QVERIFY(second && !second->isL2Active());
         QCOMPARE(second->encoding(), TextEncoding::Utf16LE);
 
         findAction->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(mw_->findChild<FindReplaceDialog *>() != nullptr, 1000);
+        auto *dialog = mw_->findChild<FindReplaceDialog *>();
         QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
         auto *scope = dialog->findChild<QComboBox *>(QStringLiteral("searchScopeCombo"));
