@@ -156,8 +156,9 @@ Text/Binary、S1/S2、GBK、UTF-8/BOM、UTF-16LE/BE。
 
 当前实现：`DocumentState` 已建立 DocumentId/revision/content/persistence/security/capabilities 单一值对象，
 source byte 与 editor position 使用不可互换类型；EditorTab 的旧 revision API 是对该状态的引用 facade，
-不保留第二份 revision。`ReadOnlySelectionModel` 对连续选择和无效 owner 切换提供纯合同哨兵。其余
-EditorTab persistence/presentation 旧字段仍在迁移期，不能声称 EditorTab 职责迁移已经全部完成。
+不保留第二份 revision，文件 location 也已删除旧 `m_filePath` 并统一转发到 DocumentState。
+`ReadOnlySelectionModel` 对连续选择和无效 owner 切换提供纯合同哨兵。其余 presentation/content
+兼容字段仍在迁移期，不能声称 EditorTab 职责迁移已经全部完成。
 
 ### R3 搜索、命令和视图收敛
 

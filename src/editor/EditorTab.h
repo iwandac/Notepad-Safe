@@ -452,7 +452,6 @@ private:
     QSplitter *m_l1Splitter = nullptr;
     QStackedWidget *m_stack = nullptr;  // 0: m_editor (L1), 1: m_l2View (L2)
     QWidget *m_secureLockingPage = nullptr;
-    QString m_filePath;       // 真实文件路径（空=未命名）
     QString m_autosavePath;   // 内部 autosave 临时路径（对用户透明）
     QUuid m_sessionInstanceId = QUuid::createUuid();
     DocumentState m_documentState;

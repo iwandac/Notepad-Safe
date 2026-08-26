@@ -421,28 +421,28 @@ private:
 
 EditorTab::ExternalFileState EditorTab::externalFileState() const
 {
-    if (isSecureDocument() || m_filePath.isEmpty())
+    if (isSecureDocument() || m_documentState.location.isEmpty())
         return ExternalFileState::NotTracked;
-    return compareDiskFileVersion(m_filePath, m_diskVersion);
+    return compareDiskFileVersion(m_documentState.location, m_diskVersion);
 }
 
 void EditorTab::refreshDiskVersionBaseline()
 {
     m_diskVersion = {};
-    if (isSecureDocument() || m_filePath.isEmpty())
+    if (isSecureDocument() || m_documentState.location.isEmpty())
         return;
     DiskFileVersion captured;
-    if (captureDiskFileVersion(m_filePath, &captured) == ExternalFileState::Unchanged)
+    if (captureDiskFileVersion(m_documentState.location, &captured) == ExternalFileState::Unchanged)
         m_diskVersion = std::move(captured);
 }
 
 bool EditorTab::representsDiskFile(const DiskFileVersion &candidate) const
 {
-    if (isSecureDocument() || m_filePath.isEmpty() || !candidate.valid)
+    if (isSecureDocument() || m_documentState.location.isEmpty() || !candidate.valid)
         return false;
     if (sameDiskFile(m_diskVersion, candidate))
         return true;
-    return sameDiskFilePath(m_filePath, candidate.absolutePath);
+    return sameDiskFilePath(m_documentState.location, candidate.absolutePath);
 }
 
 EditorTab::EditorTab(QWidget *parent)
@@ -688,7 +688,7 @@ bool EditorTab::loadFile(const QString &path,
     m_encodingConfidence = result.confidence;
     m_encodingDecodeErrors = result.decodeErrors;
     m_editor->setEolMode(detectLineEndingMode(result.text));
-    m_filePath = QFileInfo(path).absoluteFilePath();
+    m_documentState.location = QFileInfo(path).absoluteFilePath();
     m_autosavePath.clear();  // 加载正式文件，清除 autosave 关联
 
     // 大文件分块加载：避免 setText() 一次性重建整个文档导致 UI 长时间卡死
@@ -780,7 +780,7 @@ bool EditorTab::loadAutosaveBytes(const QByteArray &data, const QString &backing
     m_encodingConfidence = result.confidence;
     m_encodingDecodeErrors = result.decodeErrors;
     m_editor->setEolMode(detectLineEndingMode(result.text));
-    // 关键：不设置 m_filePath，保持未命名状态，对用户透明
+    // 关键：不设置 m_documentState.location，保持未命名状态，对用户透明
     m_autosavePath = backingPath;
     m_diskVersion = {};
 
@@ -822,13 +822,13 @@ bool EditorTab::saveFile(QString *errMsg)
     if (!isModified())
         return true;
     if (isL2Mode())
-        return saveL2As(m_filePath, errMsg);
-    return saveAsFile(m_filePath, errMsg);
+        return saveL2As(m_documentState.location, errMsg);
+    return saveAsFile(m_documentState.location, errMsg);
 }
 
 bool EditorTab::saveAsFile(const QString &path, QString *errMsg)
 {
-    if (sameDiskFilePath(m_filePath, path)) {
+    if (sameDiskFilePath(m_documentState.location, path)) {
         const ExternalFileState diskState = externalFileState();
         if (diskState == ExternalFileState::Changed
             || diskState == ExternalFileState::Missing
@@ -849,7 +849,7 @@ bool EditorTab::saveAsFile(const QString &path, QString *errMsg)
     if (!writeTextAsEncoding(path, m_editor->text(), m_encoding, errMsg))
         return false;
 
-    m_filePath = QFileInfo(path).absoluteFilePath();
+    m_documentState.location = QFileInfo(path).absoluteFilePath();
     setModified(false);
 
     // 保存成功：自动清理 autosave 临时文件（自清理机制）
@@ -899,17 +899,16 @@ void EditorTab::setModified(bool m)
 
 bool EditorTab::isUntitled() const
 {
-    return m_filePath.isEmpty();
+    return m_documentState.location.isEmpty();
 }
 
 QString EditorTab::filePath() const
 {
-    return m_filePath;
+    return m_documentState.location;
 }
 
 void EditorTab::setFilePath(const QString &path)
 {
-    m_filePath = path;
     m_documentState.location = path;
     m_documentState.origin = path.isEmpty() ? DocumentOrigin::Untitled
                                             : DocumentOrigin::File;
@@ -924,14 +923,14 @@ QString EditorTab::fileName() const
     if (isSecureDocument()) {
         if (m_secureDocumentMasked)
             return QStringLiteral("已锁定文档");
-        if (!m_filePath.isEmpty())
-            return QFileInfo(m_filePath).fileName();
+        if (!m_documentState.location.isEmpty())
+            return QFileInfo(m_documentState.location).fileName();
         return m_secureDocumentTitle.isEmpty() ? QStringLiteral("未命名")
                                                : m_secureDocumentTitle;
     }
-    if (m_filePath.isEmpty())
+    if (m_documentState.location.isEmpty())
         return QStringLiteral("未命名");
-    return QFileInfo(m_filePath).fileName();
+    return QFileInfo(m_documentState.location).fileName();
 }
 
 QString EditorTab::tabTitle() const
@@ -958,7 +957,6 @@ void EditorTab::initializeSecureDocument(const QUuid &id, const QString &title,
     if (m_l2View)
         m_l2View->setVirtualSizeLimitExclusive(0);
     m_l2Mode = false;
-    m_filePath = filePath;
     m_autosavePath.clear();
     m_secureDocumentId = id;
     m_documentState.id = id;
@@ -1024,7 +1022,6 @@ bool EditorTab::initializeSecureBinaryDocument(const QUuid &id,
     }
     setSecurePayloadLimitExclusive(32LL * 1024 * 1024);
 
-    m_filePath = filePath;
     m_autosavePath.clear();
     m_secureDocumentId = id;
     m_documentState.id = id;
@@ -1189,7 +1186,6 @@ void EditorTab::convertToPlainDocument(const QString &filePath)
     m_secureDocumentMasked = false;
     m_secureBinaryDocument = false;
     setSecurePayloadLimitExclusive(0);
-    m_filePath = filePath;
     m_documentState.location = filePath;
     m_documentState.origin = filePath.isEmpty() ? DocumentOrigin::Untitled
                                                 : DocumentOrigin::File;
@@ -2031,7 +2027,7 @@ void EditorTab::reloadWithEncoding(TextEncoding enc)
         return;
     // 重新解释内容：当前 Unicode 文本 → 用旧编码还原字节 → 用新编码解码
     // 但更实用的做法是：如果磁盘上有文件，从磁盘按新编码重读；否则保持文本不变只改编码标记
-    if (!isUntitled() && QFileInfo::exists(m_filePath)) {
+    if (!isUntitled() && QFileInfo::exists(m_documentState.location)) {
         // 只有在用户确认后才重载（由上层调用 saveFile 检查），这里简单切换编码标记
         m_encoding = enc;
         emit encodingChanged(m_encoding);
@@ -2447,10 +2443,10 @@ void EditorTab::setDisplayEncoding(TextEncoding enc)
             bridgePopulateScintilla(start, end);
         emit encodingChanged(m_encoding);
     } else {
-        // Secure Text is a logical UTF-8 payload; m_filePath points to its
+        // Secure Text is a logical UTF-8 payload; m_documentState.location points to its
         // encrypted KDBX container and must never be decoded as document text.
-        if (m_filePath.isEmpty() || isSecureDocument()) return;
-        QFile f(m_filePath);
+        if (m_documentState.location.isEmpty() || isSecureDocument()) return;
+        QFile f(m_documentState.location);
         if (!f.open(QIODevice::ReadOnly)) return;
         QByteArray raw = f.readAll();
         f.close();
@@ -2754,7 +2750,7 @@ bool EditorTab::ensureWindowedSearchSource(QString *error)
     // can make the provider non-current without closing its source file).
     const bool hasWindowedSource = m_l2Mode && m_windowedReadOnlyProvider
         && m_windowedReadOnlyProvider->fileSize() > 0
-        && !m_filePath.isEmpty();
+        && !m_documentState.location.isEmpty();
     if (!hasWindowedSource) {
         const bool hasMappedSource = m_l2View && m_l2View->isOpen();
         if (!hasMappedSource && error) {
@@ -2765,14 +2761,14 @@ bool EditorTab::ensureWindowedSearchSource(QString *error)
                                                 : QObject::tr("不存在"))
                 .arg(m_windowedReadOnlyProvider
                          ? m_windowedReadOnlyProvider->fileSize() : -1)
-                .arg(m_filePath.isEmpty() ? QObject::tr("为空")
+                .arg(m_documentState.location.isEmpty() ? QObject::tr("为空")
                                           : QObject::tr("存在"));
         }
         return hasMappedSource;
     }
     if (m_l2View && (m_l2View->isOpen() || m_l2View->mmapSize() > 0))
         return true;
-    if (m_filePath.isEmpty()) {
+    if (m_documentState.location.isEmpty()) {
         if (error)
             *error = QObject::tr("当前大文件没有可搜索的磁盘源。");
         return false;
@@ -2783,7 +2779,7 @@ bool EditorTab::ensureWindowedSearchSource(QString *error)
                           == WindowedReadOnlyProvider::Presentation::Hex
                       ? ViewMode::Hex : ViewMode::Text);
     QString openError;
-    if (!view->openFile(m_filePath, &openError)) {
+    if (!view->openFile(m_documentState.location, &openError)) {
         if (error)
             *error = openError;
         return false;
@@ -4989,7 +4985,7 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
         return false;
     }
     // 成功：切到 L2 视图并标记模式
-    m_filePath = fi.absoluteFilePath();
+    m_documentState.location = fi.absoluteFilePath();
     refreshDiskVersionBaseline();
     m_l2Mode = true;
     // S2 and S3 intentionally expose the same capability: bounded mmap browse,
@@ -5058,7 +5054,7 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
         }
         return false;
     }
-    if (sameDiskFilePath(m_filePath, path)) {
+    if (sameDiskFilePath(m_documentState.location, path)) {
         const ExternalFileState diskState = externalFileState();
         if (diskState == ExternalFileState::Changed
             || diskState == ExternalFileState::Missing
@@ -5082,8 +5078,8 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
     QString localErr;
 
     // 判断是否保存到当前 mmap 映射的同一文件
-    const bool sameFile = !m_filePath.isEmpty() &&
-        QFileInfo(path).absoluteFilePath() == QFileInfo(m_filePath).absoluteFilePath();
+    const bool sameFile = !m_documentState.location.isEmpty() &&
+        QFileInfo(path).absoluteFilePath() == QFileInfo(m_documentState.location).absoluteFilePath();
 
     if (sameFile
         && m_l2View->virtualFileSize() < FileTierPolicy::StandardEditLimitBytes) {
@@ -5131,7 +5127,7 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
                 *errMsg = QObject::tr("保存成功但重新打开失败：%1").arg(reopenError);
             return false;
         }
-        m_filePath = QFileInfo(path).absoluteFilePath();
+        m_documentState.location = QFileInfo(path).absoluteFilePath();
     } else if (sameFile) {
         // ---- Windows 关键修复：mmap 活跃时 QSaveFile::commit() 无法替换文件 ----
         // 方案：先写到同目录临时文件（mmapBase 仍有效，applyAndSave 可读原文），
@@ -5163,7 +5159,7 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
             if (errMsg) *errMsg = QObject::tr("保存成功但重新打开失败：%1").arg(reopenErr);
             return false;
         }
-        m_filePath = path;  // sameFile 路径也同步（openFile 可能没更新 EditorTab::m_filePath，确保 tab 标题/后续状态正确）
+        m_documentState.location = path;  // sameFile 路径也同步（openFile 可能没更新 EditorTab::m_documentState.location，确保 tab 标题/后续状态正确）
     } else {
         // 不同文件：先流式保存，再把新文件切成当前 backing store。否则后续编辑
         // 仍依赖旧文件 mmap，旧文件被移动/修改后会破坏“另存为”文档。
@@ -5180,7 +5176,7 @@ bool EditorTab::saveL2As(const QString &path, QString *errMsg)
                 *errMsg = QObject::tr("文件已另存为，但无法切换到新文件：%1").arg(reopenErr);
             return false;
         }
-        m_filePath = QFileInfo(path).absoluteFilePath();
+        m_documentState.location = QFileInfo(path).absoluteFilePath();
     }
 
     setModified(false);
@@ -5295,7 +5291,7 @@ bool EditorTab::restoreRecoveryCheckpoint(const QString &checkpointPath,
 bool EditorTab::exportBinaryRecoveryJournal(QIODevice *output, QString *error)
 {
     if (!output || !output->isWritable() || !isBinaryDocument() || isSecureDocument()
-        || !isL2Mode() || !m_l2View || m_filePath.isEmpty() || isReadOnlyByPolicy()) {
+        || !isL2Mode() || !m_l2View || m_documentState.location.isEmpty() || isReadOnlyByPolicy()) {
         if (error) *error = QObject::tr("当前文档不能生成 Binary/Hex 恢复日志。");
         return false;
     }
@@ -5470,7 +5466,7 @@ bool EditorTab::openAutosaveAutoMode(const QString &autosavePath, const QString 
                ok ? 1 : 0, t.elapsed());
         if (ok && !realFilePath.isEmpty()) {
             // 已有真实路径：对用户显示原名 + 标记"有未保存修改"
-            m_filePath = realFilePath;
+            m_documentState.location = realFilePath;
             refreshDiskVersionBaseline();
             // 注意：loadAutosave 已经 setModified(true)，所以无需再调
             emit titleChanged(tabTitle());
@@ -5493,7 +5489,7 @@ bool EditorTab::openAutosaveAutoMode(const QString &autosavePath, const QString 
         return false;
     }
 
-    m_filePath = realFilePath;
+    m_documentState.location = realFilePath;
     refreshDiskVersionBaseline();
     m_autosavePath = autosavePath;
     m_l2SaveNeeded = true;
@@ -5975,7 +5971,7 @@ bool EditorTab::pendingL2SearchSourceIsCurrent() const
 {
     if (!m_pendingL2Search.active
         || m_contentRevision != m_pendingL2Search.contentRevision
-        || m_filePath != m_pendingL2Search.sourcePathAtStart
+        || m_documentState.location != m_pendingL2Search.sourcePathAtStart
         || contentSizeBytes() != m_pendingL2Search.sourceSizeAtStart) {
         return false;
     }
@@ -6190,7 +6186,7 @@ bool EditorTab::findAllL2Async(const QString& pattern, bool regex,
     m_pendingL2Search.tolerateInvalidEncodingAtStart =
         !m_pendingL2Search.byteContextModeAtStart
         && (isBinaryDocument() || encodingHasDecodeErrors());
-    m_pendingL2Search.sourcePathAtStart = m_filePath;
+    m_pendingL2Search.sourcePathAtStart = m_documentState.location;
     m_pendingL2Search.sourceSizeAtStart = contentSizeBytes();
     m_pendingL2Search.diskVersionAtStart = m_diskVersion;
     m_pendingL2Search.contentRevision = m_contentRevision;
