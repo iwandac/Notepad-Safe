@@ -248,3 +248,22 @@ CTest 按具体 QtTest 函数注册：
 11. 正式 Release 外部进程/内部首帧启动、首次输入和分批恢复满足 `DESIGN.md` 3.7/14.2；增加 100 个未使用 Tool、20 个未使用 Provider 和已安装未启用模型后仍在扩展规模预算内，首帧前重型 factory 调用为零；无受控缓存协议时不声称冷/热启动结论。
 
 这组退出条件不能数学上保证未来永远没有缺陷，但能证明本轮资金没有只购买目录移动：架构边界由编译器执行，扩展点由测试 Provider/Tool 证明，旧功能由重构前后同旅程和持久化结果证明，历史回归由已验证会失败的快速哨兵保护。
+
+## 8. 2026-08-26 最终执行证据与未完成边界
+
+已验证：
+
+- KDBX ON：17/17 非 GUI/架构/供应链/真实 `testfiles` 合同通过；受影响的 Shell/Accounts/Secure GUI 63/63 通过；搜索 GUI 41/41 通过；其余 adjacent 在最终修改前通过且修改未触及对应产品组件。
+- KDBX OFF：正式 EXE、架构/启动合同和 smallfixes harness 编译；架构/启动及基础编辑代表旅程 5/5 通过。OFF 仍只表示解耦门禁，不表示安全发布验证。
+- quick：5/5，实测约 1.45–3.03 秒；两个历史哨兵均在其中；没有统一 3600 秒 timeout。
+- 正式 Release 进程：100 MiB 真实文件 session 主窗口 368 ms 可见，100 MiB autosave session 248 ms 可见，均正常退出且未走 L1 阻塞路径；这两次是普通外部进程启动，不宣称受控冷缓存 P95。
+- 内部启动合同：first paint 前重型 factory=0；100 个未使用 Tool、20 个附加 DocumentProvider、20 个 InferenceProvider 均实例化为 0。
+- 验收过程中门禁实际阻止两类回归：Find dialog 延迟创建破坏旧测试前置假设；Accounts KDBX 文件入口在 lazy VaultDock 创建前解引用。前者改为动作后合同，后者修复产品生命周期并通过恢复密钥/重启/记忆凭据完整旅程。
+
+不得上推为完成的边界：
+
+- MainWindow 仍含 KDBX 条件 UI 与部分打开/保存协调；虽然具体 service 已通过 port/factory 注入且 ON/OFF 可编译，但尚未满足“MainWindow 无后端业务”的最终形态。
+- SearchResultsDock 头文件已无 target/revision 状态，但 cpp 的迁移 facade 仍操作 SearchResultSession；NavigationController 尚未完全独立。
+- EditorTab revision 已单一化到 DocumentState，但 persistence/presentation 旧字段和搜索执行 facade 尚未全部移出。
+- Document/Inference/Tool registry 已落地；PersistenceAdapterRegistry 仍只有设计，尚不能声称新增持久化 adapter 完全无需修改打开/保存协调。
+- 当前测试结果证明本轮涉及路径未发现功能回退，并建立了更强门禁；它不构成“未来永不回退”的数学保证，也不能把尚未迁移的职责称为低复杂度完成态。
