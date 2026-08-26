@@ -127,11 +127,16 @@ public:
     const DocumentState &documentState() const noexcept { return m_documentState; }
     // Secure notes use the same QScintilla editor but are persisted through
     // VaultService instead of a plaintext filesystem path.
-    bool isSecureDocument() const { return !m_secureDocumentId.isNull(); }
-    bool isSecureBinaryDocument() const {
-        return isSecureDocument() && m_secureBinaryDocument;
+    bool isSecureDocument() const {
+        return m_documentState.securityClass == DocumentSecurityClass::SecureDocument;
     }
-    bool isBinaryDocument() const { return m_binaryDocument; }
+    bool isSecureBinaryDocument() const {
+        return isSecureDocument()
+            && m_documentState.contentKind == DocumentContentKind::Binary;
+    }
+    bool isBinaryDocument() const {
+        return m_documentState.contentKind == DocumentContentKind::Binary;
+    }
     // Content classification and the active representation are independent.
     // A Binary document shown as Text participates in decoded text search;
     // byte/hex search belongs only to the Hex representation.
@@ -140,7 +145,9 @@ public:
     void toggleHexOverwriteMode();
     bool isSecureDocumentMasked() const { return m_secureDocumentMasked; }
     bool isSecureDocumentTransitioning() const { return m_secureDocumentTransitioning; }
-    QUuid secureDocumentId() const { return m_secureDocumentId; }
+    QUuid secureDocumentId() const {
+        return isSecureDocument() ? m_documentState.id : QUuid{};
+    }
     QString secureDocumentTitle() const { return m_secureDocumentTitle; }
     void initializeSecureDocument(const QUuid &id, const QString &title,
                                   const QString &plainText = {},
@@ -353,7 +360,7 @@ public:
     // 当前是否处于 L2 模式
     bool isL2Mode() const { return m_l2Mode; }
     bool isLargeDocument() const {
-        return m_l2Mode && !m_secureBinaryDocument;
+        return m_l2Mode && !isSecureBinaryDocument();
     }
     bool isReadOnlyByPolicy() const {
         return m_l2ReadOnlyByPolicy;
@@ -455,19 +462,13 @@ private:
     QString m_autosavePath;   // 内部 autosave 临时路径（对用户透明）
     QUuid m_sessionInstanceId = QUuid::createUuid();
     DocumentState m_documentState;
-    // Compatibility facade during the EditorTab migration. This is a reference,
-    // not duplicated state; every legacy search path observes the same revision.
-    quint64 &m_contentRevision = m_documentState.revision;
     mutable quint64 m_characterCountRevision = std::numeric_limits<quint64>::max();
     mutable qint64 m_cachedCharacterCount = 0;
     mutable bool m_cachedCharacterCountHex = false;
-    QUuid m_secureDocumentId;
     QString m_secureDocumentTitle;
     bool m_secureDocumentMasked = false;
     qint64 m_securePayloadLimitExclusive = 0;
     bool m_secureDocumentTransitioning = false;
-    bool m_secureBinaryDocument = false;
-    bool m_binaryDocument = false;
     TextEncoding m_encoding = TextEncoding::Utf8;
     EncodingOrigin m_encodingOrigin = EncodingOrigin::Fallback;
     EncodingConfidence m_encodingConfidence = EncodingConfidence::Low;
