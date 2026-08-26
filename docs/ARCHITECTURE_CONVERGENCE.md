@@ -165,6 +165,13 @@ EditorTab persistence/presentation 旧字段仍在迁移期，不能声称 Edito
 - SearchResultsDock 变成纯 view；所有模式使用同一 model/delegate/geometry contract。
 - CommandRegistry 根据当前 DocumentCapabilities 统一启停和分派菜单、快捷键、工具栏和上下文菜单。
 
+当前实现：`CommandRegistry` 已将菜单/工具栏/快捷键共享的 command objectName 绑定到稳定
+FeatureId，并提供统一 DocumentCapabilities 基线；启动合同拒绝任何未登记 QAction。
+SearchResultsDock 头文件已不再声明 target/revision/stale/rerun 状态，这些状态由非视觉
+`SearchResultSession` 持有，架构脚本阻止其回流；41 个单/多文件、Text/Hex、S1/S2/S3 搜索 GUI
+旅程通过。FindReplaceDialog 到 EditorTab 的执行协调以及 Dock cpp 内部的 session 操作仍是迁移
+facade，因此本项只能标记为部分收敛，不能声称 SearchController/NavigationController 已完全独立。
+
 ### R4 安全与未来扩展边界
 
 - 加密文档持久化通过 Document port 接入，不在 EditorTab 建立功能分叉。

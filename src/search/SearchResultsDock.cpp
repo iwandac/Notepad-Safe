@@ -1,4 +1,5 @@
 #include "SearchResultsDock.h"
+#include "SearchResultSession.h"
 #include "VirtualFileView.h"
 
 #include <QTreeView>
@@ -551,6 +552,7 @@ public:
 // ============================================================================
 SearchResultsDock::SearchResultsDock(QWidget *parent)
     : QDockWidget(QStringLiteral("搜索结果"), parent)
+    , m_session(std::make_unique<SearchResultSession>())
 {
     // ⚠️ 关键修复：禁用浮动和移动，防止双击 / 拖动后嵌入错位
     //  - Fixed: 允许用户关闭/显示，不允许脱离位置
@@ -610,7 +612,7 @@ SearchResultsDock::SearchResultsDock(QWidget *parent)
     connect(m_treeView, &QTreeView::doubleClicked,
             this, &SearchResultsDock::onModelDoubleClicked);
     connect(m_rerunButton, &QPushButton::clicked, this, [this]() {
-        emit rerunRequested(m_rerunTarget.data());
+        emit rerunRequested(m_session->rerunTarget.data());
     });
 
     // 关键：安装事件过滤器到 m_treeView viewport，以捕获 context 列内的点击位置
@@ -618,10 +620,12 @@ SearchResultsDock::SearchResultsDock(QWidget *parent)
     m_treeView->viewport()->installEventFilter(this);
 }
 
+SearchResultsDock::~SearchResultsDock() = default;
+
 void SearchResultsDock::setRerunAvailable(bool available,
                                           EditorTab *preferredTarget)
 {
-    m_rerunTarget = available ? preferredTarget : nullptr;
+    m_session->rerunTarget = available ? preferredTarget : nullptr;
     if (m_rerunButton)
         m_rerunButton->setVisible(available);
 }
@@ -651,24 +655,24 @@ void SearchResultsDock::clearResults()
 {
     setRerunAvailable(false);
     SearchResultsModel *oldSingleModel = m_model;
-    if (m_singleTarget)
-        m_singleTarget->clearSearchHighlights();
-    for (auto it = m_multiTargets.cbegin(); it != m_multiTargets.cend(); ++it) {
+    if (m_session->singleTarget)
+        m_session->singleTarget->clearSearchHighlights();
+    for (auto it = m_session->multiTargets.cbegin(); it != m_session->multiTargets.cend(); ++it) {
         if (it.value())
             it.value()->clearSearchHighlights();
     }
     resetTargetWatches();
     m_lastHitRow = -1;
     m_lastHitMatchIdx = -1;
-    m_multiFileMode = false;
-    m_multiPattern.clear();
-    m_multiMatchCount = 0;
-    m_multiStaleCount = 0;
-    m_multiIncompleteCount = 0;
-    m_multiTargets.clear();
-    m_multiTargetRevisions.clear();
-    m_singleTarget.clear();
-    m_singleTargetRevision = 0;
+    m_session->multiFileMode = false;
+    m_session->multiPattern.clear();
+    m_session->multiMatchCount = 0;
+    m_session->multiStaleCount = 0;
+    m_session->multiIncompleteCount = 0;
+    m_session->multiTargets.clear();
+    m_session->multiTargetRevisions.clear();
+    m_session->singleTarget.clear();
+    m_session->singleTargetRevision = 0;
     m_singlePreviewMatches.clear();
     m_model = nullptr;
     if (m_treeView)
@@ -689,11 +693,11 @@ void SearchResultsDock::setResultsModel(SearchResultsModel *model,
 {
     setRerunAvailable(false);
     resetTargetWatches();
-    m_multiFileMode = false;
-    m_multiTargets.clear();
-    m_multiTargetRevisions.clear();
-    m_singleTarget.clear();
-    m_singleTargetRevision = 0;
+    m_session->multiFileMode = false;
+    m_session->multiTargets.clear();
+    m_session->multiTargetRevisions.clear();
+    m_session->singleTarget.clear();
+    m_session->singleTargetRevision = 0;
     watchTarget(target);
     m_singlePreviewMatches.clear();
     SearchResultsModel *oldModel = m_model;
@@ -757,7 +761,7 @@ void SearchResultsDock::appendSingleFilePreview(
     EditorTab *target, const QVector<LargeFileSearchMatch> &batch,
     TextEncoding encoding, bool bytePositionMode)
 {
-    if (m_multiFileMode || !target || target != m_singleTarget || !m_model
+    if (m_session->multiFileMode || !target || target != m_session->singleTarget || !m_model
         || !targetRevisionIsCurrent(target) || batch.isEmpty()
         || m_model->textEncoding() != encoding
         || m_model->bytePositionMode() != bytePositionMode) {
@@ -774,21 +778,21 @@ void SearchResultsDock::appendSingleFilePreview(
 
 QString SearchResultsDock::registerTarget(EditorTab *tab)
 {
-    for (auto it = m_multiTargets.cbegin(); it != m_multiTargets.cend(); ++it) {
+    for (auto it = m_session->multiTargets.cbegin(); it != m_session->multiTargets.cend(); ++it) {
         if (it.value() == tab)
             return it.key();
     }
     const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    m_multiTargets.insert(id, tab);
+    m_session->multiTargets.insert(id, tab);
     watchTarget(tab, id);
     return id;
 }
 
 void SearchResultsDock::resetTargetWatches()
 {
-    for (const auto &connection : std::as_const(m_targetConnections))
+    for (const auto &connection : std::as_const(m_session->targetConnections))
         QObject::disconnect(connection);
-    m_targetConnections.clear();
+    m_session->targetConnections.clear();
 }
 
 void SearchResultsDock::watchTarget(EditorTab *tab, const QString &targetId)
@@ -796,40 +800,40 @@ void SearchResultsDock::watchTarget(EditorTab *tab, const QString &targetId)
     if (!tab)
         return;
     if (targetId.isEmpty()) {
-        m_singleTarget = tab;
-        m_singleTargetRevision = tab->contentRevision();
+        m_session->singleTarget = tab;
+        m_session->singleTargetRevision = tab->contentRevision();
     } else {
-        m_multiTargetRevisions.insert(targetId, tab->contentRevision());
+        m_session->multiTargetRevisions.insert(targetId, tab->contentRevision());
     }
     QPointer<EditorTab> guard(tab);
-    m_targetConnections.push_back(connect(
+    m_session->targetConnections.push_back(connect(
         tab, &EditorTab::contentChanged, this,
         [this, guard](quint64) {
             if (guard)
                 invalidateResultsFor(guard);
         }));
-    m_targetConnections.push_back(connect(
+    m_session->targetConnections.push_back(connect(
         tab, &EditorTab::l2LineBuildFinished, this,
         [this, guard](bool ok) {
             if (ok && guard)
                 decorateResultsFor(guard);
         }));
-    m_targetConnections.push_back(connect(
+    m_session->targetConnections.push_back(connect(
         tab, &QObject::destroyed, this,
         [this, targetId]() {
-            if (m_multiFileMode && !targetId.isEmpty()) {
+            if (m_session->multiFileMode && !targetId.isEmpty()) {
                 if (m_multiModel && m_multiModel->invalidate(targetId))
-                    ++m_multiStaleCount;
-                m_multiTargetRevisions.remove(targetId);
+                    ++m_session->multiStaleCount;
+                m_session->multiTargetRevisions.remove(targetId);
                 m_summary->setText(
                     QStringLiteral("在全部打开文件中搜索 “%1”：已找到至少 %2 处；%3 个文件不完整，%4 个已失效")
-                        .arg(m_multiPattern).arg(m_multiMatchCount)
-                        .arg(m_multiIncompleteCount).arg(m_multiStaleCount));
+                        .arg(m_session->multiPattern).arg(m_session->multiMatchCount)
+                        .arg(m_session->multiIncompleteCount).arg(m_session->multiStaleCount));
                 setRerunAvailable(true);
-            } else if (!m_multiFileMode) {
+            } else if (!m_session->multiFileMode) {
                 SearchResultsModel *oldModel = m_model;
-                m_singleTarget.clear();
-                m_singleTargetRevision = 0;
+                m_session->singleTarget.clear();
+                m_session->singleTargetRevision = 0;
                 m_model = nullptr;
                 m_treeView->setModel(nullptr);
                 if (oldModel && oldModel->QObject::parent() == this)
@@ -847,14 +851,14 @@ void SearchResultsDock::decorateResultsFor(EditorTab *tab)
         return;
     }
     const LineIndex &index = tab->l2View()->lineIndex();
-    if (!m_multiFileMode) {
-        if (m_singleTarget == tab && m_model)
+    if (!m_session->multiFileMode) {
+        if (m_session->singleTarget == tab && m_model)
             m_model->decorateLineNumbers(index);
         return;
     }
     if (!m_multiModel)
         return;
-    for (auto it = m_multiTargets.cbegin(); it != m_multiTargets.cend(); ++it) {
+    for (auto it = m_session->multiTargets.cbegin(); it != m_session->multiTargets.cend(); ++it) {
         if (it.value() == tab) {
             m_multiModel->decorate(it.key(), index);
             return;
@@ -868,9 +872,9 @@ bool SearchResultsDock::targetRevisionIsCurrent(EditorTab *tab,
     if (!tab)
         return false;
     if (targetId.isEmpty())
-        return m_singleTarget == tab && m_singleTargetRevision == tab->contentRevision();
-    return m_multiTargets.value(targetId) == tab
-           && m_multiTargetRevisions.value(targetId, std::numeric_limits<quint64>::max())
+        return m_session->singleTarget == tab && m_session->singleTargetRevision == tab->contentRevision();
+    return m_session->multiTargets.value(targetId) == tab
+           && m_session->multiTargetRevisions.value(targetId, std::numeric_limits<quint64>::max())
                   == tab->contentRevision();
 }
 
@@ -880,9 +884,9 @@ void SearchResultsDock::invalidateResultsFor(EditorTab *tab)
         return;
     tab->clearSearchHighlights();
 
-    if (m_multiFileMode) {
+    if (m_session->multiFileMode) {
         QString targetId;
-        for (auto it = m_multiTargets.cbegin(); it != m_multiTargets.cend(); ++it) {
+        for (auto it = m_session->multiTargets.cbegin(); it != m_session->multiTargets.cend(); ++it) {
             if (it.value() == tab) {
                 targetId = it.key();
                 break;
@@ -892,13 +896,13 @@ void SearchResultsDock::invalidateResultsFor(EditorTab *tab)
             targetId = registerTarget(tab);
 
         if (m_multiModel && m_multiModel->invalidate(targetId)) {
-            ++m_multiStaleCount;
+            ++m_session->multiStaleCount;
         }
-        m_multiTargetRevisions.remove(targetId);
+        m_session->multiTargetRevisions.remove(targetId);
         m_summary->setText(
             QStringLiteral("在全部打开文件中搜索 “%1”：已找到至少 %2 处；%3 个文件不完整，%4 个已失效")
-                .arg(m_multiPattern).arg(m_multiMatchCount)
-                .arg(m_multiIncompleteCount).arg(m_multiStaleCount));
+                .arg(m_session->multiPattern).arg(m_session->multiMatchCount)
+                .arg(m_session->multiIncompleteCount).arg(m_session->multiStaleCount));
         setRerunAvailable(true);
         show();
         return;
@@ -910,11 +914,11 @@ void SearchResultsDock::invalidateResultsFor(EditorTab *tab)
     m_treeView->setModel(nullptr);
     if (oldModel && oldModel->QObject::parent() == this)
         delete oldModel;
-    m_multiFileMode = false;
-    m_multiTargets.clear();
-    m_multiTargetRevisions.clear();
-    m_singleTarget.clear();
-    m_singleTargetRevision = 0;
+    m_session->multiFileMode = false;
+    m_session->multiTargets.clear();
+    m_session->multiTargetRevisions.clear();
+    m_session->singleTarget.clear();
+    m_session->singleTargetRevision = 0;
     m_summary->setText(QStringLiteral("文档内容已修改，搜索结果已失效；请重新搜索。"));
     setRerunAvailable(true, tab);
     show();
@@ -924,15 +928,15 @@ void SearchResultsDock::beginMultiFileResults(const QString &pattern, int target
 {
     setRerunAvailable(false);
     resetTargetWatches();
-    m_multiFileMode = true;
-    m_multiPattern = pattern;
-    m_multiMatchCount = 0;
-    m_multiStaleCount = 0;
-    m_multiIncompleteCount = 0;
-    m_multiTargets.clear();
-    m_multiTargetRevisions.clear();
-    m_singleTarget.clear();
-    m_singleTargetRevision = 0;
+    m_session->multiFileMode = true;
+    m_session->multiPattern = pattern;
+    m_session->multiMatchCount = 0;
+    m_session->multiStaleCount = 0;
+    m_session->multiIncompleteCount = 0;
+    m_session->multiTargets.clear();
+    m_session->multiTargetRevisions.clear();
+    m_session->singleTarget.clear();
+    m_session->singleTargetRevision = 0;
     m_stack->setCurrentIndex(0);
     m_treeView->setModel(nullptr);
     delete m_multiModel;
@@ -957,7 +961,7 @@ void SearchResultsDock::beginMultiFileTarget(EditorTab *tab,
                                               TextEncoding encoding,
                                               bool bytePositionMode)
 {
-    if (!m_multiFileMode || !m_multiModel || !tab) return;
+    if (!m_session->multiFileMode || !m_multiModel || !tab) return;
     const QString targetId = registerTarget(tab);
     auto *preview = new SearchResultsModel(m_multiModel);
     preview->setBytePositionMode(bytePositionMode);
@@ -969,12 +973,12 @@ void SearchResultsDock::appendMultiFilePreview(
     EditorTab *tab, const QVector<LargeFileSearchMatch> &batch,
     TextEncoding encoding, bool bytePositionMode)
 {
-    if (!m_multiFileMode || !m_multiModel || !tab || batch.isEmpty()) return;
+    if (!m_session->multiFileMode || !m_multiModel || !tab || batch.isEmpty()) return;
     const QString targetId = registerTarget(tab);
     if (m_multiModel->appendPreview(targetId, batch, encoding,
                                     bytePositionMode)) {
         m_summary->setText(QStringLiteral("正在全部打开文件中搜索 “%1”…")
-                               .arg(m_multiPattern));
+                               .arg(m_session->multiPattern));
     }
 }
 
@@ -982,7 +986,7 @@ void SearchResultsDock::appendMultiFileResults(EditorTab *tab,
                                                const QVector<SearchMatch> &matches,
                                                bool incomplete)
 {
-    if (!m_multiFileMode || !tab)
+    if (!m_session->multiFileMode || !tab)
         return;
     const QString targetId = registerTarget(tab);
     if (m_multiModel) {
@@ -990,19 +994,19 @@ void SearchResultsDock::appendMultiFileResults(EditorTab *tab,
         m_treeView->expand(m_multiModel->index(m_multiModel->rowCount() - 1, 0));
     }
     if (incomplete)
-        ++m_multiIncompleteCount;
-    m_multiMatchCount += matches.size();
-    m_summary->setText(m_multiIncompleteCount > 0
+        ++m_session->multiIncompleteCount;
+    m_session->multiMatchCount += matches.size();
+    m_summary->setText(m_session->multiIncompleteCount > 0
         ? QStringLiteral("在全部打开文件中搜索 “%1”：已找到至少 %2 处；%3 个文件结果不完整")
-              .arg(m_multiPattern).arg(m_multiMatchCount).arg(m_multiIncompleteCount)
+              .arg(m_session->multiPattern).arg(m_session->multiMatchCount).arg(m_session->multiIncompleteCount)
         : QStringLiteral("在全部打开文件中搜索 “%1”：已找到 %2 处")
-              .arg(m_multiPattern).arg(m_multiMatchCount));
+              .arg(m_session->multiPattern).arg(m_session->multiMatchCount));
 }
 
 void SearchResultsDock::appendMultiFileResults(EditorTab *tab,
                                                SearchResultsModel *model)
 {
-    if (!m_multiFileMode || !tab || !model)
+    if (!m_session->multiFileMode || !tab || !model)
         return;
     const QString targetId = registerTarget(tab);
     if (m_multiModel) {
@@ -1017,34 +1021,34 @@ void SearchResultsDock::appendMultiFileResults(EditorTab *tab,
         }
     }
     if (model->isIncomplete())
-        ++m_multiIncompleteCount;
-    m_multiMatchCount += model->totalMatches();
+        ++m_session->multiIncompleteCount;
+    m_session->multiMatchCount += model->totalMatches();
     decorateResultsFor(tab);
-    m_summary->setText(m_multiIncompleteCount > 0
+    m_summary->setText(m_session->multiIncompleteCount > 0
         ? QStringLiteral("在全部打开文件中搜索 “%1”：已找到至少 %2 处；%3 个文件结果不完整")
-              .arg(m_multiPattern).arg(m_multiMatchCount).arg(m_multiIncompleteCount)
+              .arg(m_session->multiPattern).arg(m_session->multiMatchCount).arg(m_session->multiIncompleteCount)
         : QStringLiteral("在全部打开文件中搜索 “%1”：已找到 %2 处")
-              .arg(m_multiPattern).arg(m_multiMatchCount));
+              .arg(m_session->multiPattern).arg(m_session->multiMatchCount));
 }
 
 void SearchResultsDock::finishMultiFileResults(bool cancelled)
 {
-    if (!m_multiFileMode)
+    if (!m_session->multiFileMode)
         return;
     if (cancelled) {
         m_summary->setText(
             QStringLiteral("已取消在全部打开文件中搜索 “%1”；已保留 %2 处完成结果")
-                .arg(m_multiPattern).arg(m_multiMatchCount));
+                .arg(m_session->multiPattern).arg(m_session->multiMatchCount));
         return;
     }
-    if (m_multiStaleCount > 0 || m_multiIncompleteCount > 0) {
+    if (m_session->multiStaleCount > 0 || m_session->multiIncompleteCount > 0) {
         m_summary->setText(
             QStringLiteral("在全部打开文件中搜索 “%1”：找到至少 %2 处；%3 个文件不完整，%4 个已失效")
-                .arg(m_multiPattern).arg(m_multiMatchCount)
-                .arg(m_multiIncompleteCount).arg(m_multiStaleCount));
+                .arg(m_session->multiPattern).arg(m_session->multiMatchCount)
+                .arg(m_session->multiIncompleteCount).arg(m_session->multiStaleCount));
     } else {
         m_summary->setText(QStringLiteral("在全部打开文件中搜索 “%1”：找到 %2 处匹配")
-                               .arg(m_multiPattern).arg(m_multiMatchCount));
+                               .arg(m_session->multiPattern).arg(m_session->multiMatchCount));
     }
 }
 
@@ -1099,7 +1103,7 @@ bool SearchResultsDock::eventFilter(QObject *watched, QEvent *event)
 void SearchResultsDock::onModelDoubleClicked(const QModelIndex &index)
 {
     if ((!m_model && !m_multiModel) || !index.isValid()) return;
-    if (m_multiFileMode && m_multiModel) {
+    if (m_session->multiFileMode && m_multiModel) {
         MultiSearchResultsModel::Group *group = m_multiModel->groupFor(index);
         if (!group || !index.parent().isValid() || group->stale)
             return;
@@ -1121,8 +1125,8 @@ void SearchResultsDock::onModelDoubleClicked(const QModelIndex &index)
         return;
     }
     if (!m_model) return;
-    if (m_singleTarget && !targetRevisionIsCurrent(m_singleTarget)) {
-        invalidateResultsFor(m_singleTarget);
+    if (m_session->singleTarget && !targetRevisionIsCurrent(m_session->singleTarget)) {
+        invalidateResultsFor(m_session->singleTarget);
         return;
     }
     qint64 byteOff = -1;
@@ -1131,8 +1135,8 @@ void SearchResultsDock::onModelDoubleClicked(const QModelIndex &index)
     if (m_lastHitRow == index.row() && m_lastHitMatchIdx >= 0) {
         if (m_model->matchByteOffsetAtIndex(index.row(), m_lastHitMatchIdx, &byteOff, &length)) {
             // 命中：跳转到用户点击的具体匹配词
-            if (m_singleTarget)
-                emit jumpToTabByteOffset(m_singleTarget, byteOff, length);
+            if (m_session->singleTarget)
+                emit jumpToTabByteOffset(m_session->singleTarget, byteOff, length);
             else
                 emit jumpToByteOffset(byteOff, length);
             return;
@@ -1142,8 +1146,8 @@ void SearchResultsDock::onModelDoubleClicked(const QModelIndex &index)
     byteOff = m_model->matchByteOffset(index);
     length  = m_model->matchLength(index);
     if (byteOff >= 0) {
-        if (m_singleTarget)
-            emit jumpToTabByteOffset(m_singleTarget, byteOff, length);
+        if (m_session->singleTarget)
+            emit jumpToTabByteOffset(m_session->singleTarget, byteOff, length);
         else
             emit jumpToByteOffset(byteOff, length);
     }

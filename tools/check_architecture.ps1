@@ -58,6 +58,26 @@ foreach ($concrete in @('unique_ptr<SecuritySessionService>',
     }
 }
 
+$searchDockHeader = Get-Content -LiteralPath (Join-Path $SourceRoot 'src/search/SearchResultsDock.h') -Raw
+foreach ($forbiddenState in @('QPointer<EditorTab>', 'TargetRevision',
+                               'targetConnections', 'multiTargets')) {
+    if ($searchDockHeader.Contains($forbiddenState)) {
+        Add-Failure "SearchResultsDock view declares result-session state: $forbiddenState"
+    }
+}
+
+$domainFiles = Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src/domain') -File |
+    Where-Object Extension -in '.cpp', '.h'
+foreach ($domainFile in $domainFiles) {
+    $domainContent = Get-Content -LiteralPath $domainFile.FullName -Raw
+    foreach ($token in @('QWidget', 'QAction', 'MainWindow', 'EditorTab',
+                         'SearchResultsDock', 'KeePass', 'Windows.h')) {
+        if ($domainContent.Contains($token)) {
+            Add-Failure "domain depends on UI/vendor token '$token': $($domainFile.Name)"
+        }
+    }
+}
+
 $concreteFactories = Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src') -Recurse -File |
     Where-Object Extension -in '.cpp', '.h' |
     Select-String -Pattern 'make_unique<SecuritySessionService>|make_unique<SecureDocumentService>'

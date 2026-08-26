@@ -3,6 +3,7 @@
 #include <QDockWidget>
 #include <QPointer>
 #include <QHash>
+#include <memory>
 #include "EditorTab.h"
 #include "SearchResultsModel.h"
 
@@ -12,12 +13,14 @@ class QPushButton;
 class QStackedWidget;
 class QMouseEvent;
 class MultiSearchResultsModel;
+struct SearchResultSession;
 
 // 搜索结果 Dock 窗口
 class SearchResultsDock : public QDockWidget {
     Q_OBJECT
 public:
     explicit SearchResultsDock(QWidget *parent = nullptr);
+    ~SearchResultsDock() override;
 
     // ---- Editable Text results are adapted to the canonical result model.
     void setResults(const QVector<SearchMatch> &matches, const QString &pattern,
@@ -73,17 +76,7 @@ private:
     // 上次按下位置对应的"行 / 匹配索引"（用于双击时跳转到指定匹配）
     int m_lastHitMatchIdx = -1;
     int m_lastHitRow = -1;
-    bool m_multiFileMode = false;
-    QString m_multiPattern;
-    qint64 m_multiMatchCount = 0;
-    int m_multiStaleCount = 0;
-    int m_multiIncompleteCount = 0;
-    QHash<QString, QPointer<EditorTab>> m_multiTargets;
-    QHash<QString, quint64> m_multiTargetRevisions;
-    QPointer<EditorTab> m_singleTarget;
-    QPointer<EditorTab> m_rerunTarget;
-    quint64 m_singleTargetRevision = 0;
-    QVector<QMetaObject::Connection> m_targetConnections;
+    std::unique_ptr<SearchResultSession> m_session;
     QVector<LargeFileSearchMatch> m_singlePreviewMatches;
 
     void updateSummary(const QString &pattern, const QString &fileName,
