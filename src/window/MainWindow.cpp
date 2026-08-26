@@ -11,11 +11,10 @@
 #include "AsyncSerialQueue.h"
 #include "AsyncUiOperation.h"
 #include "VaultDock.h"
-#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
 #include "KdbxFormatProbe.h"
 #include "SecureDocumentService.h"
+#include "SecurityServiceFactory.h"
 #include "SecuritySessionService.h"
-#endif
 
 #include <QTabWidget>
 #include <QTabBar>
@@ -604,11 +603,6 @@ MainWindow::MainWindow(QWidget *parent)
 
     // 会话管理器
     m_session = new SessionManager(this);
-#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
-    m_securitySession = std::make_unique<SecuritySessionService>();
-    m_secureDocuments = std::make_unique<SecureDocumentService>(m_securitySession.get());
-#endif
-
     createActions();
     createMenus();         // 菜单项用默认值创建，action 指针存在 m_act* / m_edgeColGroup
     createToolBar();
@@ -2176,8 +2170,18 @@ void MainWindow::createStatusBar()
 
 // ============ 文件操作 ============
 
+void MainWindow::ensureSecurityServicesCreated()
+{
+    if (m_securitySession && m_secureDocuments)
+        return;
+    SecurityServiceBundle services = createSecurityServiceBundle();
+    m_securitySession = std::move(services.session);
+    m_secureDocuments = std::move(services.documents);
+}
+
 bool MainWindow::ensureSecuritySessionInteractive()
 {
+    ensureSecurityServicesCreated();
 #ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
     QMessageBox::critical(this, QStringLiteral("安全功能不可用"),
                           QStringLiteral("当前构建未包含 KDBX 安全后端。"));
@@ -3036,6 +3040,7 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
     Q_UNUSED(reuseTab)
     return false;
 #else
+    ensureSecurityServicesCreated();
     if (!m_secureDocuments)
         return false;
     const QString absolutePath = QFileInfo(path).absoluteFilePath();
@@ -5497,6 +5502,10 @@ void MainWindow::deferredRestoreSession()
     // 此时 main.cpp 的 w.show() 已调用；但首次 paint 需要事件循环派发。
     // 主动 AllEvents 派发一次，确保窗口立刻可见（用户不会"双击后以为没启动"）。
     QApplication::processEvents(QEventLoop::AllEvents);
+
+    // Security adapters may inspect the local identity/session descriptor, so
+    // their creation is deliberately after the first visible paint.
+    ensureSecurityServicesCreated();
 
     QPointer<EditorTab> preferredActiveTab = currentTab();
     SessionData data = m_session->loadSession();

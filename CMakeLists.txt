@@ -97,17 +97,54 @@ set(APP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src/vault
 )
 
-add_library(notepadsafe_search_runtime STATIC
+add_library(notepadsafe_async_runtime STATIC
+    src/async/AsyncTask.cpp
+    src/async/AsyncThreadPool.cpp
+    src/async/AsyncTaskManager.cpp
+    src/async/AsyncSerialQueue.cpp
+)
+target_include_directories(notepadsafe_async_runtime PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/async
+)
+target_link_libraries(notepadsafe_async_runtime PUBLIC
+    Qt6::Core
+    Qt6::Concurrent
+)
+
+add_library(notepadsafe_file_runtime STATIC
     src/editor/TextEncoding.cpp
+    src/editor/DynamicThresholds.cpp
+    src/editor/LineIndex.cpp
+    src/editor/PatchList.cpp
+    src/editor/FileContentProbe.cpp
+)
+target_include_directories(notepadsafe_file_runtime PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/editor
+    ${CMAKE_SOURCE_DIR}/src/domain
+)
+target_link_libraries(notepadsafe_file_runtime PUBLIC
+    notepadsafe_domain
+    notepadsafe_async_runtime
+    Qt6::Core
+    Qt6::Concurrent
+)
+
+add_library(notepadsafe_search_runtime STATIC
     src/search/EncodedRegexCompiler.cpp
     src/search/Pcre2Regex.cpp
+    src/search/LargeFileSearch.cpp
 )
 target_include_directories(notepadsafe_search_runtime PUBLIC
     ${CMAKE_SOURCE_DIR}/src/search
     ${CMAKE_SOURCE_DIR}/src/editor
+    ${CMAKE_SOURCE_DIR}/src/async
 )
 target_link_libraries(notepadsafe_search_runtime PUBLIC
+    notepadsafe_file_runtime
+    notepadsafe_async_runtime
     Qt6::Core
+    Qt6::Gui
+    Qt6::Concurrent
     notepadsafe_pcre2
 )
 
@@ -131,6 +168,7 @@ add_library(notepadsafe_vault STATIC
     src/vault/VaultService.cpp
     src/vault/KdbxFormatProbe.cpp
     src/vault/VaultBackendFactory.cpp
+    src/vault/SecurityServiceFactory.cpp
 )
 target_include_directories(notepadsafe_vault PUBLIC
     ${CMAKE_SOURCE_DIR}/src/vault
@@ -176,6 +214,14 @@ if(WIN32)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         VERBATIM
     )
+    add_custom_target(verify_architecture
+        COMMAND ${NOTEPADSAFE_POWERSHELL_EXECUTABLE}
+            -NoProfile -ExecutionPolicy Bypass
+            -File ${CMAKE_SOURCE_DIR}/tools/check_architecture.ps1
+            -SourceRoot ${CMAKE_SOURCE_DIR}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        VERBATIM
+    )
     set(NOTEPADSAFE_SBOM "${CMAKE_CURRENT_BINARY_DIR}/notepad-safe.spdx.json")
     add_custom_command(
         OUTPUT "${NOTEPADSAFE_SBOM}"
@@ -200,21 +246,9 @@ endif()
 # the test harness out of this target; everything below is production code.
 set(NOTEPADSAFE_EDITOR_RUNTIME_SOURCES
     src/editor/EditorTab.cpp
-    src/editor/FileContentProbe.cpp
-    src/search/FindReplaceDialog.cpp
-    src/search/SearchResultsDock.cpp
-    src/session/SessionManager.cpp
-    src/editor/DynamicThresholds.cpp
-    src/editor/LineIndex.cpp
-    src/editor/PatchList.cpp
-    src/search/LargeFileSearch.cpp
-    src/search/SearchResultsModel.cpp
     src/editor/VirtualFileView.cpp
     src/editor/WindowedReadOnlyProvider.cpp
-    src/async/AsyncTask.cpp
-    src/async/AsyncThreadPool.cpp
-    src/async/AsyncTaskManager.cpp
-    src/async/AsyncSerialQueue.cpp
+    src/search/SearchResultsModel.cpp
 )
 
 add_library(notepadsafe_editor_runtime STATIC
@@ -226,6 +260,60 @@ target_include_directories(notepadsafe_editor_runtime PUBLIC
 )
 target_link_libraries(notepadsafe_editor_runtime PUBLIC
     notepadsafe_domain
+    notepadsafe_file_runtime
+    notepadsafe_async_runtime
+    notepadsafe_search_runtime
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::PrintSupport
+    Qt6::Svg
+    Qt6::SvgWidgets
+    Qt6::TaskTree
+    ${QSCINTILLA_LIB}
+)
+
+add_library(notepadsafe_session_runtime STATIC
+    src/session/SessionManager.cpp
+)
+target_include_directories(notepadsafe_session_runtime PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/session
+    ${CMAKE_SOURCE_DIR}/src/editor
+)
+target_link_libraries(notepadsafe_session_runtime PUBLIC
+    notepadsafe_domain
+    notepadsafe_editor_runtime
+    Qt6::Core
+    Qt6::Widgets
+)
+
+# ============ 应用 Shell ============
+
+# MainWindow and its platform-facing widgets are production code. Keep them in
+# one target so the formal executable and Shell GUI journeys cannot silently
+# compile different implementations.
+add_library(notepadsafe_app STATIC
+    src/window/MainWindow.cpp
+    src/search/FindReplaceDialog.cpp
+    src/search/SearchResultsDock.cpp
+    src/async/StatusBarTaskWidget.cpp
+    src/async/AsyncTaskPanelDialog.cpp
+    src/vault/VaultDock.cpp
+)
+target_include_directories(notepadsafe_app PUBLIC
+    ${APP_INCLUDE_DIRS}
+    ${QSCINTILLA_INCLUDE_DIR}
+)
+target_compile_definitions(notepadsafe_app PUBLIC
+    NOTEPADSAFE_VERSION="${PROJECT_VERSION}"
+)
+target_link_libraries(notepadsafe_app PUBLIC
+    notepadsafe_editor_runtime
+    notepadsafe_session_runtime
+    notepadsafe_async_runtime
+    notepadsafe_domain
+    notepadsafe_vault
     notepadsafe_search_runtime
     Qt6::Core
     Qt6::Gui
@@ -242,16 +330,12 @@ target_link_libraries(notepadsafe_editor_runtime PUBLIC
 
 add_executable(notepad-safe WIN32
     src/main.cpp
-    src/window/MainWindow.cpp
-    src/async/StatusBarTaskWidget.cpp
-    src/async/AsyncTaskPanelDialog.cpp
-    src/vault/VaultDock.cpp
     ${APP_RC_FILE}
     ${APP_QRC_FILE}
 )
 
 if(WIN32)
-    add_dependencies(notepad-safe generate_sbom verify_async_threading)
+    add_dependencies(notepad-safe generate_sbom verify_async_threading verify_architecture)
 endif()
 
 target_include_directories(notepad-safe PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
@@ -260,6 +344,7 @@ target_compile_definitions(notepad-safe PRIVATE
 )
 
 target_link_libraries(notepad-safe PRIVATE
+    notepadsafe_app
     notepadsafe_editor_runtime
     notepadsafe_domain
     notepadsafe_vault
@@ -409,17 +494,10 @@ endif()
 
 add_executable(test_largefile_encoded_search
     tests/test_largefile_encoded_search.cpp
-    src/search/LargeFileSearch.cpp
-    src/editor/LineIndex.cpp
-    src/editor/PatchList.cpp
-    src/editor/DynamicThresholds.cpp
-    src/async/AsyncTask.cpp
-    src/async/AsyncThreadPool.cpp
-    src/async/AsyncTaskManager.cpp
 )
 target_include_directories(test_largefile_encoded_search PRIVATE ${APP_INCLUDE_DIRS})
 target_link_libraries(test_largefile_encoded_search PRIVATE
-    notepadsafe_search_runtime Qt6::Core Qt6::Gui Qt6::Concurrent)
+    notepadsafe_editor_runtime Qt6::Core Qt6::Gui Qt6::Concurrent)
 if(WIN32)
     target_link_libraries(test_largefile_encoded_search PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
@@ -427,21 +505,11 @@ endif()
 # 测试 3: 会话序列化（需 Qt6::Core + QScintilla，因为 SessionManager.cpp 依赖 EditorTab）
 add_executable(test_session
     tests/test_session.cpp
-    src/session/SessionManager.cpp
-    src/editor/EditorTab.cpp
-    src/editor/DynamicThresholds.cpp
-    src/editor/LineIndex.cpp
-    src/editor/PatchList.cpp
-    src/search/LargeFileSearch.cpp
-    src/search/SearchResultsModel.cpp
-    src/editor/VirtualFileView.cpp
-    src/editor/WindowedReadOnlyProvider.cpp
-    src/async/AsyncTask.cpp
-    src/async/AsyncThreadPool.cpp
-    src/async/AsyncTaskManager.cpp
 )
 target_include_directories(test_session PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(test_session PRIVATE
+    notepadsafe_session_runtime
+    notepadsafe_editor_runtime
     notepadsafe_domain
     notepadsafe_search_runtime
     Qt6::Core
@@ -643,6 +711,16 @@ if(WIN32)
             -File ${CMAKE_SOURCE_DIR}/tools/verify_supply_chain.ps1
     )
     set_tests_properties(supply_chain_lock PROPERTIES LABELS "supply-chain")
+    add_test(NAME architecture_boundary
+        COMMAND ${NOTEPADSAFE_POWERSHELL_EXECUTABLE}
+            -NoProfile -ExecutionPolicy Bypass
+            -File ${CMAKE_SOURCE_DIR}/tools/check_architecture.ps1
+            -SourceRoot ${CMAKE_SOURCE_DIR}
+    )
+    set_tests_properties(architecture_boundary PROPERTIES
+        LABELS "quick;architecture"
+        TIMEOUT 30
+    )
 endif()
 
 # ============ 诊断工具 ============
@@ -651,24 +729,20 @@ if(NOTEPADSAFE_BUILD_DIAGNOSTICS)
 
 add_executable(diag_lineindex
     tests/diag_lineindex.cpp
-    src/async/AsyncThreadPool.cpp
-    src/editor/DynamicThresholds.cpp
-    src/editor/LineIndex.cpp
 )
 target_include_directories(diag_lineindex PRIVATE ${APP_INCLUDE_DIRS})
 target_link_libraries(diag_lineindex PRIVATE
+    notepadsafe_editor_runtime
     Qt6::Core
     Qt6::Concurrent
 )
 
 add_executable(diag_scroll_lines
     tests/diag_scroll_lines.cpp
-    src/async/AsyncThreadPool.cpp
-    src/editor/DynamicThresholds.cpp
-    src/editor/LineIndex.cpp
 )
 target_include_directories(diag_scroll_lines PRIVATE ${APP_INCLUDE_DIRS})
 target_link_libraries(diag_scroll_lines PRIVATE
+    notepadsafe_editor_runtime
     Qt6::Core
     Qt6::Concurrent
 )
@@ -680,7 +754,7 @@ endif()
 #  - 所有 target 走 Qt6 Test（QTEST_MAIN），真实 GUI 事件模拟（QTest::mouseClick 等）
 #  - Editor/Search/Session/Async 链接正式 notepadsafe_editor_runtime；测试不再
 #    重编一套 GUI_SMOKE_SHARED_SOURCES。只有需要 Shell 旅程的目标额外编译
-#    MainWindow.cpp，测试入口仍由 QTEST_MAIN 提供。
+#    notepadsafe_app，测试入口仍由 QTEST_MAIN 提供。
 #  - 构建与执行由 run_all_gui_smoke.bat 统一管理
 # ============================================================================
 add_library(notepadsafe_gui_test_support STATIC
@@ -736,6 +810,7 @@ target_compile_definitions(gui_smoke_large_readonly PRIVATE
 )
 target_include_directories(gui_smoke_large_readonly PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_large_readonly PRIVATE
+    notepadsafe_app
     notepadsafe_gui_test_support
     notepadsafe_editor_runtime
     notepadsafe_domain
@@ -754,6 +829,7 @@ target_link_libraries(gui_smoke_large_readonly PRIVATE
 
 target_include_directories(gui_smoke_findreplace PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_findreplace PRIVATE
+    notepadsafe_app
     notepadsafe_gui_test_support
     notepadsafe_editor_runtime
     notepadsafe_domain
@@ -775,10 +851,6 @@ target_link_libraries(gui_smoke_findreplace PRIVATE
 # 测试目标中单独列出；共享编辑器实现来自正式产品 runtime。
 add_executable(gui_smoke_smallfixes
     tests/gui_smoke/smoke_smallfixes_menu_ui.cpp
-    src/window/MainWindow.cpp
-    src/async/StatusBarTaskWidget.cpp
-    src/async/AsyncTaskPanelDialog.cpp
-    src/vault/VaultDock.cpp
     ${APP_QRC_FILE}
 )
 target_compile_definitions(gui_smoke_smallfixes PRIVATE
@@ -786,6 +858,7 @@ target_compile_definitions(gui_smoke_smallfixes PRIVATE
 )
 target_include_directories(gui_smoke_smallfixes PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(gui_smoke_smallfixes PRIVATE
+    notepadsafe_app
     notepadsafe_gui_test_support
     notepadsafe_editor_runtime
     notepadsafe_domain
@@ -815,17 +888,13 @@ endif()
 # 保险库真实控件 smoke：注入内存后端，驱动解锁、账号/笔记编辑、保存、筛选与锁定。
 add_executable(gui_smoke_vault
     tests/gui_smoke/smoke_vault.cpp
-    src/vault/VaultDock.cpp
-    src/async/AsyncTask.cpp
-    src/async/AsyncThreadPool.cpp
-    src/async/AsyncTaskManager.cpp
-    src/async/AsyncSerialQueue.cpp
 )
 target_compile_definitions(gui_smoke_findreplace PRIVATE
     NOTEPADSAFE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
 target_include_directories(gui_smoke_vault PRIVATE ${APP_INCLUDE_DIRS})
 target_link_libraries(gui_smoke_vault PRIVATE
+    notepadsafe_app
     notepadsafe_vault
     Qt6::Core
     Qt6::Gui
@@ -845,16 +914,13 @@ qt_import_plugins(gui_smoke_vault INCLUDE Qt6::QWindowsIntegrationPlugin)
 if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     add_executable(gui_smoke_secure_documents
         tests/gui_smoke/smoke_secure_documents.cpp
-        src/window/MainWindow.cpp
-        src/async/StatusBarTaskWidget.cpp
-        src/async/AsyncTaskPanelDialog.cpp
-        src/vault/VaultDock.cpp
         ${APP_QRC_FILE}
     )
     target_include_directories(gui_smoke_secure_documents PRIVATE
         ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR}
     )
     target_link_libraries(gui_smoke_secure_documents PRIVATE
+        notepadsafe_app
         notepadsafe_gui_test_support
         notepadsafe_editor_runtime
         notepadsafe_domain
@@ -881,9 +947,9 @@ if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     )
 endif()
 
-# CTest registration and the build gate share one target list.  This avoids a
-# new GUI suite being registered in CMake but silently omitted by the batch
-# runner (or the inverse).
+# The build gate and per-function CTest registration share one target list.
+# A hung GUI case therefore costs only its own bounded timeout instead of a
+# 3600-second monolithic executable timeout.
 set(NOTEPADSAFE_GUI_SMOKE_TARGETS
     gui_smoke_coord
     gui_smoke_findreplace
@@ -894,21 +960,58 @@ set(NOTEPADSAFE_GUI_SMOKE_TARGETS
 if(TARGET gui_smoke_secure_documents)
     list(APPEND NOTEPADSAFE_GUI_SMOKE_TARGETS gui_smoke_secure_documents)
 endif()
-foreach(gui_smoke_target IN LISTS NOTEPADSAFE_GUI_SMOKE_TARGETS)
-    add_test(NAME ${gui_smoke_target} COMMAND ${gui_smoke_target})
-endforeach()
 add_custom_target(notepadsafe_gui_smoke_tests
     DEPENDS ${NOTEPADSAFE_GUI_SMOKE_TARGETS}
 )
-set_tests_properties(${NOTEPADSAFE_GUI_SMOKE_TARGETS} PROPERTIES
-    LABELS "gui;smoke"
-    RUN_SERIAL TRUE
-    # A target is a complete interaction suite, not one test case.  The large
-    # read-only suite alone has several bounded scans whose valid combined
-    # runtime exceeds three minutes; a 180 s target timeout made the formal
-    # gate kill healthy coverage that the old direct runner allowed to finish.
-    TIMEOUT 3600
-)
+
+function(notepadsafe_register_qt_cases target source tier timeout feature)
+    file(STRINGS "${CMAKE_SOURCE_DIR}/${source}" qt_case_lines
+        REGEX "^[ \t]*void[ \t]+[A-Za-z0-9_]+[ \t]*\\(\\)")
+    foreach(qt_case_line IN LISTS qt_case_lines)
+        string(REGEX MATCH "void[ \t]+([A-Za-z0-9_]+)" _ "${qt_case_line}")
+        set(qt_case "${CMAKE_MATCH_1}")
+        if(qt_case STREQUAL "initTestCase"
+           OR qt_case STREQUAL "cleanupTestCase"
+           OR qt_case STREQUAL "init"
+           OR qt_case STREQUAL "cleanup")
+            continue()
+        endif()
+        set(test_name "${target}.${qt_case}")
+        add_test(NAME "${test_name}" COMMAND ${target} ${qt_case})
+        set_tests_properties("${test_name}" PROPERTIES
+            LABELS "gui;${tier};${feature}"
+            RUN_SERIAL TRUE
+            TIMEOUT ${timeout}
+        )
+    endforeach()
+endfunction()
+
+notepadsafe_register_qt_cases(gui_smoke_coord
+    tests/gui_smoke/smoke_coord_editops.cpp adjacent 120 NSP-EDIT)
+notepadsafe_register_qt_cases(gui_smoke_findreplace
+    tests/gui_smoke/smoke_find_replace.cpp adjacent 180 NSP-SEARCH)
+notepadsafe_register_qt_cases(gui_smoke_large_readonly
+    tests/gui_smoke/smoke_large_readonly.cpp adjacent 300 NSP-LARGEFILE)
+notepadsafe_register_qt_cases(gui_smoke_smallfixes
+    tests/gui_smoke/smoke_smallfixes_menu_ui.cpp adjacent 180 NSP-SHELL)
+notepadsafe_register_qt_cases(gui_smoke_vault
+    tests/gui_smoke/smoke_vault.cpp adjacent 180 NSP-ACCOUNTS)
+if(TARGET gui_smoke_secure_documents)
+    notepadsafe_register_qt_cases(gui_smoke_secure_documents
+        tests/gui_smoke/smoke_secure_documents.cpp adjacent 300 NSP-SECURE)
+endif()
+
+# Permanent historical regressions are also registered in the quick gate.
+add_test(NAME quick.search_dock_compact
+    COMMAND gui_smoke_findreplace tc_fr_041_search_dock_rows_remain_compact_across_modes)
+set_tests_properties(quick.search_dock_compact PROPERTIES
+    LABELS "gui;quick;NSP-SEARCH;regression"
+    RUN_SERIAL TRUE TIMEOUT 60)
+add_test(NAME quick.readonly_repeated_copy
+    COMMAND gui_smoke_large_readonly readonlyTextNativeSelectionSupersedesSearchSelectionForEveryCopy)
+set_tests_properties(quick.readonly_repeated_copy PROPERTIES
+    LABELS "gui;quick;NSP-LARGEFILE;regression"
+    RUN_SERIAL TRUE TIMEOUT 60)
 
 # 真实进程 E2E：启动完整 notepad-safe.exe，并通过 Win32 获取窗口/像素。
 # 串行执行，避免两个测试同时抢占前台窗口、DWM 和同机磁盘吞吐导致误判。

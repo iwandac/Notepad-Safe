@@ -25,8 +25,8 @@ class SearchResultsDock;
 class SessionManager;
 class VaultDock;
 class StatusBarTaskWidget;
-class SecuritySessionService;
-class SecureDocumentService;
+class ISecuritySessionService;
+class ISecureDocumentService;
 struct SecureDocumentSnapshot;
 
 class MainWindow : public QMainWindow {
@@ -124,8 +124,8 @@ private:
     SearchResultsDock *m_searchDock = nullptr;
     VaultDock *m_vaultDock = nullptr;
     SessionManager *m_session = nullptr;
-    std::unique_ptr<SecuritySessionService> m_securitySession;
-    std::unique_ptr<SecureDocumentService> m_secureDocuments;
+    std::unique_ptr<ISecuritySessionService> m_securitySession;
+    std::unique_ptr<ISecureDocumentService> m_secureDocuments;
 
     // 状态栏
     QLabel *m_statusPos = nullptr;
@@ -249,6 +249,7 @@ private:
     ExternalSaveDisposition resolveSecureExternalSaveConflict(EditorTab *tab);
     bool reloadTabFromDisk(EditorTab *tab);
     bool reloadSecureTabFromDisk(EditorTab *tab);
+    void ensureSecurityServicesCreated();
     // closingApp=true: 关闭整个应用，未命名文件走 autosave 不提示
     // closingApp=false (默认): 关闭单个标签，未命名文件且有内容也要提示是否保存
     bool maybeSaveTab(int index, bool closingApp = false);

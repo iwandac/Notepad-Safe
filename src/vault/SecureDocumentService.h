@@ -29,7 +29,46 @@ struct SecureDocumentSnapshot {
     bool recoveredUnsaved = false;
 };
 
-class SecureDocumentService final {
+class ISecureDocumentService {
+public:
+    virtual ~ISecureDocumentService() = default;
+
+    virtual bool available() const noexcept = 0;
+    virtual VaultError newDraft(SecureDocumentSnapshot *snapshot) = 0;
+    virtual VaultError open(const QString &filePath,
+                            SecureDocumentSnapshot *snapshot) = 0;
+    virtual VaultError openWithPassphrase(
+        const QString &filePath, const SecureBuffer &passphraseUtf8,
+        SecureDocumentSnapshot *snapshot) = 0;
+    virtual VaultError openWithRecovery(const QString &filePath,
+                                        const QString &recoveryKey,
+                                        SecureDocumentSnapshot *snapshot) = 0;
+    virtual VaultError reload(const QUuid &documentId,
+                              SecureDocumentSnapshot *snapshot) = 0;
+    virtual VaultError save(const QUuid &documentId, const QString &text,
+                            const QString &title, const QString &targetPath = {},
+                            bool explicitRevision = true) = 0;
+    virtual VaultError saveBinary(const QUuid &documentId, const QByteArray &binary,
+                                  const QString &title,
+                                  const QString &targetPath = {},
+                                  bool explicitRevision = true) = 0;
+    virtual VaultError saveAsSecure(const QString &text, const QString &title,
+                                    const QString &targetPath,
+                                    SecureDocumentSnapshot *snapshot) = 0;
+    virtual VaultError saveAsSecureBinary(
+        const QByteArray &binary, const QString &title, const QString &targetPath,
+        SecureDocumentSnapshot *snapshot) = 0;
+    virtual void close(const QUuid &documentId) noexcept = 0;
+    virtual void closeAll() noexcept = 0;
+    virtual QString backingPath(const QUuid &documentId) const = 0;
+    virtual DiskFileState externalFileState(const QUuid &documentId) const = 0;
+    virtual VaultError checkpointText(const QUuid &documentId,
+                                      const QString &text) = 0;
+    virtual VaultError checkpointBinary(const QUuid &documentId,
+                                        const QByteArray &binary) = 0;
+};
+
+class SecureDocumentService final : public ISecureDocumentService {
 public:
     static constexpr qsizetype PayloadMaximumExclusive = 32 * 1024 * 1024;
 
@@ -37,33 +76,37 @@ public:
                                    const QString &dataDirectory = {});
     ~SecureDocumentService();
 
-    VaultError newDraft(SecureDocumentSnapshot *snapshot);
-    VaultError open(const QString &filePath, SecureDocumentSnapshot *snapshot);
+    bool available() const noexcept override { return true; }
+    VaultError newDraft(SecureDocumentSnapshot *snapshot) override;
+    VaultError open(const QString &filePath, SecureDocumentSnapshot *snapshot) override;
     VaultError openWithPassphrase(const QString &filePath,
                                   const SecureBuffer &passphraseUtf8,
-                                  SecureDocumentSnapshot *snapshot);
+                                  SecureDocumentSnapshot *snapshot) override;
     VaultError openWithRecovery(const QString &filePath,
                                 const QString &recoveryKey,
-                                SecureDocumentSnapshot *snapshot);
-    VaultError reload(const QUuid &documentId, SecureDocumentSnapshot *snapshot);
+                                SecureDocumentSnapshot *snapshot) override;
+    VaultError reload(const QUuid &documentId,
+                      SecureDocumentSnapshot *snapshot) override;
     VaultError save(const QUuid &documentId, const QString &text,
                     const QString &title, const QString &targetPath = {},
-                    bool explicitRevision = true);
+                    bool explicitRevision = true) override;
     VaultError saveBinary(const QUuid &documentId, const QByteArray &binary,
                           const QString &title, const QString &targetPath = {},
-                          bool explicitRevision = true);
+                          bool explicitRevision = true) override;
     VaultError saveAsSecure(const QString &text, const QString &title,
                             const QString &targetPath,
-                            SecureDocumentSnapshot *snapshot);
+                            SecureDocumentSnapshot *snapshot) override;
     VaultError saveAsSecureBinary(const QByteArray &binary, const QString &title,
                                   const QString &targetPath,
-                                  SecureDocumentSnapshot *snapshot);
-    void close(const QUuid &documentId) noexcept;
-    void closeAll() noexcept;
-    QString backingPath(const QUuid &documentId) const;
-    DiskFileState externalFileState(const QUuid &documentId) const;
-    VaultError checkpointText(const QUuid &documentId, const QString &text);
-    VaultError checkpointBinary(const QUuid &documentId, const QByteArray &binary);
+                                  SecureDocumentSnapshot *snapshot) override;
+    void close(const QUuid &documentId) noexcept override;
+    void closeAll() noexcept override;
+    QString backingPath(const QUuid &documentId) const override;
+    DiskFileState externalFileState(const QUuid &documentId) const override;
+    VaultError checkpointText(const QUuid &documentId,
+                              const QString &text) override;
+    VaultError checkpointBinary(const QUuid &documentId,
+                                const QByteArray &binary) override;
     bool hasRecoverySnapshot(const QUuid &documentId) const;
     void clearRecoverySnapshot(const QUuid &documentId) noexcept;
 

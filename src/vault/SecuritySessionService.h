@@ -47,7 +47,46 @@ private:
     SecureBuffer recoverySecret_;
 };
 
-class SecuritySessionService final {
+// Application-facing port.  MainWindow and document workflows depend on this
+// capability contract, never on whether the KDBX adapter was compiled.
+class ISecuritySessionService {
+public:
+    virtual ~ISecuritySessionService() = default;
+
+    virtual bool available() const noexcept = 0;
+    virtual bool hasIdentity() const noexcept = 0;
+    virtual bool hasActiveSession() = 0;
+    virtual QString identityId() const = 0;
+    virtual int keyVersion() const noexcept = 0;
+    virtual QDateTime issuedAtUtc() const = 0;
+    virtual QDateTime expiresAtUtc() const = 0;
+    virtual QDateTime recoveryVerifiedAtUtc() const = 0;
+    virtual VaultError createIdentity(const SecureBuffer &passphraseUtf8,
+                                      QString *recoveryKey) = 0;
+    virtual VaultError unlockIdentity(const SecureBuffer &passphraseUtf8) = 0;
+    virtual VaultError changeMasterPassword(
+        const SecureBuffer &currentPassphraseUtf8,
+        const SecureBuffer &newPassphraseUtf8) = 0;
+    virtual VaultError verifyRecoverySecret(const SecureBuffer &recoverySecret) = 0;
+    virtual bool restoreSealedSession() = 0;
+    virtual void endSession(bool removeDeviceSession = true) noexcept = 0;
+    virtual VaultError acquireOperationLease(SecurityOperationLease *lease) = 0;
+    virtual VaultError acquireRememberedMasterKey(
+        const SecurityIdentityParameters &parameters,
+        SecureBuffer *masterUnlockKey) = 0;
+    virtual VaultError acquireRememberedRecoverySecret(
+        const SecurityIdentityParameters &parameters,
+        SecureBuffer *recoverySecret) = 0;
+    virtual VaultError rememberMasterKey(
+        const SecurityIdentityParameters &parameters,
+        const SecureBuffer &masterUnlockKey) = 0;
+    virtual VaultError rememberRecoverySecret(
+        const SecurityIdentityParameters &parameters,
+        const SecureBuffer &recoverySecret) = 0;
+    virtual const SecurityIdentityParameters &parameters() const = 0;
+};
+
+class SecuritySessionService final : public ISecuritySessionService {
 public:
     explicit SecuritySessionService(const QString &dataDirectory = {});
     ~SecuritySessionService();
@@ -55,31 +94,32 @@ public:
     SecuritySessionService(const SecuritySessionService &) = delete;
     SecuritySessionService &operator=(const SecuritySessionService &) = delete;
 
-    bool hasIdentity() const noexcept { return identityLoaded_; }
-    bool hasActiveSession();
-    QString identityId() const { return parameters_.identityId; }
-    int keyVersion() const noexcept { return parameters_.keyVersion; }
-    QDateTime issuedAtUtc() const { return issuedAtUtc_; }
-    QDateTime expiresAtUtc() const { return expiresAtUtc_; }
-    QDateTime recoveryVerifiedAtUtc() const { return recoveryVerifiedAtUtc_; }
+    bool available() const noexcept override { return true; }
+    bool hasIdentity() const noexcept override { return identityLoaded_; }
+    bool hasActiveSession() override;
+    QString identityId() const override { return parameters_.identityId; }
+    int keyVersion() const noexcept override { return parameters_.keyVersion; }
+    QDateTime issuedAtUtc() const override { return issuedAtUtc_; }
+    QDateTime expiresAtUtc() const override { return expiresAtUtc_; }
+    QDateTime recoveryVerifiedAtUtc() const override { return recoveryVerifiedAtUtc_; }
 
     VaultError createIdentity(const SecureBuffer &passphraseUtf8,
-                              QString *recoveryKey);
-    VaultError unlockIdentity(const SecureBuffer &passphraseUtf8);
+                              QString *recoveryKey) override;
+    VaultError unlockIdentity(const SecureBuffer &passphraseUtf8) override;
     // Creates a new keyVersion for future files without rewriting existing
     // KDBX envelopes. The previous master/recovery keys remain in the sealed
     // session ring so old files continue to open silently during this session.
     VaultError changeMasterPassword(const SecureBuffer &currentPassphraseUtf8,
-                                    const SecureBuffer &newPassphraseUtf8);
+                                    const SecureBuffer &newPassphraseUtf8) override;
     // Verifies an independently supplied recovery secret against the active
     // identity and persists only a non-secret verification timestamp.
-    VaultError verifyRecoverySecret(const SecureBuffer &recoverySecret);
-    bool restoreSealedSession();
-    void endSession(bool removeDeviceSession = true) noexcept;
+    VaultError verifyRecoverySecret(const SecureBuffer &recoverySecret) override;
+    bool restoreSealedSession() override;
+    void endSession(bool removeDeviceSession = true) noexcept override;
 
     // Unseals the DPAPI capsule only for the lifetime of the returned lease.
     // The service itself never owns a long-lived plaintext key after the call.
-    VaultError acquireOperationLease(SecurityOperationLease *lease);
+    VaultError acquireOperationLease(SecurityOperationLease *lease) override;
 
     // Open secure documents retain only a DPAPI blob for their random KDBX
     // credential.  These helpers are intentionally session-gated and keep the
@@ -90,15 +130,17 @@ public:
                                         SecureBuffer *credential);
 
     VaultError acquireRememberedMasterKey(
-        const SecurityIdentityParameters &parameters, SecureBuffer *masterUnlockKey);
+        const SecurityIdentityParameters &parameters,
+        SecureBuffer *masterUnlockKey) override;
     VaultError acquireRememberedRecoverySecret(
-        const SecurityIdentityParameters &parameters, SecureBuffer *recoverySecret);
+        const SecurityIdentityParameters &parameters,
+        SecureBuffer *recoverySecret) override;
     VaultError rememberMasterKey(const SecurityIdentityParameters &parameters,
-                                 const SecureBuffer &masterUnlockKey);
+                                 const SecureBuffer &masterUnlockKey) override;
     VaultError rememberRecoverySecret(const SecurityIdentityParameters &parameters,
-                                      const SecureBuffer &recoverySecret);
+                                      const SecureBuffer &recoverySecret) override;
 
-    const SecurityIdentityParameters &parameters() const { return parameters_; }
+    const SecurityIdentityParameters &parameters() const override { return parameters_; }
 
     bool matches(const SecurityIdentityParameters &parameters);
     QString descriptorPath() const;
