@@ -5,6 +5,7 @@
 #include <QByteArray>
 #include <QString>
 
+#include <algorithm>
 #include <cstdio>
 
 static int test_count = 0;
@@ -231,6 +232,70 @@ void test_replacement_character_projection_truth()
           "固定字节网格同样不暴露低价值的 U+FFFD 来源差异");
 }
 
+void test_projection_position_mapper_half_open_contract()
+{
+    TEST("投影位置统一保持半开 source-byte 边界");
+    const QString sample = QStringLiteral("A中😀B");
+    const TextEncoding encodings[] = {
+        TextEncoding::Utf8,
+        TextEncoding::Utf16LE,
+        TextEncoding::Utf16BE,
+    };
+    for (const TextEncoding encoding : encodings) {
+        bool encodedExactly = false;
+        const QByteArray bytes = encodeTextFragment(sample, encoding,
+                                                    &encodedExactly);
+        CHECK(encodedExactly, "测试文本可被目标编码精确表示");
+        const DecodedTextProjection projection = decodeTextProjection(
+            bytes, encoding, false, true);
+        CHECK(!projection.sourceBoundaries.isEmpty()
+                  && projection.sourceBoundaries.size()
+                         == projection.projectedBoundaries.size(),
+              "源边界与投影边界一一对应");
+
+        for (qsizetype i = 0; i < projection.sourceBoundaries.size(); ++i) {
+            const qint32 source = projection.sourceBoundaries.at(i);
+            const qint32 projected = projection.projectedBoundaries.at(i);
+            CHECK(TextProjectionPositionMapper::toProjected(
+                      projection.sourceBoundaries,
+                      projection.projectedBoundaries, source) == projected,
+                  "每个源字符边界可精确映射到投影边界");
+            CHECK(TextProjectionPositionMapper::toSource(
+                      projection.projectedToSource, projected,
+                      TextBoundaryAffinity::Start) == source,
+                  "投影边界的起点 affinity 不向前漂移");
+            CHECK(TextProjectionPositionMapper::toSource(
+                      projection.projectedToSource, projected,
+                      TextBoundaryAffinity::End) == source,
+                  "投影边界的终点 affinity 不多复制一个字符");
+        }
+
+        for (qint32 projected = 1;
+             projected < projection.projectedBoundaries.constLast();
+             ++projected) {
+            const auto upper = std::lower_bound(
+                projection.projectedBoundaries.cbegin(),
+                projection.projectedBoundaries.cend(), projected);
+            if (upper != projection.projectedBoundaries.cend()
+                && *upper == projected) {
+                continue;
+            }
+            const qsizetype upperIndex = qsizetype(
+                upper - projection.projectedBoundaries.cbegin());
+            CHECK(TextProjectionPositionMapper::toSource(
+                      projection.projectedToSource, projected,
+                      TextBoundaryAffinity::Start)
+                      == projection.sourceBoundaries.at(upperIndex - 1),
+                  "字符内部的选择起点向前扩展到完整源字符");
+            CHECK(TextProjectionPositionMapper::toSource(
+                      projection.projectedToSource, projected,
+                      TextBoundaryAffinity::End)
+                      == projection.sourceBoundaries.at(upperIndex),
+                  "字符内部的选择终点向后扩展到完整源字符");
+        }
+    }
+}
+
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
@@ -254,6 +319,7 @@ int main(int argc, char *argv[])
     test_encoding_name();
     test_multibyte_byte_grid_projection();
     test_replacement_character_projection_truth();
+    test_projection_position_mapper_half_open_contract();
 
     fprintf(stderr, "\n=== Result: %d/%d passed ===\n\n", test_passed, test_count);
     return (test_passed == test_count) ? 0 : 1;

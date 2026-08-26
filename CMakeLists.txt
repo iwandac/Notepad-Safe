@@ -132,7 +132,10 @@ target_include_directories(notepadsafe_vault PUBLIC
     ${CMAKE_SOURCE_DIR}/src/vault
     ${CMAKE_SOURCE_DIR}/src/domain
 )
-target_link_libraries(notepadsafe_vault PUBLIC Qt6::Core)
+target_link_libraries(notepadsafe_vault
+    PUBLIC Qt6::Core
+    PRIVATE notepadsafe_domain
+)
 
 if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     include(cmake/KeePassXCCore.cmake)
@@ -791,24 +794,34 @@ if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     )
 endif()
 
-# CTest 注册（可选；日常由 run_all_gui_smoke.bat 直跑更直观）
-add_test(NAME gui_smoke_coord        COMMAND gui_smoke_coord)
-add_test(NAME gui_smoke_findreplace  COMMAND gui_smoke_findreplace)
-add_test(NAME gui_smoke_large_readonly COMMAND gui_smoke_large_readonly)
-add_test(NAME gui_smoke_smallfixes   COMMAND gui_smoke_smallfixes)
-add_test(NAME gui_smoke_vault        COMMAND gui_smoke_vault)
-if(TARGET gui_smoke_secure_documents)
-    add_test(NAME gui_smoke_secure_documents COMMAND gui_smoke_secure_documents)
-    set_tests_properties(gui_smoke_secure_documents PROPERTIES LABELS "gui;security;vault")
-endif()
-set_tests_properties(
-    gui_smoke_coord gui_smoke_findreplace gui_smoke_large_readonly
-    gui_smoke_smallfixes gui_smoke_vault
-    PROPERTIES RUN_SERIAL TRUE TIMEOUT 180
+# CTest registration and the build gate share one target list.  This avoids a
+# new GUI suite being registered in CMake but silently omitted by the batch
+# runner (or the inverse).
+set(NOTEPADSAFE_GUI_SMOKE_TARGETS
+    gui_smoke_coord
+    gui_smoke_findreplace
+    gui_smoke_large_readonly
+    gui_smoke_smallfixes
+    gui_smoke_vault
 )
 if(TARGET gui_smoke_secure_documents)
-    set_tests_properties(gui_smoke_secure_documents PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
+    list(APPEND NOTEPADSAFE_GUI_SMOKE_TARGETS gui_smoke_secure_documents)
 endif()
+foreach(gui_smoke_target IN LISTS NOTEPADSAFE_GUI_SMOKE_TARGETS)
+    add_test(NAME ${gui_smoke_target} COMMAND ${gui_smoke_target})
+endforeach()
+add_custom_target(notepadsafe_gui_smoke_tests
+    DEPENDS ${NOTEPADSAFE_GUI_SMOKE_TARGETS}
+)
+set_tests_properties(${NOTEPADSAFE_GUI_SMOKE_TARGETS} PROPERTIES
+    LABELS "gui;smoke"
+    RUN_SERIAL TRUE
+    # A target is a complete interaction suite, not one test case.  The large
+    # read-only suite alone has several bounded scans whose valid combined
+    # runtime exceeds three minutes; a 180 s target timeout made the formal
+    # gate kill healthy coverage that the old direct runner allowed to finish.
+    TIMEOUT 3600
+)
 
 # 真实进程 E2E：启动完整 notepad-safe.exe，并通过 Win32 获取窗口/像素。
 # 串行执行，避免两个测试同时抢占前台窗口、DWM 和同机磁盘吞吐导致误判。

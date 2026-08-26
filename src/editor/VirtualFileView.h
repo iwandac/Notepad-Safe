@@ -3,7 +3,6 @@
 #include <QtGlobal>
 #include <QAbstractScrollArea>
 #include <QTimer>
-#include <QPainter>
 #include <QColor>
 #include <QFont>
 #include <QFontMetrics>
@@ -348,13 +347,6 @@ private:
         if (off <= 0) return 0;
         return int(qMin<qint64>(off / qint64(m_hexBytesPerRow), hexTotalLines() - 1));
     }
-
-    // 绘制：行号区 + 内容区
-    void drawGutterLine(QPainter& p, int viewY, int lineNo, bool isCurrent, bool hasBookmark);
-    // 绘制一行内容；返回该行占用的显示行数（自动换行时可能>1）
-    int  drawContentLine(QPainter& p, int viewX, int viewY, int lineNo);
-    // 16 进制视图：绘制一行（地址 + 16 hex + 16 ascii）
-    void drawHexLine(QPainter& p, int viewX, int viewY, int lineNo);
 
     // 将字节区间按 m_displayEncoding 解码为 QChar 数组（用于渲染）
     // 返回解码后的字符数；每个字符的源字节宽度写入 charWidths（可选）

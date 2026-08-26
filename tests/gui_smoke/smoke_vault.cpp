@@ -320,6 +320,9 @@ private slots:
         backendView->records.push_back({QUuid::createUuid(), QStringLiteral("Existing"),
                                         QStringLiteral("alice"), QStringLiteral("https://example.test"),
                                         {}, QStringLiteral("old-secret"), QString(), QString()});
+        backendView->records.push_back({QUuid::createUuid(), QStringLiteral("Recovery plan"),
+                                        {}, {}, {VaultSecureNoteTag}, {},
+                                        QStringLiteral("Encrypted note body"), {}});
 
         QMainWindow window;
         window.resize(900, 760);
@@ -335,9 +338,9 @@ private slots:
 
         auto *tree = dock->findChild<QTreeWidget *>(QStringLiteral("vaultEntryTree"));
         auto *newLogin = dock->findChild<QPushButton *>(QStringLiteral("vaultNewLoginButton"));
-        auto *newNote = dock->findChild<QPushButton *>(QStringLiteral("vaultNewNoteButton"));
         auto *save = dock->findChild<QPushButton *>(QStringLiteral("vaultSaveButton"));
         auto *edit = dock->findChild<QPushButton *>(QStringLiteral("vaultEditButton"));
+        auto *history = dock->findChild<QPushButton *>(QStringLiteral("vaultHistoryButton"));
         auto *cancel = dock->findChild<QPushButton *>(QStringLiteral("vaultCancelButton"));
         auto *copyUsername = dock->findChild<QPushButton *>(QStringLiteral("vaultCopyUsernameButton"));
         auto *openUrl = dock->findChild<QPushButton *>(QStringLiteral("vaultOpenUrlButton"));
@@ -357,12 +360,12 @@ private slots:
         auto *revealTimer = dock->findChild<QTimer *>(QStringLiteral("vaultPasswordRevealTimer"));
         auto *notes = dock->findChild<QTextEdit *>(QStringLiteral("vaultNotesEdit"));
         auto *filter = dock->findChild<QLineEdit *>(QStringLiteral("vaultFilterEdit"));
-        QVERIFY(tree && newLogin && newNote && save && edit && cancel && copyUsername
+        QVERIFY(tree && newLogin && save && edit && history && cancel && copyUsername
                 && openUrl && lock && title && username
                 && url && tags && password && totp && totpCode && copyTotp && copyPassword
                 && generatePassword && passwordStrength
                 && showPassword && revealTimer && notes && filter);
-        QVERIFY(newLogin->isEnabled() && newNote->isEnabled() && lock->isEnabled());
+        QVERIFY(newLogin->isEnabled() && lock->isEnabled());
         QCOMPARE(tree->topLevelItemCount(), 3);
 
         QTest::mouseClick(newLogin, Qt::LeftButton);
@@ -394,7 +397,7 @@ private slots:
         notes->setPlainText(QStringLiteral("recovery codes stored offline"));
         QTest::mouseClick(save, Qt::LeftButton);
         QTRY_COMPARE(backendView->saveCount, 1);
-        QCOMPARE(backendView->records.size(), 2);
+        QCOMPARE(backendView->records.size(), 3);
         QCOMPARE(backendView->records.last().password, generatedPassword);
         QCOMPARE(backendView->records.last().totp, QStringLiteral("JBSWY3DPEHPK3PXP"));
         QVERIFY(backendView->records.last().tags.contains(QStringLiteral("production")));
@@ -484,14 +487,20 @@ private slots:
                                           Qt::DirectConnection));
         QVERIFY(QGuiApplication::clipboard()->text().isEmpty());
 
-        QTest::mouseClick(newNote, Qt::LeftButton);
-        title->setText(QStringLiteral("Recovery plan"));
-        notes->setPlainText(QStringLiteral("Encrypted note body"));
-        QTest::mouseClick(save, Qt::LeftButton);
-        QTRY_COMPARE(backendView->saveCount, 2);
+        auto *legacyRoot = rootNamed(tree, QStringLiteral("旧版笔记（迁移）"));
+        QVERIFY(legacyRoot && legacyRoot->childCount() == 1);
+        tree->setCurrentItem(legacyRoot->child(0));
+        QCoreApplication::processEvents();
+        QCOMPARE(title->text(), QStringLiteral("Recovery plan"));
+        QCOMPARE(notes->toPlainText(), QStringLiteral("Encrypted note body"));
+        QVERIFY(title->isReadOnly() && notes->isReadOnly());
+        QVERIFY(!edit->isVisible());
+        QVERIFY(!history->isVisible());
+        QTest::mouseDClick(tree->viewport(), Qt::LeftButton, {},
+                          tree->visualItemRect(legacyRoot->child(0)).center());
+        QCoreApplication::processEvents();
+        QCOMPARE(backendView->saveCount, 1);
         QCOMPARE(backendView->records.size(), 3);
-        QVERIFY(backendView->records.last().tags.contains(VaultSecureNoteTag));
-        QCOMPARE(backendView->records.last().notes, QStringLiteral("Encrypted note body"));
 
         filter->setText(QStringLiteral("Recovery"));
         QCoreApplication::processEvents();
@@ -503,7 +512,7 @@ private slots:
         QVERIFY(password->text().isEmpty());
         QVERIFY(notes->toPlainText().isEmpty());
         QVERIFY(!backendView->unlocked);
-        QVERIFY(!newLogin->isEnabled() && !newNote->isEnabled() && !lock->isEnabled());
+        QVERIFY(!newLogin->isEnabled() && !lock->isEnabled());
     }
 
     void recoverableDeleteRestoreAndPermanentDelete()

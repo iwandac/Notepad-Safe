@@ -56,10 +56,6 @@ public:
                                    const QString &recoveryKey);
     QString preferredManagedStorePath() const;
     bool ensureSecureStoreReadyInteractive();
-    std::unique_ptr<VaultEntryData> readSecureDocument(const QUuid &id,
-                                                       VaultError *error = nullptr) const;
-    VaultError saveSecureDocument(const QUuid &id, const QString &title,
-                                  const QString &plainText);
     bool prepareToClose();
     // Leaving the Accounts workspace seals its KDBX backend without ending
     // the document security session or masking open encrypted documents.
@@ -80,10 +76,8 @@ public slots:
     bool prepareToLock();
     bool lockVaultSilently();
     void createLogin();
-    void createSecureNote();
 
 signals:
-    void secureNoteOpenRequested(const QUuid &id);
     void lockRequested();
     void secureStoreLocked();
     void externalStoreReloadRequested(const QString &filePath);
@@ -204,7 +198,6 @@ private:
     QPushButton *restoreButton_ = nullptr;
     QPushButton *lockButton_ = nullptr;
     QPushButton *newLoginButton_ = nullptr;
-    QPushButton *newNoteButton_ = nullptr;
 
     QUuid currentEntryId_;
     QStringList currentTags_;

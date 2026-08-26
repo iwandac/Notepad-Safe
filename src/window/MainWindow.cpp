@@ -503,8 +503,6 @@ MainWindow::MainWindow(QWidget *parent)
     m_workspaceStack->addWidget(m_accountsPage);
     connect(backToDocuments, &QPushButton::clicked,
             this, &MainWindow::showDocumentWorkspace);
-    connect(m_vaultDock, &VaultDock::secureNoteOpenRequested,
-            this, &MainWindow::openSecureNote);
     connect(m_vaultDock, &VaultDock::lockRequested,
             this, &MainWindow::lockSecureDocuments);
     connect(m_vaultDock, &VaultDock::secureStoreLocked,
@@ -697,20 +695,23 @@ MainWindow::MainWindow(QWidget *parent)
     // 加密笔记直接保存回KDBX，绝不进入明文 session/autosave 目录。
     // 仅在安全身份已经解锁时后台保存；锁定状态下不突然弹出解锁框。
     m_secureAutosaveTimer.setSingleShot(true);
-    m_secureAutosaveTimer.setInterval(1200);
+    m_secureAutosaveTimer.setInterval(5000);
     connect(&m_secureAutosaveTimer, &QTimer::timeout, this, [this]() {
         if (AsyncSerialQueue::security().busy()) {
-            m_secureAutosaveTimer.start();
+            m_secureAutosaveTimer.start(1000);
             return;
         }
         if (!m_secureDocuments || !m_securitySession
             || !m_securitySession->hasActiveSession())
             return;
+        bool retryNeeded = false;
         for (int i = 0; i < m_tabs->count(); ++i) {
             auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
             if (tab && tab->isSecureDocument() && tab->isModified())
-                saveSecureTab(tab, false, false);
+                retryNeeded = !saveSecureTab(tab, false, false) || retryNeeded;
         }
+        if (retryNeeded)
+            m_secureAutosaveTimer.start(30000);
     });
 
     m_securityExpiryTimer.setInterval(60 * 1000);
@@ -721,7 +722,7 @@ MainWindow::MainWindow(QWidget *parent)
             || QDateTime::currentDateTimeUtc() < m_securitySession->expiresAtUtc()) {
             return;
         }
-        lockSecureDocuments();
+        lockSecureDocumentsImpl(true);
     });
     m_securityExpiryTimer.start();
 }
@@ -2207,16 +2208,6 @@ void MainWindow::createStatusBar()
     statusBar()->addPermanentWidget(m_taskWidget);
 }
 
-void MainWindow::createDock()
-{
-    // Dock 在构造函数中已创建
-}
-
-void MainWindow::createFindDialog()
-{
-    // 查找对话框在构造函数中已创建
-}
-
 // ============ 文件操作 ============
 
 bool MainWindow::ensureSecuritySessionInteractive()
@@ -2443,7 +2434,7 @@ EditorTab *MainWindow::addNewTab()
     connect(tab, &EditorTab::modificationChanged, this, [this, tab](bool m) {
         if (m && tab->isSecureDocument() && !tab->isSecureDocumentTransitioning()) {
             tab->setSecureDocumentTitle(secureTitleFrom(tab));
-            m_secureAutosaveTimer.start();
+            m_secureAutosaveTimer.start(5000);
         }
         int idx = m_tabs->indexOf(tab);
         if (idx >= 0) {
@@ -2621,8 +2612,16 @@ bool MainWindow::saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool
         return false;
     }
     if (!m_securitySession->hasActiveSession()) {
-        if (!allowInteractiveUnlock || !ensureSecuritySessionInteractive())
+        if (!allowInteractiveUnlock || !ensureSecuritySessionInteractive()) {
+            QString recoveryError;
+            checkpointSecureTab(tab, &recoveryError);
+            if (!showErrors && !recoveryError.isEmpty()) {
+                statusBar()->showMessage(
+                    QStringLiteral("安全文档未保存，且无法建立加密恢复点：%1")
+                        .arg(recoveryError), 8000);
+            }
             return false;
+        }
     }
 
     const DiskFileState diskState = m_secureDocuments->externalFileState(
@@ -2631,8 +2630,13 @@ bool MainWindow::saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool
         || diskState == DiskFileState::Missing
         || diskState == DiskFileState::Unreadable) {
         if (!allowInteractiveUnlock) {
+            QString recoveryError;
+            checkpointSecureTab(tab, &recoveryError);
             statusBar()->showMessage(
-                QStringLiteral("安全文档已在磁盘上变化，自动保存已暂停。"), 6000);
+                recoveryError.isEmpty()
+                    ? QStringLiteral("安全文档已在磁盘上变化；最新内容已写入本机加密恢复点。")
+                    : QStringLiteral("安全文档已在磁盘上变化，且恢复点写入失败。"),
+                8000);
             return false;
         }
         const ExternalSaveDisposition disposition = resolveSecureExternalSaveConflict(tab);
@@ -2658,9 +2662,9 @@ bool MainWindow::saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool
             showErrors ? AsyncTaskPriority::High : AsyncTaskPriority::Low,
             showErrors ? QStringLiteral("正在安全保存")
                        : QStringLiteral("正在保存加密恢复点"),
-            [this, tab, &body, title, targetPath] {
+            [this, tab, &body, title, targetPath, showErrors] {
                 return m_secureDocuments->saveBinary(
-                    tab->secureDocumentId(), body, title, targetPath);
+                    tab->secureDocumentId(), body, title, targetPath, showErrors);
             }, showErrors);
         scrubByteArray(body);
     } else {
@@ -2670,15 +2674,17 @@ bool MainWindow::saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool
             showErrors ? AsyncTaskPriority::High : AsyncTaskPriority::Low,
             showErrors ? QStringLiteral("正在安全保存")
                        : QStringLiteral("正在保存加密恢复点"),
-            [this, tab, &body, title, targetPath] {
+            [this, tab, &body, title, targetPath, showErrors] {
                 return m_secureDocuments->save(
-                    tab->secureDocumentId(), body, title, targetPath);
+                    tab->secureDocumentId(), body, title, targetPath, showErrors);
             }, showErrors);
         if (!body.isEmpty())
             body.fill(QChar(0));
         body.clear();
     }
     if (error.isError()) {
+        QString recoveryError;
+        const bool recovered = checkpointSecureTab(tab, &recoveryError);
         if (error.diagnosticCode.startsWith(
                 QStringLiteral("secure-document.external-change"))) {
             if (allowInteractiveUnlock) {
@@ -2687,7 +2693,10 @@ bool MainWindow::saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool
                 return disposition == ExternalSaveDisposition::HandledSuccess;
             }
             statusBar()->showMessage(
-                QStringLiteral("安全文档已在磁盘上变化，自动保存已暂停。"), 6000);
+                recovered
+                    ? QStringLiteral("安全文档已在磁盘上变化；最新内容已写入本机加密恢复点。")
+                    : QStringLiteral("安全文档已在磁盘上变化，且恢复点写入失败。"),
+                8000);
             return false;
         }
         if (showErrors) {
@@ -2695,6 +2704,13 @@ bool MainWindow::saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool
                             error.userMessage, QMessageBox::Ok, this);
             box.setDetailedText(error.diagnosticCode);
             box.exec();
+        }
+        if (!showErrors) {
+            statusBar()->showMessage(
+                recovered
+                    ? QStringLiteral("自动保存失败；最新内容已加密恢复，将在稍后重试。")
+                    : QStringLiteral("自动保存及本机加密恢复点均失败，请立即手动保存。"),
+                8000);
         }
         return false;
     }
@@ -2709,48 +2725,50 @@ bool MainWindow::saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool
     return true;
 }
 
-void MainWindow::openSecureNote(const QUuid &id)
+bool MainWindow::checkpointSecureTab(EditorTab *tab, QString *errorMessage)
 {
-    if (id.isNull() || !m_vaultDock)
-        return;
-    EditorTab *maskedTab = nullptr;
-    for (int i = 0; i < m_tabs->count(); ++i) {
-        auto *existing = qobject_cast<EditorTab *>(m_tabs->widget(i));
-        if (existing && existing->isSecureDocument() && existing->secureDocumentId() == id) {
-            if (!existing->isSecureDocumentMasked()) {
-                m_tabs->setCurrentIndex(i);
-                return;
-            }
-            maskedTab = existing;
-            break;
-        }
-    }
-    if (!m_vaultDock->isSecureStoreOpen()
-        && !m_vaultDock->ensureSecureStoreReadyInteractive()) {
-        return;
+    if (errorMessage)
+        errorMessage->clear();
+    if (!tab || !tab->isSecureDocument() || tab->isSecureDocumentMasked()
+        || !m_secureDocuments) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("文档当前不可恢复。");
+        return false;
     }
 
     VaultError error;
-    auto entry = m_vaultDock->readSecureDocument(id, &error);
-    if (!entry || !entry->tags.contains(VaultSecureNoteTag)) {
-        QMessageBox box(QMessageBox::Critical, QStringLiteral("无法打开加密笔记"),
-                        error.userMessage.isEmpty() ? QStringLiteral("加密笔记不存在。")
-                                                    : error.userMessage,
-                        QMessageBox::Ok, this);
-        box.setDetailedText(error.diagnosticCode);
-        box.exec();
-        return;
+    if (tab->isSecureBinaryDocument()) {
+        QByteArray body;
+        QString exportError;
+        if (!tab->exportBinaryPayloadBytes(&body, &exportError)) {
+            if (errorMessage)
+                *errorMessage = exportError;
+            return false;
+        }
+        error = runSerializedSecurityOperation(
+            this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
+            QStringLiteral("正在建立本机加密恢复点"),
+            [this, tab, &body] {
+                return m_secureDocuments->checkpointBinary(
+                    tab->secureDocumentId(), body);
+            }, false);
+        scrubByteArray(body);
+    } else {
+        QString body = tab->editor()->text();
+        error = runSerializedSecurityOperation(
+            this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
+            QStringLiteral("正在建立本机加密恢复点"),
+            [this, tab, &body] {
+                return m_secureDocuments->checkpointText(
+                    tab->secureDocumentId(), body);
+            }, false);
+        if (!body.isEmpty())
+            body.fill(QChar(0));
+        body.clear();
     }
-    QString body = QString::fromUtf8(
-        reinterpret_cast<const char *>(entry->notesUtf8.data()), entry->notesUtf8.size());
-    entry->notesUtf8.clear();
-    auto *tab = maskedTab ? maskedTab : addNewTab();
-    tab->initializeSecureDocument(entry->id, entry->title, body);
-    if (!body.isEmpty())
-        body.fill(QChar(0));
-    body.clear();
-    m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
-    tab->setFocusEditor();
+    if (error.isError() && errorMessage)
+        *errorMessage = error.userMessage;
+    return !error.isError();
 }
 
 void MainWindow::closeSecureDocumentOnSecurityLane(const QUuid &documentId)
@@ -2781,15 +2799,15 @@ void MainWindow::closeAllSecureDocumentsOnSecurityLane()
         false);
 }
 
-void MainWindow::endSecuritySessionOnSecurityLane(bool preserveSealedSession)
+void MainWindow::endSecuritySessionOnSecurityLane(bool removeDeviceSession)
 {
     if (!m_securitySession)
         return;
     (void)runSerializedSecurityOperation(
         this, AsyncTaskType::SecureIdentity, AsyncTaskPriority::Highest,
         QStringLiteral("正在结束安全会话"),
-        [this, preserveSealedSession] {
-            m_securitySession->endSession(preserveSealedSession);
+        [this, removeDeviceSession] {
+            m_securitySession->endSession(removeDeviceSession);
             return VaultError{};
         },
         false);
@@ -2797,7 +2815,14 @@ void MainWindow::endSecuritySessionOnSecurityLane(bool preserveSealedSession)
 
 void MainWindow::lockSecureDocuments()
 {
+    lockSecureDocumentsImpl(false);
+}
+
+void MainWindow::lockSecureDocumentsImpl(bool sessionExpired)
+{
     m_secureAutosaveTimer.stop();
+    bool accountChangesDiscarded = false;
+    bool secureChangesDiscarded = false;
     QVector<EditorTab *> lockingTabs;
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
@@ -2811,17 +2836,35 @@ void MainWindow::lockSecureDocuments()
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
         if (tab && tab->isSecureDocument() && !tab->isSecureDocumentMasked()
             && tab->isModified() && !saveSecureTab(tab, false, false)) {
-            for (EditorTab *lockingTab : lockingTabs)
-                lockingTab->cancelSecureDocumentLocking();
-            statusBar()->showMessage(QStringLiteral("未能保存加密文档，已取消锁定。"), 5000);
-            return;
+            // Confirm that this exact in-memory revision is recoverable. An
+            // older recovery file must never authorize discarding newer text.
+            QString recoveryError;
+            if (!checkpointSecureTab(tab, &recoveryError)) {
+                if (sessionExpired) {
+                    secureChangesDiscarded = true;
+                    continue;
+                }
+                for (EditorTab *lockingTab : lockingTabs)
+                    lockingTab->cancelSecureDocumentLocking();
+                statusBar()->showMessage(
+                    QStringLiteral("保存及本机加密恢复均失败，已取消锁定。"),
+                    8000);
+                return;
+            }
         }
     }
     if (m_vaultDock && !m_vaultDock->prepareToLock()) {
-        for (EditorTab *lockingTab : lockingTabs)
-            lockingTab->cancelSecureDocumentLocking();
-        statusBar()->showMessage(QStringLiteral("账户修改尚未处理，已取消锁定。"), 5000);
-        return;
+        if (sessionExpired) {
+            // Expired credentials must not leave account fields visible. The
+            // silent save has already failed, so conceal and clear the editor.
+            m_vaultDock->discardAndLockForExternalReload();
+            accountChangesDiscarded = true;
+        } else {
+            for (EditorTab *lockingTab : lockingTabs)
+                lockingTab->cancelSecureDocumentLocking();
+            statusBar()->showMessage(QStringLiteral("账户修改尚未处理，已取消锁定。"), 5000);
+            return;
+        }
     }
     // Lock is also a recovery boundary for ordinary documents. The operation is
     // explicit, so establish the latest encrypted S1/S2 recovery point first.
@@ -2831,6 +2874,21 @@ void MainWindow::lockSecureDocuments()
     if (m_vaultDock)
         m_vaultDock->lockVault();
     maskSecureDocuments();
+    if (secureChangesDiscarded || accountChangesDiscarded) {
+        QString warning;
+        if (secureChangesDiscarded && accountChangesDiscarded) {
+            warning = QStringLiteral(
+                "会话到期时安全文档与账户均无法保存；为清除明文，未保存内容已丢弃。");
+        } else if (secureChangesDiscarded) {
+            warning = QStringLiteral(
+                "会话到期时安全文档保存及加密恢复均失败；为清除明文，未保存内容已丢弃。");
+        } else {
+            warning = QStringLiteral(
+                "会话到期时账户保存失败；为清除明文，未保存字段已丢弃。");
+        }
+        statusBar()->showMessage(
+            warning, 10000);
+    }
 }
 
 void MainWindow::purgeSensitiveSearchState()
@@ -2890,19 +2948,24 @@ void MainWindow::protectForSystemLock()
     if (m_systemProtectionActive)
         return;
     m_secureAutosaveTimer.stop();
+    m_systemLockRecoveryFailed = false;
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
         if (tab && tab->isSecureDocument() && !tab->isSecureDocumentMasked()
             && tab->isModified() && !saveSecureTab(tab, false, false)) {
-            // Data integrity wins over clearing an unsaved buffer. Retry on the
-            // next system notification/timer instead of silently losing text.
-            return;
+            QString recoveryError;
+            if (!checkpointSecureTab(tab, &recoveryError))
+                m_systemLockRecoveryFailed = true;
         }
     }
     m_restoreAccountsAfterSystemUnlock = m_workspaceStack && m_accountsPage
                                          && m_workspaceStack->currentWidget() == m_accountsPage;
-    if (m_vaultDock && !m_vaultDock->lockVaultSilently())
-        return;
+    if (m_vaultDock && !m_vaultDock->lockVaultSilently()) {
+        // A system lock is a confidentiality boundary. If the account editor
+        // cannot save, it is still cleared instead of keeping secrets visible.
+        m_vaultDock->discardAndLockForExternalReload();
+        m_systemLockRecoveryFailed = true;
+    }
     saveSessionNow(true);
     purgeSensitiveSearchState();
     closeAllSecureDocumentsOnSecurityLane();
@@ -2927,6 +2990,10 @@ void MainWindow::restoreAfterSystemUnlock()
     m_restoreAccountsAfterSystemUnlock = false;
     if (!restored)
         statusBar()->showMessage(QStringLiteral("安全会话需要重新登录。"), 5000);
+    else if (m_systemLockRecoveryFailed)
+        statusBar()->showMessage(
+            QStringLiteral("锁屏前有安全文档未能保存或建立恢复点，请检查最近编辑。"), 10000);
+    m_systemLockRecoveryFailed = false;
 }
 
 void MainWindow::maskSecureDocuments()
@@ -2975,12 +3042,19 @@ EditorTab *MainWindow::adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
         snapshot.text.clear();
     }
     tab->setAutosavePath(snapshot.backingPath);
+    tab->setModified(snapshot.recoveredUnsaved);
     const int index = m_tabs->indexOf(tab);
     if (index >= 0) {
         m_tabs->setCurrentIndex(index);
         m_tabs->setTabText(index, tab->tabTitle());
     }
     tab->setFocusEditor();
+    if (snapshot.recoveredUnsaved) {
+        statusBar()->showMessage(
+            QStringLiteral("已恢复上次未写入 KDBX 的本机加密内容，请确认后保存。"),
+            10000);
+        m_secureAutosaveTimer.start(5000);
+    }
     return tab;
 #else
     Q_UNUSED(snapshot)
@@ -4868,7 +4942,7 @@ bool MainWindow::maybeSaveTab(int index, bool closingApp)
     if (tab->isSecureDocument()) {
         if (!tab->isModified())
             return true;
-        return saveSecureTab(tab, true, false);
+        return saveSecureTab(tab, true, true);
     }
 
     // 无论何种情况，内容未修改都直接放行

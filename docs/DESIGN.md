@@ -1,9 +1,11 @@
 # Notepad Safe 架构设计
 
 > 状态：已决策，作为后续开发的唯一架构基线
-> 版本：3.2
-> 更新日期：2026-08-18
+> 版本：3.3
+> 更新日期：2026-08-26
 > 产品许可证：GPLv3
+
+> **实现状态声明：** 本文中的“目标”“必须”“新增接口”描述待实现架构，不等于当前代码已经具备。当前事实与本轮交付边界见 3.8、15、18 和 `ARCHITECTURE_CONVERGENCE.md`；只有代码、正式构建、合同测试和真实 GUI/性能证据同时存在的条目才能标记“已实现”。部分 facade、头文件或测试 double 不得作为完整架构已经落地的证据。
 
 本文替代旧版“L1/L2 + mmap + Patch 编辑”方案，以及“记事本 + 保险箱 Dock + `.nsk` 旁车文件”方案。旧代码仍可用于回归和迁移，但不再代表目标产品或架构。
 
@@ -13,17 +15,29 @@
 > 生产路由禁用/移除。本文后文或历史时间线中出现的“S2 晋升、准备编辑、Editable、
 > ReadOnlyFallback”均是已否决的历史方案，不得作为当前能力、实现任务或验收依据。
 
-用户可见目标、跨入口体验不变量、功能总账和真实 GUI 动态验收方法见 `docs/TARGET_EXPERIENCE.md`；外部产品和上游组件的采用/拒绝边界见 `docs/REFERENCE_BASELINE.md`；最终目标、迭代轮次和停止条件见 `docs/ITERATION_ROADMAP.md`。本文负责架构与安全边界，后续阶段只有同时满足全部基线才能标记完成。
+用户可见目标、跨入口体验不变量、功能总账和真实 GUI 动态验收方法见 `docs/TARGET_EXPERIENCE.md`；外部产品和上游组件的采用/拒绝边界见 `docs/REFERENCE_BASELINE.md`；最终目标、迭代轮次和停止条件见 `docs/ITERATION_ROADMAP.md`；当前架构重构的迁移顺序和防回退退出合同见 `docs/ARCHITECTURE_CONVERGENCE.md`。本文负责架构与安全边界，后续阶段只有同时满足全部基线才能标记完成。
 
 ## 1. 产品目标与边界
 
-Notepad Safe 是 Windows 优先、离线优先的 Qt 桌面产品，提供三组核心体验：
+Notepad Safe 是 Windows 优先、离线优先的 Qt 桌面产品，提供四组核心体验：
 
 1. 接近 Notepad++ 的多标签文本编辑、编码、搜索、替换和会话体验，并能打开任意格式文件。
 2. 默认加密、使用时无感的安全文档；明文是用户可选的对等保存格式，而不是另一套工作区。
 3. 现代化的本地账号密码管理；账号工作区与文档编辑器共享同一安全身份、密钥解析和保存基础设施。
+4. 面向后续文本处理、AI 辅助和脚本可视化解读的统一文档工具能力；工具作用于用户明确选择的文档快照，不建立另一套编辑器或按 Plain/Secure 分叉。
 
-产品哲学固定为：**文件离线时抗复制和抗口令暴力破解，可信 Windows 用户使用时像普通记事本一样无感。**“加密”是内部持久化策略，不是用户需要反复操作的功能。
+产品哲学固定为：**文件离线时抗复制和抗口令暴力破解，可信 Windows 用户解锁使用时像普通记事本一样无感。**“加密”首先是文件静态持久化策略，不是把普通文档正文变成账号保险库秘密，也不是用户需要反复操作的功能。只有账号密码、TOTP seed、恢复材料和密钥属于需要单独隔离、按需短时暴露的运行时秘密。
+
+### 1.1 数据分级与未来扩展事实
+
+| 数据类别 | 离线/持久化目标 | 解锁后的运行态 | 文本工具、AI 与可视化边界 |
+|---|---|---|---|
+| 普通文档 | 按用户选择保持明文格式 | 普通编辑工作数据 | 可由用户选择范围后处理 |
+| Notepad Safe 加密文档 | 文件和恢复点必须保持加密、可离线恢复 | 与普通文档共用 EditorProvider、搜索、撤销和文档工具；正文可在标签和有界任务快照生命周期内存在 | 与普通文档使用同一工具接口；不得因 PersistenceKind 另建弱功能路径 |
+| 账号标题、用户名、URL、备注 | 保存在账号 KDBX | 只通过账号工作区的结构化模型访问 | 不自动进入通用文档工具；未来能力必须逐字段授权 |
+| 账号密码、TOTP seed、恢复材料和密钥 | 必须加密 | 独立服务、最小副本、短生命周期 lease | 默认禁止进入通用 AI、脚本、搜索结果导出和插件接口 |
+
+“离线优先”不等于禁止未来 AI Provider。无网络时核心编辑、打开、保存、搜索和离线恢复必须完整可用；本地模型可以在用户选择的范围内工作。任何远程模型或服务若未来进入产品，必须由用户对本次数据范围显式授权、清楚显示将离开本机的数据，并且不得接收账号秘密。是否使用本地或远程实现是 Provider 策略，不得渗入 EditorTab、文档格式或菜单的平行分支。
 
 所有本地文件必须能进入应用，统一入口为“打开文件”：
 
@@ -46,7 +60,7 @@ Notepad Safe 是 Windows 优先、离线优先的 Qt 桌面产品，提供三组
 
 边界统一使用二进制单位：32 MiB = 32 × 1024² 字节，2 GiB = 2 × 1024³ 字节。S2/S3 仍保留不同名称以记录尺寸和性能测试范围，但不表示编辑能力不同。
 
-### 1.1 当前阶段不做
+### 1.2 当前阶段不做
 
 - 不从零开发文本编辑内核。
 - 不再扩展 mmap + PatchList 为通用编辑器。
@@ -83,6 +97,13 @@ Notepad Safe 是 Windows 优先、离线优先的 Qt 桌面产品，提供三组
 | ADR-020 | 十六进制控件、字节存储 Provider 与搜索引擎分层 | 可替换成熟 Hex UI，但 B2/B3 仍复用 mmap 窗口、64 位坐标和异步搜索；禁止让控件自带同步搜索或全量缓冲接管大文件路径 |
 | ADR-021（否决） | 不引入 Boost.Regex + ICU 单 matcher | 它显著扩大依赖和运行时，却仍需复杂的原始编码 iterator/映射，不符合维护性目标 |
 | ADR-022 | PCRE2 是唯一正则执行引擎；非 UTF 原始正文只翻译受控日志正则子集 | UTF-8 走 PCRE2 UTF/UCP；UTF-16/传统代码页走编码边界感知的 PCRE2 byte pattern，不全文转码、不建 offset map、不引入第二 matcher；完整合同见 §9.3 与 `REGEX_ENGINE_EXPLORATION.md` |
+| ADR-023 | 文档静态加密与账号运行时秘密隔离是两种不同安全策略 | 加密文档解锁后必须保持普通编辑器和工具能力；账号密码、TOTP seed、恢复材料和密钥才使用独立 lease、受控剪贴板和最小暴露 |
+| ADR-024 | AI、文本处理和脚本可视化共用 `DocumentSnapshot → DocumentTool → AnalysisArtifact` 扩展合同 | 新工具不直接依赖 MainWindow、EditorTab 或具体持久化格式；结果绑定 DocumentId/revision/typed range，过期即失效，账号秘密默认不可进入 |
+| ADR-025 | 产品采用模块化单体、Ports/Adapters 和唯一组合根 | 保持单进程、离线和部署简单，同时用 CMake target 与构造注入形成真实依赖边界；不引入微服务、Service Locator 或 DI 容器 |
+| ADR-026 | 内建文档 Provider 和 DocumentTool 使用静态注册表，不建立进程内第三方插件平台 | 新能力可注册扩展但仍进入固定供应链；同进程动态插件能访问全部解锁正文和账号进程内存，不符合当前产品边界 |
+| ADR-027 | 正式程序和测试链接同一产品组件，合同测试按具体用例注册 | 禁止测试重新列举一套产品源码或用大型测试程序统一超时；防止编译配置漂移、假通过和不可接受的反馈时间 |
+| ADR-028 | 当前功能不回退是架构重构的独立 P0 门槛 | 每个现有 FeatureId 必须保持相同或更好的行为、数据结果、兼容性、体验和性能；任何删除或降级都需用户明确批准 |
+| ADR-029 | 启动采用最小 Shell 和首帧后/首次使用延迟加载 | 启动关键路径不得随文档 Provider、DocumentTool、AI 模型或账号能力数量线性增长；重型实现只由工厂在真实使用时创建 |
 
 ## 3. 总体分层
 
@@ -91,6 +112,7 @@ flowchart TB
     UI["Qt Widgets 表现层"] --> APP["应用服务层"]
     APP --> DOC["DocumentService"]
     APP --> SEARCH["SearchController / SearchCoordinator"]
+    APP --> TOOLS["DocumentToolController / Registry"]
     APP --> SECURE["SecureDocumentService"]
     APP --> ACCOUNT["AccountService"]
     APP --> SESSION["SecuritySessionService"]
@@ -109,6 +131,10 @@ flowchart TB
     ENGINE --> DIALECT["Product PCRE2 query contract"]
     DIALECT --> REGEX["One PCRE2 executor"]
     REGEX --> SOURCES["Native UTF-8 / generated encoded-byte pattern"]
+
+    TOOLS --> DOC
+    TOOLS --> TOOLSNAP["DocumentSnapshot / AnalysisArtifact"]
+    TOOLS --> INFER["IInferenceProvider"]
 
     SECURE --> KEY["KeyResolver / KeySlotCodec"]
     ACCOUNT --> ADAPTER["KeePassXcStorageAdapter"]
@@ -130,11 +156,137 @@ flowchart TB
 | notepadsafe_domain | 无 UI 的文档、探测、保存策略、搜索和安全领域类型 |
 | notepadsafe_editor | ScintillaGateway、文本编辑、十六进制编辑、窗口化只读视图 |
 | notepadsafe_search | SearchScope/Target/Cursor、Text/Byte/Account 快照、编码感知 RegexEngine、分页结果存储和原始字节导航契约 |
+| notepadsafe_tools | DocumentSnapshot、文本/AI/脚本分析工具合同、取消/进度、AnalysisArtifact 和 revision 失效；不含具体模型运行时 |
 | notepadsafe_secure | SecureDocumentService、KeyResolver、KeySlotCodec、KeePassXC 适配器 |
 | notepadsafe_accounts | AccountService、账号领域类型、安全剪贴板、TOTP |
 | notepadsafe_session | SecuritySessionService、DraftStore、WorkspaceSession |
 | notepadsafe_platform | mmap、原子替换、文件身份、DPAPI、Windows 会话事件和进程加固 |
 | notepadsafe_app | Qt Widgets、命令、菜单、中央工作区和组合根 |
+
+### 3.2 模块化单体、组合根与依赖注入
+
+Notepad Safe 保持一个本地桌面进程和一个正式产品安装单元。这里的“模块”是编译与职责边界，不是微服务、IPC 拆分或为了抽象而拆出的细粒度库。依赖方向由 CMake target 的 `PUBLIC/PRIVATE` include 和 link 关系执行；仅在文档里约定目录名称不算完成。
+
+`AppComposition` 是唯一组合根，也是唯一允许选择具体 adapter、创建应用服务、controller 和 registry 的位置。正式 `main.cpp` 只建立平台生命周期并调用组合根；MainWindow、EditorTab、Dock 和后台任务不得自行查找或构造文件、搜索、KDBX、账号、模型和平台服务。
+
+依赖注入采用普通构造函数参数：
+
+- QObject 视图和纯 UI controller 使用 Qt parent ownership；非 QObject 服务由组合根以 `std::unique_ptr` 管理，禁止同一对象同时由 parent 和智能指针拥有。
+- 只有存在替代实现或外部副作用的边界建立 port，例如文件系统、剪贴板、时钟、Scintilla、mmap、KDBX/DPAPI 和推理 Provider；领域内稳定算法保持具体类型。
+- 禁止 Service Locator、全局可变单例、运行时字符串查找服务、MainWindow 反向传递和为每个类机械制造接口。
+- KDBX=ON 的正式产品注入真实 Secure/Accounts adapter；KDBX=OFF 注入 capability unavailable adapter。OFF 只是验证基础编辑器、搜索和文档工具不依赖 KDBX 具体类型的架构编译门禁，不是发布的无加密产品，也不替代 ON 的安全与 GUI 验收。
+
+### 3.3 静态扩展注册表与插件边界
+
+`DocumentProviderRegistry` 在组合根静态注册 Text、Hex、Windowed ReadOnly 和未来内容/呈现 Provider。每个 descriptor 声明 ContentKind、SizeTier、Capabilities、SearchSnapshot、PositionMapper 和有界 snapshot reader；新增 Provider 不能在 MainWindow、FindReplaceDialog 或 SearchResultsDock 增加模式特判。
+
+`PersistenceAdapterRegistry` 独立注册 PlainFile、SecureKdbx、SecureDraft 和后续持久化 adapter，负责 probe/load/save/conflict/recovery。OpenDispatcher/DocumentService 把 PersistenceKind 与内容 Provider 正交组合；Secure 绝不是一种 EditorProvider，KDBX=OFF 只让对应 persistence capability unavailable，不能改变 Text/Hex/Tool 语义。
+
+`DocumentToolRegistry` 静态注册格式化、转换、摘要、AI 辅助和脚本可视化工具。每个 descriptor 声明输入 ContentKind、只读或修改型、选区/全文范围、是否允许远程 Provider、结果类型和资源预算。菜单、命令面板和上下文入口只根据 registry 与当前 DocumentCapabilities 生成，不分别维护工具清单。
+
+当前不采用 Qt 动态插件、任意 DLL 扫描或第三方进程内插件市场。静态注册仍提供插件式扩展点，但所有实现进入固定构建、许可证、hash、测试和发布门禁。未来若确有第三方扩展需求，必须作为独立架构决策采用进程外隔离、版本化协议和最小数据授权；账号秘密永不默认提供给扩展。
+
+### 3.4 文档工具合同
+
+```mermaid
+flowchart LR
+    D["DocumentState\nidentity/revision/kind/capabilities"] --> S["DocumentSnapshot\nimmutable range/content/encoding/typed positions"]
+    S --> T["DocumentTool\ndescriptor/run/cancel/progress"]
+    T --> A["AnalysisArtifact\nsource revision/annotations/text/graph/chart"]
+    T --> E["EditProposal\nbase revision/typed edits"]
+    E --> C["DocumentCommand\npreflight/one undo transaction"]
+```
+
+| 合同 | 必须包含 | 禁止包含 |
+|---|---|---|
+| `DocumentState` | DocumentId、revision、ContentKind、PersistenceKind、Presentation、Capabilities | QWidget、Scintilla pointer、KDBX Database |
+| `DocumentSnapshot` | SnapshotId、用户批准的全文或选区、编码、typed source range、revision、取消/字节/时间预算，以及不可变的有界或流式 reader | EditorTab 指针、可变正文、未授权其他标签、默认完整复制大文件 |
+| `DocumentTool` | 稳定 ToolId、输入/输出 capability、运行/取消/进度、数据暴露策略 | 自行读取最近文件、账号库、剪贴板或扩大范围 |
+| `AnalysisArtifact` | 来源 DocumentId/revision、typed annotations、文本或图形/图表 payload、stale 状态 | 隐式写回正文、脱离来源 revision 的位置 |
+| `EditProposal` | 基线 revision、有序 typed edits、预览说明 | 直接调用 Scintilla、绕过 undo/dirty/save policy |
+
+文档变化、关闭、锁定或任务取消后，旧 snapshot 和 artifact 必须失效；修改型工具只能把 proposal 交给统一 DocumentCommand，在 revision 预检通过后形成一个 undo transaction，S2/S3/B2/B3 等只读 capability 在 proposal 生成前即拒绝修改型工具。Plain 与已解锁 Secure 对同一工具暴露相同文档能力，差异只在 snapshot 是否允许落盘缓存及最终 SaveRouter；Accounts workspace 不实现通用 DocumentTool target，账号秘密只能通过明确的账号专用能力逐字段授权。
+
+Snapshot 的“不可变”表示身份、revision、范围和 reader 视图冻结，不表示必须复制整个文档。S1 可以使用共享只读 buffer；窗口化/大文件 Provider 使用冻结文件身份和 revision 的分块 reader。全文 AI/分析必须显式声明预算并流式/分块消费，超过工具或 Provider 上限时要求缩小范围或采用可解释的分段策略，禁止静默全量转成 QString/QByteArray。
+
+### 3.5 AI、模型与脚本可视化适配
+
+`IInferenceProvider` 是 `notepadsafe_tools` 使用的窄 port，只负责模型能力发现、调用、流式输出、取消、进度和错误归一化；它不能读取标签、文件路径、账号数据库或剪贴板。内嵌本地运行时、独立本地服务和未来远程服务都实现同一接口，因此选择 Provider 不改变文档格式、EditorTab 或菜单路径。
+
+- 提示词和上下文只能由 DocumentTool 从本次获批 DocumentSnapshot 构造；Provider 不得自行扩大到全文、其他标签、搜索历史或最近文件。
+- 无网络时核心编辑、搜索、保存、恢复和本地可用工具保持完整。远程 Provider 必须逐次显示即将离开本机的数据范围并取得用户动作授权；账号密码、TOTP seed、恢复材料和密钥始终拒绝。
+- 加密文档的临时 AI/分析结果默认只在内存；用户明确保存结果时走 DocumentCommand/SaveRouter。这是防止离线明文旁路，不是把正文提升为账号秘密。
+- 脚本可视化默认静态解析文本并产生 graph/chart/annotation artifact，不执行被分析脚本。脚本执行若未来立项，必须使用独立进程、权限和资源限制，不能隐藏在可视化工具中。
+- 模型权重、分词器、运行时和模板使用独立版本化 manifest，记录来源、许可证、hash、格式、量化、硬件要求和兼容协议；核心安装、启动和离线编辑不得依赖即时下载模型。
+- 后台任务使用可注册的稳定 kind id 和通用阶段/取消合同；禁止每新增一个 AI 或分析工具就扩展封闭 `AsyncTaskType` 枚举并修改多个 UI switch。
+
+### 3.6 架构适配性门禁
+
+以下门禁是架构的一部分，不是可选测试便利：
+
+1. 正式程序和全部测试链接同一组产品 targets；测试不得重复列举产品 `.cpp` 或维护测试专用应用组合。
+2. KDBX=ON 构建验证正式产品；KDBX=OFF 构建验证 editor/search/tools 不包含具体 KDBX 类型或条件宏。OFF 不证明加密行为，ON 不能替代解耦检查。
+3. lower target 的头文件或 link graph 出现 QWidget/MainWindow/EditorTab、KeePassXC 或 Windows 实现类型时编译或架构检查失败。
+4. 测试中新增一个 DocumentProvider、一个只读 DocumentTool 和一个修改型 DocumentTool 时，不得修改 MainWindow、EditorTab、SearchResultsDock 或具体持久化服务；否则扩展点判定失败。
+5. 每个 Provider 通过同一 contract suite；每个 DocumentTool 通过范围、取消、revision stale、数据暴露和 edit proposal contract。
+6. 当前功能不回退是 P0：重构前功能总账中的每个 FeatureId 必须在正式程序中保持相同或更好的行为、文件结果、兼容性、恢复、交互和性能，未经用户批准不得删除或降级。
+
+### 3.7 最小启动与延迟加载
+
+启动的完成真值是**可见且可响应的空 Shell 首帧**，不是会话、账号、模型或后台维护全部完成。启动关键路径固定为：
+
+```mermaid
+flowchart LR
+    P["process entry"] --> M["读取最小外观/窗口设置"]
+    M --> C["创建轻量 AppComposition descriptor/factory"]
+    C --> W["创建 MainWindow Shell 与核心 Command descriptor"]
+    W --> F["show + 首帧可交互"]
+    F --> R["分批恢复 session manifest/当前标签"]
+    F --> L["低优先级维护与非关键元数据"]
+    F --> U["首次使用时创建 KDBX/Accounts/AI/Tool/Provider 实现"]
+```
+
+首帧前只允许：进程/Qt 平台初始化、单实例与命令行最小解析、轻量外观/窗口几何读取、空工作区、核心菜单 descriptor 和错误日志入口。以下工作禁止进入首帧前同步路径：
+
+- KDBX 数据库打开、Argon2/KDF、DPAPI 会话解封、账号工作区构建和安全文档恢复；
+- 文档 FileProbe/正文读取、最近文件有效性扫描、标签恢复、Draft 清理、搜索索引和目录枚举；
+- AI 模型权重/分词器加载、GPU 探测、模型服务启动或连接、远程请求、工具实例创建；
+- 供应链全树校验、缓存清理、升级检查、插件/DLL 扫描和任何与扩展数量成比例的重型初始化；
+- 全局静态构造函数中的磁盘、网络、密码学、线程池或模型工作。
+
+`AppComposition` 在启动时只建立轻量 descriptor、factory 和必要 controller。Provider/Tool/Secure/Accounts/Inference 的具体实现由显式 lazy factory 在首次命令、首次打开相应文件或首个任务时创建；这不是 Service Locator，factory 仍由组合根构造并通过窄接口注入。工具菜单和命令面板可以读取轻量 descriptor，具体 Tool 不得为了显示菜单而实例化。
+
+首帧后调度由 `StartupCoordinator` 监听 MainWindow 的首次实际 Paint 完成信号，再以 queued batch 启动；不以固定 30 ms 定时器、构造函数 zero-timer 或长期手工 `processEvents()` 作为最终架构。当前 `main.cpp` 的 show/sync/双 `processEvents` 是已验证避免白窗的兼容桥，只有新的外部可见窗口+首次输入 E2E 先通过后才能删除，不能为了代码整洁回退到恢复任务抢在 Paint 前执行。
+
+首帧后的工作也不能一次性堵塞事件循环：恢复先处理当前可见标签，再按 manifest 分批；每个 UI 批次目标小于 8 ms、不得超过 16 ms，I/O/KDF/模型初始化进入受控 worker。后台任务以低优先级运行并在用户输入、打开、保存和搜索前让步。失败只影响对应延迟能力，不能延迟或关闭已经可用的 Shell。
+
+扩展稳定性由两个不变量保证：
+
+1. 首帧前 Provider/Tool/Inference/Accounts 重型 factory 调用次数为零；测试用 counting factory 直接断言。
+2. 注册 100 个不使用的测试 DocumentTool 和 20 个测试 DocumentProvider 后，`QApplication` 构造完成到 first paint 的内部 P95 增量不得超过 5% 或 25 ms 中较大者，且这些实现实例化次数仍为零。外部冷启动继续使用相对基线门禁，避免 Windows 映像装载/DWM 噪声掩盖真实依赖成本；新增扩展不能通过延长统一启动超时绕过该门禁。
+
+启动计时使用正式 Release、固定基准机和相同用户数据 fixture，记录 process entry、MainWindow constructed、show requested、first paint、first input accepted 和 session restore started/completed。普通自动化只把每次新建进程称为“外部进程启动”，不能假称清除了 Windows 文件缓存；首轮/重复轮次分别报告，真正“冷缓存”数字只有在记录受控重启/缓存协议时才允许使用。诊断只记录阶段、耗时和计数，不记录路径、正文、查询或账号数据。
+
+### 3.8 当前实现可行性与状态（2026-08-26 审计）
+
+状态词固定为：`已有基础` 表示存在可复用实现；`部分实现` 表示只覆盖局部路径；`未实现` 表示只有设计或测试替身；`已验证` 还必须给出本轮正式证据。任何一行的局部完成不得上推为整行或整体架构完成。
+
+| 设计项 | 当前代码事实 | 可实施路径 | 本轮可声称完成的证据 |
+|---|---|---|---|
+| 模块化产品 targets | `notepadsafe_domain/search_runtime/vault` 已有基础；正式 exe 和 GUI 测试仍直接列举大量 `.cpp` | 先把共享 value type 移到 domain，拆开 editor↔search、session→editor 循环，再机械迁移 targets | 正式程序/测试同 target；无重复产品源码清单；link/include 图无禁止边 |
+| `AppComposition` 与手工 DI | 未实现；MainWindow 构造 VaultDock、Session、Security 服务，AsyncTaskManager/ThreadPool 仍为可变 singleton | facade 保持调用面，逐个把外部服务和任务调度改为构造注入；不可一次删除全部旧 API | 组合根是具体实现唯一创建点；MainWindow/EditorTab 无供应商构造和 mutable service singleton 访问 |
+| DocumentState/Capabilities/typed position | revision、部分 capability 和 TextProjectionPositionMapper 已有基础；状态仍散落 EditorTab/Provider | 先引入纯 value state 和唯一 selection/position owner，旧 EditorTab API 只转发 | Plain/Secure/Text/Hex/只读 capability contract 与连续状态迁移通过 |
+| Search 分层 | 搜索运行时可复用；FindReplaceDialog/SearchResultsDock 仍直接依赖 EditorTab，Dock 仍拥有 target/revision/navigation | 把 SearchSession/ResultStore/NavigationController 移出 Widget，Dock 保留 view/delegate | search target 无 QWidget；Dock 无 target watch/navigation；现有搜索旅程零回退 |
+| 静态 Provider/Persistence registry | 未实现，但现有打开、Provider 和 Save 分支可逐项包装为 descriptor/factory | 内容 Provider 与 Plain/Secure/Draft persistence adapter 正交注册；先覆盖现有 Text/Hex/Windowed，不引入新格式 | 新测试 Provider/adapter 不修改 MainWindow/EditorTab/Search UI；Secure 不形成第二套 EditorProvider |
+| DocumentTool/AnalysisArtifact | 未实现；当前没有通用文档工具 API | 本轮只实现合同、registry、Echo/StaticGraph 测试工具和修改提案，不接真实模型 | Plain/Secure 等价、Accounts denied、取消/stale/undo 合同通过；不得宣称已有 AI 功能 |
+| `IInferenceProvider`、本地/远程 AI、模型 manifest | 未实现，当前仓库无模型运行时或推理 Provider | 只冻结 port 与数据暴露/manifest schema；真实 Provider 必须另立功能批次和供应链准入 | 本轮最多声称“扩展合同可接入”，不得声称本地/远程 AI 可用或性能已验证 |
+| 账号秘密隔离 | SecretLease、受控剪贴板和 AccountService 有部分基础；MainWindow/EditorTab 仍混有 Secure/Accounts 条件逻辑 | 账户结构化服务保持独立，普通加密文档回归 Document 路径，工具策略默认拒绝 secret | Accounts contract、KDBX ON 正式 GUI、Plain/Secure 文档工具等价共同通过 |
+| KDBX OFF 架构门禁 | CMake 选项存在，但当前 OFF 不是绿色基线，具体安全类型仍泄漏到 MainWindow 生命周期 | 以窄 port/unavailable adapter 代替具体类型和 UI 宏分支 | ON/OFF 都编译；OFF 不发布、不宣称验证加密；ON 完整安全旅程通过 |
+| 最小启动 | main.cpp 已先 show/processEvents 并延迟 session；但 MainWindow 首帧前仍创建 Accounts/Security 页面、VaultDock、Find dialog、Security 服务和计时器 | 保留已验证首帧顺序，把页面/服务改为 descriptor+lazy factory，并新增 first paint/input instrumentation | 外部 <1500 ms 与相对基线、内部 <500 ms、factory 零调用、扩展规模和渐进恢复全部通过 |
+| 同组件和分级测试 | QtTest/CTest、部分单元/GUI 哨兵已有基础；GUI 仍重复编译产品源码并按大型 exe 注册 | 先建立产品 libraries，再逐函数 CTest 注册 quick/adjacent/release | 两次历史回归证明会失败；默认 quick 可持续运行；无统一 3600 秒；正式 exe 旅程通过 |
+| 当前功能不回退 | 功能总账和大量历史测试存在，但两次用户发现的回归证明其尚未形成充分保护 | 冻结 FeatureId 基线，先失败测试，再 facade/differential/正式 GUI 迁移，最后删除旧路径 | 每个 FeatureId 有前后结果；任何未批准退化即整轮失败；不能承诺未来数学意义上的零缺陷 |
+
+因此，本方案在当前 Qt/C++/CMake 技术栈内可以实施，但不是小改动，也没有任何一项因写入本文就自动完成。本轮合理边界是完成模块、状态所有权、测试组合、启动 lazy seam 和未来工具合同；真实 AI 模型、远程服务、第三方插件和脚本执行明确不属于本轮实现或完成声明。
 
 ## 4. 供应链与版本治理
 
@@ -408,7 +560,7 @@ S2 预览不得把带自身滚动条的 QScintilla 叠放在 `QAbstractScrollAre
 
 #### 7.1.2 窗口投影不是文本编辑模型
 
-`WindowedReadOnlyProvider` 中的 Scintilla 文档只是原文件某个 byte range 的有界显示投影，局部 position 可以可靠换算成绝对 `SourceBytes`。这种换算只足以支持导航、选择、搜索高亮，以及 Hex 中**不改变字节长度**的覆盖写；它不能让普通文本插入/删除直接写回 mmap：一次变长编辑会移动其后全部字节，并使后续位置、撤销、搜索结果、编码边界和崩溃恢复同时失效。
+`WindowedReadOnlyProvider` 中的 Scintilla 文档只是原文件某个 byte range 的有界显示投影，局部 position 可以可靠换算成绝对 `SourceBytes`。这种换算只足以支持导航、选择、搜索高亮，以及 Hex 中**不改变字节长度**的覆盖写；它不能让普通文本插入/删除直接写回 mmap：一次变长编辑会移动其后全部字节，并使后续位置、撤销、搜索结果、编码边界和崩溃恢复同时失效。Text S2/S3 打开、外部文件刷新或显示编码变化时只启动一次顺序扫描，同时产生稀疏换行前缀和 Unicode 字符数；禁止为状态栏字符数再读第二遍全文件。
 
 因此生产路径明确禁止“在窗口内编辑后把相对地址直接写回文件”的通用文本方案，也不再恢复 PatchList/piece-table 实验。S2 Text 始终是可浏览、可搜索、可复制的只读投影。B2 Hex 当前同样只读；任何未来等长覆盖实验也不得据此宣称支持变长文本编辑。
 
@@ -923,8 +1075,9 @@ DPAPI 的同用户/同设备约束也意味着：已在相同 Windows 用户上�
 - `Ctrl+N` 直接建立 `Untitled + SecureKdbx + Text` 文档，并立即分配 DocumentId、FileKey 和当前 key slots。
 - 未命名文档第一次编辑后写入 `DraftStore/<DocumentId>.nsafe-draft`，不弹路径或加密确认。
 - 未命名安全文档按 `Ctrl+S` 只提交同一个加密草稿，仍不询问路径；只有“另存为”才创建用户选择路径的 `.nsafe` 或转换为明文。
-- 草稿保存采用 debounce；切换标签、应用退出、会话过期和系统休眠前强制 flush，失败必须阻止静默退出并提供重试/导出恢复副本。
-- 打开安全文档的恢复副本仍是加密 KDBX/加密增量，不生成明文正文。
+- 安全文档自动保存采用 5 秒 debounce；安全串行通道繁忙时 1 秒重试，主 KDBX 保存失败时建立本机 DPAPI 加密恢复点并以 30 秒退避重试，失败状态必须在状态栏可见。
+- 会话过期、Windows 锁屏和休眠是明文清理边界：主 KDBX 保存失败但 DPAPI 恢复点成功时仍清除编辑器正文、Undo、搜索结果和进程内文档句柄；下次打开同一 DocumentId 时覆盖载入恢复内容并保持 dirty。只有主保存与恢复点同时失败时，显式锁定才允许取消；系统锁屏仍必须遮罩并在解锁后告警。
+- 恢复点使用版本化 `DraftStore` 分块容器，密文内绑定 DocumentId 和 Text/Binary payload kind，只能由同一 Windows 用户解封；它不是可移植文档格式，也不替代 KDBX、主密码或恢复密钥。KDBX 成功保存或用户明确从磁盘重新加载后立即删除对应恢复点。
 - `< 32 MiB` 不只在保存时检查：安全文本每次内容变化后按 Scintilla UTF-8 字节长度检查，
   达到排他上限时撤销本次编辑并在状态栏提示转存普通文件；安全 Hex 把同一排他上限下沉到
   `VirtualFileView`，在 insert/replace 生成 patch 之前按虚拟字节数拒绝。这样自动保存不会
@@ -933,7 +1086,7 @@ DPAPI 的同用户/同设备约束也意味着：已在相同 Windows 用户上�
 - S1 可保存完整加密恢复快照。S2/S3/B2/B3 永久只读，不产生正文恢复数据。
 - 恢复索引仅保存 DocumentId、原路径、持久化类型、revision、光标、恢复文件路径和时间；标题/正文摘要不得出现在 `session.json`。
 
-当前落地状态：S1 普通文档已经使用版本化 `.ndraft`，由 Windows DPAPI
+当前落地状态：S1 普通文档和安全文档故障恢复点已经使用版本化 `.ndraft`，由 Windows DPAPI
 CurrentUser 密封并以原子替换提交，恢复时仅在内存解密。S2/S3/B2/B3 不产生编辑日志或
 完整检查点；旧版本遗留的大文件恢复载荷必须明确拒绝，不能暗中恢复已禁用的编辑能力。
 
@@ -958,9 +1111,11 @@ CurrentUser 密封并以原子替换提交，恢复时仅在内存解密。S2/S3
 
 保存前检查文件 ID、大小、mtime 和采样 hash。外部修改进入统一冲突页：重新加载、另存为、取消。没有 KDBX merge golden tests 前禁止自动合并。
 
-### 10.7 运行时秘密内存安全基线
+### 10.7 密钥与账号秘密的运行时安全基线
 
-不把同用户恶意程序和管理员内存读取作为主要威胁，不等于允许密钥无边界驻留。工程目标是：**只让完成当前操作所必需的最小秘密，在最短时间、最少副本和最窄组件范围内以明文存在。**
+本节的严格短生命周期目标适用于密钥、恢复材料、账号密码和 TOTP seed，不适用于用户正在编辑的整篇加密文档正文。不把同用户恶意程序和管理员内存读取作为主要威胁，不等于允许高价值秘密无边界驻留。工程目标是：**只让完成当前操作所必需的最小账号或密钥秘密，在最短时间、最少副本和最窄组件范围内以明文存在。**
+
+加密文档正文的核心保证是静态文件、自动恢复点和明确产生的持久缓存不落明文。文档一旦由可信用户解锁，就是正常的编辑工作数据，可以在编辑器、撤销、搜索以及用户主动调用的 AI/文本处理/可视化任务的有界内存快照中存在；不要求用 30 秒 lease 隔离整篇正文，也不为它建立低功能的“保险库编辑器”。关闭、锁定和任务结束时仍清理已知副本，这是减少残留和实现锁定语义，不宣称达到账号秘密相同的运行时隔离等级。
 
 #### 10.7.1 秘密分类与最长生命周期
 
@@ -973,7 +1128,6 @@ CurrentUser 密封并以原子替换提交，恢复时仅在内存解密。S2/S3
 | FileKey/KDBX composite key | KeePassXC adapter 内部 | 单次 KDBX 读写 | Database/Writer 完成前销毁 composite key 和派生中间值 |
 | 账号密码 | `SecretLease` + 当前可见控件 | 默认 30 秒或复制完成 | 隐藏控件、清零 lease、清理受控剪贴板 |
 | TOTP seed | TOTP 计算函数栈/锁页 buffer | 一次验证码计算，目标 < 1 秒 | 计算后立即清零 |
-| 安全文档明文 | 当前 Scintilla/Hex 文档和必要搜索快照 | 标签打开期间 | 关闭、锁屏或休眠时清撤销/搜索并尽力覆盖后释放 |
 | Accounts KDBX 解密对象 | `AccountSession` 专用串行上下文 | 工作区可见；离开后 5 分钟空闲上限 | 销毁 Database 和详情缓存；需要时由有效会话无提示重开 |
 
 七天会话表示“七天内 Windows 可以无提示重新授予解密能力”，不表示 MasterUnlockKey 必须在堆上驻留七天。`SecuritySessionService::acquireOperationLease()` 按需调用 DPAPI 解封；完成密钥解析后立即清理。已打开的安全文档保留其明文内容以便编辑，但不需要继续保留主密码或 FileKey；保存时重新获取短期 lease 并从文件头解包 FileKey。
@@ -1000,7 +1154,7 @@ CurrentUser 密封并以原子替换提交，恢复时仅在内存解密。S2/S3
 
 Microsoft 文档说明 `VirtualLock` 可阻止已锁定页面写入 pagefile，但系统有意限制可锁页数量；因此只锁定短小密钥而不锁定正文。安全清零必须使用不会被优化器删除的 volatile/平台实现，而不是普通 `memset`。
 
-#### 10.7.3 解密正文和编辑器清理
+#### 10.7.3 加密文档运行态与编辑器清理
 
 - 每个安全标签使用独立 Scintilla document，不与普通标签共享 document pointer、undo collection 或搜索缓存。
 - 工作站锁定、休眠、用户“立即锁定”和七天会话结束时：先确保最新内容已有加密 DraftStore checkpoint，再清除 selection/clipboard lease、搜索结果、lexer 缓存和 undo history，最后尽力覆盖编辑缓冲并释放 document。
@@ -1010,7 +1164,7 @@ Microsoft 文档说明 `VirtualLock` 可阻止已锁定页面写入 pagefile，�
   Scintilla 撤销正文，再释放文档句柄与进程内会话密钥；系统解锁后仅在七天 Capsule
   仍有效时无提示恢复安全标签及此前打开的账户工作区。显式“立即锁定”仍删除 Capsule。
 - Scintilla/Qt/系统分配器可能留下无法定位的旧副本，因此上述动作是 best-effort reduction，测试和文案不得声称能够对任意进程内存取证实现绝对清除。
-- 安全标签禁止生成明文缩略图、预览缓存、拖放 payload、输入法候选日志、崩溃附件和最近内容摘要。
+- 加密文档禁止未经用户动作生成跨重启或落盘的明文缩略图、预览缓存、崩溃附件和最近内容摘要。用户主动调用的 AI、文本处理和脚本可视化可以使用绑定当前 revision 的有界内存快照；任务结束、取消、文档 revision 变化或锁定时立即失效并释放。远程 Provider 还必须满足 1.1 的逐次数据范围授权。
 - 普通明文文件不在 Windows 锁定时销毁编辑缓冲；产品不能把用户主动选择的明文伪装成安全数据。
 
 #### 10.7.4 账号显示、剪贴板和拖放
@@ -1080,6 +1234,7 @@ Microsoft 文档说明 `VirtualLock` 可阻止已锁定页面写入 pagefile，�
 - 导航只保留：全部、收藏、最近、标签、回收站。
 - 顶部单一搜索框覆盖标题、用户名、URL、标签和备注，不搜索密码。
 - 页面内单一 `+` 创建账号，不在主工具栏堆叠“新账号/新分组/新笔记”。
+- 中央 KDBX 中历史遗留的 `SecureNote` 只作为“旧版笔记（迁移）”只读展示，可查看、搜索、复制或删除；不得双击进入独立安全文档编辑器，也不得在账户页继续创建或编辑该旧类型。新的笔记一律使用自包含安全文档。
 - 详情页主要动作：复制用户名、复制密码、复制验证码、打开网站、编辑。
 - 密码生成器嵌入密码字段；保存时提供强度提示，但不阻止导入旧密码。
 - 密码默认隐藏，显示超时自动恢复；复制后按设置清理剪贴板，且只清理由本应用写入且内容仍匹配的值。
@@ -1116,7 +1271,7 @@ seed；`readEntrySecrets()` 才把两者放入 move-only `VaultEntrySecrets/Secu
 
 账户搜索由 KeePassXC 适配层在已解锁数据库内执行，覆盖标题、用户名、URL、标签和备注，明确排除密码与 TOTP seed；返回值只有匹配条目的 UUID 集合，备注正文不会被复制进树控件、摘要模型或搜索历史。标签使用标准 KDBX tags 保存，详情态仅在非空时展示，编辑态接受中英文逗号或分号分隔并去重。搜索范围同时包含当前账户列表和回收站，但回收站结果仍保持只读与禁用秘密动作。
 
-账号历史直接复用 KeePassXC Entry History，不另建产品私有版本格式。保存已存在账号前保留完整旧条目；历史对话框只返回非秘密摘要（本地时间、标题、用户名和“是否含密码”布尔值），不把历史密码、TOTP seed 或备注复制到列表模型。恢复在同一 KDBX 内完成，恢复前的当前版本会再次进入历史，因此用户可以反向恢复而不会因一次误选丢失新值。`Entry::setTotp()` 自带 `beginUpdate/endUpdate`，适配层必须在 TOTP 改变时以它作为唯一历史事务，再应用同次表单的普通字段；TOTP 未改变时普通字段使用单一外层事务。禁止嵌套两者；新条目和 `recordHistory=false` 的安全文档自动保存会移除该内部事务产生的伪历史。真实后端门禁验证“更新密码→一个历史版本→恢复旧密码→当前新版本仍可恢复→原子落盘”，GUI 证据为 `gui-account-history.png`。
+账号历史直接复用 KeePassXC Entry History，不另建产品私有版本格式。保存已存在账号前保留完整旧条目；历史对话框只返回非秘密摘要（本地时间、标题、用户名和“是否含密码”布尔值），不把历史密码、TOTP seed 或备注复制到列表模型。恢复在同一 KDBX 内完成，恢复前的当前版本会再次进入历史，因此用户可以反向恢复而不会因一次误选丢失新值。`Entry::setTotp()` 自带 `beginUpdate/endUpdate`，适配层必须在 TOTP 改变时以它作为唯一历史事务，再应用同次表单的普通字段；TOTP 未改变时普通字段使用单一外层事务。禁止嵌套两者。安全文档复用 KDBX Entry History：显式保存保留前一版本，连续自动保存按 10 分钟限频生成历史，新文档首次落盘不产生伪历史。真实后端门禁验证“更新密码→一个历史版本→恢复旧密码→当前新版本仍可恢复→原子落盘”，GUI 证据为 `gui-account-history.png`。
 
 密码生成和强度评估不自研随机算法：固定供应链闭包纳入 KeePassXC `PasswordGenerator.cpp`，使用其 `crypto/Random`、排除易混淆字符并保证大小写、数字和特殊字符各至少一个；账号编辑态生成 24 位密码。强度提示复用已固定的 KeePassXC `PasswordHealth`/zxcvbn，只作非阻断提示，不拒绝旧密码。生成结果经 `SecureBuffer` 穿过适配层，写入受控密码框后立即清理中间缓冲；退出编辑态立即恢复遮罩，生成与评估控件不出现在只读详情或回收站。
 
@@ -1341,7 +1496,9 @@ Provider 的 `reveal(range)`，不得调用 `setText`、写 undo、改变 modifi
 Text/Hex Load、LineIndex、Text/Byte Search、Snapshot、Migration、AccountSave。当前编译实现只有
 LineIndex、LargeFileSearch 和通用 Other；没有调用者的 `FileEncrypt/FileDecrypt/LargeFileSave`
 预留枚举已归档。新增任务类型必须与真实提交者、取消语义、阶段和脱敏合同一起落地，不能
-用预留名称伪装尚未实现的异步能力。
+用预留名称伪装尚未实现的异步能力。任务类型对 UI 暴露可注册的稳定 kind id、显示 descriptor
+和通用 phase/cancel 字段；C++ enum 只允许作为内部兼容层，AI/DocumentTool 不得要求每新增
+一个工具就在任务中心多个 switch 中追加枚举分支。
 
 ### 11.10 设置与持久化
 
@@ -1413,7 +1570,9 @@ S2/S3/B2/B3 不存在“编辑准备”任务，也不创建完整 Scintilla Doc
 | 安全文件路径、keyVersion ID | 是 | 非秘密元数据；不保存标题/正文摘要 |
 | 主密码 | 否 | 只在输入和派生期间存在，随后清零 |
 | SessionKeyRing | 是，密封后 | DPAPI CurrentUser Capsule；七天绝对过期 |
-| 解密正文、账号密码、TOTP seed | 否 | 仅短生命周期进程内存 |
+| 解锁后的加密文档正文 | 否，除用户明确保存的文档/导出结果 | 标签、撤销、搜索及用户发起的有界 DocumentTool snapshot 可在运行内存存在；锁定/关闭/revision 失效时清理已知副本 |
+| 账号密码、TOTP seed、恢复材料和密钥 | 否 | 账号/安全服务的短生命周期 lease；禁止进入通用 DocumentTool/AI/脚本入口 |
+| AI/分析中间结果 | 默认否 | 内存 AnalysisArtifact；用户明确保存时走 DocumentCommand/SaveRouter，远程发送另需本次范围授权 |
 | 普通大文件搜索 offset | 临时 | delete-on-close spool，不含上下文文本 |
 | 安全文档搜索结果 | 否 | 仅内存并设结果上限；锁定时清除 |
 | 二进制搜索结果 | 临时 | 只保存 byte offset/length，不复制匹配字节 |
@@ -1444,6 +1603,11 @@ S2/S3/B2/B3 不存在“编辑准备”任务，也不创建完整 Scintilla Doc
 - session-golden：DPAPI 成功/失败、七天边界、绝对过期、时间回拨、工作站锁定、休眠、立即结束会话和旧密码会话缓存。
 - interoperability：KeePassXC 打开/保存后未知 PublicCustomData 不丢失；产品可导出标准 KDBX 恢复副本；外部 KDBX 可进入兼容工作区。
 - account-golden：账号 CRUD、历史、回收站、搜索脱敏、SecretLease 到期、TOTP 和剪贴板清理。
+- document-provider-contract：所有 Text/Hex/Windowed/测试 Provider 共用打开、capability、snapshot、typed position、搜索、选择、连续复制、保存/拒绝和 revision 失效语料。
+- document-tool-contract：所有文本/AI/脚本分析工具共用获批范围、取消、进度、revision stale、数据暴露、AnalysisArtifact 和 EditProposal/单次 undo 语料；Plain 与已解锁 Secure 结果一致，Accounts secret target 必须拒绝。
+- architecture-build：正式程序与测试链接同一产品 targets；KDBX ON/OFF、lower target forbidden include/link、测试 Provider/Tool 零核心 Widget 修改。
+- startup-contract：正式 Release 记录 process entry→first paint→first input；counting factory 证明首帧前零 KDBX/Accounts/Provider/Tool/Inference 重型实例，扩展 100 个空 Tool/20 个空 Provider 后仍满足规模预算。
+- regression-sentinel：每个历史回归保存修复前失败证据或违反合同的 negative double，证明测试确实能拒绝错误实现；至少覆盖连续第二次操作与一次状态所有权切换。
 - fault-injection：磁盘满、断电点、ReplaceFileW 失败、外部修改、错误密码、取消解锁、DPAPI blob 损坏、DraftStore 部分写入。
 - fuzz：KDBX 解析入口、编码检测、正则替换解析和 session 元数据。
 - gui-smoke：统一打开（含同路径、硬链接身份、Text/Hex 既有标签定位）、按钮/菜单精简、默认加密新建、保存保持类型、另存为转换、未知二进制默认 Hex、陌生密码单次提示、账号全页工作区。
@@ -1454,6 +1618,12 @@ S2/S3/B2/B3 不存在“编辑准备”任务，也不创建完整 Scintilla Doc
 
 | 指标 | 目标 |
 |---|---|
+| 外部进程启动可交互 Shell | 固定基准机正式 Release 从 `CreateProcess` 到可见窗口并成功处理探针输入的 P95 小于 1500 ms；本轮先记录干净重构前基线，重构后不得退化超过 10% 或 100 ms 中较大者；未执行受控缓存协议时不得称为冷启动 |
+| 内部首帧 | `QApplication` 构造完成到 MainWindow first paint 的 P95 小于 500 ms；该指标不冒充外部进程冷启动 |
+| 首轮/重复轮次 | 分别建立可复现 P50/P95；在没有受控缓存协议和基线前不得写“冷/热启动”宣传数字，重构后仍适用相对零回退预算 |
+| 首次输入可响应 | first paint 后 100 ms 内接受并呈现测试菜单/键盘输入；会话恢复不能抢占 |
+| 启动扩展规模 | 增加 100 个未使用 Tool 与 20 个未使用 Provider 后，内部首帧 P95 增量不超过 5% 或 25 ms 中较大者；首帧前重型 factory 调用为零。外部时间只应用相对零回退预算，避免系统装载噪声造成假失败 |
+| 延迟恢复 UI 批次 | 首帧后单个 UI 批次目标小于 8 ms、硬上限 16 ms；KDF、I/O、模型初始化不在 UI 线程 |
 | S2/S3 首屏可见 | NVMe 常规机器小于 500 ms，不等待全量索引 |
 | UI 最长事件 | 正常小于 16 ms，任何路径小于 50 ms |
 | 取消反馈 | 小于 100 ms；单次受限正则不得无限阻塞 |
@@ -1490,6 +1660,7 @@ S2/S3/B2/B3 不存在“编辑准备”任务，也不创建完整 Scintilla Doc
 12. 同一 UTF-8 日志行包含多个中文/emoji 命中时，双击第二个高亮词只跳到第二个 byte range；快速连续双击两个远距离结果，最终正文必须停在最后一次选择。
 13. 同时打开 S1 UTF-8、S2 GBK、S3 日志、B3 二进制和安全文档后，“全部打开文件”的 F3 按标签顺序跨 Provider 精确导航；“查找全部”产生同一 SearchSession 下的文档分组，不遗漏、不重复、不泄露安全上下文。
 14. 对包含文本、未知二进制、产品安全文档、兼容 KDBX、无权限文件和符号链接的目录执行查找：FileProbe 正确路由，筛选/排除生效，失败按文件呈现；双击结果通过统一 OpenDispatcher 打开并定位，不存在第二套简化打开路径。
+15. 在有混合标签会话、KDBX/Accounts、100 个测试 Tool、20 个测试 Provider 和已安装但未启用模型的构建中冷启动：Shell 在预算内接受首次输入；首帧前零文档恢复、KDF、账号库、模型/GPU 和重型 factory；随后当前标签优先、其余分批恢复，期间菜单和新建文档持续可用。
 
 ### 14.4 功能总账与 GUI 调试门槛
 
@@ -1609,6 +1780,24 @@ GUI 验证分三层，三层都需要：
 同日用户在正式 exe 中完成参与式验证，确认该 Provider 能浏览完整大文件，方案方向成立；同时确认大文件 Text 横向滚动无法到达完整长行、鼠标滚轮不能连续浏览、Hex 交互细节未成熟以及宽屏存在大量无用途空白。上述结果不是视觉精修建议，而是产品可用性门槛；已登记为 `TARGET_EXPERIENCE.md` 的 `LF-UX-001/002`、`HEX-UX-001/002`，后续必须以真实 wheel/scrollbar/nibble/selection 输入和实际渲染内容验收，不能只检查 64 位 offset。
 
 截至 2026-08-17，`GUI-SEARCH-ALL-008` 的过渡链路已由真实 Qt GUI smoke 覆盖：S1 生成结果后编辑正文，Dock 清空旧 model、显示“文档内容已修改，搜索结果已失效”和“重新搜索”；点击后使用原查询生成新结果，按钮隐藏，真实鼠标双击结果后 Scintilla 精确选中 UTF-8 byte range。L2 独立覆盖可见 overlay flush、正文 indicator 高亮和编辑后失效。证据文件为 `gui-search-rerun-stale.png`、`gui-search-rerun-valid.png`、`gui-live-l2-search-highlight.png` 和 `gui-live-l2-search-invalidated.png`；定向运行结果 4 passed / 0 failed / 497 ms。
+
+### 14.6 测试组合、分级门禁与重构证明
+
+测试框架继续使用 QtTest/CTest；当前问题不通过更换 Catch2/GoogleTest 或增加 mock 数量解决。正式程序和 GUI harness 只允许入口/窗口包装不同，必须链接 3.1 的同一产品 targets；禁止 `GUI_SMOKE_SHARED_SOURCES` 或其他测试专用产品源码清单。
+
+CTest 注册到具体 QtTest 函数，而不是只注册包含大量场景的可执行文件。统一 CMake helper 同时登记 FeatureId、target、case、labels 和 timeout，并生成覆盖清单，避免功能总账、测试注册和运行脚本成为三份真值：
+
+| 门禁 | 触发 | 时间合同 |
+|---|---|---|
+| quick | 每次受影响修改；领域/Provider/Tool 合同和历史回归哨兵 | 单项 30–60 秒，增量总目标不超过 5 分钟 |
+| adjacent | 合并前；受影响组件与邻接 GUI 状态迁移 | 单项按实测预算，普通用例不超过 300 秒 |
+| release | 阶段门；正式 exe、KDBX、大文件、失败恢复、性能和供应链 | 可以长时间运行，但仍逐用例设置超时并输出耗时/失败现场；禁止每个大型测试程序统一 3600 秒 |
+
+重构先建立行为基线和失败测试，再迁移职责。纯逻辑替代路径在删除旧实现前运行 differential tests；GUI 使用同一 FeatureId 旅程比较重构前后的可见内容、焦点、选区、命令状态、undo、session、文件 hash 和性能边界。新回归测试必须在修复前 revision 实际失败，或用 negative double/mutation 证明断言会变红；“新实现通过新测试”本身不足以证明门禁有效。
+
+当前功能不回退是独立 P0，而不是“尽量保持”。除用户对具体 FeatureId 明确批准外，功能、模式、快捷键、文件兼容、恢复、交互和性能必须相同或更好；架构更整洁、测试更多或主要路径通过均不能抵消一个未批准的回退。详细迁移检查点和退出清单见 `ARCHITECTURE_CONVERGENCE.md`。
+
+该承诺的前置条件是功能总账完整且比较基线不可变，不能假定现有文档已经穷尽产品行为，也不能用持续漂移的脏工作树同时代表“重构前”和“重构后”。R0 必须先分清并保存当前功能修复与无关改动，形成用户确认的 baseline revision；再从正式程序运行时枚举全部 QAction/CommandId、菜单/工具栏/上下文入口、Dock/Workspace、快捷键、设置键、会话字段、文件格式/版本和 Provider capability，并与源码公开入口及目标体验逐项对账。未登记项先补 FeatureId、现状证据和保留/删除裁决，用户确认后才能开始对应结构迁移。对未完成这一步的区域只能声称“尚未证明回退”，不得声称“无回退”。
 
 ## 15. 现有代码逐项改造
 
@@ -1750,6 +1939,15 @@ GUI 验证分三层，三层都需要：
 多文件结果按文档形成层级 model，不再为每条命中创建 `QTreeWidgetItem/QLabel`；
 目标 revision 改变或标签关闭时只失效对应文档组。F3/Shift+F3 复用相同查询和
 revision 的已完成 spool，并从稀疏 checkpoint 定位，不重复全文件扫描。
+`SearchResultsDock` 的绘制与尺寸提示共同遵守单行契约：上下文只在一行内围绕命中
+截断，所有 Text/Binary、行号/字节偏移和单/多文件模式使用同一字体派生紧凑行高；
+禁止让完整 `DisplayRole` 经平台自动换行另行决定行高。`WindowedReadOnlyProvider`
+则把选区权威明确为二选一：跨窗口/搜索导航期间由 source-byte 虚拟选区持有，用户
+在可见 Scintilla 投影中建立新选区后立即撤销旧虚拟权威；复制始终读取当前可见选择
+对应的 `[byteStart, byteEnd)`，不得因第一次搜索跳转或全选而锁死后续复制。普通编辑
+桥与窗口化只读 Provider 必须共同调用 `TextProjectionPositionMapper`；精确字符边界不因
+Start/End affinity 移动，只有落在多字节投影字符内部的位置才向相应外侧边界扩展，禁止
+在 Provider 内复制另一套位置算法。
 搜索启动时 Dock 立即进入运行态，L2 首 5,000 个命中以有界 preview 渐进显示，
 完成后原位切换到完整分页 store；取消通过同一任务 token 收敛并保留已发布结果。
 S1 过渡 provider 的“查找全部”最多发布 200,000 处并明确标记截断，避免稠密

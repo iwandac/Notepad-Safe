@@ -74,6 +74,8 @@ protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
+    enum class SelectionAuthority { NativeProjection, SourceBytes };
+
     void reloadWindow(qint64 anchorOffset, qint64 selectionBytes,
                       qint64 requestedTopOffset = -1, bool preserveHorizontal = false);
     void scrollByLines(int lineDelta);
@@ -103,8 +105,6 @@ private:
     int sliderForOffset(qint64 offset) const;
     QByteArray formatHexWindow(const uchar *data, qsizetype length, qint64 absoluteStart) const;
     void selectProjectedBytes(qint64 absoluteOffset, qint64 selectionBytes);
-    void startCharacterCount();
-    void cancelCharacterCount();
     void startLineNumberIndex();
     void cancelLineNumberIndex();
     bool lineNumberBaseForOffset(qint64 offset, qint64 *baseLine) const;
@@ -134,9 +134,11 @@ private:
     bool m_hexRelayoutPending = false;
     bool m_syncingHexSelection = false;
     bool m_syncingAsciiSelection = false;
+    bool m_applyingSourceSelection = false;
     bool m_asciiMouseSelecting = false;
-    qint64 m_selectionAnchor = -1;
-    qint64 m_selectionCaret = -1;
+    SelectionAuthority m_selectionAuthority = SelectionAuthority::NativeProjection;
+    qint64 m_selectionAnchor = 0;
+    qint64 m_selectionCaret = 0;
     QFileSystemWatcher *m_fileWatcher = nullptr;
     QTimer *m_remapDebounce = nullptr;
     QTimer *m_filePoll = nullptr;
@@ -149,8 +151,6 @@ private:
     qint64 m_lastSearchResult = -1;
     QByteArray m_searchNeedle;
     qint64 m_characterCount = -1;
-    qint64 m_characterCountTaskId = -1;
-    quint64 m_characterCountGeneration = 0;
     bool m_characterCountPending = false;
     qint64 m_lineNumberTaskId = -1;
     quint64 m_lineNumberGeneration = 0;

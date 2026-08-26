@@ -63,7 +63,7 @@
 | SR-A02 | 全部打开文件 | S1/S2/S3/Secure/Text/Binary 混合 | 增量分文件发布；目标过滤明确；不串文件 |
 | SR-A03 | 运行中新增/关闭 | 新 L1/L2、目标销毁、切活动标签 | generation/settled 正确；无悬空跳转或重复完成 |
 | SR-A04 | 取消/重跑 | 派发前/中/完成边界、连续取消 | 保留已完成结果并标记取消；可立即重跑 |
-| SR-A05 | Dock 高亮 | Unicode/Hex、窄宽、超长上下文、同一 context 多命中、hover/selected | 关键词优先完整可见；文件/内容正文起点一致；整行状态和 inline highlight 层级/基线正确 |
+| SR-A05 | Dock 高亮 | Unicode/Hex、窄宽、超长上下文、同一 context 多命中、hover/selected、行号/字节、单/多文件切换 | 关键词优先完整可见；文件/内容正文起点一致；整行状态和 inline highlight 层级/基线正确；真实结果子行始终保持统一单行紧凑高度 |
 | SR-A06 | 双击跳转 | 点击命中/同行空白、折叠组、失效结果 | 激活正确 tab，正文选中精确 query range；导航不改变 modified/revision；失效行不可跳 |
 | SR-A07 | 结果失效 | 编辑、Replace、关闭、重新解释编码/模式 | 仅相关文件失效；提供重跑；其他文件仍可跳 |
 | SR-A08 | 大结果 | 内存上限、磁盘 spool、64 位 offset | 计数准确；随机页/尾页可达；不把截断当完整 |
@@ -113,6 +113,8 @@
 - 后台任务验证 priority/queued/running/progress/ETA/cooperative-yield/cancel/finished 的 GUI 状态及
   generation；完成提示不能早于结果提交；预计或实际超过 30 秒只弹一次可点击任务气泡。
 - 每次视觉改动保存对话框、正文、Dock 或确认框截图并人工检查；截图不能代替动态断言。
+- Dock 结构测试必须断言真实结果索引：单文件为顶层结果行，多文件为文档组的子行；只检查
+  文档组、控件属性或 model 数据不能作为结果行布局通过的依据。
 - 临时 fixture 使用 `QTemporaryDir` 或 `build/` 证据目录；测试结束清除日志和临时数据。
 
 完成不是“现有测试全绿”，而是本矩阵 P0 数据正确性全部有可执行证据、真实 S2/S3/Hex

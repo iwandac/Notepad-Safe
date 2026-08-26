@@ -112,7 +112,6 @@ private slots:
     // 搜索结果
     void onJumpToByteOffset(qint64 byteOffset, int length);
     void onJumpToTabByteOffset(EditorTab *tab, qint64 byteOffset, int length);
-    void openSecureNote(const QUuid &id);
     void lockSecureDocuments();
     void maskSecureDocuments();
 
@@ -229,8 +228,6 @@ private:
     void createMenus();
     void createToolBar();
     void createStatusBar();
-    void createDock();
-    void createFindDialog();
 
     EditorTab *currentTab() const;
     EditorTab *addNewTab();
@@ -273,13 +270,15 @@ private:
     void restoreSession();
     void saveSessionNow(bool forceSnapshots = false);
     bool saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool showErrors = true);
+    bool checkpointSecureTab(EditorTab *tab, QString *errorMessage = nullptr);
     static QString secureTitleFrom(EditorTab *tab);
     void purgeSensitiveSearchState();
     void rememberSensitiveDocumentClipboard(EditorTab *sourceTab);
     void clearSensitiveDocumentClipboard();
     void closeSecureDocumentOnSecurityLane(const QUuid &documentId);
     void closeAllSecureDocumentsOnSecurityLane();
-    void endSecuritySessionOnSecurityLane(bool preserveSealedSession);
+    void endSecuritySessionOnSecurityLane(bool removeDeviceSession);
+    void lockSecureDocumentsImpl(bool sessionExpired);
     void protectForSystemLock();
     void restoreAfterSystemUnlock();
 
@@ -308,6 +307,7 @@ private:
     bool m_systemProtectionActive = false;
     bool m_sessionNotificationsRegistered = false;
     bool m_restoreAccountsAfterSystemUnlock = false;
+    bool m_systemLockRecoveryFailed = false;
     bool m_destroying = false;
     QByteArray m_sensitiveDocumentClipboardFingerprint;
 

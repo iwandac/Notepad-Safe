@@ -22,7 +22,10 @@ if defined NOTEPADSAFE_BUILD_DIR (
 set "NOTEPADSAFE_BUILD_TESTS=ON"
 set "NOTEPADSAFE_BUILD_DIAGNOSTICS=OFF"
 set "NOTEPADSAFE_WITH_KDBX=ON"
-set TARGETS=gui_smoke_coord gui_smoke_findreplace gui_smoke_large_readonly gui_smoke_smallfixes gui_smoke_vault gui_smoke_secure_documents
+if not defined NOTEPADSAFE_VS_ROOT (
+    set "NOTEPADSAFE_VS_ROOT=C:\Program Files\Microsoft Visual Studio\18\Insiders"
+)
+set "VS_CTEST=%NOTEPADSAFE_VS_ROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\ctest.exe"
 
 echo.
 echo === notepad-safe GUI Smoke Suite ===
@@ -31,7 +34,7 @@ echo.
 REM -------- Step 1: build --------
 pushd "%ROOT%"
 if /I "%1"=="build" (
-    call "%ROOT%build_incr.bat" %TARGETS% 2>&1
+    call "%ROOT%build_incr.bat" notepadsafe_gui_smoke_tests 2>&1
     set "BUILD_RC=!errorlevel!"
     if not "!BUILD_RC!"=="0" (
         echo. & echo [FATAL] Build failed. & exit /b 1
@@ -51,8 +54,9 @@ if /I "%1"=="fr" (
     goto RUN_ONE_FR
 )
 
-REM Default: build and run the complete suite.
-call "%ROOT%build_incr.bat" %TARGETS% 2>&1
+REM Default: build and run the complete suite. CMake owns the suite list so a
+REM newly registered GUI smoke cannot be silently omitted by this script.
+call "%ROOT%build_incr.bat" notepadsafe_gui_smoke_tests 2>&1
 set "BUILD_RC=!errorlevel!"
 if not "!BUILD_RC!"=="0" (
     echo.
@@ -61,36 +65,16 @@ if not "!BUILD_RC!"=="0" (
 )
 
 :RUN_ALL
-set PASS=0
-set FAIL=0
-for %%T in (%TARGETS%) do (
-    echo.
-    echo ------------------------------------------------------------
-    echo Running %%T ...
-    echo ------------------------------------------------------------
-    pushd "%BUILD%"
-    ".\%%T.exe" -o "%TEMP%\%%T.txt",txt -o "%TEMP%\%%T.junit.xml",junitxml
-    set EC=!errorlevel!
-    popd
-    if !EC! equ 0 (
-        echo [PASS] %%T
-        set /a PASS+=1
-    ) else (
-        echo [FAIL] %%T  exit=!EC!  log=%TEMP%\%%T.txt
-        echo ---- tail ----
-        powershell -NoProfile -Command "Get-Content '%TEMP%\%%T.txt' -ErrorAction SilentlyContinue | Select-Object -Last 80"
-        echo --------------
-        set /a FAIL+=1
-    )
+pushd "%BUILD%"
+if exist "%VS_CTEST%" (
+    "%VS_CTEST%" --output-on-failure -L "^smoke$"
+) else (
+    ctest --output-on-failure -L "^smoke$"
 )
-
-:FINISH
-echo.
-echo ============================================================
-echo   GUI SMOKE SUMMARY
-echo   PASS = %PASS%    FAIL = %FAIL%
-echo ============================================================
-if %FAIL% gtr 0 exit /b %FAIL%
+set EC=!errorlevel!
+popd
+if not "!EC!"=="0" exit /b !EC!
+echo === GUI SMOKE TESTS PASSED ===
 exit /b 0
 
 :RUN_ONE_COORD

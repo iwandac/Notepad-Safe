@@ -5,6 +5,7 @@
 #include "DiskFileVersion.h"
 
 #include <QByteArray>
+#include <QDateTime>
 #include <QString>
 #include <QUuid>
 
@@ -25,6 +26,7 @@ struct SecureDocumentSnapshot {
     QByteArray binary;
     SecureDocumentPayloadKind payloadKind = SecureDocumentPayloadKind::Text;
     bool draft = false;
+    bool recoveredUnsaved = false;
 };
 
 class SecureDocumentService final {
@@ -45,9 +47,11 @@ public:
                                 SecureDocumentSnapshot *snapshot);
     VaultError reload(const QUuid &documentId, SecureDocumentSnapshot *snapshot);
     VaultError save(const QUuid &documentId, const QString &text,
-                    const QString &title, const QString &targetPath = {});
+                    const QString &title, const QString &targetPath = {},
+                    bool explicitRevision = true);
     VaultError saveBinary(const QUuid &documentId, const QByteArray &binary,
-                          const QString &title, const QString &targetPath = {});
+                          const QString &title, const QString &targetPath = {},
+                          bool explicitRevision = true);
     VaultError saveAsSecure(const QString &text, const QString &title,
                             const QString &targetPath,
                             SecureDocumentSnapshot *snapshot);
@@ -58,6 +62,10 @@ public:
     void closeAll() noexcept;
     QString backingPath(const QUuid &documentId) const;
     DiskFileState externalFileState(const QUuid &documentId) const;
+    VaultError checkpointText(const QUuid &documentId, const QString &text);
+    VaultError checkpointBinary(const QUuid &documentId, const QByteArray &binary);
+    bool hasRecoverySnapshot(const QUuid &documentId) const;
+    void clearRecoverySnapshot(const QUuid &documentId) noexcept;
 
     static VaultError inspect(const QString &filePath,
                               QString *documentType,
@@ -78,6 +86,7 @@ private:
         bool draft = false;
         SecureDocumentPayloadKind payloadKind = SecureDocumentPayloadKind::Text;
         DiskFileVersion diskVersion;
+        QDateTime lastHistoryAtUtc;
     };
 
     Handle *find(const QUuid &documentId) const;
@@ -88,7 +97,16 @@ private:
                                   SecureDocumentSnapshot *snapshot);
     VaultError persist(Handle *handle, SecureDocumentPayloadKind payloadKind,
                        const QString &text, const QByteArray &binary,
-                       const QString &title, const QString &targetPath);
+                       const QString &title, const QString &targetPath,
+                       bool explicitRevision);
+    VaultError writeRecoverySnapshot(const QUuid &documentId,
+                                     SecureDocumentPayloadKind payloadKind,
+                                     const QByteArray &payload);
+    VaultError applyRecoverySnapshot(const QUuid &documentId,
+                                     SecureDocumentPayloadKind *payloadKind,
+                                     QString *text, QByteArray *binary,
+                                     bool *recovered);
+    QString recoveryPath(const QUuid &documentId) const;
     QString draftPath(const QUuid &documentId) const;
     bool isManagedDraftPath(const QString &path, const QUuid &documentId) const;
     static VaultError validatePayload(const QString &text);

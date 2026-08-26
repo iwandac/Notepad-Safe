@@ -20,6 +20,7 @@
 #include <QKeySequence>
 #include <QMouseEvent>
 #include <QPlainTextEdit>
+#include <QScopedValueRollback>
 #include <QScrollBar>
 #include <QScopeGuard>
 #include <QTextBlock>
@@ -197,8 +198,18 @@ WindowedReadOnlyProvider::WindowedReadOnlyProvider(QWidget *parent)
         m_globalScrollBar->setValue(m_globalScrollBar->maximum());
         m_updatingScrollBar = false;
     });
-    connect(m_editor, &QsciScintilla::selectionChanged,
-            this, &WindowedReadOnlyProvider::syncAsciiSelectionFromHex);
+    connect(m_editor, &QsciScintilla::selectionChanged, this, [this]() {
+        if (m_presentation == Presentation::Text
+            && !m_applyingSourceSelection) {
+            // A native user selection is the new authority. Search navigation,
+            // Select All and cross-window keyboard selection may have installed
+            // a source-byte virtual selection; retaining it here would make
+            // every later Copy read the first selection instead of the visible
+            // one.
+            clearVirtualSelection();
+        }
+        syncAsciiSelectionFromHex();
+    });
     connect(m_editor, &QsciScintilla::cursorPositionChanged,
             this, [this](int, int) { syncAsciiSelectionFromHex(); });
 
@@ -303,7 +314,6 @@ bool WindowedReadOnlyProvider::openFile(const QString &path, Presentation presen
     m_filePoll->start();
     if (presentation == Presentation::Text && !m_binaryContent) {
         startLineNumberIndex();
-        startCharacterCount();
     }
     return true;
 }
@@ -324,7 +334,6 @@ void WindowedReadOnlyProvider::closeFile()
     m_searchTaskId = -1;
     m_searchResultPending = false;
     cancelLineNumberIndex();
-    cancelCharacterCount();
     m_file.close();
     m_fileSize = 0;
     m_globalOffset = 0;
@@ -391,10 +400,10 @@ bool WindowedReadOnlyProvider::refreshFileMapping(QString *error)
                           / m_fileSize))
         : kSliderMaximum);
 
-    m_selectionAnchor = m_selectionAnchor < 0
-        ? -1 : std::clamp(m_selectionAnchor, 0LL, m_fileSize);
-    m_selectionCaret = m_selectionCaret < 0
-        ? -1 : std::clamp(m_selectionCaret, 0LL, m_fileSize);
+    if (m_selectionAuthority == SelectionAuthority::SourceBytes) {
+        m_selectionAnchor = std::clamp(m_selectionAnchor, 0LL, m_fileSize);
+        m_selectionCaret = std::clamp(m_selectionCaret, 0LL, m_fileSize);
+    }
     if (m_fileSize > 0) {
         reloadWindow(clampOffset(preservedAnchor, m_fileSize), 0,
                      std::clamp(preservedTop, 0LL, m_fileSize - 1), false);
@@ -416,7 +425,6 @@ bool WindowedReadOnlyProvider::refreshFileMapping(QString *error)
     emit sourceFileChanged(previousSize, m_fileSize);
     if (m_presentation == Presentation::Text && !m_binaryContent) {
         startLineNumberIndex();
-        startCharacterCount();
     }
     return true;
 }
@@ -441,10 +449,9 @@ void WindowedReadOnlyProvider::setPresentation(Presentation presentation)
         1, int((static_cast<long double>(m_windowSpan) * kSliderMaximum) / m_fileSize)));
     reloadWindow(m_globalOffset, 0);
     if (presentation == Presentation::Text && !m_binaryContent) {
-        if (m_lineBreakPrefix.isEmpty() && !m_lineNumberPending)
+        if ((m_lineBreakPrefix.isEmpty() || m_characterCount < 0)
+            && !m_lineNumberPending)
             startLineNumberIndex();
-        if (m_characterCount < 0 && !m_characterCountPending)
-            startCharacterCount();
     }
 }
 
@@ -455,14 +462,12 @@ void WindowedReadOnlyProvider::setBinaryContent(bool binary)
     m_binaryContent = binary;
     if (binary) {
         cancelLineNumberIndex();
-        cancelCharacterCount();
         m_lineBreakPrefix.clear();
         m_lineBreakPrefixEndsWithCr.clear();
         m_characterCount = -1;
         emit characterCountChanged(-1, false);
     } else if (m_presentation == Presentation::Text && !m_path.isEmpty()) {
         startLineNumberIndex();
-        startCharacterCount();
     }
     if (!m_path.isEmpty())
         reloadWindow(m_globalOffset, 0, visibleTopOffset(), true);
@@ -477,133 +482,8 @@ void WindowedReadOnlyProvider::setTextEncoding(TextEncoding encoding)
         reloadWindow(m_globalOffset, 0, visibleTopOffset(), true);
         if (m_presentation == Presentation::Text && !m_binaryContent) {
             startLineNumberIndex();
-            startCharacterCount();
         }
     }
-}
-
-void WindowedReadOnlyProvider::cancelCharacterCount()
-{
-    ++m_characterCountGeneration;
-    if (m_characterCountTaskId >= 0)
-        AsyncTaskManager::instance().cancel(m_characterCountTaskId);
-    m_characterCountTaskId = -1;
-    m_characterCountPending = false;
-}
-
-void WindowedReadOnlyProvider::startCharacterCount()
-{
-    cancelCharacterCount();
-    if (m_binaryContent || m_path.isEmpty() || m_fileSize <= 0)
-        return;
-
-    m_characterCount = -1;
-    m_characterCountPending = true;
-    emit characterCountChanged(-1, true);
-
-    const QString path = m_path;
-    const qint64 size = m_fileSize;
-    const TextEncoding encoding = m_textEncoding;
-    const quint64 generation = ++m_characterCountGeneration;
-    QPointer<WindowedReadOnlyProvider> guard(this);
-    m_characterCountTaskId = AsyncTaskManager::instance().submit(
-        AsyncTaskType::CharacterCount,
-        AsyncTaskPriority::Lowest,
-        tr("统计文档字符数"),
-        tr("后台扫描只读大文件并统计 Unicode 字符。"),
-        [guard, generation, path, size, encoding]
-        (qint64, AsyncCancelPtr cancel,
-         std::function<void(qint64, qint64)> reportProgress,
-         std::function<void(const AsyncErrorInfo &)> reportError) {
-            const auto clearPending = qScopeGuard([guard, generation]() {
-                QMetaObject::invokeMethod(guard, [guard, generation]() {
-                    if (!guard || guard->m_characterCountGeneration != generation)
-                        return;
-                    guard->m_characterCountPending = false;
-                    guard->m_characterCountTaskId = -1;
-                }, Qt::QueuedConnection);
-            });
-            QString openError;
-            // Leave a short edit/save grace period and never retain a source
-            // handle for the duration of a multi-GiB scan. On Windows even a
-            // share-delete reader can make QSaveFile's atomic rename fail.
-            // Brief per-chunk handles preserve exact counting while leaving
-            // regular gaps for editors and log rotators to replace the path.
-            for (int wait = 0; wait < 25; ++wait) {
-                if (cancel && cancel->load(std::memory_order_acquire))
-                    return;
-                QThread::msleep(10);
-            }
-
-            constexpr qint64 chunkBytes = kLinePrefixChunkBytes;
-            QStringDecoder utf8Decoder("UTF-8");
-            qint64 totalCharacters = 0;
-            qint64 offset = 0;
-            bool firstDecodedChunk = true;
-            while (offset < size) {
-                if (cancel && cancel->load(std::memory_order_acquire))
-                    return;
-                const qint64 wanted = qMin(chunkBytes, size - offset);
-                SharedReadOnlyFile reader;
-                if (!openSharedReadOnlyFile(reader, path, &openError)) {
-                    AsyncErrorInfo error;
-                    error.message = QObject::tr("无法统计字符数：%1").arg(openError);
-                    if (reportError)
-                        reportError(error);
-                    QMetaObject::invokeMethod(guard, [guard, generation]() {
-                        if (!guard || guard->m_characterCountGeneration != generation)
-                            return;
-                        guard->m_characterCountPending = false;
-                        guard->m_characterCountTaskId = -1;
-                        emit guard->characterCountChanged(-1, false);
-                    }, Qt::QueuedConnection);
-                    return;
-                }
-                const QByteArray chunk = reader.readAt(
-                    offset, static_cast<qsizetype>(wanted), &openError);
-                reader.close();
-                if (chunk.isEmpty() && wanted > 0) {
-                    AsyncErrorInfo error;
-                    error.message = QObject::tr("统计字符数时读取失败：%1").arg(openError);
-                    if (reportError)
-                        reportError(error);
-                    QMetaObject::invokeMethod(guard, [guard, generation]() {
-                        if (!guard || guard->m_characterCountGeneration != generation)
-                            return;
-                        guard->m_characterCountPending = false;
-                        guard->m_characterCountTaskId = -1;
-                        emit guard->characterCountChanged(-1, false);
-                    }, Qt::QueuedConnection);
-                    return;
-                }
-                QString decoded = (encoding == TextEncoding::Utf8
-                                   || encoding == TextEncoding::Utf8Bom)
-                    ? utf8Decoder(chunk)
-                    : decodeTextFragment(chunk, encoding);
-                qint64 decodedCount = unicodeScalarCount(decoded);
-                if (firstDecodedChunk && !decoded.isEmpty()
-                    && decoded.front() == QChar::ByteOrderMark) {
-                    --decodedCount;
-                }
-                firstDecodedChunk = false;
-                totalCharacters += qMax<qint64>(0, decodedCount);
-                offset += chunk.size();
-                if (reportProgress)
-                    reportProgress(offset, size);
-                QThread::msleep(2);
-            }
-            if (cancel && cancel->load(std::memory_order_acquire))
-                return;
-            QMetaObject::invokeMethod(
-                guard, [guard, generation, totalCharacters]() {
-                    if (!guard || guard->m_characterCountGeneration != generation)
-                        return;
-                    guard->m_characterCount = totalCharacters;
-                    guard->m_characterCountPending = false;
-                    guard->m_characterCountTaskId = -1;
-                    emit guard->characterCountChanged(totalCharacters, false);
-                }, Qt::QueuedConnection);
-        }, 0, QLatin1String("CharacterCount"), size);
 }
 
 void WindowedReadOnlyProvider::cancelLineNumberIndex()
@@ -613,6 +493,7 @@ void WindowedReadOnlyProvider::cancelLineNumberIndex()
         AsyncTaskManager::instance().cancel(m_lineNumberTaskId);
     m_lineNumberTaskId = -1;
     m_lineNumberPending = false;
+    m_characterCountPending = false;
 }
 
 void WindowedReadOnlyProvider::startLineNumberIndex()
@@ -624,6 +505,9 @@ void WindowedReadOnlyProvider::startLineNumberIndex()
     m_lineBreakPrefix.clear();
     m_lineBreakPrefixEndsWithCr.clear();
     m_lineNumberPending = true;
+    m_characterCount = -1;
+    m_characterCountPending = true;
+    emit characterCountChanged(-1, true);
     configureProjectionMargin();
 
     const QString path = m_path;
@@ -635,8 +519,8 @@ void WindowedReadOnlyProvider::startLineNumberIndex()
     m_lineNumberTaskId = AsyncTaskManager::instance().submit(
         AsyncTaskType::LineIndexBuild,
         AsyncTaskPriority::Normal,
-        tr("扫描文本行号"),
-        tr("快速扫描换行符，使只读大文件窗口显示全局行号。"),
+        tr("分析大文件文本"),
+        tr("单次后台扫描生成全局行号并统计 Unicode 字符。"),
         [guard, generation, path, size, encoding]
         (qint64, AsyncCancelPtr cancel,
          std::function<void(qint64, qint64)> reportProgress,
@@ -647,10 +531,14 @@ void WindowedReadOnlyProvider::startLineNumberIndex()
                         return;
                     guard->m_lineNumberPending = false;
                     guard->m_lineNumberTaskId = -1;
+                    guard->m_characterCountPending = false;
                 }, Qt::QueuedConnection);
             });
             qint64 totalLineBreaks = 0;
+            qint64 totalCharacters = 0;
             bool previousWasCr = false;
+            bool firstDecodedChunk = true;
+            QStringDecoder utf8Decoder("UTF-8");
             QVector<qint64> lineBreakPrefix{0};
             QVector<quint8> lineBreakPrefixEndsWithCr{0};
             lineBreakPrefix.reserve(int(qMin<qint64>(
@@ -666,7 +554,7 @@ void WindowedReadOnlyProvider::startLineNumberIndex()
                 SharedReadOnlyFile reader;
                 if (!openSharedReadOnlyFile(reader, path, &openError)) {
                     AsyncErrorInfo error;
-                    error.message = QObject::tr("无法扫描文本行号：%1").arg(openError);
+                    error.message = QObject::tr("无法分析大文件文本：%1").arg(openError);
                     if (reportError)
                         reportError(error);
                     QMetaObject::invokeMethod(guard, [guard, generation]() {
@@ -674,6 +562,8 @@ void WindowedReadOnlyProvider::startLineNumberIndex()
                             return;
                         guard->m_lineNumberPending = false;
                         guard->m_lineNumberTaskId = -1;
+                        guard->m_characterCountPending = false;
+                        emit guard->characterCountChanged(-1, false);
                     }, Qt::QueuedConnection);
                     return;
                 }
@@ -682,7 +572,7 @@ void WindowedReadOnlyProvider::startLineNumberIndex()
                 reader.close();
                 if (chunk.size() != wanted) {
                     AsyncErrorInfo error;
-                    error.message = QObject::tr("扫描文本行号时读取失败：%1").arg(openError);
+                    error.message = QObject::tr("分析大文件文本时读取失败：%1").arg(openError);
                     if (reportError)
                         reportError(error);
                     QMetaObject::invokeMethod(guard, [guard, generation]() {
@@ -690,6 +580,8 @@ void WindowedReadOnlyProvider::startLineNumberIndex()
                             return;
                         guard->m_lineNumberPending = false;
                         guard->m_lineNumberTaskId = -1;
+                        guard->m_characterCountPending = false;
+                        emit guard->characterCountChanged(-1, false);
                     }, Qt::QueuedConnection);
                     return;
                 }
@@ -704,6 +596,19 @@ void WindowedReadOnlyProvider::startLineNumberIndex()
                     totalLineBreaks += countPhysicalLineBreaks(
                         QByteArrayView(chunk.constData() + local, partSize),
                         encoding, previousWasCr, &previousWasCr);
+                    const QByteArrayView part(chunk.constData() + local, partSize);
+                    const QByteArray partBytes = QByteArray::fromRawData(
+                        part.data(), part.size());
+                    QString decoded = (encoding == TextEncoding::Utf8
+                                       || encoding == TextEncoding::Utf8Bom)
+                        ? utf8Decoder(part) : decodeTextFragment(partBytes, encoding);
+                    qint64 decodedCount = unicodeScalarCount(decoded);
+                    if (firstDecodedChunk && !decoded.isEmpty()
+                        && decoded.front() == QChar::ByteOrderMark) {
+                        --decodedCount;
+                    }
+                    firstDecodedChunk = false;
+                    totalCharacters += qMax<qint64>(0, decodedCount);
                     local += partSize;
                     offset += partSize;
                     lineBreakPrefix.append(totalLineBreaks);
@@ -716,9 +621,9 @@ void WindowedReadOnlyProvider::startLineNumberIndex()
                 return;
             QMetaObject::invokeMethod(
                 guard, [guard, generation,
-                        lineBreakPrefix = std::move(lineBreakPrefix),
-                        lineBreakPrefixEndsWithCr = std::move(lineBreakPrefixEndsWithCr),
-                        encoding]() mutable {
+                         lineBreakPrefix = std::move(lineBreakPrefix),
+                         lineBreakPrefixEndsWithCr = std::move(lineBreakPrefixEndsWithCr),
+                         encoding, totalCharacters]() mutable {
                     if (!guard || guard->m_lineNumberGeneration != generation)
                         return;
                     guard->m_lineBreakPrefix = std::move(lineBreakPrefix);
@@ -727,7 +632,10 @@ void WindowedReadOnlyProvider::startLineNumberIndex()
                     guard->m_lineBreakPrefixEncoding = encoding;
                     guard->m_lineNumberPending = false;
                     guard->m_lineNumberTaskId = -1;
+                    guard->m_characterCount = totalCharacters;
+                    guard->m_characterCountPending = false;
                     guard->configureProjectionMargin();
+                    emit guard->characterCountChanged(totalCharacters, false);
                 }, Qt::QueuedConnection);
         }, 0, QLatin1String("LineNumberIndex"), size);
 }
@@ -828,7 +736,7 @@ qint64 WindowedReadOnlyProvider::visibleBottomOffset() const
 
 qint64 WindowedReadOnlyProvider::selectionStartOffset() const
 {
-    if (m_selectionAnchor >= 0 && m_selectionCaret >= 0)
+    if (m_selectionAuthority == SelectionAuthority::SourceBytes)
         return std::min(m_selectionAnchor, m_selectionCaret);
     if (m_presentation == Presentation::Hex && m_asciiPreview
         && (m_asciiPreview->hasFocus()
@@ -845,7 +753,7 @@ qint64 WindowedReadOnlyProvider::selectionStartOffset() const
 
 qint64 WindowedReadOnlyProvider::selectionEndOffset() const
 {
-    if (m_selectionAnchor >= 0 && m_selectionCaret >= 0)
+    if (m_selectionAuthority == SelectionAuthority::SourceBytes)
         return std::max(m_selectionAnchor, m_selectionCaret);
     if (m_presentation == Presentation::Hex && m_asciiPreview
         && (m_asciiPreview->hasFocus()
@@ -899,6 +807,7 @@ void WindowedReadOnlyProvider::goToOffset(qint64 offset, qint64 selectionBytes)
     if (m_path.isEmpty())
         return;
     if (selectionBytes > 0) {
+        m_selectionAuthority = SelectionAuthority::SourceBytes;
         m_selectionAnchor = clampOffset(offset, m_fileSize);
         m_selectionCaret = std::min(m_fileSize, m_selectionAnchor + selectionBytes);
     } else {
@@ -911,6 +820,7 @@ void WindowedReadOnlyProvider::selectAllSource()
 {
     if (m_path.isEmpty() || m_fileSize <= 0)
         return;
+    m_selectionAuthority = SelectionAuthority::SourceBytes;
     m_selectionAnchor = 0;
     m_selectionCaret = m_fileSize;
     applyVirtualSelection();
@@ -1245,6 +1155,8 @@ void WindowedReadOnlyProvider::reloadWindow(qint64 anchorOffset, qint64 selectio
                                             qint64 requestedTopOffset,
                                             bool preserveHorizontal)
 {
+    QScopedValueRollback<bool> selectionTransaction(
+        m_applyingSourceSelection, true);
     anchorOffset = clampOffset(anchorOffset, m_fileSize);
     const int horizontalOffset = preserveHorizontal
         ? static_cast<int>(directScintilla(m_editor, QsciScintillaBase::SCI_GETXOFFSET))
@@ -1411,7 +1323,7 @@ void WindowedReadOnlyProvider::reloadWindow(qint64 anchorOffset, qint64 selectio
                             m_presentation == Presentation::Hex
                                 ? 0 : std::max(0, horizontalOffset)));
     }
-    if (m_selectionAnchor >= 0 && m_selectionCaret >= 0)
+    if (m_selectionAuthority == SelectionAuthority::SourceBytes)
         applyVirtualSelection();
     syncAsciiScrollFromHex();
     emit windowReady(start, end, anchorOffset);
@@ -1455,7 +1367,7 @@ void WindowedReadOnlyProvider::scrollByLines(int lineDelta)
 
 void WindowedReadOnlyProvider::beginVirtualSelection()
 {
-    if (m_selectionAnchor >= 0 && m_selectionCaret >= 0)
+    if (m_selectionAuthority == SelectionAuthority::SourceBytes)
         return;
     const qint64 anchorPosition = directScintilla(
         m_editor, QsciScintillaBase::SCI_GETANCHOR);
@@ -1468,11 +1380,12 @@ void WindowedReadOnlyProvider::beginVirtualSelection()
         m_selectionAnchor = sourceOffsetForProjectedPosition(anchorPosition, true);
         m_selectionCaret = sourceOffsetForProjectedPosition(caretPosition, true);
     }
+    m_selectionAuthority = SelectionAuthority::SourceBytes;
 }
 
 void WindowedReadOnlyProvider::updateVirtualSelection(qint64 caretOffset)
 {
-    if (m_selectionAnchor < 0)
+    if (m_selectionAuthority != SelectionAuthority::SourceBytes)
         beginVirtualSelection();
     m_selectionCaret = std::clamp(caretOffset, 0LL, m_fileSize);
     applyVirtualSelection();
@@ -1480,14 +1393,18 @@ void WindowedReadOnlyProvider::updateVirtualSelection(qint64 caretOffset)
 
 void WindowedReadOnlyProvider::clearVirtualSelection()
 {
-    m_selectionAnchor = -1;
-    m_selectionCaret = -1;
+    m_selectionAuthority = SelectionAuthority::NativeProjection;
+    m_selectionAnchor = 0;
+    m_selectionCaret = 0;
 }
 
 void WindowedReadOnlyProvider::applyVirtualSelection()
 {
-    if (m_path.isEmpty() || m_selectionAnchor < 0 || m_selectionCaret < 0)
+    if (m_path.isEmpty()
+        || m_selectionAuthority != SelectionAuthority::SourceBytes)
         return;
+    QScopedValueRollback<bool> selectionTransaction(
+        m_applyingSourceSelection, true);
     const qint64 low = std::min(m_selectionAnchor, m_selectionCaret);
     const qint64 high = std::max(m_selectionAnchor, m_selectionCaret);
     const qint64 visibleLow = std::clamp(low, m_windowStart, m_windowEnd);
@@ -1697,13 +1614,10 @@ qint64 WindowedReadOnlyProvider::sourceOffsetForProjectedPosition(
     if (m_presentation == Presentation::Text) {
         if (m_projectedToSource.isEmpty())
             return m_windowStart;
-        const qsizetype index = static_cast<qsizetype>(std::clamp<qint64>(
-            position, 0, m_projectedToSource.size() - 1));
-        qint32 relative = m_projectedToSource.at(index);
-        if (endBoundary && index + 1 < m_projectedToSource.size()
-            && m_projectedToSource.at(index + 1) > relative) {
-            relative = m_projectedToSource.at(index + 1);
-        }
+        const qint32 relative = TextProjectionPositionMapper::toSource(
+            m_projectedToSource, position,
+            endBoundary ? TextBoundaryAffinity::End
+                        : TextBoundaryAffinity::Start);
         return std::clamp(m_windowStart + qint64(relative),
                           m_windowStart, m_windowEnd);
     }
@@ -1742,14 +1656,8 @@ qint64 WindowedReadOnlyProvider::projectedPositionForSourceOffset(qint64 offset)
     if (m_presentation == Presentation::Text) {
         if (m_sourceBoundaries.isEmpty())
             return 0;
-        const qint32 relative = qint32(localOffset);
-        auto it = std::lower_bound(m_sourceBoundaries.cbegin(),
-                                   m_sourceBoundaries.cend(), relative);
-        const qsizetype index = it == m_sourceBoundaries.cend()
-            ? m_sourceBoundaries.size() - 1
-            : qsizetype(it - m_sourceBoundaries.cbegin());
-        return m_projectedBoundaries.value(index,
-            m_projectedBoundaries.isEmpty() ? 0 : m_projectedBoundaries.constLast());
+        return TextProjectionPositionMapper::toProjected(
+            m_sourceBoundaries, m_projectedBoundaries, localOffset);
     }
     if (localOffset >= m_windowEnd - m_windowStart)
         return directScintilla(m_editor, QsciScintillaBase::SCI_GETLENGTH);
@@ -1824,6 +1732,8 @@ void WindowedReadOnlyProvider::selectProjectedBytes(qint64 absoluteOffset, qint6
 {
     if (absoluteOffset < m_windowStart || absoluteOffset >= m_windowEnd)
         return;
+    QScopedValueRollback<bool> selectionTransaction(
+        m_applyingSourceSelection, true);
     qint64 localStart = absoluteOffset - m_windowStart;
     qint64 localEnd = localStart + std::max(0LL, selectionBytes);
     if (m_presentation == Presentation::Hex) {
@@ -1995,6 +1905,7 @@ void WindowedReadOnlyProvider::setHexSourceSelection(qint64 anchor, qint64 caret
     caret = std::clamp(caret, 0LL, m_fileSize);
     if (anchor < m_windowStart || anchor > m_windowEnd
         || caret < m_windowStart || caret > m_windowEnd) {
+        m_selectionAuthority = SelectionAuthority::SourceBytes;
         m_selectionAnchor = anchor;
         m_selectionCaret = caret;
         const qint64 display = caret >= m_fileSize ? m_fileSize - 1 : caret;

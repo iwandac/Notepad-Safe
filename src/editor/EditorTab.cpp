@@ -3513,13 +3513,10 @@ qint64 EditorTab::bridgeSourceOffsetForProjectedPosition(
         || m_bridge.projectedToSource.isEmpty()) {
         return qMin(position, m_bridge.windowLen);
     }
-    const qsizetype index = static_cast<qsizetype>(qBound<qint64>(
-        qint64(0), position, qint64(m_bridge.projectedToSource.size() - 1)));
-    qint32 source = m_bridge.projectedToSource.at(index);
-    if (endBoundary && index + 1 < m_bridge.projectedToSource.size()
-        && m_bridge.projectedToSource.at(index + 1) > source) {
-        source = m_bridge.projectedToSource.at(index + 1);
-    }
+    const qint32 source = TextProjectionPositionMapper::toSource(
+        m_bridge.projectedToSource, position,
+        endBoundary ? TextBoundaryAffinity::End
+                    : TextBoundaryAffinity::Start);
     return qBound<qint64>(qint64(0), qint64(source), m_bridge.windowLen);
 }
 
@@ -3530,15 +3527,8 @@ long EditorTab::bridgeProjectedPositionForSourceOffset(qint64 sourceOffset) cons
         || m_bridge.sourceBoundaries.isEmpty()) {
         return long(qMin<qint64>(sourceOffset, LONG_MAX));
     }
-    const qint32 relative = qint32(qMin<qint64>(sourceOffset, INT_MAX));
-    const auto found = std::lower_bound(m_bridge.sourceBoundaries.cbegin(),
-                                        m_bridge.sourceBoundaries.cend(), relative);
-    const qsizetype index = found == m_bridge.sourceBoundaries.cend()
-        ? m_bridge.sourceBoundaries.size() - 1
-        : qsizetype(found - m_bridge.sourceBoundaries.cbegin());
-    return long(m_bridge.projectedBoundaries.value(
-        index, m_bridge.projectedBoundaries.isEmpty()
-                   ? 0 : m_bridge.projectedBoundaries.constLast()));
+    return long(TextProjectionPositionMapper::toProjected(
+        m_bridge.sourceBoundaries, m_bridge.projectedBoundaries, sourceOffset));
 }
 
 void EditorTab::bridgeOnSyncDebounce()

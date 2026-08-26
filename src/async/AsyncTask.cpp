@@ -80,7 +80,6 @@ QString AsyncTask::typeText() const
     switch (type) {
     case AsyncTaskType::LineIndexBuild: return QObject::tr("行索引构建");
     case AsyncTaskType::LargeFileSearch:return QObject::tr("大文件搜索");
-    case AsyncTaskType::CharacterCount: return QObject::tr("字符统计");
     case AsyncTaskType::EncodingConversion: return QObject::tr("编码转换");
     case AsyncTaskType::SessionSnapshot: return QObject::tr("恢复快照");
     case AsyncTaskType::SecureOpen: return QObject::tr("安全打开");

@@ -1,12 +1,14 @@
 #include "SecureDocumentService.h"
 
 #include "SecurityIdentity.h"
+#include "DraftStore.h"
 #include "VaultBackendFactory.h"
 #include "VaultService.h"
 
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QIODevice>
 #include <QProcessEnvironment>
 #include <QStandardPaths>
 #include <QSaveFile>
@@ -18,6 +20,10 @@
 #endif
 
 namespace {
+
+constexpr char RecoveryMagic[] = "NotepadSafe.SecureRecovery.v1";
+constexpr qsizetype RecoveryHeaderBytes = sizeof(RecoveryMagic) + 16 + 1;
+constexpr qint64 SecureHistoryIntervalSeconds = 10 * 60;
 
 VaultError documentError(VaultErrorCode code, const QString &message,
                          const QString &diagnostic)
@@ -96,6 +102,7 @@ SecureDocumentService::SecureDocumentService(SecuritySessionService *securitySes
                                                        : QDir::cleanPath(dataDirectory))
 {
     QDir().mkpath(QDir(dataDirectory_).filePath(QStringLiteral("drafts")));
+    QDir().mkpath(QDir(dataDirectory_).filePath(QStringLiteral("secure-recovery")));
 }
 
 SecureDocumentService::~SecureDocumentService()
@@ -131,6 +138,144 @@ QString SecureDocumentService::draftPath(const QUuid &documentId) const
     return QDir(dataDirectory_).filePath(
         QStringLiteral("drafts/%1.nsafe-draft")
             .arg(documentId.toString(QUuid::WithoutBraces)));
+}
+
+QString SecureDocumentService::recoveryPath(const QUuid &documentId) const
+{
+    return QDir(dataDirectory_).filePath(
+        QStringLiteral("secure-recovery/%1.ndraft")
+            .arg(documentId.toString(QUuid::WithoutBraces)));
+}
+
+VaultError SecureDocumentService::writeRecoverySnapshot(
+    const QUuid &documentId, SecureDocumentPayloadKind payloadKind,
+    const QByteArray &payload)
+{
+    if (documentId.isNull() || payload.size() >= PayloadMaximumExclusive) {
+        return documentError(VaultErrorCode::UnsupportedFormat,
+                             QStringLiteral("无法建立安全文档恢复点。"),
+                             QStringLiteral("secure-document.recovery.arguments"));
+    }
+    const QByteArray uuid = documentId.toRfc4122();
+    const char kind = payloadKind == SecureDocumentPayloadKind::Binary ? 1 : 0;
+    QString detail;
+    const bool written = DraftStore::writeCheckpoint(
+        recoveryPath(documentId), 0,
+        [&payload, &uuid, kind](QIODevice *device, QString *error) {
+            const QByteArray magic(RecoveryMagic, sizeof(RecoveryMagic));
+            if (device->write(magic) != magic.size()
+                || device->write(uuid) != uuid.size()
+                || device->write(&kind, 1) != 1
+                || device->write(payload) != payload.size()) {
+                if (error)
+                    *error = QStringLiteral("写入安全文档恢复内容失败。");
+                return false;
+            }
+            return true;
+        }, &detail);
+    if (!written) {
+        return documentError(VaultErrorCode::IoError,
+                             QStringLiteral("无法建立本机加密恢复点。"),
+                             QStringLiteral("secure-document.recovery.write: ") + detail);
+    }
+    return VaultError::success();
+}
+
+VaultError SecureDocumentService::checkpointText(const QUuid &documentId,
+                                                 const QString &text)
+{
+    VaultError error = validatePayload(text);
+    if (error.isError())
+        return error;
+    QByteArray payload = text.toUtf8();
+    error = writeRecoverySnapshot(documentId, SecureDocumentPayloadKind::Text, payload);
+    scrubByteArray(payload);
+    return error;
+}
+
+VaultError SecureDocumentService::checkpointBinary(const QUuid &documentId,
+                                                   const QByteArray &binary)
+{
+    VaultError error = validatePayload(binary);
+    if (error.isError())
+        return error;
+    return writeRecoverySnapshot(documentId, SecureDocumentPayloadKind::Binary, binary);
+}
+
+bool SecureDocumentService::hasRecoverySnapshot(const QUuid &documentId) const
+{
+    return !documentId.isNull() && QFileInfo::exists(recoveryPath(documentId));
+}
+
+void SecureDocumentService::clearRecoverySnapshot(const QUuid &documentId) noexcept
+{
+    if (!documentId.isNull())
+        QFile::remove(recoveryPath(documentId));
+}
+
+VaultError SecureDocumentService::applyRecoverySnapshot(
+    const QUuid &documentId, SecureDocumentPayloadKind *payloadKind,
+    QString *text, QByteArray *binary, bool *recovered)
+{
+    if (recovered)
+        *recovered = false;
+    const QString path = recoveryPath(documentId);
+    if (!QFileInfo::exists(path))
+        return VaultError::success();
+
+    QByteArray envelope;
+    QString detail;
+    const qint64 maximumEnvelope = PayloadMaximumExclusive + RecoveryHeaderBytes;
+    const bool read = DraftStore::readChunks(
+        path, [&envelope, maximumEnvelope](const QByteArray &chunk, QString *error) {
+            if (envelope.size() + chunk.size() > maximumEnvelope) {
+                if (error)
+                    *error = QStringLiteral("安全文档恢复点超过大小限制。");
+                return false;
+            }
+            envelope.append(chunk);
+            return true;
+        }, &detail);
+    const QByteArray magic(RecoveryMagic, sizeof(RecoveryMagic));
+    const bool valid = read && envelope.size() >= RecoveryHeaderBytes
+                       && envelope.startsWith(magic)
+                       && envelope.mid(magic.size(), 16) == documentId.toRfc4122();
+    if (!valid) {
+        scrubByteArray(envelope);
+        return documentError(VaultErrorCode::CorruptDatabase,
+                             QStringLiteral("本机加密恢复点已损坏或不属于此文档。"),
+                             QStringLiteral("secure-document.recovery.read: ") + detail);
+    }
+    const quint8 kind = quint8(envelope.at(magic.size() + 16));
+    QByteArray payload = envelope.mid(RecoveryHeaderBytes);
+    scrubByteArray(envelope);
+    if (payload.size() >= PayloadMaximumExclusive || kind > 1) {
+        scrubByteArray(payload);
+        return documentError(VaultErrorCode::CorruptDatabase,
+                             QStringLiteral("本机加密恢复点内容无效。"),
+                             QStringLiteral("secure-document.recovery.payload"));
+    }
+    if (kind == 1) {
+        if (text && !text->isEmpty())
+            text->fill(QChar(0));
+        if (text)
+            text->clear();
+        if (binary)
+            *binary = std::move(payload);
+        if (payloadKind)
+            *payloadKind = SecureDocumentPayloadKind::Binary;
+    } else {
+        if (binary)
+            scrubByteArray(*binary);
+        if (text)
+            *text = QString::fromUtf8(payload);
+        scrubByteArray(payload);
+        if (payloadKind)
+            *payloadKind = SecureDocumentPayloadKind::Text;
+    }
+    if (recovered)
+        *recovered = true;
+    return VaultError::success();
 }
 
 bool SecureDocumentService::isManagedDraftPath(const QString &path,
@@ -378,7 +523,7 @@ VaultError SecureDocumentService::openWithCredential(
     auto entry = service.readEntry(it->id, &readError);
     if (!entry)
         return readError;
-    const SecureDocumentPayloadKind payloadKind = entry->binaryPayloadPresent
+    SecureDocumentPayloadKind payloadKind = entry->binaryPayloadPresent
         ? SecureDocumentPayloadKind::Binary : SecureDocumentPayloadKind::Text;
     QString text;
     QByteArray binary;
@@ -415,6 +560,14 @@ VaultError SecureDocumentService::openWithCredential(
                              QStringLiteral("此安全文档已经打开。"),
                              QStringLiteral("secure-document.already-open"));
     }
+    bool recoveredUnsaved = false;
+    error = applyRecoverySnapshot(handle->documentId, &payloadKind, &text,
+                                  &binary, &recoveredUnsaved);
+    if (error.isError()) {
+        text.fill(QChar(0));
+        scrubByteArray(binary);
+        return error;
+    }
     handle->entryId = entry->id;
     handle->filePath = QFileInfo(filePath).absoluteFilePath();
     handle->title = entry->title;
@@ -430,6 +583,7 @@ VaultError SecureDocumentService::openWithCredential(
     handle->persisted = true;
     handle->draft = isManagedDraftPath(handle->filePath, handle->documentId);
     handle->payloadKind = payloadKind;
+    handle->lastHistoryAtUtc = QDateTime::currentDateTimeUtc();
     service.lock();
     captureDiskFileVersion(handle->filePath, &handle->diskVersion);
     snapshot->documentId = handle->documentId;
@@ -440,6 +594,7 @@ VaultError SecureDocumentService::openWithCredential(
     snapshot->text = std::move(text);
     snapshot->binary = std::move(binary);
     snapshot->draft = handle->draft;
+    snapshot->recoveredUnsaved = recoveredUnsaved;
     handles_.push_back(std::move(handle));
     return VaultError::success();
 }
@@ -537,15 +692,18 @@ VaultError SecureDocumentService::reload(const QUuid &documentId,
     snapshot->text = std::move(text);
     snapshot->binary = std::move(binary);
     snapshot->draft = handle->draft;
+    snapshot->recoveredUnsaved = false;
+    clearRecoverySnapshot(documentId);
     return VaultError::success();
 }
 
 VaultError SecureDocumentService::persist(Handle *handle,
                                           SecureDocumentPayloadKind payloadKind,
                                           const QString &text,
-                                          const QByteArray &binary,
-                                          const QString &title,
-                                          const QString &targetPath)
+                                           const QByteArray &binary,
+                                           const QString &title,
+                                           const QString &targetPath,
+                                           bool explicitRevision)
 {
     VaultError error = payloadKind == SecureDocumentPayloadKind::Binary
                            ? validatePayload(binary) : validatePayload(text);
@@ -606,7 +764,13 @@ VaultError SecureDocumentService::persist(Handle *handle,
     if (error.isError())
         return error;
     VaultEntryData entry;
-    entry.recordHistory = false;
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const bool historyDue = !handle->lastHistoryAtUtc.isValid()
+                            || handle->lastHistoryAtUtc.secsTo(now)
+                                   >= SecureHistoryIntervalSeconds;
+    const bool recordHistory = sameDestination && handle->persisted
+                               && (explicitRevision || historyDue);
+    entry.recordHistory = recordHistory;
     entry.id = handle->entryId;
     entry.title = title.trimmed().isEmpty() ? QStringLiteral("未命名") : title.trimmed();
     entry.tags = {VaultSecureNoteTag};
@@ -653,6 +817,8 @@ VaultError SecureDocumentService::persist(Handle *handle,
     handle->persisted = true;
     handle->draft = isManagedDraftPath(destination, handle->documentId);
     handle->payloadKind = payloadKind;
+    if (recordHistory || !handle->lastHistoryAtUtc.isValid())
+        handle->lastHistoryAtUtc = now;
     handle->diskVersion = {};
     service.lock();
     captureDiskFileVersion(destination, &handle->diskVersion);
@@ -660,11 +826,13 @@ VaultError SecureDocumentService::persist(Handle *handle,
         && isManagedDraftPath(oldPath, handle->documentId)) {
         QFile::remove(oldPath);
     }
+    clearRecoverySnapshot(handle->documentId);
     return VaultError::success();
 }
 
 VaultError SecureDocumentService::save(const QUuid &documentId, const QString &text,
-                                       const QString &title, const QString &targetPath)
+                                       const QString &title, const QString &targetPath,
+                                       bool explicitRevision)
 {
     Handle *handle = find(documentId);
     if (!handle) {
@@ -672,13 +840,15 @@ VaultError SecureDocumentService::save(const QUuid &documentId, const QString &t
                              QStringLiteral("安全文档句柄不存在。"),
                              QStringLiteral("secure-document.handle.missing"));
     }
-    return persist(handle, SecureDocumentPayloadKind::Text, text, {}, title, targetPath);
+    return persist(handle, SecureDocumentPayloadKind::Text, text, {}, title,
+                   targetPath, explicitRevision);
 }
 
 VaultError SecureDocumentService::saveBinary(const QUuid &documentId,
                                              const QByteArray &binary,
                                              const QString &title,
-                                             const QString &targetPath)
+                                             const QString &targetPath,
+                                             bool explicitRevision)
 {
     Handle *handle = find(documentId);
     if (!handle) {
@@ -687,7 +857,7 @@ VaultError SecureDocumentService::saveBinary(const QUuid &documentId,
                              QStringLiteral("secure-document.handle.missing"));
     }
     return persist(handle, SecureDocumentPayloadKind::Binary, {}, binary,
-                   title, targetPath);
+                   title, targetPath, explicitRevision);
 }
 
 VaultError SecureDocumentService::saveAsSecure(
@@ -704,7 +874,7 @@ VaultError SecureDocumentService::saveAsSecure(
     if (!error.isError())
     {
         error = persist(handle, SecureDocumentPayloadKind::Text, text, {},
-                        title, targetPath);
+                        title, targetPath, true);
     }
     if (error.isError()) {
         if (handle)
@@ -736,7 +906,7 @@ VaultError SecureDocumentService::saveAsSecureBinary(
                                     &handle);
     if (!error.isError()) {
         error = persist(handle, SecureDocumentPayloadKind::Binary, {}, binary,
-                        title, targetPath);
+                        title, targetPath, true);
     }
     if (error.isError()) {
         if (handle)

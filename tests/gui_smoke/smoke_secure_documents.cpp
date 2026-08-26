@@ -99,49 +99,73 @@ bool treeContainsText(QTreeWidget *tree, const QString &needle)
     return findTreeItem(tree, needle) != nullptr;
 }
 
-void confirmRecoverySeedFromIdentitySetup()
+void driveIdentityCreationDialog(MainWindow *window)
 {
-    QElapsedTimer wait;
-    wait.start();
-    QDialog *recoveryDialog = nullptr;
-    QPlainTextEdit *seedView = nullptr;
-    QLineEdit *verify = nullptr;
-    QCheckBox *confirmed = nullptr;
-    QDialogButtonBox *buttons = nullptr;
-    while (wait.elapsed() < 3000) {
-        recoveryDialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
-        if (!recoveryDialog) {
-            QTest::qWait(25);
-            continue;
+    constexpr auto ResultProperty = "notepadsafeTestIdentityDriverResult";
+    window->setProperty(ResultProperty, QStringLiteral("pending"));
+    auto elapsed = std::make_shared<QElapsedTimer>();
+    elapsed->start();
+    auto *driver = new QTimer(window);
+    driver->setInterval(25);
+    driver->setProperty("stage", 0);
+    QObject::connect(driver, &QTimer::timeout, window,
+                     [window, driver, elapsed]() {
+        auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        const int stage = driver->property("stage").toInt();
+
+        if (dialog && stage == 0) {
+            auto *password = dialog->findChild<QLineEdit *>(
+                QStringLiteral("securitySessionPassword"));
+            auto *confirmation = dialog->findChild<QLineEdit *>(
+                QStringLiteral("securitySessionConfirmation"));
+            auto *buttons = dialog->findChild<QDialogButtonBox *>();
+            auto *ok = buttons ? buttons->button(QDialogButtonBox::Ok) : nullptr;
+            if (password && confirmation && ok) {
+                password->setText(QStringLiteral("correct horse battery staple"));
+                confirmation->setText(QStringLiteral("correct horse battery staple"));
+                driver->setProperty("stage", 1);
+                QTest::mouseClick(ok, Qt::LeftButton);
+                return;
+            }
+        } else if (dialog && stage == 1) {
+            auto *seedView = dialog->findChild<QPlainTextEdit *>(
+                QStringLiteral("securityRecoveryKey"));
+            auto *buttons = dialog->findChild<QDialogButtonBox *>();
+            auto *ok = buttons ? buttons->button(QDialogButtonBox::Ok) : nullptr;
+            if (seedView && ok) {
+                auto *verify = dialog->findChild<QLineEdit *>(
+                    QStringLiteral("securitySessionRecoveryVerify"));
+                if (!verify)
+                    verify = dialog->findChild<QLineEdit *>();
+                auto *confirmed = dialog->findChild<QCheckBox *>(
+                    QStringLiteral("securityRecoveryConfirmed"));
+                if (verify)
+                    verify->setText(seedView->toPlainText().right(8));
+                else if (confirmed)
+                    confirmed->setChecked(true);
+                window->setProperty("notepadsafeTestIdentityDriverResult",
+                                    QStringLiteral("complete"));
+                driver->stop();
+                driver->deleteLater();
+                QTest::mouseClick(ok, Qt::LeftButton);
+                return;
+            }
         }
 
-        seedView = recoveryDialog->findChild<QPlainTextEdit *>(
-            QStringLiteral("securityRecoveryKey"));
-        buttons = recoveryDialog->findChild<QDialogButtonBox *>();
-        if (!seedView || !buttons) {
-            QTest::qWait(25);
-            continue;
-        }
-
-        verify = recoveryDialog->findChild<QLineEdit *>(QStringLiteral("securitySessionRecoveryVerify"));
-        if (!verify)
-            verify = recoveryDialog->findChild<QLineEdit *>();
-        confirmed = recoveryDialog->findChild<QCheckBox *>(QStringLiteral("securityRecoveryConfirmed"));
-        break;
-    }
-
-    QVERIFY(recoveryDialog);
-    QVERIFY(seedView);
-    QVERIFY(buttons);
-
-    if (verify)
-        verify->setText(seedView->toPlainText().right(8));
-    else if (confirmed)
-        confirmed->setChecked(true);
-
-    auto *ok = buttons->button(QDialogButtonBox::Ok);
-    QVERIFY(ok);
-    QTest::mouseClick(ok, Qt::LeftButton);
+        if (elapsed->elapsed() < 8000)
+            return;
+        const QString title = dialog ? dialog->windowTitle()
+                                     : QStringLiteral("<no active modal>");
+        window->setProperty(
+            "notepadsafeTestIdentityDriverResult",
+            QStringLiteral("timed out in stage %1; active modal: %2")
+                .arg(stage).arg(title));
+        driver->stop();
+        driver->deleteLater();
+        if (dialog)
+            dialog->reject();
+    });
+    driver->start();
 }
 
 } // namespace
@@ -161,23 +185,10 @@ private slots:
         window->show();
         QVERIFY(QTest::qWaitForWindowExposed(window.get()));
 
-        QTimer::singleShot(80, window.get(), []() {
-            auto *identity = qobject_cast<QDialog *>(QApplication::activeModalWidget());
-            QVERIFY(identity);
-            auto *password = identity->findChild<QLineEdit *>(
-                QStringLiteral("securitySessionPassword"));
-            auto *confirmation = identity->findChild<QLineEdit *>(
-                QStringLiteral("securitySessionConfirmation"));
-            auto *buttons = identity->findChild<QDialogButtonBox *>();
-            QVERIFY(password && confirmation && buttons);
-            QTest::keyClicks(password, QStringLiteral("correct horse battery staple"));
-            QTest::keyClicks(confirmation, QStringLiteral("correct horse battery staple"));
-            QTimer::singleShot(120, identity, []() {
-                confirmRecoverySeedFromIdentitySetup();
-            });
-            QTest::mouseClick(buttons->button(QDialogButtonBox::Ok), Qt::LeftButton);
-        });
+        driveIdentityCreationDialog(window.get());
         QVERIFY(QMetaObject::invokeMethod(window.get(), "newFile", Qt::DirectConnection));
+        QCOMPARE(window->property("notepadsafeTestIdentityDriverResult").toString(),
+                 QStringLiteral("complete"));
 
         EditorTab *tab = currentEditor(window.get());
         QVERIFY(tab && tab->isSecureDocument());
@@ -780,25 +791,11 @@ private slots:
             window->show();
             QVERIFY(QTest::qWaitForWindowExposed(window.get()));
 
-            QTimer::singleShot(80, window.get(), []() {
-                auto *identity = qobject_cast<QDialog *>(QApplication::activeModalWidget());
-                QVERIFY(identity);
-                auto *password = identity->findChild<QLineEdit *>(
-                    QStringLiteral("securitySessionPassword"));
-                auto *confirmation = identity->findChild<QLineEdit *>(
-                    QStringLiteral("securitySessionConfirmation"));
-                auto *buttons = identity->findChild<QDialogButtonBox *>();
-                QVERIFY(password && confirmation && buttons);
-                password->setText(QStringLiteral("correct horse battery staple"));
-                confirmation->setText(QStringLiteral("correct horse battery staple"));
-                QTimer::singleShot(120, identity, []() {
-                    confirmRecoverySeedFromIdentitySetup();
-                });
-                QTest::mouseClick(buttons->button(QDialogButtonBox::Ok),
-                                  Qt::LeftButton);
-            });
+            driveIdentityCreationDialog(window.get());
             QVERIFY(QMetaObject::invokeMethod(window.get(), "newFile",
                                               Qt::DirectConnection));
+            QCOMPARE(window->property("notepadsafeTestIdentityDriverResult").toString(),
+                     QStringLiteral("complete"));
             EditorTab *created = currentEditor(window.get());
             QVERIFY(created && created->isSecureDocument());
             QVERIFY(created->filePath().isEmpty());
@@ -874,23 +871,10 @@ private slots:
         window->show();
         QVERIFY(QTest::qWaitForWindowExposed(window.get()));
 
-        QTimer::singleShot(80, window.get(), []() {
-            auto *identity = qobject_cast<QDialog *>(QApplication::activeModalWidget());
-            QVERIFY(identity);
-            auto *password = identity->findChild<QLineEdit *>(
-                QStringLiteral("securitySessionPassword"));
-            auto *confirmation = identity->findChild<QLineEdit *>(
-                QStringLiteral("securitySessionConfirmation"));
-            auto *buttons = identity->findChild<QDialogButtonBox *>();
-            QVERIFY(password && confirmation && buttons);
-            QTest::keyClicks(password, QStringLiteral("correct horse battery staple"));
-            QTest::keyClicks(confirmation, QStringLiteral("correct horse battery staple"));
-            QTimer::singleShot(120, identity, []() {
-                confirmRecoverySeedFromIdentitySetup();
-            });
-            QTest::mouseClick(buttons->button(QDialogButtonBox::Ok), Qt::LeftButton);
-        });
+        driveIdentityCreationDialog(window.get());
         QVERIFY(QMetaObject::invokeMethod(window.get(), "newFile", Qt::DirectConnection));
+        QCOMPARE(window->property("notepadsafeTestIdentityDriverResult").toString(),
+                 QStringLiteral("complete"));
 
         auto *tabs = window->findChild<QTabWidget *>();
         auto *stack = window->findChild<QStackedWidget *>(QStringLiteral("WorkspaceStack"));
@@ -1062,28 +1046,28 @@ private slots:
         window->show();
         QVERIFY(QTest::qWaitForWindowExposed(window.get()));
 
-        QTimer::singleShot(80, window.get(), []() {
-            auto *identity = qobject_cast<QDialog *>(QApplication::activeModalWidget());
-            QVERIFY(identity);
-            auto *password = identity->findChild<QLineEdit *>(
-                QStringLiteral("securitySessionPassword"));
-            auto *confirmation = identity->findChild<QLineEdit *>(
-                QStringLiteral("securitySessionConfirmation"));
-            auto *buttons = identity->findChild<QDialogButtonBox *>();
-            QVERIFY(password && confirmation && buttons);
-            QTest::keyClicks(password, QStringLiteral("correct horse battery staple"));
-            QTest::keyClicks(confirmation, QStringLiteral("correct horse battery staple"));
-            QTimer::singleShot(120, identity, []() {
-                confirmRecoverySeedFromIdentitySetup();
-            });
-            QTest::mouseClick(buttons->button(QDialogButtonBox::Ok), Qt::LeftButton);
-        });
+        driveIdentityCreationDialog(window.get());
         QVERIFY(QMetaObject::invokeMethod(window.get(), "newFile", Qt::DirectConnection));
+        QCOMPARE(window->property("notepadsafeTestIdentityDriverResult").toString(),
+                 QStringLiteral("complete"));
 
         EditorTab *tab = currentEditor(window.get());
         QVERIFY(tab && tab->isSecureDocument() && !tab->isSecureDocumentMasked());
-        const QString secret = QStringLiteral("CLIPBOARD_SECRET_74f6d18c");
+        tab->editor()->setText(QStringLiteral("saved clipboard baseline"));
+        QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(tab->autosavePath())
+                                     && !tab->isModified(), 10000);
+
+        // Force the primary KDBX overwrite guard to reject the next save while
+        // leaving a valid baseline file. System lock must still mask plaintext
+        // and restore the dirty body from the DPAPI recovery point.
+        QFile backing(tab->autosavePath());
+        QVERIFY(backing.open(QIODevice::ReadWrite));
+        QVERIFY(backing.setFileTime(QDateTime::currentDateTimeUtc().addSecs(5),
+                                    QFileDevice::FileModificationTime));
+        backing.close();
+        const QString secret = QStringLiteral("CLIPBOARD_SECRET_74f6d18c_UNSAVED");
         tab->editor()->setText(secret);
+        QVERIFY(tab->isModified());
         tab->editor()->selectAll();
         tab->editor()->setFocus();
         QTest::keyClick(tab->editor(), Qt::Key_C, Qt::ControlModifier);
@@ -1094,10 +1078,23 @@ private slots:
         QCOMPARE(QApplication::clipboard()->text(), secret);
 
 #ifdef Q_OS_WIN
+        bool unexpectedModalSeen = false;
+        QString unexpectedModalTitle;
+        QTimer::singleShot(15000, window.get(), [&]() {
+            QWidget *modal = QApplication::activeModalWidget();
+            if (!modal)
+                return;
+            unexpectedModalSeen = true;
+            unexpectedModalTitle = modal->windowTitle();
+            modal->close();
+        });
         // Exercise the native Windows workstation-lock route: copied secure
         // note text must disappear together with the editor plaintext.
         ::SendMessageW(reinterpret_cast<HWND>(window->winId()), WM_WTSSESSION_CHANGE,
                        WTS_SESSION_LOCK, 0);
+        QVERIFY2(!unexpectedModalSeen,
+                 qPrintable(QStringLiteral("system-lock path opened an unexpected modal: %1")
+                                .arg(unexpectedModalTitle)));
         QTRY_VERIFY_WITH_TIMEOUT(tab->isSecureDocumentMasked(), 3000);
         auto *tabs = window->findChild<QTabWidget *>();
         QVERIFY(tabs);
@@ -1114,6 +1111,7 @@ private slots:
                        WTS_SESSION_UNLOCK, 0);
         QTRY_VERIFY_WITH_TIMEOUT(!tab->isSecureDocumentMasked(), 5000);
         QTRY_COMPARE_WITH_TIMEOUT(tab->editor()->text(), secret, 5000);
+        QVERIFY(tab->isModified());
 
         // Clipboard cleanup is fingerprint-conditional. Never erase content
         // another application/user copied after NotepadSafe's secure copy.

@@ -63,7 +63,6 @@ constexpr int EntryRecycledRole = Qt::UserRole + 2;
 constexpr int ProtectedClipboardLifetimeMs = 30 * 1000;
 constexpr int RecoveryClipboardLifetimeMs = 60 * 1000;
 constexpr int PasswordRevealLifetimeMs = 30 * 1000;
-constexpr qsizetype SecureNoteMaximumBytes = 32 * 1024 * 1024;
 
 void scrubByteArray(QByteArray &bytes)
 {
@@ -267,9 +266,6 @@ void VaultDock::buildUi()
 
     newLoginButton_ = new QPushButton(tr("新建账号"), container);
     newLoginButton_->setObjectName(QStringLiteral("vaultNewLoginButton"));
-    newNoteButton_ = new QPushButton(tr("导入旧版安全笔记"), container);
-    newNoteButton_->setObjectName(QStringLiteral("vaultNewNoteButton"));
-    newNoteButton_->hide();
 
     pages_ = new QStackedWidget(container);
     pages_->setObjectName(QStringLiteral("vaultPages"));
@@ -626,7 +622,6 @@ void VaultDock::buildUi()
     connect(lockButton_, &QPushButton::clicked, this, &VaultDock::requestLock);
     connect(newLoginButton_, &QPushButton::clicked, this, &VaultDock::createLogin);
     connect(emptyCreateButton_, &QPushButton::clicked, this, &VaultDock::createLogin);
-    connect(newNoteButton_, &QPushButton::clicked, this, &VaultDock::createSecureNote);
     connect(filterEdit_, &QLineEdit::textChanged, this, &VaultDock::applyFilter);
     connect(sortCombo_, &QComboBox::currentIndexChanged, this, [this](int) {
         refreshEntries(currentEntryId_);
@@ -635,18 +630,6 @@ void VaultDock::buildUi()
             this, &VaultDock::showPasswordHealthReport);
     connect(entryTree_, &QTreeWidget::currentItemChanged,
             this, &VaultDock::onCurrentItemChanged);
-    connect(entryTree_, &QTreeWidget::itemDoubleClicked, this,
-            [this](QTreeWidgetItem *item, int) {
-        if (!item)
-            return;
-        const QUuid id(item->data(0, EntryIdRole).toString());
-        if (id.isNull() || item->data(0, EntryRecycledRole).toBool())
-            return;
-        VaultError error;
-        auto entry = service_.readEntry(id, &error);
-        if (entry && entry->tags.contains(VaultSecureNoteTag))
-            emit secureNoteOpenRequested(id);
-    });
     connect(saveButton_, &QPushButton::clicked, this, &VaultDock::saveCurrentEntry);
     connect(editButton_, &QPushButton::clicked, this, &VaultDock::editCurrentEntry);
     connect(historyButton_, &QPushButton::clicked,
@@ -984,46 +967,6 @@ VaultError VaultDock::recoverManagedStore(const QString &filePath,
         rememberManagedStore(filePath);
     return error;
 #endif
-}
-
-std::unique_ptr<VaultEntryData> VaultDock::readSecureDocument(const QUuid &id,
-                                                              VaultError *error) const
-{
-    return service_.readEntry(id, error);
-}
-
-VaultError VaultDock::saveSecureDocument(const QUuid &id, const QString &title,
-                                         const QString &plainText)
-{
-    if (service_.state() != VaultState::Open)
-        return {VaultErrorCode::Locked, tr("加密文档当前已锁定。"),
-                QStringLiteral("secure-document.locked")};
-    QByteArray body = plainText.toUtf8();
-    if (body.size() > SecureNoteMaximumBytes) {
-        scrubByteArray(body);
-        return {VaultErrorCode::IoError,
-                tr("加密笔记不能超过 32 MiB。请将大文件保存为明文文件，或只保存敏感摘要。"),
-                QStringLiteral("secure-document.size-limit")};
-    }
-    VaultEntryData data;
-    data.id = id;
-    data.title = title.trimmed().isEmpty() ? tr("未命名加密笔记") : title.trimmed();
-    data.tags = {VaultSecureNoteTag};
-    data.notesUtf8.assign(body.constData(), body.size());
-    scrubByteArray(body);
-    auto pendingData = std::make_shared<VaultEntryData>(std::move(data));
-    VaultError error = runSerializedSecurityOperation(
-        this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
-        tr("正在保存加密笔记"),
-        [this, pendingData]() mutable {
-            VaultError result = service_.upsertEntry(std::move(*pendingData));
-            if (!result.isError())
-                result = service_.save();
-            return result;
-        });
-    if (!error.isError())
-        refreshEntries(id);
-    return error;
 }
 
 void VaultDock::applyOpenState()
@@ -1668,13 +1611,6 @@ void VaultDock::createLogin()
     beginNewEntry(EntryKind::Login);
 }
 
-void VaultDock::createSecureNote()
-{
-    if (service_.state() != VaultState::Open)
-        return;
-    beginNewEntry(EntryKind::SecureNote);
-}
-
 void VaultDock::beginNewEntry(EntryKind kind)
 {
     if (!maybeSaveChanges())
@@ -1713,7 +1649,8 @@ void VaultDock::saveCurrentEntry()
 void VaultDock::editCurrentEntry()
 {
     if (service_.state() != VaultState::Open || currentEntryId_.isNull()
-        || currentEntryRecycled_ || !currentEntryPersisted_) {
+        || currentKind_ != EntryKind::Login || currentEntryRecycled_
+        || !currentEntryPersisted_) {
         return;
     }
     VaultError error;
@@ -1765,8 +1702,10 @@ void VaultDock::cancelCurrentEdit()
 
 bool VaultDock::saveCurrentEntryImpl(bool showSuccess)
 {
-    if (service_.state() != VaultState::Open || currentEntryId_.isNull())
+    if (service_.state() != VaultState::Open || currentEntryId_.isNull()
+        || currentKind_ != EntryKind::Login) {
         return false;
+    }
     if (titleEdit_->text().trimmed().isEmpty()) {
         if (showSuccess)
             QMessageBox::warning(this, tr("无法保存"), tr("标题不能为空。"));
@@ -1777,8 +1716,8 @@ bool VaultDock::saveCurrentEntryImpl(bool showSuccess)
     VaultEntryData data;
     data.id = currentEntryId_;
     data.title = titleEdit_->text().trimmed();
-    data.username = currentKind_ == EntryKind::Login ? usernameEdit_->text() : QString();
-    data.url = currentKind_ == EntryKind::Login ? urlEdit_->text() : QString();
+    data.username = usernameEdit_->text();
+    data.url = urlEdit_->text();
     data.tags.clear();
     const QStringList requestedTags = tagsEdit_->text().split(
         QRegularExpression(QStringLiteral("[,，;；]")), Qt::SkipEmptyParts);
@@ -1787,55 +1726,51 @@ bool VaultDock::saveCurrentEntryImpl(bool showSuccess)
         if (!tag.isEmpty() && !data.tags.contains(tag, Qt::CaseInsensitive))
             data.tags.push_back(tag);
     }
-    if (currentKind_ == EntryKind::SecureNote)
-        data.tags.push_back(VaultSecureNoteTag);
-    if (currentKind_ == EntryKind::Login) {
-        data.synchronizeExtendedFields = true;
-        data.groupPath = groupEdit_->text().trimmed();
-        const QStringList rawUrls = additionalUrlsEdit_->toPlainText().split(
-            QRegularExpression(QStringLiteral("[\\r\\n]+")), Qt::SkipEmptyParts);
-        for (const QString &rawUrl : rawUrls) {
-            const QString url = rawUrl.trimmed();
-            if (!url.isEmpty() && !data.additionalUrls.contains(url, Qt::CaseInsensitive))
-                data.additionalUrls.append(url);
-        }
-        const QStringList rawFields = customFieldsEdit_->toPlainText().split(
-            QRegularExpression(QStringLiteral("[\\r\\n]+")), Qt::SkipEmptyParts);
-        QSet<QString> fieldNames;
-        for (const QString &rawLine : rawFields) {
-            QString line = rawLine.trimmed();
-            bool protectedValue = true;
-            if (line.startsWith(QStringLiteral("public:"), Qt::CaseInsensitive)) {
-                line.remove(0, 7);
-                protectedValue = false;
-            }
-            const int separator = line.indexOf(QLatin1Char('='));
-            const QString name = separator > 0 ? line.left(separator).trimmed() : QString();
-            if (name.isEmpty() || fieldNames.contains(name.toCaseFolded())) {
-                if (showSuccess) {
-                    QMessageBox::warning(
-                        this, tr("自定义字段无效"),
-                        tr("每个自定义字段必须使用唯一的 name=value 格式。"));
-                }
-                customFieldsEdit_->setFocus();
-                return false;
-            }
-            fieldNames.insert(name.toCaseFolded());
-            VaultCustomField field;
-            field.name = name;
-            field.protectedValue = protectedValue;
-            field.valueUtf8 = secureUtf8From(line.mid(separator + 1));
-            data.customFields.push_back(std::move(field));
-        }
-        data.expires = expiryCheck_->isChecked();
-        data.expiryUtc = expiryEdit_->dateTime().toUTC();
-        data.passwordUtf8 = secureUtf8From(passwordEdit_->text());
-        data.totpSeedUtf8 = secureUtf8From(totpEdit_->text().trimmed());
-        currentEntryHasPassword_ = !data.passwordUtf8.empty();
-        currentEntryHasTotp_ = !data.totpSeedUtf8.empty();
-        data.hasPassword = currentEntryHasPassword_;
-        data.hasTotp = currentEntryHasTotp_;
+    data.synchronizeExtendedFields = true;
+    data.groupPath = groupEdit_->text().trimmed();
+    const QStringList rawUrls = additionalUrlsEdit_->toPlainText().split(
+        QRegularExpression(QStringLiteral("[\\r\\n]+")), Qt::SkipEmptyParts);
+    for (const QString &rawUrl : rawUrls) {
+        const QString url = rawUrl.trimmed();
+        if (!url.isEmpty() && !data.additionalUrls.contains(url, Qt::CaseInsensitive))
+            data.additionalUrls.append(url);
     }
+    const QStringList rawFields = customFieldsEdit_->toPlainText().split(
+        QRegularExpression(QStringLiteral("[\\r\\n]+")), Qt::SkipEmptyParts);
+    QSet<QString> fieldNames;
+    for (const QString &rawLine : rawFields) {
+        QString line = rawLine.trimmed();
+        bool protectedValue = true;
+        if (line.startsWith(QStringLiteral("public:"), Qt::CaseInsensitive)) {
+            line.remove(0, 7);
+            protectedValue = false;
+        }
+        const int separator = line.indexOf(QLatin1Char('='));
+        const QString name = separator > 0 ? line.left(separator).trimmed() : QString();
+        if (name.isEmpty() || fieldNames.contains(name.toCaseFolded())) {
+            if (showSuccess) {
+                QMessageBox::warning(
+                    this, tr("自定义字段无效"),
+                    tr("每个自定义字段必须使用唯一的 name=value 格式。"));
+            }
+            customFieldsEdit_->setFocus();
+            return false;
+        }
+        fieldNames.insert(name.toCaseFolded());
+        VaultCustomField field;
+        field.name = name;
+        field.protectedValue = protectedValue;
+        field.valueUtf8 = secureUtf8From(line.mid(separator + 1));
+        data.customFields.push_back(std::move(field));
+    }
+    data.expires = expiryCheck_->isChecked();
+    data.expiryUtc = expiryEdit_->dateTime().toUTC();
+    data.passwordUtf8 = secureUtf8From(passwordEdit_->text());
+    data.totpSeedUtf8 = secureUtf8From(totpEdit_->text().trimmed());
+    currentEntryHasPassword_ = !data.passwordUtf8.empty();
+    currentEntryHasTotp_ = !data.totpSeedUtf8.empty();
+    data.hasPassword = currentEntryHasPassword_;
+    data.hasTotp = currentEntryHasTotp_;
     data.notesUtf8 = secureUtf8From(notesEdit_->toPlainText());
 
     auto pendingData = std::make_shared<VaultEntryData>(std::move(data));
@@ -1881,10 +1816,13 @@ void VaultDock::removeCurrentEntry()
     }
 
     const bool permanentDelete = currentEntryRecycled_;
+    const QString entryKind = currentKind_ == EntryKind::SecureNote
+        ? tr("旧版笔记") : tr("账号");
     const QUuid entryId = currentEntryId_;
     VaultError error = runSerializedSecurityOperation(
         this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
-        permanentDelete ? tr("正在永久删除账户") : tr("正在移动账户到回收站"),
+        permanentDelete ? tr("正在永久删除%1").arg(entryKind)
+                        : tr("正在移动%1到回收站").arg(entryKind),
         [this, permanentDelete, entryId] {
             VaultError result = permanentDelete ? service_.removeEntry(entryId)
                                                 : service_.recycleEntry(entryId);
@@ -1899,8 +1837,8 @@ void VaultDock::removeCurrentEntry()
     }
     clearEditor();
     refreshEntries();
-    emit userNotificationRequested(permanentDelete ? tr("账号已永久删除")
-                                                    : tr("账号已移到回收站"),
+    emit userNotificationRequested(permanentDelete ? tr("%1已永久删除").arg(entryKind)
+                                                    : tr("%1已移到回收站").arg(entryKind),
                                    4000);
 }
 
@@ -1911,9 +1849,11 @@ void VaultDock::restoreCurrentEntry()
         return;
     }
     const QUuid restoredId = currentEntryId_;
+    const QString entryKind = currentKind_ == EntryKind::SecureNote
+        ? tr("旧版笔记") : tr("账号");
     VaultError error = runSerializedSecurityOperation(
         this, AsyncTaskType::VaultOperation, AsyncTaskPriority::Highest,
-        tr("正在恢复账户"),
+        tr("正在恢复%1").arg(entryKind),
         [this, restoredId] {
             VaultError result = service_.restoreEntry(restoredId);
             if (!result.isError())
@@ -1928,13 +1868,14 @@ void VaultDock::restoreCurrentEntry()
     currentEntryRecycled_ = false;
     refreshEntries(restoredId);
     loadEntry(restoredId);
-    emit userNotificationRequested(tr("账号已从回收站恢复"), 4000);
+    emit userNotificationRequested(tr("%1已从回收站恢复").arg(entryKind), 4000);
 }
 
 void VaultDock::showEntryHistory()
 {
     if (service_.state() != VaultState::Open || currentEntryId_.isNull()
-        || editorEditing_ || currentEntryRecycled_) {
+        || currentKind_ != EntryKind::Login || editorEditing_
+        || currentEntryRecycled_) {
         return;
     }
     VaultError error;
@@ -2214,7 +2155,8 @@ void VaultDock::setEntryKind(EntryKind kind)
 
 void VaultDock::setEditingState(bool editing, bool newEntry)
 {
-    editorEditing_ = editing && !currentEntryRecycled_;
+    editorEditing_ = editing && currentKind_ == EntryKind::Login
+                     && !currentEntryRecycled_;
     if (newEntry)
         currentEntryPersisted_ = false;
 
@@ -2253,10 +2195,12 @@ void VaultDock::setEditingState(bool editing, bool newEntry)
     saveButton_->setEnabled(editable);
     cancelButton_->setVisible(editable);
     cancelButton_->setEnabled(editable);
-    editButton_->setVisible(available && !currentEntryRecycled_ && currentEntryPersisted_
+    editButton_->setVisible(available && currentKind_ == EntryKind::Login
+                            && !currentEntryRecycled_ && currentEntryPersisted_
                             && !editorEditing_);
     editButton_->setEnabled(editButton_->isVisible());
-    historyButton_->setVisible(available && !currentEntryRecycled_
+    historyButton_->setVisible(available && currentKind_ == EntryKind::Login
+                               && !currentEntryRecycled_
                                && currentEntryPersisted_ && !editorEditing_);
     historyButton_->setEnabled(historyButton_->isVisible());
     cloneButton_->setVisible(available && currentKind_ == EntryKind::Login
@@ -2316,12 +2260,9 @@ void VaultDock::setEditingState(bool editing, bool newEntry)
                                 ? tr("回收站 · 旧版笔记（只读）")
                                 : tr("回收站 · 账号（只读）"));
     } else if (editorEditing_) {
-        kindLabel_->setText(currentKind_ == EntryKind::SecureNote
-                                ? (currentEntryPersisted_ ? tr("编辑旧版笔记")
-                                                          : tr("导入旧版笔记"))
-                                : (currentEntryPersisted_ ? tr("编辑账号") : tr("新建账号")));
+        kindLabel_->setText(currentEntryPersisted_ ? tr("编辑账号") : tr("新建账号"));
     } else {
-        kindLabel_->setText(currentKind_ == EntryKind::SecureNote ? tr("旧版笔记")
+        kindLabel_->setText(currentKind_ == EntryKind::SecureNote ? tr("旧版笔记（只读）")
                                                                   : tr("账号"));
     }
     emit workspaceCommandStateChanged();
@@ -2345,7 +2286,6 @@ void VaultDock::setVaultOpenControls(bool open)
 {
     lockButton_->setEnabled(open);
     newLoginButton_->setEnabled(open);
-    newNoteButton_->setEnabled(open);
     if (emptyCreateButton_)
         emptyCreateButton_->setEnabled(open);
     emit workspaceCommandStateChanged();

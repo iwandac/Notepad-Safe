@@ -30,7 +30,6 @@ enum class AsyncTaskType : int {
     Unknown = 0,
     LineIndexBuild = 1,   // L2 行索引构建（全量/增量/补扫）
     LargeFileSearch = 2,  // 大文件分块搜索
-    CharacterCount = 3,
     EncodingConversion = 4,
     SessionSnapshot = 5,
     SecureOpen = 6,

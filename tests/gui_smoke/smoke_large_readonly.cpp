@@ -1911,12 +1911,19 @@ private slots:
         lineWindow.close();
     }
 
-    void bigFileLineNumbersAndCharacterCountRunIndependently()
+    void bigFileLineNumbersAndCharacterCountShareOneScan()
     {
-        const QString path = portableS3Path();
-        QVERIFY2(QFileInfo::exists(path), qPrintable(path));
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        const QString path = temporary.filePath(QStringLiteral("fused-analysis.log"));
+        QSaveFile output(path);
+        QVERIFY(output.open(QIODevice::WriteOnly));
+        const QByteArray line = QByteArrayLiteral("fused-analysis-row\n");
+        for (int i = 0; i < 500000; ++i)
+            QCOMPARE(output.write(line), qint64(line.size()));
+        QVERIFY(output.commit());
         const qint64 size = QFileInfo(path).size();
-        QVERIFY(size > 4LL * 1024 * 1024 * 1024);
+        QVERIFY(size > 4LL * 1024 * 1024);
 
         auto &pool = AsyncThreadPool::instance();
         QVERIFY(pool.maxThreads() >= 1);
@@ -1938,7 +1945,7 @@ private slots:
                                     &error), qPrintable(error));
 
         qint64 lineTaskId = -1;
-        qint64 characterTaskId = -1;
+        bool characterTaskSeen = false;
         QTRY_VERIFY_WITH_TIMEOUT(([&]() {
             for (const QList<QVariant> &arguments : added) {
                 if (arguments.isEmpty())
@@ -1947,12 +1954,13 @@ private slots:
                 const AsyncTask task = AsyncTaskManager::instance().taskById(id);
                 if (task.categoryTag == QStringLiteral("LineNumberIndex"))
                     lineTaskId = id;
-                else if (task.categoryTag == QStringLiteral("CharacterCount"))
-                    characterTaskId = id;
+                if (task.categoryTag == QStringLiteral("CharacterCount"))
+                    characterTaskSeen = true;
             }
-            return lineTaskId > 0 && characterTaskId > 0;
+            return lineTaskId > 0;
         })(), 5000);
-        QVERIFY(lineTaskId != characterTaskId);
+        QVERIFY2(!characterTaskSeen,
+                 "character count must share the line-number scan");
         const int expectedTotal = qBound(
             2, QThread::idealThreadCount() - 1,
             AsyncThreadPool::MaximumWorkerThreads);
@@ -1961,30 +1969,75 @@ private slots:
 
         QTRY_VERIFY_WITH_TIMEOUT(
             AsyncTaskManager::instance().taskById(lineTaskId).state
-                    == AsyncTaskState::Running
-                && AsyncTaskManager::instance().taskById(characterTaskId).state
-                    == AsyncTaskState::Running,
-            5000);
-        QVERIFY(AsyncTaskManager::instance().activeThreadCount() >= 2);
-
-        QTRY_VERIFY_WITH_TIMEOUT(
-            AsyncTaskManager::instance().taskById(lineTaskId).state
                 == AsyncTaskState::Finished,
-            120000);
-        QCOMPARE(AsyncTaskManager::instance().taskById(characterTaskId).state,
-                 AsyncTaskState::Running);
+            30000);
+        QVERIFY(!provider->characterCountPending());
+        QCOMPARE(provider->characterCount(), size);
 
         provider->goToOffset(size * 4 / 5);
         QTRY_VERIFY_WITH_TIMEOUT(provider->windowStart() > 0, 5000);
         QTRY_VERIFY_WITH_TIMEOUT(
             marginText(provider->editor(), 0) != QStringLiteral("…"), 5000);
 
-        AsyncTaskManager::instance().cancel(characterTaskId);
-        QTRY_COMPARE_WITH_TIMEOUT(
-            AsyncTaskManager::instance().taskById(characterTaskId).state,
-            AsyncTaskState::Canceled, 5000);
         QCOMPARE(AsyncTaskManager::instance().taskById(lineTaskId).state,
                  AsyncTaskState::Finished);
+        window.close();
+    }
+
+    void readonlyTextNativeSelectionSupersedesSearchSelectionForEveryCopy()
+    {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        const QString path = temporary.filePath(QStringLiteral("repeated-copy.log"));
+        const QByteArray source = QByteArrayLiteral(
+            "first-copy-token middle second-copy-token tail third-copy-token\n");
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(file.write(source), qint64(source.size()));
+        file.close();
+
+        QWidget window;
+        window.resize(900, 500);
+        auto *layout = new QVBoxLayout(&window);
+        auto *provider = new WindowedReadOnlyProvider(&window);
+        layout->addWidget(provider);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        QString error;
+        QVERIFY2(provider->openFile(path,
+                                    WindowedReadOnlyProvider::Presentation::Text,
+                                    &error), qPrintable(error));
+
+        const QByteArray first = QByteArrayLiteral("first-copy-token");
+        const QByteArray second = QByteArrayLiteral("second-copy-token");
+        const QByteArray third = QByteArrayLiteral("third-copy-token");
+        provider->goToOffset(source.indexOf(first), first.size());
+        QVERIFY(provider->copySelection(&error));
+        QCOMPARE(QGuiApplication::clipboard()->text(), QString::fromLatin1(first));
+
+        const auto selectWithKeyboard = [&](const QByteArray &token) {
+            const qint64 sourceStart = source.indexOf(token);
+            QVERIFY(sourceStart >= provider->windowStart());
+            const qint64 projectedStart = sourceStart - provider->windowStart();
+            provider->editor()->SendScintilla(
+                QsciScintillaBase::SCI_GOTOPOS,
+                static_cast<unsigned long>(projectedStart));
+            provider->editor()->setFocus();
+            for (qsizetype index = 0; index < token.size(); ++index)
+                QTest::keyClick(provider->editor(), Qt::Key_Right,
+                                Qt::ShiftModifier);
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+            QCOMPARE(provider->selectionStartOffset(), sourceStart);
+            QCOMPARE(provider->selectionEndOffset(), sourceStart + token.size());
+        };
+
+        selectWithKeyboard(second);
+        QTest::keyClick(provider->editor(), Qt::Key_C, Qt::ControlModifier);
+        QCOMPARE(QGuiApplication::clipboard()->text(), QString::fromLatin1(second));
+
+        selectWithKeyboard(third);
+        QTest::keyClick(provider->editor(), Qt::Key_C, Qt::ControlModifier);
+        QCOMPARE(QGuiApplication::clipboard()->text(), QString::fromLatin1(third));
         window.close();
     }
 

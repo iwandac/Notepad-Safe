@@ -103,6 +103,26 @@ struct DecodedTextProjection {
     QVector<qint32> projectedBoundaries;
     bool decodeErrors = false;
 };
+
+// The one authority for translating half-open selections between Scintilla's
+// UTF-8 projection positions and source-byte positions.  A position exactly
+// on a scalar boundary maps to that boundary for either affinity; a position
+// inside a projected scalar rounds outward according to the requested edge.
+enum class TextBoundaryAffinity { Start, End };
+
+class TextProjectionPositionMapper final
+{
+public:
+    static qint32 toSource(
+        const QVector<qint32> &projectedToSource,
+        qint64 projectedPosition,
+        TextBoundaryAffinity affinity);
+    static qint32 toProjected(
+        const QVector<qint32> &sourceBoundaries,
+        const QVector<qint32> &projectedBoundaries,
+        qint64 sourceOffset);
+};
+
 DecodedTextProjection decodeTextProjection(const QByteArray &bytes,
                                            TextEncoding encoding,
                                            bool stripLeadingBom = false,

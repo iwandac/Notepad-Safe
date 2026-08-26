@@ -408,6 +408,40 @@ int main(int argc, char **argv)
           "external same-suffix document can be saved elsewhere");
     check(QFileInfo::exists(externalDraft),
           "Save As never deletes an external file merely because of its suffix");
+    check(!documents.checkpointText(draft.documentId,
+                                    QStringLiteral("recovered unsaved body")).isError()
+              && documents.hasRecoverySnapshot(draft.documentId),
+          "secure document can create a DPAPI recovery point without changing KDBX");
+    documents.closeAll();
+    SecureDocumentSnapshot recoveredText;
+    check(!documents.open(finalDocument, &recoveredText).isError()
+              && recoveredText.recoveredUnsaved
+              && recoveredText.payloadKind == SecureDocumentPayloadKind::Text
+              && recoveredText.text == QStringLiteral("recovered unsaved body"),
+          "reopening overlays the document-bound encrypted recovery point");
+    check(!documents.save(recoveredText.documentId, recoveredText.text,
+                          QStringLiteral("Recovered text"), {}, true).isError()
+              && !documents.hasRecoverySnapshot(recoveredText.documentId),
+          "successful KDBX save consumes the encrypted recovery point");
+
+    const QByteArray recoveredBinary("\0\x01recovered-binary", 18);
+    check(!documents.checkpointBinary(recoveredText.documentId,
+                                      recoveredBinary).isError(),
+          "binary secure content can use the same bounded recovery channel");
+    documents.closeAll();
+    SecureDocumentSnapshot recoveredBinarySnapshot;
+    check(!documents.open(finalDocument, &recoveredBinarySnapshot).isError()
+              && recoveredBinarySnapshot.recoveredUnsaved
+              && recoveredBinarySnapshot.payloadKind
+                     == SecureDocumentPayloadKind::Binary
+              && recoveredBinarySnapshot.binary == recoveredBinary,
+          "recovery preserves binary payload kind and bytes");
+    check(!documents.saveBinary(recoveredBinarySnapshot.documentId,
+                                recoveredBinarySnapshot.binary,
+                                QStringLiteral("Recovered binary"), {}, true).isError()
+              && !documents.hasRecoverySnapshot(
+                  recoveredBinarySnapshot.documentId),
+          "successful binary KDBX save also clears its recovery point");
     documents.closeAll();
 
     session.endSession(true);

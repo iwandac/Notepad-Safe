@@ -1096,6 +1096,44 @@ DecodedTextProjection decodeTextProjection(const QByteArray &bytes,
     return projection;
 }
 
+qint32 TextProjectionPositionMapper::toSource(
+    const QVector<qint32> &projectedToSource,
+    qint64 projectedPosition,
+    TextBoundaryAffinity affinity)
+{
+    if (projectedToSource.isEmpty())
+        return 0;
+    const qsizetype index = static_cast<qsizetype>(std::clamp<qint64>(
+        projectedPosition, 0, projectedToSource.size() - 1));
+    qint32 source = projectedToSource.at(index);
+    if (affinity == TextBoundaryAffinity::End && index > 0
+        && projectedToSource.at(index - 1) == source) {
+        const auto next = std::upper_bound(
+            projectedToSource.cbegin() + index,
+            projectedToSource.cend(), source);
+        if (next != projectedToSource.cend())
+            source = *next;
+    }
+    return source;
+}
+
+qint32 TextProjectionPositionMapper::toProjected(
+    const QVector<qint32> &sourceBoundaries,
+    const QVector<qint32> &projectedBoundaries,
+    qint64 sourceOffset)
+{
+    if (sourceBoundaries.isEmpty() || projectedBoundaries.isEmpty())
+        return 0;
+    const qint32 relative = qint32(std::clamp<qint64>(
+        sourceOffset, 0, sourceBoundaries.constLast()));
+    const auto found = std::lower_bound(sourceBoundaries.cbegin(),
+                                        sourceBoundaries.cend(), relative);
+    const qsizetype index = found == sourceBoundaries.cend()
+        ? sourceBoundaries.size() - 1
+        : qsizetype(found - sourceBoundaries.cbegin());
+    return projectedBoundaries.value(index, projectedBoundaries.constLast());
+}
+
 QString decodeByteGridText(const QByteArray &bytes, TextEncoding encoding,
                            int bytesPerRow)
 {

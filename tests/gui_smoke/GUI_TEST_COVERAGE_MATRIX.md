@@ -121,6 +121,19 @@
 | K25 | 语言变化但命令状态滞后 | Lexer 已切换而折叠、括号或语言 QAction 仍按旧语法 enabled/checked |
 | K26 | 多选相同文本受旧 target 限制 | “选择全部相同文本”只选择当前/上次查找区间，未覆盖整个文档或误沿用旧搜索 flags |
 | K27 | S2/S3 继承全局自动换行 | S1 开启 wrap 后切到 S2/S3，菜单仍可用/勾选，或 Provider 因程序调用进入 WrapWord；切回 S1 时偏好丢失 |
+| K28 | 搜索结果行在模式切换后异常增高 | Text/Binary、行号/字节偏移或单/多文件切换后，真实结果子行不再是统一单行紧凑高度，或完整上下文通过平台自动换行撑满 Dock |
+| K29 | 只读复制被旧搜索选区锁死 | 搜索跳转或全选后，用户连续建立第二、第三个可见选区时 Copy 仍读取旧 source range，或半开结束边界多复制一个字符 |
+
+### 4.1 历史哨兵的机器门禁
+
+历史哨兵不能只登记在文档中。K28 由
+`gui_smoke_findreplace::tc_fr_041_search_dock_rows_remain_compact_across_modes`
+覆盖单文件行号/字节模式与多文件真实结果子行；K29 由
+`test_textencoding::test_projection_position_mapper_half_open_contract` 锁定共享位置映射，
+并由 `gui_smoke_large_readonly::readonlyTextNativeSelectionSupersedesSearchSelectionForEveryCopy`
+执行“搜索选择→键盘新选区→复制→再次新选区→复制”的连续用户序列。GUI smoke 的构建目标、
+CTest 注册和批处理执行名单必须来自 CMake 的同一个 `NOTEPADSAFE_GUI_SMOKE_TARGETS`，新增套件
+不得只注册而不进入默认 GUI 门禁。
 
 ## 5. 参数契约展开规则
 

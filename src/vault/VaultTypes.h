@@ -141,9 +141,9 @@ struct VaultEntryData {
     SecureBuffer totpSeedUtf8;
     bool hasPassword = false;
     bool hasTotp = false;
-    // Account edits use KeePassXC Entry History. High-frequency standalone
-    // secure-document autosaves explicitly disable it to avoid unbounded
-    // history growth every 1.2 seconds.
+    // Account edits use KeePassXC Entry History. Standalone secure documents
+    // keep explicit revisions while their debounced autosaves rate-limit
+    // history creation, avoiding one history item per background write.
     bool recordHistory = true;
 };
 

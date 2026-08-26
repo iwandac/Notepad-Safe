@@ -24,8 +24,10 @@
 #include <QtWidgets/QPlainTextEdit>
 #include <QtWidgets/QWidget>
 #include <QtWidgets/QMessageBox>
+#include <QtWidgets/QStyleOption>
 #include <QtGui/QKeySequence>
 #include <QtGui/QClipboard>
+#include <QtGui/QFontMetrics>
 #include <QtGui/QMouseEvent>
 #include <QtCore/QDebug>
 #include <QtCore/QDir>
@@ -192,6 +194,10 @@ private slots:
     // L2 查询缓存、定向后台回调和 Dock 预览必须绑定搜索开始时的
     // 编码/呈现快照；切换投影不得复用或发布旧解释下的命中。
     void tc_fr_040_l2_search_identity_includes_projection_snapshot();
+
+    // Delegate 只绘制单行时，行高契约也必须是单行；长字节上下文不得因
+    // QTreeView 的隐式自动换行在不同搜索模式下撑满整个 Dock。
+    void tc_fr_041_search_dock_rows_remain_compact_across_modes();
 
 private:
     QString s3FixturePath();
@@ -1548,6 +1554,9 @@ void SmokeFindReplace::tc_fr_016_large_search_starts_before_line_index_completes
     QCoreApplication::processEvents();
     auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
     QVERIFY(tree);
+    QVERIFY2(!tree->wordWrap(),
+             "SearchResultsDock must own a single-line row policy");
+    QCOMPARE(tree->textElideMode(), Qt::ElideRight);
     QVERIFY(tree->model()->index(0, SearchResultsModel::COL_LINE)
                 .data().toString().startsWith(QStringLiteral("0x")));
 
@@ -3963,6 +3972,99 @@ void SmokeFindReplace::tc_fr_040_l2_search_identity_includes_projection_snapshot
     QVERIFY(callbackError.contains(QStringLiteral("编码"))
             || callbackError.contains(QStringLiteral("呈现")));
     editor.close();
+}
+
+void SmokeFindReplace::tc_fr_041_search_dock_rows_remain_compact_across_modes()
+{
+    SearchResultsDock dock;
+    dock.resize(980, 360);
+    dock.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&dock));
+    auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+    QVERIFY(tree);
+
+    const QString marker = QStringLiteral("COMPACT_RESULT_MARKER");
+    const QString context = QString(1800, QChar(0x6d77)) + marker
+                            + QString(1800, QChar(0x6d0b));
+    const QByteArray source = context.toUtf8();
+    const QByteArray needle = marker.toUtf8();
+    const qsizetype byteOffset = source.indexOf(needle);
+    QVERIFY(byteOffset > 0);
+
+    const auto installMode = [&](bool bytePositionMode, int *height) {
+        QVERIFY(height);
+        LargeFileSearchMatch match;
+        match.byteOffset = byteOffset;
+        match.length = needle.size();
+        match.line = bytePositionMode ? -1 : 0;
+        match.col = byteOffset;
+        match.contextByteOffset = 0;
+        match.lineContext = source;
+        auto *model = new SearchResultsModel(&dock);
+        model->setTextEncoding(TextEncoding::Utf8);
+        model->setBytePositionMode(bytePositionMode);
+        model->setResults({match}, {}, 0);
+        dock.setResultsModel(model, marker,
+                             bytePositionMode ? QStringLiteral("bytes.bin")
+                                              : QStringLiteral("lines.txt"));
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+        const QModelIndex cell = tree->model()->index(
+            0, SearchResultsModel::COL_CONTEXT);
+        tree->scrollTo(cell);
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+        const int visualHeight = tree->visualRect(cell).height();
+        QStyleOptionViewItem option;
+        option.initFrom(tree);
+        option.font = tree->font();
+        option.fontMetrics = QFontMetrics(tree->font());
+        option.rect = tree->visualRect(cell);
+        QCOMPARE(tree->itemDelegate()->sizeHint(option, cell).height(),
+                 option.fontMetrics.height() + 8);
+        *height = visualHeight;
+    };
+
+    int lineModeHeight = 0;
+    int byteModeHeight = 0;
+    installMode(false, &lineModeHeight);
+    installMode(true, &byteModeHeight);
+    const int compactMaximum = QFontMetrics(tree->font()).height() * 2;
+    QVERIFY2(lineModeHeight > 0 && lineModeHeight <= compactMaximum,
+             qPrintable(QStringLiteral("line mode row height=%1, compact max=%2")
+                            .arg(lineModeHeight).arg(compactMaximum)));
+    QVERIFY2(byteModeHeight > 0 && byteModeHeight <= compactMaximum,
+             qPrintable(QStringLiteral("byte mode row height=%1, compact max=%2")
+                            .arg(byteModeHeight).arg(compactMaximum)));
+    QCOMPARE(byteModeHeight, lineModeHeight);
+
+    // The all-open-files model introduces document parent rows.  Exercise the
+    // real child result: checking only the top-level group would allow a
+    // broken result-row delegate to pass unnoticed.
+    QTabWidget workspace;
+    auto *target = new EditorTab(&workspace);
+    workspace.addTab(target, QStringLiteral("bytes.bin"));
+    dock.beginMultiFileResults(marker, 1);
+    dock.beginMultiFileTarget(target, TextEncoding::Utf8, true);
+    LargeFileSearchMatch multiMatch;
+    multiMatch.byteOffset = byteOffset;
+    multiMatch.length = needle.size();
+    multiMatch.line = -1;
+    multiMatch.col = byteOffset;
+    multiMatch.contextByteOffset = 0;
+    multiMatch.lineContext = source;
+    dock.appendMultiFilePreview(target, {multiMatch}, TextEncoding::Utf8, true);
+    const QModelIndex group = tree->model()->index(0, 0);
+    QVERIFY(group.isValid());
+    tree->expand(group);
+    const QModelIndex child = tree->model()->index(
+        0, SearchResultsModel::COL_CONTEXT, group);
+    QVERIFY(child.isValid());
+    tree->scrollTo(child);
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+    const int childHeight = tree->visualRect(child).height();
+    QVERIFY2(childHeight > 0 && childHeight <= compactMaximum,
+             qPrintable(QStringLiteral("multi-file child row height=%1, compact max=%2")
+                            .arg(childHeight).arg(compactMaximum)));
+    QCOMPARE(childHeight, lineModeHeight);
 }
 
 QTEST_MAIN(SmokeFindReplace)

@@ -621,7 +621,7 @@ void VirtualFileView::updateMetrics() {
     if (m_viewMode == ViewMode::Hex) {
         // 16 进制模式：地址列宽度 = 固定 8 位 hex + "  " 2 空格（与内容区之间的分隔）
         // 右侧：16*(2 hex + 1 空格) + 2 空格 + 16 ascii 字符（= 文本模式的 gutterWidth 语义）
-        // gutterWidth_ 用于 paintEvent 地址区宽度（drawGutterLine 复用）：
+        // gutterWidth_ 用于 overlay 地址区宽度：
         //   地址列宽度：8 hex charWidth + 2 (pad) + 14 (bookmark padding)
         gutterWidth_ = 10 * charWidth_ + 2 * 4 + 14;  // 8 hex + 2 space + pad
         maxLineChars_ = m_hexBytesPerRow * 4 + 14;
@@ -752,29 +752,8 @@ void VirtualFileView::wheelEvent(QWheelEvent* e) {
 }
 
 // ============================================================================
-//  VFV 不做任何绘制（方案：Scintilla overlay 唯一 UI）
-//  以下绘制函数保留空壳定义仅为避免外部/历史引用导致编译错误；不画一个像素。
-// ============================================================================
-void VirtualFileView::drawGutterLine(QPainter& /*p*/, int /*viewY*/, int /*lineNo*/,
-                                      bool /*isCurrent*/, bool /*hasBookmark*/) {
-    // no-op
-}
-
-int VirtualFileView::drawContentLine(QPainter& /*p*/, int /*viewX*/, int /*viewY*/, int /*lineNo*/) {
-    return 1;  // 调用方可能用返回值累加 Y；返回 1 避免 0 除/无限循环
-}
-
-void VirtualFileView::drawHexLine(QPainter& /*p*/, int /*viewX*/, int /*viewY*/, int /*lineNo*/) {
-    // no-op
-}
-
-// ============================================================================
 //  显示编码 & 自动换行
 // ============================================================================
-// 说明：旧的 drawContentLine 已被上方空壳替代（方案不允许 VFV 自绘）。
-// 这里保留原文件区间（old：752~1232 实际是 setDisplayEncoding 起一直到 drawContentLine 旧体），
-// 用 no-op 占位避免影响后续导航函数。
-void VirtualFileView_drawContentLine_placeholder_noop() {}
 void VirtualFileView::setDisplayEncoding(TextEncoding enc) {
     if (m_displayEncoding == enc) return;
     m_displayEncoding = enc;
@@ -925,12 +904,6 @@ qint64 VirtualFileView::cursorColByte() const {
     return col;
 }
 
-// ==========================================================================
-//  旧 drawContentLine / drawHexLine 已在文件上方以空壳实现（本方案不允许 VFV 自绘，
-//  由 Scintilla overlay 承担全部 UI）。此处删除原实现以避免编译期重复定义
-//  （C2084 function already has a body）。
-// ==========================================================================
-
 void VirtualFileView::paintEvent(QPaintEvent* /*e*/) {
     // ==========================================================================
     //  方案：VFV 不做任何绘制。Scintilla overlay 盖满 viewport，是唯一 UI。
@@ -939,10 +912,6 @@ void VirtualFileView::paintEvent(QPaintEvent* /*e*/) {
     //  的独立 QLabel 浮层（后续补齐时不走 VFV paintEvent）。
     // ==========================================================================
 }
-
-// ============================================================================
-//  （旧 drawHexLine 实现已删除：全局符号在 L748 处已被空壳替换，此处避免 C2084 重复定义。）
-// ============================================================================
 
 // ============================================================================
 //  鼠标（左键点击 / 拖拽选择）

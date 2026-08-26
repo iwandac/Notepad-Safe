@@ -537,7 +537,12 @@ public:
     QSize sizeHint(const QStyleOptionViewItem& option,
                    const QModelIndex& index) const override
     {
-        return QStyledItemDelegate::sizeHint(option, index);
+        QSize hint = QStyledItemDelegate::sizeHint(option, index);
+        // paint() deliberately lays out exactly one visual line. Letting the
+        // platform delegate derive height from the full, potentially multi-KiB
+        // DisplayRole creates a second and contradictory wrapping policy.
+        hint.setHeight(option.fontMetrics.height() + 8);
+        return hint;
     }
 };
 
@@ -581,6 +586,8 @@ SearchResultsDock::SearchResultsDock(QWidget *parent)
     m_treeView->setObjectName(QStringLiteral("searchResultsTree"));
     m_treeView->setAlternatingRowColors(true);
     m_treeView->setUniformRowHeights(true);
+    m_treeView->setWordWrap(false);
+    m_treeView->setTextElideMode(Qt::ElideRight);
     m_treeView->setMouseTracking(true);
     m_treeView->viewport()->setAttribute(Qt::WA_Hover, true);
     m_treeView->setSelectionBehavior(QAbstractItemView::SelectRows);
