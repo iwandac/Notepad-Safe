@@ -8,6 +8,7 @@
 
 #include "SharedReadOnlyFile.h"
 #include "TextEncoding.h"
+#include "ReadOnlySelectionModel.h"
 
 class QFileSystemWatcher;
 class QPlainTextEdit;
@@ -137,8 +138,7 @@ private:
     bool m_applyingSourceSelection = false;
     bool m_asciiMouseSelecting = false;
     SelectionAuthority m_selectionAuthority = SelectionAuthority::NativeProjection;
-    qint64 m_selectionAnchor = 0;
-    qint64 m_selectionCaret = 0;
+    ReadOnlySelectionModel m_sourceSelection;
     QFileSystemWatcher *m_fileWatcher = nullptr;
     QTimer *m_remapDebounce = nullptr;
     QTimer *m_filePoll = nullptr;

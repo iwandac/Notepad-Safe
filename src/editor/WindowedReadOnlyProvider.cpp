@@ -401,8 +401,9 @@ bool WindowedReadOnlyProvider::refreshFileMapping(QString *error)
         : kSliderMaximum);
 
     if (m_selectionAuthority == SelectionAuthority::SourceBytes) {
-        m_selectionAnchor = std::clamp(m_selectionAnchor, 0LL, m_fileSize);
-        m_selectionCaret = std::clamp(m_selectionCaret, 0LL, m_fileSize);
+        m_sourceSelection.selectEndpoints(
+            {std::clamp(m_sourceSelection.anchor().value, 0LL, m_fileSize)},
+            {std::clamp(m_sourceSelection.caret().value, 0LL, m_fileSize)});
     }
     if (m_fileSize > 0) {
         reloadWindow(clampOffset(preservedAnchor, m_fileSize), 0,
@@ -737,7 +738,8 @@ qint64 WindowedReadOnlyProvider::visibleBottomOffset() const
 qint64 WindowedReadOnlyProvider::selectionStartOffset() const
 {
     if (m_selectionAuthority == SelectionAuthority::SourceBytes)
-        return std::min(m_selectionAnchor, m_selectionCaret);
+        return m_sourceSelection.selection()
+            ? m_sourceSelection.selection()->start.value : 0;
     if (m_presentation == Presentation::Hex && m_asciiPreview
         && (m_asciiPreview->hasFocus()
             || (m_asciiPreview->viewport()
@@ -754,7 +756,8 @@ qint64 WindowedReadOnlyProvider::selectionStartOffset() const
 qint64 WindowedReadOnlyProvider::selectionEndOffset() const
 {
     if (m_selectionAuthority == SelectionAuthority::SourceBytes)
-        return std::max(m_selectionAnchor, m_selectionCaret);
+        return m_sourceSelection.selection()
+            ? m_sourceSelection.selection()->end.value : 0;
     if (m_presentation == Presentation::Hex && m_asciiPreview
         && (m_asciiPreview->hasFocus()
             || (m_asciiPreview->viewport()
@@ -808,8 +811,9 @@ void WindowedReadOnlyProvider::goToOffset(qint64 offset, qint64 selectionBytes)
         return;
     if (selectionBytes > 0) {
         m_selectionAuthority = SelectionAuthority::SourceBytes;
-        m_selectionAnchor = clampOffset(offset, m_fileSize);
-        m_selectionCaret = std::min(m_fileSize, m_selectionAnchor + selectionBytes);
+        const qint64 anchor = clampOffset(offset, m_fileSize);
+        m_sourceSelection.selectEndpoints(
+            {anchor}, {std::min(m_fileSize, anchor + selectionBytes)});
     } else {
         clearVirtualSelection();
     }
@@ -821,8 +825,7 @@ void WindowedReadOnlyProvider::selectAllSource()
     if (m_path.isEmpty() || m_fileSize <= 0)
         return;
     m_selectionAuthority = SelectionAuthority::SourceBytes;
-    m_selectionAnchor = 0;
-    m_selectionCaret = m_fileSize;
+    m_sourceSelection.selectEndpoints({0}, {m_fileSize});
     applyVirtualSelection();
 }
 
@@ -1374,11 +1377,12 @@ void WindowedReadOnlyProvider::beginVirtualSelection()
     const qint64 caretPosition = directScintilla(
         m_editor, QsciScintillaBase::SCI_GETCURRENTPOS);
     if (anchorPosition == caretPosition) {
-        m_selectionAnchor = sourceOffsetForProjectedPosition(anchorPosition, false);
-        m_selectionCaret = m_selectionAnchor;
+        const qint64 anchor = sourceOffsetForProjectedPosition(anchorPosition, false);
+        m_sourceSelection.selectEndpoints({anchor}, {anchor});
     } else {
-        m_selectionAnchor = sourceOffsetForProjectedPosition(anchorPosition, true);
-        m_selectionCaret = sourceOffsetForProjectedPosition(caretPosition, true);
+        m_sourceSelection.selectEndpoints(
+            {sourceOffsetForProjectedPosition(anchorPosition, true)},
+            {sourceOffsetForProjectedPosition(caretPosition, true)});
     }
     m_selectionAuthority = SelectionAuthority::SourceBytes;
 }
@@ -1387,15 +1391,16 @@ void WindowedReadOnlyProvider::updateVirtualSelection(qint64 caretOffset)
 {
     if (m_selectionAuthority != SelectionAuthority::SourceBytes)
         beginVirtualSelection();
-    m_selectionCaret = std::clamp(caretOffset, 0LL, m_fileSize);
+    m_sourceSelection.selectEndpoints(
+        m_sourceSelection.anchor(),
+        {std::clamp(caretOffset, 0LL, m_fileSize)});
     applyVirtualSelection();
 }
 
 void WindowedReadOnlyProvider::clearVirtualSelection()
 {
     m_selectionAuthority = SelectionAuthority::NativeProjection;
-    m_selectionAnchor = 0;
-    m_selectionCaret = 0;
+    m_sourceSelection.clear();
 }
 
 void WindowedReadOnlyProvider::applyVirtualSelection()
@@ -1405,13 +1410,16 @@ void WindowedReadOnlyProvider::applyVirtualSelection()
         return;
     QScopedValueRollback<bool> selectionTransaction(
         m_applyingSourceSelection, true);
-    const qint64 low = std::min(m_selectionAnchor, m_selectionCaret);
-    const qint64 high = std::max(m_selectionAnchor, m_selectionCaret);
+    if (!m_sourceSelection.selection())
+        return;
+    const qint64 low = m_sourceSelection.selection()->start.value;
+    const qint64 high = m_sourceSelection.selection()->end.value;
     const qint64 visibleLow = std::clamp(low, m_windowStart, m_windowEnd);
     const qint64 visibleHigh = std::clamp(high, m_windowStart, m_windowEnd);
     const qint64 startPosition = projectedPositionForSourceOffset(visibleLow);
     const qint64 endPosition = projectedPositionForSourceOffset(visibleHigh);
-    const bool forward = m_selectionCaret >= m_selectionAnchor;
+    const bool forward = m_sourceSelection.caret().value
+        >= m_sourceSelection.anchor().value;
     directScintilla(m_editor, QsciScintillaBase::SCI_SETSEL,
                     static_cast<ScintillaUnsigned>(forward ? startPosition : endPosition),
                     static_cast<ScintillaSigned>(forward ? endPosition : startPosition));
@@ -1906,8 +1914,7 @@ void WindowedReadOnlyProvider::setHexSourceSelection(qint64 anchor, qint64 caret
     if (anchor < m_windowStart || anchor > m_windowEnd
         || caret < m_windowStart || caret > m_windowEnd) {
         m_selectionAuthority = SelectionAuthority::SourceBytes;
-        m_selectionAnchor = anchor;
-        m_selectionCaret = caret;
+        m_sourceSelection.selectEndpoints({anchor}, {caret});
         const qint64 display = caret >= m_fileSize ? m_fileSize - 1 : caret;
         reloadWindow(std::max<qint64>(0, display), 0);
         applyVirtualSelection();

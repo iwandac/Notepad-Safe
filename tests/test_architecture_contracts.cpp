@@ -3,6 +3,7 @@
 #include "ReadOnlySelectionModel.h"
 #include "FeatureRegistry.h"
 #include "InferenceProviderRegistry.h"
+#include "PersistenceAdapterRegistry.h"
 
 #include <QCoreApplication>
 #include <QDebug>
@@ -77,6 +78,19 @@ private:
     DocumentProviderDescriptor descriptor_;
 };
 
+class CountingPersistenceAdapter final : public IPersistenceAdapter {
+public:
+    explicit CountingPersistenceAdapter(PersistenceAdapterDescriptor descriptor)
+        : descriptor_(std::move(descriptor)) {}
+    PersistenceAdapterDescriptor descriptor() const override { return descriptor_; }
+    bool recognizes(const QString &path) const override
+    {
+        return path.contains(descriptor_.id);
+    }
+private:
+    PersistenceAdapterDescriptor descriptor_;
+};
+
 DocumentSnapshot snapshot(DocumentSecurityClass security)
 {
     DocumentSnapshot result;
@@ -104,6 +118,13 @@ int main(int argc, char **argv)
           "repeated copy observes the second selection, not a stale first range");
     selection.select({{9}, {3}});
     check(!selection.selection(), "invalid owner transition clears selection");
+    selection.selectEndpoints({18}, {12});
+    check(selection.selection()
+              && selection.selection()->start.value == 12
+              && selection.selection()->end.value == 18
+              && selection.anchor().value == 18
+              && selection.caret().value == 12,
+          "reverse selection preserves direction and exposes a normalized range");
 
     DocumentToolRegistry tools;
     check(tools.registerTool(EchoDocumentTool().descriptor(), [] {
@@ -166,6 +187,29 @@ int main(int argc, char **argv)
           "one hundred unused providers instantiate no implementation");
     check(descriptorRegistrationMs < 100,
           "descriptor-only extension registration stays inside startup budget");
+
+    PersistenceAdapterRegistry persistenceAdapters;
+    for (int i = 0; i < 20; ++i) {
+        const PersistenceAdapterDescriptor descriptor{
+            QStringLiteral("test.persistence.%1").arg(i), QStringLiteral("Test"),
+            i, false};
+        check(persistenceAdapters.registerAdapter(descriptor, [descriptor] {
+            return std::make_unique<CountingPersistenceAdapter>(descriptor);
+        }), "register scale persistence adapter descriptor");
+    }
+    check(persistenceAdapters.descriptors().size() == 20,
+          "twenty persistence adapters are discoverable without UI changes");
+    check(persistenceAdapters.instantiatedCount() == 0,
+          "unused persistence adapters add no startup construction");
+    check(persistenceAdapters.resolve(QStringLiteral("test.persistence.19"))
+              == QLatin1String("test.persistence.19"),
+          "highest-priority matching persistence adapter wins");
+    check(persistenceAdapters.instantiatedCount() == 1,
+          "resolving a high-priority adapter does not instantiate lower adapters");
+    check(!persistenceAdapters.registerAdapter(
+              {QStringLiteral("test.persistence.19"), QStringLiteral("Duplicate"),
+               999, false}, [] { return std::unique_ptr<IPersistenceAdapter>{}; }),
+          "duplicate persistence adapter ids fail closed");
 
     check(FeatureRegistry::featureIdForCommand(QStringLiteral("edit.copy"))
               == QLatin1String("NSP-EDIT"),

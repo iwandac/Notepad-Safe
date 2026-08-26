@@ -144,8 +144,8 @@ AnalysisArtifact
 检查单一源码归属和禁止依赖。CTest 已按 QtTest 函数拆分，并为 quick/adjacent/release 设置逐项
 30–300 秒 timeout，不再使用统一 3600 秒。`AppComposition` 与 `StartupCoordinator` 已进入正式
 启动路径；Find/Accounts/Security Center/KDBX service 首次使用创建。启动合同以实际 first paint
-信号证明首帧前重型 factory 为 0，100 个未使用 Tool、20 个未使用推理 Provider 和 20 个附加
-文档 Provider 均只注册 descriptor、实例化为 0。8 个本地 `testfiles` 样本覆盖 11–108 MiB、
+信号证明首帧前重型 factory 为 0，100 个未使用 Tool、20 个未使用推理 Provider、20 个测试
+PersistenceAdapter 和 20 个附加文档 Provider 均只注册 descriptor、实例化为 0。8 个本地 `testfiles` 样本覆盖 11–108 MiB、
 Text/Binary、S1/S2、GBK、UTF-8/BOM、UTF-16LE/BE。
 
 ### R2 状态所有权收敛
@@ -154,11 +154,12 @@ Text/Binary、S1/S2、GBK、UTF-8/BOM、UTF-16LE/BE。
 - 旧 EditorTab API 暂时保留 facade，内部转发到新状态和 Provider；禁止同时写旧、新两份状态。
 - 纯逻辑路径在删除旧实现前运行 differential tests，比较旧/新输出。
 
-当前实现：`DocumentState` 已建立 DocumentId/revision/content/persistence/security/capabilities 单一值对象，
-source byte 与 editor position 使用不可互换类型；EditorTab 的旧 revision API 是对该状态的引用 facade，
-不保留第二份 revision，文件 location 也已删除旧 `m_filePath` 并统一转发到 DocumentState。
-`ReadOnlySelectionModel` 对连续选择和无效 owner 切换提供纯合同哨兵。其余 presentation/content
-兼容字段仍在迁移期，不能声称 EditorTab 职责迁移已经全部完成。
+当前实现：`DocumentState` 已建立 DocumentId/location/origin/revision/content/persistence/security/
+capabilities/dirty 单一值对象，source byte 与 editor position 使用不可互换类型；EditorTab 的旧 API
+只转发到该状态，不保留第二份 identity、location、revision、content kind 或 security class。
+`WindowedReadOnlyProvider` 的生产选择路径使用唯一 `ReadOnlySelectionModel`，反向选择、连续用户选择和
+重复复制由纯合同与正式 GUI 双哨兵保护。presentation window、mmap 和控件状态仍正确属于 Provider；
+EditorTab 仍是较大的 UI facade，因此不能把“状态真值单一化”上推为全部 UI 职责迁移完成。
 
 ### R3 搜索、命令和视图收敛
 
@@ -170,8 +171,8 @@ source byte 与 editor position 使用不可互换类型；EditorTab 的旧 revi
 FeatureId，并提供统一 DocumentCapabilities 基线；启动合同拒绝任何未登记 QAction。
 SearchResultsDock 头文件已不再声明 target/revision/stale/rerun 状态，这些状态由非视觉
 `SearchResultsController` 持有，架构脚本阻止其回流；42 个单/多文件、Text/Hex、S1/S2/S3 搜索 GUI
-旅程通过。FindReplaceDialog 到 EditorTab 的执行协调以及 Dock cpp 内部的 session 操作仍是迁移
-facade，因此本项只能标记为部分收敛，不能声称 SearchController/NavigationController 已完全独立。
+旅程通过。FindReplaceDialog 到 EditorTab 的执行协调仍是迁移 facade；本轮完成的是导致模式不一致的
+结果会话状态与视图分离，不虚构全局 SearchController/NavigationController 已全部改写。
 
 ### R4 安全与未来扩展边界
 
@@ -254,17 +255,15 @@ CTest 按具体 QtTest 函数注册：
 
 已验证：
 
-- KDBX ON：17/17 非 GUI/架构/供应链/真实 `testfiles` 合同通过；受影响的 Shell/Accounts/Secure GUI 63/63 通过；搜索 GUI 41/41 通过；其余 adjacent 在最终修改前通过且修改未触及对应产品组件。
-- KDBX OFF：正式 EXE、架构/启动合同和 smallfixes harness 编译；架构/启动及基础编辑代表旅程 5/5 通过。OFF 仍只表示解耦门禁，不表示安全发布验证。
-- quick：5/5，实测约 1.45–3.03 秒；两个历史哨兵均在其中；没有统一 3600 秒 timeout。
-- 正式 Release 进程：100 MiB 真实文件 session 主窗口 368 ms 可见，100 MiB autosave session 248 ms 可见，均正常退出且未走 L1 阻塞路径；这两次是普通外部进程启动，不宣称受控冷缓存 P95。
-- 内部启动合同：first paint 前重型 factory=0；100 个未使用 Tool、20 个附加 DocumentProvider、20 个 InferenceProvider 均实例化为 0。
-- 验收过程中门禁实际阻止两类回归：Find dialog 延迟创建破坏旧测试前置假设；Accounts KDBX 文件入口在 lazy VaultDock 创建前解引用。前者改为动作后合同，后者修复产品生命周期并通过恢复密钥/重启/记忆凭据完整旅程。
+- 本节的最终计数只在本轮最终门禁全部执行后更新；此前各轮数字仅作为检查点证据，禁止把部分运行冒充最终验收。
+- 已确认两类历史回归均有正式产品哨兵：搜索 Dock 单行紧凑几何；窗口化只读文本在搜索选择后连续用户选择并重复复制。
+- GUI 测试驱动原先在模态对话框尚未出现时执行一次性 timer，断言返回后会把对话框永久留住直至 300 秒超时；现改为有界轮询状态机和 8 秒 watchdog，失败会关闭模态框并给出明确原因，不再用长超时掩盖测试机制错误。
+- KDBX ON/OFF、quick/adjacent、真实 `testfiles`、正式进程启动和 E2E 的最终数量与耗时将在下方“最终证据”提交前由同一 revision 重新生成。
 
 不得上推为完成的边界：
 
-- MainWindow 仍含 KDBX 条件 UI 与部分打开/保存协调；虽然具体 service 已通过 port/factory 注入且 ON/OFF 可编译，但尚未满足“MainWindow 无后端业务”的最终形态。
+- MainWindow 已清除 KDBX 编译宏、KdbxFormatProbe 和 SecurityIdentity/SecureDocument 静态后端调用；安全能力通过 port/factory 和运行时 capability 表达。它仍协调凭据对话框、打开/保存用户旅程，是较大的 UI application controller，不能称为整体低复杂度完成态。
 - 搜索 target/revision/watch/stale 生命周期已从 SearchResultsDock 移入 `SearchResultsController`；Dock 仅保留模型呈现、点击命中计算和导航信号适配。
-- EditorTab revision 已单一化到 DocumentState，但 persistence/presentation 旧字段和搜索执行 facade 尚未全部移出。
-- Document/Inference/Tool registry 已落地；PersistenceAdapterRegistry 仍只有设计，尚不能声称新增持久化 adapter 完全无需修改打开/保存协调。
+- EditorTab 的 durable identity/location/revision/content/security 真值已单一化到 DocumentState，窗口化只读选择已单一化到 ReadOnlySelectionModel；presentation/provider 控件状态和搜索执行 facade 尚未全部移出。
+- Document/Inference/Tool registry 已落地；PersistenceAdapterRegistry 已接管格式探测优先级与延迟实例化，但 adapter 尚未统一 load/save/conflict/recovery，新增完全不同的持久化格式仍需修改应用协调层，不能声称完整持久化插件化。
 - 当前测试结果证明本轮涉及路径未发现功能回退，并建立了更强门禁；它不构成“未来永不回退”的数学保证，也不能把尚未迁移的职责称为低复杂度完成态。

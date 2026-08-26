@@ -383,6 +383,13 @@ VaultError SecureDocumentService::inspect(const QString &filePath,
     return error;
 }
 
+VaultError SecureDocumentService::inspectFile(
+    const QString &filePath, QString *documentType, QUuid *documentId,
+    SecurityIdentityParameters *parameters) const
+{
+    return inspect(filePath, documentType, documentId, parameters);
+}
+
 VaultError SecureDocumentService::open(const QString &filePath,
                                        SecureDocumentSnapshot *snapshot)
 {

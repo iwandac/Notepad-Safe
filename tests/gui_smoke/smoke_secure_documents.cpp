@@ -703,52 +703,73 @@ private slots:
 
         bool rejectedPasswordWasShown = false;
         bool recoveryDialogWasShown = false;
-        QTimer::singleShot(80, window.get(), [&, recoveryKey = foreignRecoveryKey]() {
+        bool credentialDriverTimedOut = false;
+        int credentialStage = 0;
+        QTimer credentialDriver;
+        credentialDriver.setInterval(20);
+        connect(&credentialDriver, &QTimer::timeout, window.get(),
+                [&, recoveryKey = foreignRecoveryKey]() {
             auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
-            QVERIFY(dialog);
-            QCOMPARE(dialog->objectName(), QStringLiteral("fileCredentialDialog"));
-            QVERIFY(dialog->windowTitle().contains(QStringLiteral("其他密码")));
-            auto *password = dialog->findChild<QLineEdit *>(
-                QStringLiteral("fileCredentialPassphrase"));
-            auto *buttons = dialog->findChild<QDialogButtonBox *>(
-                QStringLiteral("fileCredentialButtons"));
-            QVERIFY(password && buttons);
-            password->setText(QStringLiteral("definitely wrong password"));
-
-            QTimer::singleShot(50, window.get(), [&, recoveryKey]() {
-                auto *retryDialog = qobject_cast<QDialog *>(
-                    QApplication::activeModalWidget());
-                QVERIFY(retryDialog);
-                QCOMPARE(retryDialog->objectName(),
-                         QStringLiteral("fileCredentialDialog"));
-                auto *errorLabel = retryDialog->findChild<QLabel *>(
-                    QStringLiteral("fileCredentialError"));
-                auto *kind = retryDialog->findChild<QComboBox *>(
-                    QStringLiteral("fileCredentialKind"));
-                auto *recovery = retryDialog->findChild<QLineEdit *>(
-                    QStringLiteral("fileCredentialRecoveryKey"));
-                auto *retryButtons = retryDialog->findChild<QDialogButtonBox *>(
+            if (!dialog || dialog->objectName() != QStringLiteral("fileCredentialDialog"))
+                return;
+            if (credentialStage == 0) {
+                if (!dialog->windowTitle().contains(QStringLiteral("其他密码")))
+                    return;
+                auto *password = dialog->findChild<QLineEdit *>(
+                    QStringLiteral("fileCredentialPassphrase"));
+                auto *buttons = dialog->findChild<QDialogButtonBox *>(
                     QStringLiteral("fileCredentialButtons"));
-                QVERIFY(errorLabel && kind && recovery && retryButtons);
-                rejectedPasswordWasShown = !errorLabel->text().trimmed().isEmpty();
-                QVERIFY(rejectedPasswordWasShown);
-
-                const int recoveryIndex = kind->findText(QStringLiteral("恢复密钥"));
-                QVERIFY(recoveryIndex >= 0);
-                kind->setCurrentIndex(recoveryIndex);
-                recovery->setText(recoveryKey);
-                recoveryDialogWasShown = true;
-                const QString screenshot = QDir::current().filePath(
-                    QStringLiteral("gui-file-credential-recovery.png"));
-                QVERIFY2(retryDialog->grab().save(screenshot), qPrintable(screenshot));
-                QTest::mouseClick(retryButtons->button(QDialogButtonBox::Open),
+                if (!password || !buttons)
+                    return;
+                password->setText(QStringLiteral("definitely wrong password"));
+                credentialStage = 1;
+                QTest::mouseClick(buttons->button(QDialogButtonBox::Open),
                                   Qt::LeftButton);
-            });
+                return;
+            }
 
-            QTest::mouseClick(buttons->button(QDialogButtonBox::Open), Qt::LeftButton);
+            auto *errorLabel = dialog->findChild<QLabel *>(
+                QStringLiteral("fileCredentialError"));
+            auto *kind = dialog->findChild<QComboBox *>(
+                QStringLiteral("fileCredentialKind"));
+            auto *recovery = dialog->findChild<QLineEdit *>(
+                QStringLiteral("fileCredentialRecoveryKey"));
+            auto *retryButtons = dialog->findChild<QDialogButtonBox *>(
+                QStringLiteral("fileCredentialButtons"));
+            if (!errorLabel || !kind || !recovery || !retryButtons
+                || errorLabel->text().trimmed().isEmpty()) {
+                return;
+            }
+            rejectedPasswordWasShown = !errorLabel->text().trimmed().isEmpty();
+            const int recoveryIndex = kind->findText(QStringLiteral("恢复密钥"));
+            if (recoveryIndex < 0)
+                return;
+            kind->setCurrentIndex(recoveryIndex);
+            recovery->setText(recoveryKey);
+            recoveryDialogWasShown = true;
+            const QString screenshot = QDir::current().filePath(
+                QStringLiteral("gui-file-credential-recovery.png"));
+            if (!dialog->grab().save(screenshot))
+                return;
+            credentialStage = 2;
+            credentialDriver.stop();
+            QTest::mouseClick(retryButtons->button(QDialogButtonBox::Open),
+                              Qt::LeftButton);
         });
+        QTimer credentialWatchdog;
+        credentialWatchdog.setSingleShot(true);
+        connect(&credentialWatchdog, &QTimer::timeout, window.get(), [&]() {
+            credentialDriverTimedOut = true;
+            if (auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget()))
+                dialog->reject();
+        });
+        credentialDriver.start();
+        credentialWatchdog.start(8000);
 
         window->openFilesFromExternal({firstPath});
+        credentialDriver.stop();
+        credentialWatchdog.stop();
+        QVERIFY(!credentialDriverTimedOut);
         QVERIFY(rejectedPasswordWasShown);
         QVERIFY(recoveryDialogWasShown);
         QVERIFY(QApplication::activeModalWidget() == nullptr);

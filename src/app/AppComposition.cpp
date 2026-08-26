@@ -1,4 +1,7 @@
 #include "AppComposition.h"
+#include "KdbxFormatProbe.h"
+
+#include <QFileInfo>
 
 namespace {
 
@@ -13,6 +16,32 @@ public:
 
 private:
     DocumentProviderDescriptor descriptor_;
+};
+
+class PlainFilePersistenceAdapter final : public IPersistenceAdapter {
+public:
+    PersistenceAdapterDescriptor descriptor() const override
+    {
+        return {QStringLiteral("plain.file"), QStringLiteral("Plain file"),
+                0, false};
+    }
+    bool recognizes(const QString &path) const override
+    {
+        return QFileInfo(path).isFile();
+    }
+};
+
+class KdbxPersistenceAdapter final : public IPersistenceAdapter {
+public:
+    PersistenceAdapterDescriptor descriptor() const override
+    {
+        return {QStringLiteral("secure.kdbx"), QStringLiteral("KDBX"),
+                100, true};
+    }
+    bool recognizes(const QString &path) const override
+    {
+        return KdbxFormatProbe::inspectFile(path).recognized;
+    }
 };
 
 } // namespace
@@ -34,6 +63,14 @@ AppComposition::AppComposition()
             return std::make_unique<BuiltinDocumentProvider>(descriptor);
         });
     }
+    persistenceAdapters_.registerAdapter(
+        KdbxPersistenceAdapter().descriptor(), [] {
+            return std::make_unique<KdbxPersistenceAdapter>();
+        });
+    persistenceAdapters_.registerAdapter(
+        PlainFilePersistenceAdapter().descriptor(), [] {
+            return std::make_unique<PlainFilePersistenceAdapter>();
+        });
 }
 
 SecurityServiceBundle AppComposition::createSecurityServices()

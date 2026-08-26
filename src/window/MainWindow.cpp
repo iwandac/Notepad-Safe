@@ -11,7 +11,6 @@
 #include "AsyncSerialQueue.h"
 #include "AsyncUiOperation.h"
 #include "VaultDock.h"
-#include "KdbxFormatProbe.h"
 #include "SecureDocumentService.h"
 #include "SecurityServiceFactory.h"
 #include "SecuritySessionService.h"
@@ -161,7 +160,6 @@ void clearSensitiveLineEdit(QLineEdit *edit)
     sensitive.clear();
 }
 
-#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
 class FileCredentialDialog final : public QDialog {
 public:
     enum class Kind { Passphrase, RecoveryKey };
@@ -287,7 +285,6 @@ private:
     QLineEdit *recoveryKey_ = nullptr;
     QLabel *error_ = nullptr;
 };
-#endif
 
 } // namespace
 
@@ -782,11 +779,12 @@ void MainWindow::ensureSecurityCenterCreated()
 
 bool MainWindow::showAccountsWorkspace()
 {
-#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
-    QMessageBox::critical(this, QStringLiteral("账户功能不可用"),
-                          QStringLiteral("当前构建未包含 KDBX 安全后端。"));
-    return false;
-#else
+    ensureSecurityServicesCreated();
+    if (!m_securitySession || !m_securitySession->available()) {
+        QMessageBox::critical(this, QStringLiteral("账户功能不可用"),
+                              QStringLiteral("当前构建未包含 KDBX 安全后端。"));
+        return false;
+    }
     ensureAccountsWorkspaceCreated();
     if (!m_vaultDock || !ensureSecuritySessionInteractive())
         return false;
@@ -846,16 +844,16 @@ bool MainWindow::showAccountsWorkspace()
         m_findDialog->setActiveTab(nullptr);
     showWorkspaceStatus(QStringLiteral("账户"));
     return true;
-#endif
 }
 
 bool MainWindow::showSecurityCenterWorkspace()
 {
-#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
-    QMessageBox::critical(this, QStringLiteral("安全功能不可用"),
-                          QStringLiteral("当前构建未包含 KDBX 安全后端。"));
-    return false;
-#else
+    ensureSecurityServicesCreated();
+    if (!m_securitySession || !m_securitySession->available()) {
+        QMessageBox::critical(this, QStringLiteral("安全功能不可用"),
+                              QStringLiteral("当前构建未包含 KDBX 安全后端。"));
+        return false;
+    }
     ensureSecurityCenterCreated();
     if (!m_securityCenterPage || !ensureSecuritySessionInteractive())
         return false;
@@ -877,15 +875,17 @@ bool MainWindow::showSecurityCenterWorkspace()
         m_findDialog->setActiveTab(nullptr);
     showWorkspaceStatus(QStringLiteral("安全中心"));
     return true;
-#endif
 }
 
 void MainWindow::refreshSecurityCenter()
 {
-#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
-    const bool hasIdentity = m_securitySession && m_securitySession->hasIdentity();
+    const bool backendAvailable = m_securitySession && m_securitySession->available();
+    const bool hasIdentity = backendAvailable && m_securitySession->hasIdentity();
     const bool active = hasIdentity && m_securitySession->hasActiveSession();
-    if (m_securitySessionStatus) {
+    if (m_securitySessionStatus && !backendAvailable) {
+        m_securitySessionStatus->setText(
+            QStringLiteral("当前构建未包含 KDBX 安全后端。"));
+    } else if (m_securitySessionStatus) {
         m_securitySessionStatus->setText(
             active
                 ? QStringLiteral("已解锁\n本设备会话有效至：%1")
@@ -942,18 +942,12 @@ void MainWindow::refreshSecurityCenter()
             button->setEnabled(active);
         }
     }
-#else
-    if (m_securitySessionStatus)
-        m_securitySessionStatus->setText(QStringLiteral("当前构建未包含 KDBX 安全后端。"));
-#endif
 }
 
 void MainWindow::changeMasterPassword()
 {
-#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
-    return;
-#else
-    if (!m_securitySession || !m_securitySession->hasActiveSession())
+    if (!m_securitySession || !m_securitySession->available()
+        || !m_securitySession->hasActiveSession())
         return;
 
     QDialog dialog(this);
@@ -1075,25 +1069,20 @@ void MainWindow::changeMasterPassword()
     clearSensitiveLineEdit(currentPassword);
     clearSensitiveLineEdit(newPassword);
     clearSensitiveLineEdit(confirmation);
-#endif
 }
 
 void MainWindow::exportRecoveryKey()
 {
-#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
-    return;
-#else
-    if (!m_securitySession || !m_securitySession->hasActiveSession())
+    if (!m_securitySession || !m_securitySession->available()
+        || !m_securitySession->hasActiveSession())
         return;
-    SecurityOperationLease lease;
-    const VaultError leaseError = m_securitySession->acquireOperationLease(&lease);
-    if (leaseError.isError()) {
+    QString recoveryKey;
+    const VaultError exportError = m_securitySession->exportRecoveryKey(&recoveryKey);
+    if (exportError.isError()) {
         QMessageBox::critical(this, QStringLiteral("无法读取恢复密钥"),
-                              leaseError.userMessage);
+                              exportError.userMessage);
         return;
     }
-    QString recoveryKey = SecurityIdentity::recoveryKeyText(lease.recoverySecret());
-    lease.clear();
 
     QDialog dialog(this);
     dialog.setObjectName(QStringLiteral("securityCenterRecoveryDialog"));
@@ -1169,15 +1158,12 @@ void MainWindow::exportRecoveryKey()
     if (!recoveryKey.isEmpty())
         recoveryKey.fill(QChar(0));
     recoveryKey.clear();
-#endif
 }
 
 void MainWindow::verifyRecoveryKey()
 {
-#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
-    return;
-#else
-    if (!m_securitySession || !m_securitySession->hasActiveSession())
+    if (!m_securitySession || !m_securitySession->available()
+        || !m_securitySession->hasActiveSession())
         return;
 
     QDialog dialog(this);
@@ -1224,21 +1210,15 @@ void MainWindow::verifyRecoveryKey()
         if (!rawRecoveryText.isEmpty())
             rawRecoveryText.fill(QChar(0));
         rawRecoveryText.clear();
-        SecureBuffer candidate;
-        VaultError result = SecurityIdentity::parseRecoveryKey(
-            recoveryText, &candidate);
+        VaultError result = runSerializedSecurityOperation(
+            this, AsyncTaskType::SecureIdentity, AsyncTaskPriority::Highest,
+            QStringLiteral("正在验证恢复密钥"),
+            [this, &recoveryText] {
+                return m_securitySession->verifyRecoveryKey(recoveryText);
+            });
         if (!recoveryText.isEmpty())
             recoveryText.fill(QChar(0));
         recoveryText.clear();
-        if (!result.isError()) {
-            result = runSerializedSecurityOperation(
-                this, AsyncTaskType::SecureIdentity, AsyncTaskPriority::Highest,
-                QStringLiteral("正在验证恢复密钥"),
-                [this, &candidate] {
-                    return m_securitySession->verifyRecoverySecret(candidate);
-                });
-        }
-        candidate.clear();
         if (result.isError()) {
             errorLabel->setText(result.userMessage);
             input->setFocus();
@@ -1250,7 +1230,6 @@ void MainWindow::verifyRecoveryKey()
         return;
     }
     clearSensitiveLineEdit(input);
-#endif
 }
 
 // ============ 创建 Actions / Menus / Toolbar / StatusBar ============
@@ -2215,11 +2194,12 @@ void MainWindow::ensureFindDialogCreated()
 bool MainWindow::ensureSecuritySessionInteractive()
 {
     ensureSecurityServicesCreated();
-#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
-    QMessageBox::critical(this, QStringLiteral("安全功能不可用"),
-                          QStringLiteral("当前构建未包含 KDBX 安全后端。"));
-    return false;
-#else
+    if (!m_securitySession || !m_securitySession->available()
+        || !m_secureDocuments || !m_secureDocuments->available()) {
+        QMessageBox::critical(this, QStringLiteral("安全功能不可用"),
+                              QStringLiteral("当前构建未包含 KDBX 安全后端。"));
+        return false;
+    }
     const auto restoreMaskedTabs = [this]() {
         if (m_secureDocuments) {
             const int activeIndex = m_tabs ? m_tabs->currentIndex() : -1;
@@ -2386,13 +2366,16 @@ bool MainWindow::ensureSecuritySessionInteractive()
     if (confirmation)
         clearSensitiveLineEdit(confirmation);
     return false;
-#endif
 }
 
 void MainWindow::newFile()
 {
-#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
-    if (!ensureSecuritySessionInteractive() || !m_secureDocuments)
+    ensureSecurityServicesCreated();
+    if (!m_secureDocuments || !m_secureDocuments->available()) {
+        addNewTab();
+        return;
+    }
+    if (!ensureSecuritySessionInteractive())
         return;
     SecureDocumentSnapshot snapshot;
     const VaultError error = runSerializedSecurityOperation(
@@ -2409,9 +2392,6 @@ void MainWindow::newFile()
     tab->setAutosavePath(snapshot.backingPath);
     m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
     statusBar()->showMessage(QStringLiteral("已新建文档"), 1800);
-#else
-    addNewTab();
-#endif
 }
 
 EditorTab *MainWindow::addNewTab()
@@ -2467,7 +2447,6 @@ EditorTab *MainWindow::addNewTab()
         if (currentTab() == tab)
             updateStatusBar();
     });
-#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
     connect(tab, &EditorTab::contentChanged, this, [this, tab](quint64) {
         if (!tab->isSecureDocument() || tab->isBinaryDocument()
             || tab->isSecureDocumentMasked()
@@ -2501,7 +2480,6 @@ EditorTab *MainWindow::addNewTab()
             QApplication::beep();
         });
     });
-#endif
     connect(tab, &EditorTab::cursorPositionChanged, this, &MainWindow::onTabCursorPositionChanged);
     connect(tab, &EditorTab::titleChanged, this, [this, tab](const QString &) {
         int idx = m_tabs->indexOf(tab);
@@ -3016,7 +2994,8 @@ void MainWindow::maskSecureDocuments()
 EditorTab *MainWindow::adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
                                           EditorTab *reuseTab)
 {
-#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
+    if (!m_secureDocuments || !m_secureDocuments->available())
+        return nullptr;
     showDocumentWorkspace();
     EditorTab *tab = reuseTab ? reuseTab : addNewTab();
     if (reuseTab && reuseTab->isSecureDocument()
@@ -3061,22 +3040,12 @@ EditorTab *MainWindow::adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
         m_secureAutosaveTimer.start(5000);
     }
     return tab;
-#else
-    Q_UNUSED(snapshot)
-    Q_UNUSED(reuseTab)
-    return nullptr;
-#endif
 }
 
 bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
 {
-#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
-    Q_UNUSED(path)
-    Q_UNUSED(reuseTab)
-    return false;
-#else
     ensureSecurityServicesCreated();
-    if (!m_secureDocuments)
+    if (!m_secureDocuments || !m_secureDocuments->available())
         return false;
     const QString absolutePath = QFileInfo(path).absoluteFilePath();
     for (int i = 0; i < m_tabs->count(); ++i) {
@@ -3160,7 +3129,6 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
         dialog.showError(error.userMessage);
     }
     return false;
-#endif
 }
 
 bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
@@ -3169,13 +3137,19 @@ bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
     const QFileInfo info(path);
     if (!info.isFile())
         return false;
-#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
-    const KdbxHeaderInfo kdbx = KdbxFormatProbe::inspectFile(path);
-    if (kdbx.recognized) {
+    const QString persistenceAdapter =
+        m_composition->persistenceAdapters().resolve(path);
+    if (persistenceAdapter == QLatin1String("secure.kdbx")) {
+        ensureSecurityServicesCreated();
+        if (!m_secureDocuments || !m_secureDocuments->available()) {
+            QMessageBox::critical(this, QStringLiteral("安全文件不可用"),
+                                  QStringLiteral("当前构建未包含 KDBX 安全后端。"));
+            return false;
+        }
         QString documentType;
         QUuid documentId;
         SecurityIdentityParameters fileParameters;
-        const VaultError probe = SecureDocumentService::inspect(
+        const VaultError probe = m_secureDocuments->inspectFile(
             path, &documentType, &documentId, &fileParameters);
         if (!probe.isError() && documentType == QStringLiteral("SecureDocument")) {
             // A copied or hard-linked .nsafe still carries the same document id.
@@ -3264,7 +3238,7 @@ bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
                     continue;
                 }
                 SecureBuffer recoverySecret;
-                error = SecurityIdentity::parseRecoveryKey(
+                error = m_securitySession->decodeRecoveryKey(
                     recoveryKey, &recoverySecret);
                 if (!error.isError()) {
                     error = m_vaultDock->unlockManagedStoreWithRecoverySecret(
@@ -3285,7 +3259,7 @@ bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
                 }
                 if (managedAccounts) {
                     SecureBuffer masterUnlockKey;
-                    error = SecurityIdentity::deriveMasterUnlockKey(
+                    error = m_securitySession->deriveMasterUnlockKey(
                         buffer, fileParameters, &masterUnlockKey);
                     if (!error.isError()) {
                         error = m_vaultDock->unlockManagedStoreWithMasterKey(
@@ -3309,8 +3283,6 @@ bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
         }
         return false;
     }
-#endif
-
     // Normal Open is idempotent.  Probe at most 192 KiB regardless of file
     // size, then compare against the baselines already captured by each tab.
     // Reload deliberately supplies reuseTab and must re-read that tab instead.
@@ -3497,11 +3469,8 @@ MainWindow::ExternalSaveDisposition MainWindow::resolveExternalSaveConflict(Edit
 MainWindow::ExternalSaveDisposition MainWindow::resolveSecureExternalSaveConflict(
     EditorTab *tab)
 {
-#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
-    Q_UNUSED(tab)
-    return ExternalSaveDisposition::Cancelled;
-#else
-    if (!tab || !tab->isSecureDocument() || !m_secureDocuments)
+    if (!tab || !tab->isSecureDocument() || !m_secureDocuments
+        || !m_secureDocuments->available())
         return ExternalSaveDisposition::Cancelled;
     const DiskFileState state = m_secureDocuments->externalFileState(
         tab->secureDocumentId());
@@ -3544,16 +3513,12 @@ MainWindow::ExternalSaveDisposition MainWindow::resolveSecureExternalSaveConflic
         return saveAsFile() ? ExternalSaveDisposition::HandledSuccess
                             : ExternalSaveDisposition::Cancelled;
     return ExternalSaveDisposition::Cancelled;
-#endif
 }
 
 bool MainWindow::reloadSecureTabFromDisk(EditorTab *tab)
 {
-#ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
-    Q_UNUSED(tab)
-    return false;
-#else
-    if (!tab || !tab->isSecureDocument() || !m_secureDocuments)
+    if (!tab || !tab->isSecureDocument() || !m_secureDocuments
+        || !m_secureDocuments->available())
         return false;
     SecureDocumentSnapshot snapshot;
     const VaultError error = runSerializedSecurityOperation(
@@ -3576,7 +3541,6 @@ bool MainWindow::reloadSecureTabFromDisk(EditorTab *tab)
     updateStatusBar();
     statusBar()->showMessage(QStringLiteral("已重新解密并加载磁盘版本"), 2500);
     return true;
-#endif
 }
 
 bool MainWindow::reloadTabFromDisk(EditorTab *tab)
@@ -3752,7 +3716,6 @@ bool MainWindow::saveAsFile()
         fileName += QLatin1Char('.') + plainSuffix;
     }
     if (saveSecure) {
-#ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
         const bool binaryPayload = tab->isBinaryDocument();
         if (tab->isLargeDocument() && !binaryPayload) {
             QMessageBox::information(
@@ -3846,9 +3809,6 @@ bool MainWindow::saveAsFile()
             box.exec();
             return false;
         }
-#else
-        return false;
-#endif
     } else {
         const QUuid previousSecureId = tab->isSecureDocument()
                                            ? tab->secureDocumentId() : QUuid();

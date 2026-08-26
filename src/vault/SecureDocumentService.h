@@ -66,6 +66,10 @@ public:
                                       const QString &text) = 0;
     virtual VaultError checkpointBinary(const QUuid &documentId,
                                         const QByteArray &binary) = 0;
+    virtual VaultError inspectFile(
+        const QString &filePath, QString *documentType,
+        QUuid *documentId = nullptr,
+        SecurityIdentityParameters *parameters = nullptr) const = 0;
 };
 
 class SecureDocumentService final : public ISecureDocumentService {
@@ -107,6 +111,9 @@ public:
                               const QString &text) override;
     VaultError checkpointBinary(const QUuid &documentId,
                                 const QByteArray &binary) override;
+    VaultError inspectFile(const QString &filePath, QString *documentType,
+                           QUuid *documentId = nullptr,
+                           SecurityIdentityParameters *parameters = nullptr) const override;
     bool hasRecoverySnapshot(const QUuid &documentId) const;
     void clearRecoverySnapshot(const QUuid &documentId) noexcept;
 

@@ -32,6 +32,16 @@ public:
     { return unavailableError(); }
     VaultError verifyRecoverySecret(const SecureBuffer &) override
     { return unavailableError(); }
+    VaultError exportRecoveryKey(QString *) override
+    { return unavailableError(); }
+    VaultError verifyRecoveryKey(const QString &) override
+    { return unavailableError(); }
+    VaultError decodeRecoveryKey(const QString &, SecureBuffer *) override
+    { return unavailableError(); }
+    VaultError deriveMasterUnlockKey(const SecureBuffer &,
+                                     const SecurityIdentityParameters &,
+                                     SecureBuffer *) override
+    { return unavailableError(); }
     bool restoreSealedSession() override { return false; }
     void endSession(bool) noexcept override {}
     VaultError acquireOperationLease(SecurityOperationLease *) override
@@ -91,6 +101,9 @@ public:
     VaultError checkpointText(const QUuid &, const QString &) override
     { return unavailableError(); }
     VaultError checkpointBinary(const QUuid &, const QByteArray &) override
+    { return unavailableError(); }
+    VaultError inspectFile(const QString &, QString *, QUuid *,
+                           SecurityIdentityParameters *) const override
     { return unavailableError(); }
 };
 #endif

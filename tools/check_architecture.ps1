@@ -57,6 +57,15 @@ foreach ($concrete in @('unique_ptr<SecuritySessionService>',
         Add-Failure "MainWindow owns concrete security adapter: $concrete"
     }
 }
+$mainSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'src/window/MainWindow.cpp') -Raw
+foreach ($backendLeak in @('NOTEPADSAFE_HAS_KDBX_BACKEND',
+                            'SecurityIdentity::',
+                            'SecureDocumentService::inspect',
+                            'KdbxFormatProbe')) {
+    if ($mainSource.Contains($backendLeak)) {
+        Add-Failure "MainWindow contains backend selection/business token: $backendLeak"
+    }
+}
 
 $searchDockHeader = Get-Content -LiteralPath (Join-Path $SourceRoot 'src/search/SearchResultsDock.h') -Raw
 foreach ($forbiddenState in @('QPointer<EditorTab>', 'TargetRevision',
@@ -75,6 +84,20 @@ foreach ($forbiddenControllerWork in @('contentRevision()',
 }
 if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot 'src/search/SearchResultsController.cpp'))) {
     Add-Failure 'SearchResultsController implementation is missing'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot 'src/domain/PersistenceAdapterRegistry.cpp'))) {
+    Add-Failure 'PersistenceAdapterRegistry implementation is missing'
+}
+
+$windowedProviderHeader = Get-Content -LiteralPath (
+    Join-Path $SourceRoot 'src/editor/WindowedReadOnlyProvider.h') -Raw
+if (-not $windowedProviderHeader.Contains('ReadOnlySelectionModel')) {
+    Add-Failure 'WindowedReadOnlyProvider does not use the shared selection owner'
+}
+foreach ($duplicateSelectionState in @('m_selectionAnchor', 'm_selectionCaret')) {
+    if ($windowedProviderHeader.Contains($duplicateSelectionState)) {
+        Add-Failure "WindowedReadOnlyProvider duplicates selection state: $duplicateSelectionState"
+    }
 }
 
 $domainFiles = Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src/domain') -File |

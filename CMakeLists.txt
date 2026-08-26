@@ -157,6 +157,7 @@ add_library(notepadsafe_domain STATIC
     src/domain/DocumentProviderRegistry.cpp
     src/domain/FeatureRegistry.cpp
     src/domain/InferenceProviderRegistry.cpp
+    src/domain/PersistenceAdapterRegistry.cpp
     src/session/DraftStore.cpp
 )
 target_include_directories(notepadsafe_domain PUBLIC

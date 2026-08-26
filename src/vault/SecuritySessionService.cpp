@@ -570,6 +570,47 @@ VaultError SecuritySessionService::verifyRecoverySecret(
     return error;
 }
 
+VaultError SecuritySessionService::exportRecoveryKey(QString *recoveryKey)
+{
+    if (!recoveryKey) {
+        return sessionError(VaultErrorCode::InternalError,
+                            QStringLiteral("恢复密钥输出无效。"),
+                            QStringLiteral("session.recovery.export-output"));
+    }
+    SecurityOperationLease lease;
+    VaultError error = acquireOperationLease(&lease);
+    if (error.isError())
+        return error;
+    *recoveryKey = SecurityIdentity::recoveryKeyText(lease.recoverySecret());
+    lease.clear();
+    return {};
+}
+
+VaultError SecuritySessionService::verifyRecoveryKey(const QString &recoveryKey)
+{
+    SecureBuffer candidate;
+    VaultError error = SecurityIdentity::parseRecoveryKey(recoveryKey, &candidate);
+    if (!error.isError())
+        error = verifyRecoverySecret(candidate);
+    candidate.clear();
+    return error;
+}
+
+VaultError SecuritySessionService::decodeRecoveryKey(
+    const QString &recoveryKey, SecureBuffer *recoverySecret)
+{
+    return SecurityIdentity::parseRecoveryKey(recoveryKey, recoverySecret);
+}
+
+VaultError SecuritySessionService::deriveMasterUnlockKey(
+    const SecureBuffer &passphraseUtf8,
+    const SecurityIdentityParameters &parameters,
+    SecureBuffer *masterUnlockKey)
+{
+    return SecurityIdentity::deriveMasterUnlockKey(
+        passphraseUtf8, parameters, masterUnlockKey);
+}
+
 VaultError SecuritySessionService::sealSession(
     const SecureBuffer &masterUnlockKey, const SecureBuffer &recoverySecret,
     const std::vector<RememberedKey> &rememberedKeys)

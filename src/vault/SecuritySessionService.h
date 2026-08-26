@@ -68,6 +68,14 @@ public:
         const SecureBuffer &currentPassphraseUtf8,
         const SecureBuffer &newPassphraseUtf8) = 0;
     virtual VaultError verifyRecoverySecret(const SecureBuffer &recoverySecret) = 0;
+    virtual VaultError exportRecoveryKey(QString *recoveryKey) = 0;
+    virtual VaultError verifyRecoveryKey(const QString &recoveryKey) = 0;
+    virtual VaultError decodeRecoveryKey(const QString &recoveryKey,
+                                         SecureBuffer *recoverySecret) = 0;
+    virtual VaultError deriveMasterUnlockKey(
+        const SecureBuffer &passphraseUtf8,
+        const SecurityIdentityParameters &parameters,
+        SecureBuffer *masterUnlockKey) = 0;
     virtual bool restoreSealedSession() = 0;
     virtual void endSession(bool removeDeviceSession = true) noexcept = 0;
     virtual VaultError acquireOperationLease(SecurityOperationLease *lease) = 0;
@@ -114,6 +122,14 @@ public:
     // Verifies an independently supplied recovery secret against the active
     // identity and persists only a non-secret verification timestamp.
     VaultError verifyRecoverySecret(const SecureBuffer &recoverySecret) override;
+    VaultError exportRecoveryKey(QString *recoveryKey) override;
+    VaultError verifyRecoveryKey(const QString &recoveryKey) override;
+    VaultError decodeRecoveryKey(const QString &recoveryKey,
+                                 SecureBuffer *recoverySecret) override;
+    VaultError deriveMasterUnlockKey(
+        const SecureBuffer &passphraseUtf8,
+        const SecurityIdentityParameters &parameters,
+        SecureBuffer *masterUnlockKey) override;
     bool restoreSealedSession() override;
     void endSession(bool removeDeviceSession = true) noexcept override;
 

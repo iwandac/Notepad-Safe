@@ -44,6 +44,16 @@ private:
     InferenceProviderManifest manifest_;
 };
 
+class NoopPersistenceAdapter final : public IPersistenceAdapter {
+public:
+    explicit NoopPersistenceAdapter(PersistenceAdapterDescriptor descriptor)
+        : descriptor_(std::move(descriptor)) {}
+    PersistenceAdapterDescriptor descriptor() const override { return descriptor_; }
+    bool recognizes(const QString &) const override { return false; }
+private:
+    PersistenceAdapterDescriptor descriptor_;
+};
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -80,6 +90,15 @@ int main(int argc, char **argv)
                 return std::make_unique<NoopInferenceProvider>(manifest);
             }))
             return 10;
+        const PersistenceAdapterDescriptor persistenceDescriptor{
+            QStringLiteral("startup.persistence.%1").arg(i),
+            QStringLiteral("Persistence"), -100 - i, false};
+        if (!composition.persistenceAdapters().registerAdapter(
+                persistenceDescriptor, [persistenceDescriptor] {
+                    return std::make_unique<NoopPersistenceAdapter>(
+                        persistenceDescriptor);
+                }))
+            return 11;
     }
 
     QElapsedTimer timer;
@@ -88,6 +107,7 @@ int main(int argc, char **argv)
     if (composition.heavyFactoryCalls() != 0
         || composition.documentTools().instantiatedCount() != 0
         || composition.documentProviders().instantiatedCount() != 0
+        || composition.persistenceAdapters().instantiatedCount() != 0
         || composition.inferenceProviders().instantiatedCount() != 0)
         return 5;
 
@@ -102,6 +122,7 @@ int main(int argc, char **argv)
     if (composition.heavyFactoryCalls() != 0
         || composition.documentTools().instantiatedCount() != 0
         || composition.documentProviders().instantiatedCount() != 0
+        || composition.persistenceAdapters().instantiatedCount() != 0
         || composition.inferenceProviders().instantiatedCount() != 0)
         return 7;
     const auto actions = window.findChildren<QAction *>();
@@ -115,7 +136,7 @@ int main(int argc, char **argv)
     if (firstPaintMs >= 1500)
         return 8;
 
-    qInfo("Startup composition: first paint %lld ms, heavy factories 0, tools 100, document providers 24, inference providers 20",
+    qInfo("Startup composition: first paint %lld ms, heavy factories 0, tools 100, document providers 24, persistence adapters 22, inference providers 20",
           static_cast<long long>(firstPaintMs));
     return 0;
 }

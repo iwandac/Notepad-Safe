@@ -4,6 +4,7 @@
 #include "DocumentProviderRegistry.h"
 #include "DocumentToolRegistry.h"
 #include "InferenceProviderRegistry.h"
+#include "PersistenceAdapterRegistry.h"
 
 #include <atomic>
 
@@ -40,10 +41,19 @@ public:
     {
         return inferenceProviders_;
     }
+    PersistenceAdapterRegistry &persistenceAdapters() noexcept
+    {
+        return persistenceAdapters_;
+    }
+    const PersistenceAdapterRegistry &persistenceAdapters() const noexcept
+    {
+        return persistenceAdapters_;
+    }
 
 private:
     std::atomic<int> heavyFactoryCalls_{0};
     DocumentToolRegistry documentTools_;
     DocumentProviderRegistry documentProviders_;
     InferenceProviderRegistry inferenceProviders_;
+    PersistenceAdapterRegistry persistenceAdapters_;
 };
