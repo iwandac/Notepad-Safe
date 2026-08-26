@@ -169,7 +169,7 @@ source byte 与 editor position 使用不可互换类型；EditorTab 的旧 revi
 当前实现：`CommandRegistry` 已将菜单/工具栏/快捷键共享的 command objectName 绑定到稳定
 FeatureId，并提供统一 DocumentCapabilities 基线；启动合同拒绝任何未登记 QAction。
 SearchResultsDock 头文件已不再声明 target/revision/stale/rerun 状态，这些状态由非视觉
-`SearchResultSession` 持有，架构脚本阻止其回流；41 个单/多文件、Text/Hex、S1/S2/S3 搜索 GUI
+`SearchResultsController` 持有，架构脚本阻止其回流；42 个单/多文件、Text/Hex、S1/S2/S3 搜索 GUI
 旅程通过。FindReplaceDialog 到 EditorTab 的执行协调以及 Dock cpp 内部的 session 操作仍是迁移
 facade，因此本项只能标记为部分收敛，不能声称 SearchController/NavigationController 已完全独立。
 
@@ -264,7 +264,7 @@ CTest 按具体 QtTest 函数注册：
 不得上推为完成的边界：
 
 - MainWindow 仍含 KDBX 条件 UI 与部分打开/保存协调；虽然具体 service 已通过 port/factory 注入且 ON/OFF 可编译，但尚未满足“MainWindow 无后端业务”的最终形态。
-- SearchResultsDock 头文件已无 target/revision 状态，但 cpp 的迁移 facade 仍操作 SearchResultSession；NavigationController 尚未完全独立。
+- 搜索 target/revision/watch/stale 生命周期已从 SearchResultsDock 移入 `SearchResultsController`；Dock 仅保留模型呈现、点击命中计算和导航信号适配。
 - EditorTab revision 已单一化到 DocumentState，但 persistence/presentation 旧字段和搜索执行 facade 尚未全部移出。
 - Document/Inference/Tool registry 已落地；PersistenceAdapterRegistry 仍只有设计，尚不能声称新增持久化 adapter 完全无需修改打开/保存协调。
 - 当前测试结果证明本轮涉及路径未发现功能回退，并建立了更强门禁；它不构成“未来永不回退”的数学保证，也不能把尚未迁移的职责称为低复杂度完成态。

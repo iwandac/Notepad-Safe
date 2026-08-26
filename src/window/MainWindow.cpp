@@ -4624,22 +4624,33 @@ void MainWindow::syncCommandStates(EditorTab *tab)
     }
     const bool canModify = hasDocument && tab->canModifyCommand();
     const bool hasSelection = hasDocument && tab->hasSelectionCommand();
-    if (m_undoAction)
-        m_undoAction->setEnabled(hasDocument && tab->canUndoCommand());
-    if (m_redoAction)
-        m_redoAction->setEnabled(hasDocument && tab->canRedoCommand());
-    if (m_cutAction)
-        m_cutAction->setEnabled(canModify && hasSelection);
-    if (m_copyAction)
-        m_copyAction->setEnabled(hasSelection);
-    if (m_pasteAction) {
-        const QMimeData *clipboardData = QGuiApplication::clipboard()->mimeData();
-        m_pasteAction->setEnabled(canModify && clipboardData
-                                  && clipboardData->hasText()
-                                  && !clipboardData->text().isEmpty());
+    const bool accountsWorkspace = m_workspaceStack && m_accountsPage
+        && m_workspaceStack->currentWidget() == m_accountsPage;
+    const QMimeData *clipboardData = QGuiApplication::clipboard()->mimeData();
+    if (m_commandRegistry) {
+        CommandContext context;
+        context.document = hasDocument ? &tab->documentState() : nullptr;
+        context.hasDocument = hasDocument;
+        context.canModify = canModify;
+        context.hasSelection = hasSelection;
+        context.clipboardHasText = clipboardData && clipboardData->hasText()
+            && !clipboardData->text().isEmpty();
+        context.canUndo = hasDocument && tab->canUndoCommand();
+        context.canRedo = hasDocument && tab->canRedoCommand();
+        context.masked = hasDocument && tab->isSecureDocumentMasked();
+        context.modifiedOrUntitled = hasDocument
+            && (tab->isModified() || tab->isUntitled());
+        context.accountsWorkspace = accountsWorkspace;
+        context.accountCanSave = accountsWorkspace && m_vaultDock
+            && m_vaultDock->canSaveActiveEntry();
+        context.accountCanSearch = accountsWorkspace && m_vaultDock
+            && m_vaultDock->canSearchAccounts();
+        context.reloadable = hasDocument && (tab->isSecureDocument()
+            ? !tab->filePath().isEmpty() : !tab->isUntitled());
+        context.canCloseAll = documentWorkspace && m_tabs
+            && m_tabs->count() > 0 && currentTab() != nullptr;
+        m_commandRegistry->applyContext(context);
     }
-    if (m_selectAllAction)
-        m_selectAllAction->setEnabled(hasDocument && !tab->isSecureDocumentMasked());
     if (m_actWordWrap)
         m_actWordWrap->setEnabled(hasDocument && !tab->isReadOnlyByPolicy());
     const bool editableHex = hasDocument && canModify && tab->isL2Active()
@@ -4683,22 +4694,6 @@ void MainWindow::syncCommandStates(EditorTab *tab)
             hasDocument && tab->splitViewEnabled()
             && tab->splitOrientation() == Qt::Vertical);
     }
-    const bool accountsWorkspace = m_workspaceStack && m_accountsPage
-                                   && m_workspaceStack->currentWidget() == m_accountsPage;
-    if (m_saveAction) {
-        m_saveAction->setEnabled((hasDocument && (tab->isModified() || tab->isUntitled()))
-                                 || (accountsWorkspace && m_vaultDock
-                                     && m_vaultDock->canSaveActiveEntry()));
-    }
-    if (m_saveAsAction)
-        m_saveAsAction->setEnabled(hasDocument);
-    if (m_findAction) {
-        m_findAction->setEnabled(hasDocument
-                                 || (accountsWorkspace && m_vaultDock
-                                     && m_vaultDock->canSearchAccounts()));
-    }
-    if (m_replaceAction)
-        m_replaceAction->setEnabled(hasDocument);
     if (m_statusModified && accountsWorkspace) {
         m_statusModified->setText(m_vaultDock && m_vaultDock->canSaveActiveEntry()
                                       ? QStringLiteral("未保存")
@@ -4729,17 +4724,6 @@ void MainWindow::syncCommandStates(EditorTab *tab)
         m_actTextViewMode->setEnabled(hasDualPresentation);
     if (m_actHexViewMode)
         m_actHexViewMode->setEnabled(hasDualPresentation);
-    if (m_searchPanelAction)
-        m_searchPanelAction->setEnabled(hasDocument);
-    if (m_actReload)
-        m_actReload->setEnabled(tab && (tab->isSecureDocument()
-                                            ? !tab->filePath().isEmpty()
-                                            : !tab->isUntitled()));
-    if (m_actCloseTab)
-        m_actCloseTab->setEnabled(tab != nullptr);
-    if (m_actCloseAll)
-        m_actCloseAll->setEnabled(documentWorkspace && m_tabs
-                                  && m_tabs->count() > 0 && currentTab() != nullptr);
     // 注："以编码显示..."组不在 m_convertEncodingActions 里，文档工作区内
     // 始终可用（只改显示解码不改字节流，L2 允许）。
 }

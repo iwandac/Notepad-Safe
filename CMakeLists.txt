@@ -304,6 +304,7 @@ add_library(notepadsafe_app STATIC
     src/app/CommandRegistry.cpp
     src/window/MainWindow.cpp
     src/search/FindReplaceDialog.cpp
+    src/search/SearchResultsController.cpp
     src/search/SearchResultsDock.cpp
     src/async/StatusBarTaskWidget.cpp
     src/async/AsyncTaskPanelDialog.cpp

@@ -65,6 +65,17 @@ foreach ($forbiddenState in @('QPointer<EditorTab>', 'TargetRevision',
         Add-Failure "SearchResultsDock view declares result-session state: $forbiddenState"
     }
 }
+$searchDockSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'src/search/SearchResultsDock.cpp') -Raw
+foreach ($forbiddenControllerWork in @('contentRevision()',
+                                        '&EditorTab::contentChanged',
+                                        'targetConnections')) {
+    if ($searchDockSource.Contains($forbiddenControllerWork)) {
+        Add-Failure "SearchResultsDock view performs controller work: $forbiddenControllerWork"
+    }
+}
+if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot 'src/search/SearchResultsController.cpp'))) {
+    Add-Failure 'SearchResultsController implementation is missing'
+}
 
 $domainFiles = Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src/domain') -File |
     Where-Object Extension -in '.cpp', '.h'

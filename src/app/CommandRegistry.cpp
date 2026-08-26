@@ -33,6 +33,39 @@ QList<QAction *> CommandRegistry::actions(const QString &commandId) const
     return actions_.value(commandId);
 }
 
+void CommandRegistry::setEnabled(const QString &commandId, bool enabled) const
+{
+    for (QAction *action : actions(commandId))
+        action->setEnabled(enabled);
+}
+
+void CommandRegistry::applyContext(const CommandContext &context) const
+{
+    const bool document = context.hasDocument && context.document;
+    setEnabled(QStringLiteral("edit.undo"), document && context.canUndo);
+    setEnabled(QStringLiteral("edit.redo"), document && context.canRedo);
+    setEnabled(QStringLiteral("edit.cut"), document && context.canModify
+                                          && context.hasSelection);
+    setEnabled(QStringLiteral("edit.copy"), document && context.hasSelection
+        && context.document->capabilities.testFlag(DocumentCapability::Copy));
+    setEnabled(QStringLiteral("edit.paste"), document && context.canModify
+                                            && context.clipboardHasText);
+    setEnabled(QStringLiteral("edit.selectAll"), document && !context.masked);
+
+    setEnabled(QStringLiteral("file.save"),
+               (document && context.modifiedOrUntitled)
+                   || (context.accountsWorkspace && context.accountCanSave));
+    setEnabled(QStringLiteral("file.saveAs"), document);
+    setEnabled(QStringLiteral("file.reload"), document && context.reloadable);
+    setEnabled(QStringLiteral("file.close"), document);
+    setEnabled(QStringLiteral("file.closeAll"), context.canCloseAll);
+
+    setEnabled(QStringLiteral("search.find"), document
+        || (context.accountsWorkspace && context.accountCanSearch));
+    setEnabled(QStringLiteral("search.replace"), document);
+    setEnabled(QStringLiteral("view.panel.searchResults"), document);
+}
+
 bool CommandRegistry::allowedByDocument(const QString &commandId,
                                         const DocumentState *state,
                                         bool hasSelection)
@@ -61,4 +94,3 @@ bool CommandRegistry::allowedByDocument(const QString &commandId,
         return state->capabilities.testFlag(DocumentCapability::Save);
     return state->capabilities.testFlag(DocumentCapability::Read);
 }
-

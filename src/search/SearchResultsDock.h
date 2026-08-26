@@ -11,9 +11,8 @@ class QTreeView;
 class QLabel;
 class QPushButton;
 class QStackedWidget;
-class QMouseEvent;
 class MultiSearchResultsModel;
-struct SearchResultSession;
+class SearchResultsController;
 
 // 搜索结果 Dock 窗口
 class SearchResultsDock : public QDockWidget {
@@ -76,14 +75,10 @@ private:
     // 上次按下位置对应的"行 / 匹配索引"（用于双击时跳转到指定匹配）
     int m_lastHitMatchIdx = -1;
     int m_lastHitRow = -1;
-    std::unique_ptr<SearchResultSession> m_session;
+    SearchResultsController *m_controller = nullptr;
     QVector<LargeFileSearchMatch> m_singlePreviewMatches;
 
     void updateSummary(const QString &pattern, const QString &fileName,
                        qint64 totalMatches);
-    QString registerTarget(EditorTab *tab);
-    void resetTargetWatches();
-    void watchTarget(EditorTab *tab, const QString &targetId = QString());
-    bool targetRevisionIsCurrent(EditorTab *tab, const QString &targetId = QString()) const;
     void setRerunAvailable(bool available, EditorTab *preferredTarget = nullptr);
 };
