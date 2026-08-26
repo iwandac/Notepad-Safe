@@ -255,10 +255,14 @@ CTest 按具体 QtTest 函数注册：
 
 已验证：
 
-- 本节的最终计数只在本轮最终门禁全部执行后更新；此前各轮数字仅作为检查点证据，禁止把部分运行冒充最终验收。
+- 最终 revision `895fe94` 的 KDBX ON 正式 Release 构建成功；CTest 全矩阵 **153/153** 通过，总实耗 **315.62 秒**。其中 adjacent 133、GUI 136、搜索 42、大文件 24、Shell 51、Accounts 6、Secure 6、E2E 2；单项 timeout 为 30–300 秒，没有统一 3600 秒等待。
+- KDBX OFF 正式 EXE、架构/启动合同、smallfixes 与窗口化只读 GUI harness 编译成功；架构、启动、生命周期动作、Hex 保存重开和连续复制代表旅程 **5/5** 通过（8.86 秒）。OFF 只证明编译和 capability 解耦，不表示安全发布验证。
+- quick **5/5**，累计测试时间 1.47 秒；两个历史回归哨兵均在其中。架构、供应链和真实 `testfiles` 合同也包含在 153 项最终矩阵中。
+- 真实 `testfiles` 八文件矩阵通过：11–108 MiB，Text/Binary、S1/S2、GBK、UTF-8、UTF-8 BOM、UTF-16LE/BE；每个样本同时核对冻结字节数、大小分层、内容路由、编码和 BOM。
+- 正式 Release 外部进程启动 E2E：100 MiB 真实文件 session **223 ms** 可见，100 MiB autosave session **213 ms** 可见，均 exit=0 且未走 L1 阻塞路径；L2 40 MiB 正文连续三帧可见 E2E 通过。数据是普通新进程启动，不宣称受控冷缓存 P95。
+- 内部启动合同通过（整个测试进程 0.45 秒，合同内 first paint <1500 ms）：first paint 前 Security 重型 factory=0；100 个 Tool、24 个 DocumentProvider（4 内建+20 测试）、22 个 PersistenceAdapter（2 内建+20 测试）和 20 个 InferenceProvider 均实例化为 0。
 - 已确认两类历史回归均有正式产品哨兵：搜索 Dock 单行紧凑几何；窗口化只读文本在搜索选择后连续用户选择并重复复制。
 - GUI 测试驱动原先在模态对话框尚未出现时执行一次性 timer，断言返回后会把对话框永久留住直至 300 秒超时；现改为有界轮询状态机和 8 秒 watchdog，失败会关闭模态框并给出明确原因，不再用长超时掩盖测试机制错误。
-- KDBX ON/OFF、quick/adjacent、真实 `testfiles`、正式进程启动和 E2E 的最终数量与耗时将在下方“最终证据”提交前由同一 revision 重新生成。
 
 不得上推为完成的边界：
 
@@ -266,4 +270,4 @@ CTest 按具体 QtTest 函数注册：
 - 搜索 target/revision/watch/stale 生命周期已从 SearchResultsDock 移入 `SearchResultsController`；Dock 仅保留模型呈现、点击命中计算和导航信号适配。
 - EditorTab 的 durable identity/location/revision/content/security 真值已单一化到 DocumentState，窗口化只读选择已单一化到 ReadOnlySelectionModel；presentation/provider 控件状态和搜索执行 facade 尚未全部移出。
 - Document/Inference/Tool registry 已落地；PersistenceAdapterRegistry 已接管格式探测优先级与延迟实例化，但 adapter 尚未统一 load/save/conflict/recovery，新增完全不同的持久化格式仍需修改应用协调层，不能声称完整持久化插件化。
-- 当前测试结果证明本轮涉及路径未发现功能回退，并建立了更强门禁；它不构成“未来永不回退”的数学保证，也不能把尚未迁移的职责称为低复杂度完成态。
+- 当前 153 项正式矩阵与 KDBX OFF 代表旅程证明已登记功能未发现本轮回退，并建立了更强门禁；它不构成“未来永不回退”的数学保证，也不能把尚未迁移的职责称为低复杂度完成态。

@@ -283,8 +283,8 @@ flowchart LR
 | 账号秘密隔离 | SecretLease、受控剪贴板和 AccountService 保持独立；普通加密文档仍复用 Document/EditorProvider 路径，Accounts 不成为通用 DocumentTool target | 继续把账号结构化交互限制在 AccountsWorkspace 和安全服务 port；工具策略默认拒绝 secret | Accounts contract、KDBX ON 正式 GUI、Plain/Secure 文档工具等价共同通过；不夸大普通文档运行态秘密等级 |
 | KDBX OFF 架构门禁 | **已实现架构选择目标**：Security port/unavailable adapter 使 OFF 正式程序可编译；MainWindow 不含 KDBX 编译宏、KdbxFormatProbe 或 SecurityIdentity/SecureDocument 静态后端调用，运行时只读取 capability | ON 继续承担真实加密与账号验收；OFF 只验证基础功能不依赖具体后端 | ON/OFF 正式构建和代表旅程通过；OFF 仍不是安全证明或发布配置 |
 | 最小启动 | **已验证核心合同**：真实 paint 信号后才排队恢复，Find/Accounts/Security/KDBX service lazy；首帧前重型 factory=0 | 继续把 Session manifest 和低优先级维护分批，补固定基准机 P95/首次输入 | 内部 first paint <1500ms；100 Tool、20 DocumentProvider、20 PersistenceAdapter、20 InferenceProvider 零实例；外部冷/热 P95 尚需受控环境 |
-| 同组件和分级测试 | **已验证结构**：正式/GUI 共用产品 target；QtTest 按函数注册，quick/adjacent/release 逐项 timeout；真实八文件 matrix 已注册 | 保持覆盖矩阵与 FeatureId 同步，新增回归必须有失败有效性证明 | quick 约 3 秒且无统一 3600 秒；最终仍需运行全部 adjacent/release |
-| 当前功能不回退 | **机制已落地，最终结论待整轮回归**：运行时 QAction 绑定 FeatureId，未知入口 fail closed；现有功能总账见 `FEATURE_LEDGER.md` | 最终统一执行正式 GUI、数据结果、KDBX、testfiles、启动和发布门禁 | 只有最终矩阵全绿后才声称本轮无已发现回退；不能承诺未来数学意义上的零缺陷 |
+| 同组件和分级测试 | **已验证结构和最终矩阵**：正式/GUI 共用产品 target；QtTest 按函数注册，quick/adjacent/release 逐项 timeout；真实八文件 matrix 已注册 | 保持覆盖矩阵与 FeatureId 同步，新增回归必须有失败有效性证明 | KDBX ON 153/153、quick 5/5、KDBX OFF 代表旅程 5/5；无统一 3600 秒 |
+| 当前功能不回退 | **本轮已登记范围未发现回退**：运行时 QAction 绑定 FeatureId，未知入口 fail closed；现有功能总账见 `FEATURE_LEDGER.md` | 后续修改继续执行按 FeatureId 选出的 quick/adjacent/release；任何未登记入口先补总账和失败哨兵 | 同一 revision 的正式 GUI、数据结果、KDBX、testfiles、启动和 E2E 全绿；这是可审计的本轮结论，不承诺未来数学意义上的零缺陷 |
 
 因此，本方案在当前 Qt/C++/CMake 技术栈内可以实施，但不是小改动，也没有任何一项因写入本文就自动完成。本轮合理边界是完成模块、状态所有权、测试组合、启动 lazy seam 和未来工具合同；真实 AI 模型、远程服务、第三方插件和脚本执行明确不属于本轮实现或完成声明。
 
