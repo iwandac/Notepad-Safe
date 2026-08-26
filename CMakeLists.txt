@@ -88,6 +88,7 @@ set(APP_QRC_FILE   "${CMAKE_CURRENT_SOURCE_DIR}/resources/app_resources.qrc")
 # ============================================================================
 set(APP_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/app
     ${CMAKE_SOURCE_DIR}/src/domain
     ${CMAKE_SOURCE_DIR}/src/editor
     ${CMAKE_SOURCE_DIR}/src/search
@@ -152,6 +153,10 @@ target_link_libraries(notepadsafe_search_runtime PUBLIC
 # QWidget/QScintilla dependencies so they can be tested at exact byte boundaries.
 add_library(notepadsafe_domain STATIC
     src/domain/FileTierPolicy.cpp
+    src/domain/DocumentToolRegistry.cpp
+    src/domain/DocumentProviderRegistry.cpp
+    src/domain/FeatureRegistry.cpp
+    src/domain/InferenceProviderRegistry.cpp
     src/session/DraftStore.cpp
 )
 target_include_directories(notepadsafe_domain PUBLIC
@@ -294,6 +299,9 @@ target_link_libraries(notepadsafe_session_runtime PUBLIC
 # one target so the formal executable and Shell GUI journeys cannot silently
 # compile different implementations.
 add_library(notepadsafe_app STATIC
+    src/app/AppComposition.cpp
+    src/app/StartupCoordinator.cpp
+    src/app/CommandRegistry.cpp
     src/window/MainWindow.cpp
     src/search/FindReplaceDialog.cpp
     src/search/SearchResultsDock.cpp
@@ -548,6 +556,23 @@ if(WIN32)
     target_link_libraries(test_filetierpolicy PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
 
+add_executable(test_architecture_contracts tests/test_architecture_contracts.cpp)
+target_include_directories(test_architecture_contracts PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(test_architecture_contracts PRIVATE notepadsafe_domain Qt6::Core)
+if(WIN32)
+    target_link_libraries(test_architecture_contracts PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+
+add_executable(test_startup_composition tests/test_startup_composition.cpp)
+target_include_directories(test_startup_composition PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(test_startup_composition PRIVATE
+    notepadsafe_app Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test)
+if(WIN32)
+    target_link_libraries(test_startup_composition PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+qt_import_plugins(test_startup_composition INCLUDE Qt6::QWindowsIntegrationPlugin)
+
 # Frozen real-file matrix used by local adjacent/release validation. The files
 # are intentionally not source-controlled because they total about 310 MiB.
 set(NOTEPADSAFE_TESTFILE_NAMES
@@ -627,6 +652,8 @@ set(NOTEPADSAFE_NON_GUI_TEST_TARGETS
     test_session
     test_settings_ui
     test_filetierpolicy
+    test_architecture_contracts
+    test_startup_composition
     test_vault_contract
 )
 if(TARGET test_testfile_matrix)
@@ -681,6 +708,12 @@ add_test(NAME largefile_encoded_search COMMAND test_largefile_encoded_search)
 add_test(NAME session      COMMAND test_session)
 add_test(NAME settings_ui  COMMAND test_settings_ui)
 add_test(NAME filetierpolicy COMMAND test_filetierpolicy)
+add_test(NAME architecture_contracts COMMAND test_architecture_contracts)
+set_tests_properties(architecture_contracts PROPERTIES
+    LABELS "quick;architecture;tools;providers" TIMEOUT 30)
+add_test(NAME startup_composition COMMAND test_startup_composition)
+set_tests_properties(startup_composition PROPERTIES
+    LABELS "quick;startup;architecture" TIMEOUT 30)
 if(TARGET test_testfile_matrix)
     add_test(NAME testfile_matrix COMMAND test_testfile_matrix)
     set_tests_properties(testfile_matrix PROPERTIES

@@ -15,6 +15,8 @@
 #include "SecureDocumentService.h"
 #include "SecurityServiceFactory.h"
 #include "SecuritySessionService.h"
+#include "AppComposition.h"
+#include "CommandRegistry.h"
 
 #include <QTabWidget>
 #include <QTabBar>
@@ -42,6 +44,7 @@
 #include <QCloseEvent>
 #include <QContextMenuEvent>
 #include <QShowEvent>
+#include <QPaintEvent>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QMimeData>
@@ -404,8 +407,10 @@ static void restoreSessionSplit(EditorTab *tab, const SessionTab &state)
                   ? Qt::Vertical : Qt::Horizontal);
 }
 
-MainWindow::MainWindow(QWidget *parent)
+MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
     : QMainWindow(parent)
+    , m_ownedComposition(composition ? nullptr : std::make_unique<AppComposition>())
+    , m_composition(composition ? composition : m_ownedComposition.get())
 {
     setWindowTitle(QStringLiteral("Notepad Safe"));
     setWindowIcon(QIcon(QStringLiteral(":/notepad_safe.png")));
@@ -440,166 +445,8 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_searchDock, &SearchResultsDock::jumpToTabByteOffset,
             this, &MainWindow::onJumpToTabByteOffset);
 
-    // 账户管理是一级中央工作区。现有 VaultDock 的业务表单先复用为页面内容，
-    // 移除 Dock 标题和停靠能力，用户不再看到“插件拼在编辑器右侧”的形态。
-    m_accountsPage = new QWidget(m_workspaceStack);
-    m_accountsPage->setObjectName(QStringLiteral("AccountsWorkspace"));
-    auto *accountsLayout = new QVBoxLayout(m_accountsPage);
-    accountsLayout->setContentsMargins(18, 14, 18, 14);
-    auto *accountsHeader = new QHBoxLayout();
-    auto *backToDocuments = new QPushButton(QStringLiteral("← 返回文档"), m_accountsPage);
-    backToDocuments->setObjectName(QStringLiteral("accountsBackToDocuments"));
-    auto *accountsTitle = new QLabel(QStringLiteral("账户"), m_accountsPage);
-    QFont accountsTitleFont = accountsTitle->font();
-    accountsTitleFont.setPointSize(accountsTitleFont.pointSize() + 5);
-    accountsTitleFont.setBold(true);
-    accountsTitle->setFont(accountsTitleFont);
-    accountsHeader->addWidget(backToDocuments);
-    accountsHeader->addSpacing(12);
-    accountsHeader->addWidget(accountsTitle);
-    accountsHeader->addStretch();
-    accountsLayout->addLayout(accountsHeader);
-    m_vaultDock = new VaultDock(m_accountsPage);
-    m_vaultDock->setFeatures(QDockWidget::NoDockWidgetFeatures);
-    auto *emptyDockTitle = new QWidget(m_vaultDock);
-    emptyDockTitle->setFixedHeight(0);
-    m_vaultDock->setTitleBarWidget(emptyDockTitle);
-    accountsLayout->addWidget(m_vaultDock, 1);
-    m_workspaceStack->addWidget(m_accountsPage);
-    connect(backToDocuments, &QPushButton::clicked,
-            this, &MainWindow::showDocumentWorkspace);
-    connect(m_vaultDock, &VaultDock::lockRequested,
-            this, &MainWindow::lockSecureDocuments);
-    connect(m_vaultDock, &VaultDock::secureStoreLocked,
-            this, &MainWindow::maskSecureDocuments);
-    connect(m_vaultDock, &VaultDock::workspaceCommandStateChanged,
-            this, [this]() { syncCommandStates(currentTab()); });
-    connect(m_vaultDock, &VaultDock::userNotificationRequested,
-            this, [this](const QString &message, int timeoutMs) {
-                statusBar()->showMessage(message, timeoutMs);
-            });
-    connect(m_vaultDock, &VaultDock::externalStoreReloadRequested,
-            this, [this](const QString &path) {
-                if (!m_vaultDock || path.isEmpty())
-                    return;
-                m_vaultDock->discardAndLockForExternalReload();
-                if (!openPathUnified(path)) {
-                    QMessageBox::warning(
-                        this, QStringLiteral("无法重新打开账户文件"),
-                        QStringLiteral("磁盘版本无法使用当前会话或输入的凭据解锁。"));
-                    return;
-                }
-                showAccountsWorkspace();
-                statusBar()->showMessage(QStringLiteral("已重新打开账户文件的磁盘版本"), 3000);
-            });
-
-    m_securityCenterPage = new QWidget(m_workspaceStack);
-    m_securityCenterPage->setObjectName(QStringLiteral("SecurityCenterWorkspace"));
-    auto *securityLayout = new QVBoxLayout(m_securityCenterPage);
-    securityLayout->setContentsMargins(28, 20, 28, 24);
-    securityLayout->setSpacing(16);
-    auto *securityHeader = new QHBoxLayout();
-    auto *securityBack = new QPushButton(QStringLiteral("← 返回文档"), m_securityCenterPage);
-    securityBack->setObjectName(QStringLiteral("securityCenterBackToDocuments"));
-    auto *securityTitle = new QLabel(QStringLiteral("安全中心"), m_securityCenterPage);
-    QFont securityTitleFont = securityTitle->font();
-    securityTitleFont.setPointSize(securityTitleFont.pointSize() + 5);
-    securityTitleFont.setBold(true);
-    securityTitle->setFont(securityTitleFont);
-    securityHeader->addWidget(securityBack);
-    securityHeader->addSpacing(12);
-    securityHeader->addWidget(securityTitle);
-    securityHeader->addStretch();
-    securityLayout->addLayout(securityHeader);
-    auto *securityIntro = new QLabel(
-        QStringLiteral("这里管理本机安全身份、恢复能力和七天设备会话。日常编辑无需在这里执行加解密操作。"),
-        m_securityCenterPage);
-    securityIntro->setWordWrap(true);
-    securityLayout->addWidget(securityIntro);
-
-    auto *deviceGroup = new QGroupBox(QStringLiteral("本设备会话"), m_securityCenterPage);
-    deviceGroup->setObjectName(QStringLiteral("securityCenterDeviceGroup"));
-    auto *deviceLayout = new QHBoxLayout(deviceGroup);
-    m_securitySessionStatus = new QLabel(deviceGroup);
-    m_securitySessionStatus->setObjectName(QStringLiteral("securityCenterSessionStatus"));
-    m_securitySessionStatus->setWordWrap(true);
-    auto *securityLock = new QPushButton(QStringLiteral("立即锁定"), deviceGroup);
-    securityLock->setObjectName(QStringLiteral("securityCenterLockNow"));
-    deviceLayout->addWidget(m_securitySessionStatus, 1);
-    deviceLayout->addWidget(securityLock, 0, Qt::AlignTop);
-    securityLayout->addWidget(deviceGroup);
-
-    auto *identityGroup = new QGroupBox(QStringLiteral("主密码与本地身份"), m_securityCenterPage);
-    identityGroup->setObjectName(QStringLiteral("securityCenterIdentityGroup"));
-    auto *identityLayout = new QVBoxLayout(identityGroup);
-    m_securityIdentityStatus = new QLabel(identityGroup);
-    m_securityIdentityStatus->setObjectName(QStringLiteral("securityCenterIdentityStatus"));
-    m_securityIdentityStatus->setWordWrap(true);
-    identityLayout->addWidget(m_securityIdentityStatus);
-    auto *identityExplanation = new QLabel(
-        QStringLiteral("主密码不存储在设备会话中；会话只保存由 Windows 当前用户保护的派生密钥。"),
-        identityGroup);
-    identityExplanation->setWordWrap(true);
-    identityLayout->addWidget(identityExplanation);
-    auto *identityActions = new QHBoxLayout();
-    identityActions->addStretch();
-    auto *changePasswordButton = new QPushButton(
-        QStringLiteral("修改主密码…"), identityGroup);
-    changePasswordButton->setObjectName(
-        QStringLiteral("securityCenterChangePassword"));
-    identityActions->addWidget(changePasswordButton);
-    identityLayout->addLayout(identityActions);
-    securityLayout->addWidget(identityGroup);
-
-    auto *recoveryGroup = new QGroupBox(QStringLiteral("恢复"), m_securityCenterPage);
-    recoveryGroup->setObjectName(QStringLiteral("securityCenterRecoveryGroup"));
-    auto *recoveryLayout = new QHBoxLayout(recoveryGroup);
-    m_securityRecoveryStatus = new QLabel(
-        QStringLiteral("恢复密钥用于应用数据损坏、设备迁移或忘记主密码时解锁文件。请离线保存。"),
-        recoveryGroup);
-    m_securityRecoveryStatus->setObjectName(QStringLiteral("securityCenterRecoveryStatus"));
-    m_securityRecoveryStatus->setWordWrap(true);
-    auto *recoveryButton = new QPushButton(QStringLiteral("查看或导出恢复密钥"), recoveryGroup);
-    recoveryButton->setObjectName(QStringLiteral("securityCenterRecoveryButton"));
-    auto *verifyRecoveryButton = new QPushButton(
-        QStringLiteral("验证恢复密钥…"), recoveryGroup);
-    verifyRecoveryButton->setObjectName(
-        QStringLiteral("securityCenterVerifyRecovery"));
-    auto *recoveryActions = new QVBoxLayout();
-    recoveryActions->addWidget(recoveryButton);
-    recoveryActions->addWidget(verifyRecoveryButton);
-    recoveryActions->addStretch();
-    recoveryLayout->addWidget(m_securityRecoveryStatus, 1);
-    recoveryLayout->addLayout(recoveryActions);
-    securityLayout->addWidget(recoveryGroup);
-    securityLayout->addStretch();
-    m_workspaceStack->addWidget(m_securityCenterPage);
-    connect(securityBack, &QPushButton::clicked,
-            this, &MainWindow::showDocumentWorkspace);
-    connect(recoveryButton, &QPushButton::clicked,
-            this, &MainWindow::exportRecoveryKey);
-    connect(verifyRecoveryButton, &QPushButton::clicked,
-            this, &MainWindow::verifyRecoveryKey);
-    connect(changePasswordButton, &QPushButton::clicked,
-            this, &MainWindow::changeMasterPassword);
-    connect(securityLock, &QPushButton::clicked, this, [this]() {
-        lockSecureDocuments();
-        refreshSecurityCenter();
-        if (!m_securitySession || !m_securitySession->hasActiveSession())
-            showDocumentWorkspace();
-    });
-
-    // 查找/替换对话框
-    m_findDialog = new FindReplaceDialog(this);
-    m_findDialog->setSearchResultsDock(m_searchDock);
-    m_findDialog->setTabWidget(m_tabs);
-    connect(m_findDialog, &FindReplaceDialog::findParametersChanged,
-            this, [this](const QString &pattern, bool regex, bool cs, bool wo) {
-        m_lastFindPattern = pattern;
-        m_lastFindRegex = regex;
-        m_lastFindCase = cs;
-        m_lastFindWord = wo;
-    });
+    // Accounts and Security Center are created on first use. Their widgets and
+    // backend discovery must not participate in the empty-Shell first paint.
 
     // 会话管理器
     m_session = new SessionManager(this);
@@ -607,6 +454,10 @@ MainWindow::MainWindow(QWidget *parent)
     createMenus();         // 菜单项用默认值创建，action 指针存在 m_act* / m_edgeColGroup
     createToolBar();
     createStatusBar();
+    m_commandRegistry = std::make_unique<CommandRegistry>();
+    m_commandRegistry->bind(this);
+    if (!m_commandRegistry->unboundCommandIds().isEmpty())
+        qWarning() << "Unbound command ids:" << m_commandRegistry->unboundCommandIds();
     connect(QGuiApplication::clipboard(), &QClipboard::dataChanged,
             this, [this]() { syncCommandStates(currentTab()); });
     syncCommandStates(nullptr);
@@ -626,10 +477,9 @@ MainWindow::MainWindow(QWidget *parent)
     //  原做法 v2：构造内 QTimer::singleShot(0, deferredRestoreSession)
     //             → main.cpp 的 processEvents 派发时，zero-timer 比 Paint 事件先运行
     //             → 会话恢复先跑完 916ms 才开始绘制窗口 → 用户依然感觉「双击没反应/静默」
-    //  新做法 v3：main.cpp 在 w.show() + sync() + 双 processEvents + 打日志确认可见后，
-    //             再用 QTimer::singleShot(30ms) 触发 deferredRestoreSession。
-    //             30ms 延时 + DWM 已合成首帧 → 窗口标题栏/空客户区必然先对用户可见，
-    //             之后才开始状态栏显示「正在恢复会话 0/N」异步加载 tab。
+    //  新做法 v3：StartupCoordinator 观察首次实际 Paint 完成，再以 queued
+    //             invocation 触发 deferredRestoreSession。外部打开排在恢复之前，
+    //             不依赖固定毫秒数猜测 DWM/事件队列时序。
     // ============================================================
     //   【此处不允许再注册任何启动会话恢复的 timer / 调用】
 
@@ -715,6 +565,15 @@ void MainWindow::showEvent(QShowEvent *event)
 #endif
 }
 
+void MainWindow::paintEvent(QPaintEvent *event)
+{
+    QMainWindow::paintEvent(event);
+    if (m_firstPaintCompleted)
+        return;
+    m_firstPaintCompleted = true;
+    emit firstPaintCompleted();
+}
+
 bool MainWindow::nativeEvent(const QByteArray &eventType, void *message,
                              qintptr *result)
 {
@@ -767,6 +626,160 @@ bool MainWindow::isDocumentWorkspaceActive() const
            || m_workspaceStack->currentWidget() == m_tabs;
 }
 
+void MainWindow::ensureAccountsWorkspaceCreated()
+{
+    if (m_accountsPage)
+        return;
+    m_composition->recordHeavyFactoryCall();
+    m_accountsPage = new QWidget(m_workspaceStack);
+    m_accountsPage->setObjectName(QStringLiteral("AccountsWorkspace"));
+    auto *accountsLayout = new QVBoxLayout(m_accountsPage);
+    accountsLayout->setContentsMargins(18, 14, 18, 14);
+    auto *accountsHeader = new QHBoxLayout();
+    auto *backToDocuments = new QPushButton(QStringLiteral("← 返回文档"), m_accountsPage);
+    backToDocuments->setObjectName(QStringLiteral("accountsBackToDocuments"));
+    auto *accountsTitle = new QLabel(QStringLiteral("账户"), m_accountsPage);
+    QFont titleFont = accountsTitle->font();
+    titleFont.setPointSize(titleFont.pointSize() + 5);
+    titleFont.setBold(true);
+    accountsTitle->setFont(titleFont);
+    accountsHeader->addWidget(backToDocuments);
+    accountsHeader->addSpacing(12);
+    accountsHeader->addWidget(accountsTitle);
+    accountsHeader->addStretch();
+    accountsLayout->addLayout(accountsHeader);
+    m_vaultDock = new VaultDock(m_accountsPage);
+    m_vaultDock->setFeatures(QDockWidget::NoDockWidgetFeatures);
+    auto *emptyDockTitle = new QWidget(m_vaultDock);
+    emptyDockTitle->setFixedHeight(0);
+    m_vaultDock->setTitleBarWidget(emptyDockTitle);
+    accountsLayout->addWidget(m_vaultDock, 1);
+    m_workspaceStack->addWidget(m_accountsPage);
+    connect(backToDocuments, &QPushButton::clicked,
+            this, &MainWindow::showDocumentWorkspace);
+    connect(m_vaultDock, &VaultDock::lockRequested,
+            this, &MainWindow::lockSecureDocuments);
+    connect(m_vaultDock, &VaultDock::secureStoreLocked,
+            this, &MainWindow::maskSecureDocuments);
+    connect(m_vaultDock, &VaultDock::workspaceCommandStateChanged,
+            this, [this]() { syncCommandStates(currentTab()); });
+    connect(m_vaultDock, &VaultDock::userNotificationRequested,
+            this, [this](const QString &message, int timeoutMs) {
+                statusBar()->showMessage(message, timeoutMs);
+            });
+    connect(m_vaultDock, &VaultDock::externalStoreReloadRequested,
+            this, [this](const QString &path) {
+                if (!m_vaultDock || path.isEmpty())
+                    return;
+                m_vaultDock->discardAndLockForExternalReload();
+                if (!openPathUnified(path)) {
+                    QMessageBox::warning(
+                        this, QStringLiteral("无法重新打开账户文件"),
+                        QStringLiteral("磁盘版本无法使用当前会话或输入的凭据解锁。"));
+                    return;
+                }
+                showAccountsWorkspace();
+                statusBar()->showMessage(
+                    QStringLiteral("已重新打开账户文件的磁盘版本"), 3000);
+            });
+}
+
+void MainWindow::ensureSecurityCenterCreated()
+{
+    if (m_securityCenterPage)
+        return;
+    m_composition->recordHeavyFactoryCall();
+    m_securityCenterPage = new QWidget(m_workspaceStack);
+    m_securityCenterPage->setObjectName(QStringLiteral("SecurityCenterWorkspace"));
+    auto *layout = new QVBoxLayout(m_securityCenterPage);
+    layout->setContentsMargins(28, 20, 28, 24);
+    layout->setSpacing(16);
+    auto *header = new QHBoxLayout();
+    auto *back = new QPushButton(QStringLiteral("← 返回文档"), m_securityCenterPage);
+    back->setObjectName(QStringLiteral("securityCenterBackToDocuments"));
+    auto *title = new QLabel(QStringLiteral("安全中心"), m_securityCenterPage);
+    QFont titleFont = title->font();
+    titleFont.setPointSize(titleFont.pointSize() + 5);
+    titleFont.setBold(true);
+    title->setFont(titleFont);
+    header->addWidget(back);
+    header->addSpacing(12);
+    header->addWidget(title);
+    header->addStretch();
+    layout->addLayout(header);
+    auto *intro = new QLabel(
+        QStringLiteral("这里管理本机安全身份、恢复能力和七天设备会话。日常编辑无需在这里执行加解密操作。"),
+        m_securityCenterPage);
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+
+    auto *deviceGroup = new QGroupBox(QStringLiteral("本设备会话"), m_securityCenterPage);
+    deviceGroup->setObjectName(QStringLiteral("securityCenterDeviceGroup"));
+    auto *deviceLayout = new QHBoxLayout(deviceGroup);
+    m_securitySessionStatus = new QLabel(deviceGroup);
+    m_securitySessionStatus->setObjectName(QStringLiteral("securityCenterSessionStatus"));
+    m_securitySessionStatus->setWordWrap(true);
+    auto *lock = new QPushButton(QStringLiteral("立即锁定"), deviceGroup);
+    lock->setObjectName(QStringLiteral("securityCenterLockNow"));
+    deviceLayout->addWidget(m_securitySessionStatus, 1);
+    deviceLayout->addWidget(lock, 0, Qt::AlignTop);
+    layout->addWidget(deviceGroup);
+
+    auto *identityGroup = new QGroupBox(QStringLiteral("主密码与本地身份"),
+                                         m_securityCenterPage);
+    identityGroup->setObjectName(QStringLiteral("securityCenterIdentityGroup"));
+    auto *identityLayout = new QVBoxLayout(identityGroup);
+    m_securityIdentityStatus = new QLabel(identityGroup);
+    m_securityIdentityStatus->setObjectName(QStringLiteral("securityCenterIdentityStatus"));
+    m_securityIdentityStatus->setWordWrap(true);
+    identityLayout->addWidget(m_securityIdentityStatus);
+    auto *explanation = new QLabel(
+        QStringLiteral("主密码不存储在设备会话中；会话只保存由 Windows 当前用户保护的派生密钥。"),
+        identityGroup);
+    explanation->setWordWrap(true);
+    identityLayout->addWidget(explanation);
+    auto *identityActions = new QHBoxLayout();
+    identityActions->addStretch();
+    auto *changePassword = new QPushButton(QStringLiteral("修改主密码…"), identityGroup);
+    changePassword->setObjectName(QStringLiteral("securityCenterChangePassword"));
+    identityActions->addWidget(changePassword);
+    identityLayout->addLayout(identityActions);
+    layout->addWidget(identityGroup);
+
+    auto *recoveryGroup = new QGroupBox(QStringLiteral("恢复"), m_securityCenterPage);
+    recoveryGroup->setObjectName(QStringLiteral("securityCenterRecoveryGroup"));
+    auto *recoveryLayout = new QHBoxLayout(recoveryGroup);
+    m_securityRecoveryStatus = new QLabel(
+        QStringLiteral("恢复密钥用于应用数据损坏、设备迁移或忘记主密码时解锁文件。请离线保存。"),
+        recoveryGroup);
+    m_securityRecoveryStatus->setObjectName(QStringLiteral("securityCenterRecoveryStatus"));
+    m_securityRecoveryStatus->setWordWrap(true);
+    auto *recovery = new QPushButton(QStringLiteral("查看或导出恢复密钥"), recoveryGroup);
+    recovery->setObjectName(QStringLiteral("securityCenterRecoveryButton"));
+    auto *verify = new QPushButton(QStringLiteral("验证恢复密钥…"), recoveryGroup);
+    verify->setObjectName(QStringLiteral("securityCenterVerifyRecovery"));
+    auto *recoveryActions = new QVBoxLayout();
+    recoveryActions->addWidget(recovery);
+    recoveryActions->addWidget(verify);
+    recoveryActions->addStretch();
+    recoveryLayout->addWidget(m_securityRecoveryStatus, 1);
+    recoveryLayout->addLayout(recoveryActions);
+    layout->addWidget(recoveryGroup);
+    layout->addStretch();
+    m_workspaceStack->addWidget(m_securityCenterPage);
+    connect(back, &QPushButton::clicked, this, &MainWindow::showDocumentWorkspace);
+    connect(recovery, &QPushButton::clicked, this, &MainWindow::exportRecoveryKey);
+    connect(verify, &QPushButton::clicked, this, &MainWindow::verifyRecoveryKey);
+    connect(changePassword, &QPushButton::clicked,
+            this, &MainWindow::changeMasterPassword);
+    connect(lock, &QPushButton::clicked, this, [this]() {
+        lockSecureDocuments();
+        refreshSecurityCenter();
+        if (!m_securitySession || !m_securitySession->hasActiveSession())
+            showDocumentWorkspace();
+    });
+}
+
 bool MainWindow::showAccountsWorkspace()
 {
 #ifndef NOTEPADSAFE_HAS_KDBX_BACKEND
@@ -774,6 +787,7 @@ bool MainWindow::showAccountsWorkspace()
                           QStringLiteral("当前构建未包含 KDBX 安全后端。"));
     return false;
 #else
+    ensureAccountsWorkspaceCreated();
     if (!m_vaultDock || !ensureSecuritySessionInteractive())
         return false;
     if (!m_vaultDock->isSecureStoreOpen()) {
@@ -842,6 +856,7 @@ bool MainWindow::showSecurityCenterWorkspace()
                           QStringLiteral("当前构建未包含 KDBX 安全后端。"));
     return false;
 #else
+    ensureSecurityCenterCreated();
     if (!m_securityCenterPage || !ensureSecuritySessionInteractive())
         return false;
     if (m_workspaceStack && m_accountsPage
@@ -2174,9 +2189,27 @@ void MainWindow::ensureSecurityServicesCreated()
 {
     if (m_securitySession && m_secureDocuments)
         return;
-    SecurityServiceBundle services = createSecurityServiceBundle();
+    SecurityServiceBundle services = m_composition->createSecurityServices();
     m_securitySession = std::move(services.session);
     m_secureDocuments = std::move(services.documents);
+}
+
+void MainWindow::ensureFindDialogCreated()
+{
+    if (m_findDialog)
+        return;
+    m_composition->recordHeavyFactoryCall();
+    m_findDialog = new FindReplaceDialog(this);
+    m_findDialog->setSearchResultsDock(m_searchDock);
+    m_findDialog->setTabWidget(m_tabs);
+    m_findDialog->setActiveTab(currentTab());
+    connect(m_findDialog, &FindReplaceDialog::findParametersChanged,
+            this, [this](const QString &pattern, bool regex, bool cs, bool wo) {
+        m_lastFindPattern = pattern;
+        m_lastFindRegex = regex;
+        m_lastFindCase = cs;
+        m_lastFindWord = wo;
+    });
 }
 
 bool MainWindow::ensureSecuritySessionInteractive()
@@ -2528,8 +2561,10 @@ EditorTab *MainWindow::addNewTab()
     });
 
     m_tabs->setCurrentIndex(index);
-    m_findDialog->setActiveTab(tab);
-    m_findDialog->notifyTabOpened(tab);
+    if (m_findDialog) {
+        m_findDialog->setActiveTab(tab);
+        m_findDialog->notifyTabOpened(tab);
+    }
     // 新建后立刻同步一次 L2 敏感动作（覆盖新 tab 还没收到任何信号的早期空状态）
     syncCommandStates(tab);
     return tab;
@@ -3965,6 +4000,7 @@ void MainWindow::sortLinesDesc()
 
 void MainWindow::showFindDialog()
 {
+    ensureFindDialogCreated();
     if (m_workspaceStack && m_accountsPage
         && m_workspaceStack->currentWidget() == m_accountsPage) {
         if (m_vaultDock)
@@ -3982,6 +4018,7 @@ void MainWindow::showFindDialog()
 
 void MainWindow::showReplaceDialog()
 {
+    ensureFindDialogCreated();
     if (!isDocumentWorkspaceActive())
         return;
     auto *tab = currentTab();
@@ -3993,6 +4030,7 @@ void MainWindow::showReplaceDialog()
 
 void MainWindow::findNext()
 {
+    ensureFindDialogCreated();
     if (!currentTab() || m_lastFindPattern.isEmpty())
         return;
     m_findDialog->findNextFromShortcut(true);
@@ -4000,6 +4038,7 @@ void MainWindow::findNext()
 
 void MainWindow::findPrev()
 {
+    ensureFindDialogCreated();
     if (!currentTab() || m_lastFindPattern.isEmpty())
         return;
     m_findDialog->findNextFromShortcut(false);
@@ -5502,10 +5541,6 @@ void MainWindow::deferredRestoreSession()
     // 此时 main.cpp 的 w.show() 已调用；但首次 paint 需要事件循环派发。
     // 主动 AllEvents 派发一次，确保窗口立刻可见（用户不会"双击后以为没启动"）。
     QApplication::processEvents(QEventLoop::AllEvents);
-
-    // Security adapters may inspect the local identity/session descriptor, so
-    // their creation is deliberately after the first visible paint.
-    ensureSecurityServicesCreated();
 
     QPointer<EditorTab> preferredActiveTab = currentTab();
     SessionData data = m_session->loadSession();

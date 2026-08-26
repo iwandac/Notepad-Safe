@@ -11,6 +11,7 @@
 #include "TextEncoding.h"
 #include "LargeFileSearch.h"   // 先入 LargeFileSearchMatch 定义
 #include "DiskFileVersion.h"
+#include "DocumentState.h"
 
 enum class ViewMode : int;  // 前置声明（定义在 VirtualFileView.h）
 
@@ -122,7 +123,8 @@ public:
     QString fileName() const;
     QString tabTitle() const;
     QUuid sessionInstanceId() const { return m_sessionInstanceId; }
-    quint64 contentRevision() const { return m_contentRevision; }
+    quint64 contentRevision() const { return m_documentState.revision; }
+    const DocumentState &documentState() const noexcept { return m_documentState; }
     // Secure notes use the same QScintilla editor but are persisted through
     // VaultService instead of a plaintext filesystem path.
     bool isSecureDocument() const { return !m_secureDocumentId.isNull(); }
@@ -453,7 +455,10 @@ private:
     QString m_filePath;       // 真实文件路径（空=未命名）
     QString m_autosavePath;   // 内部 autosave 临时路径（对用户透明）
     QUuid m_sessionInstanceId = QUuid::createUuid();
-    quint64 m_contentRevision = 0;
+    DocumentState m_documentState;
+    // Compatibility facade during the EditorTab migration. This is a reference,
+    // not duplicated state; every legacy search path observes the same revision.
+    quint64 &m_contentRevision = m_documentState.revision;
     mutable quint64 m_characterCountRevision = std::numeric_limits<quint64>::max();
     mutable qint64 m_cachedCharacterCount = 0;
     mutable bool m_cachedCharacterCountHex = false;

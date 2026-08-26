@@ -273,18 +273,18 @@ flowchart LR
 
 | 设计项 | 当前代码事实 | 可实施路径 | 本轮可声称完成的证据 |
 |---|---|---|---|
-| 模块化产品 targets | `notepadsafe_domain/search_runtime/vault` 已有基础；正式 exe 和 GUI 测试仍直接列举大量 `.cpp` | 先把共享 value type 移到 domain，拆开 editor↔search、session→editor 循环，再机械迁移 targets | 正式程序/测试同 target；无重复产品源码清单；link/include 图无禁止边 |
-| `AppComposition` 与手工 DI | 未实现；MainWindow 构造 VaultDock、Session、Security 服务，AsyncTaskManager/ThreadPool 仍为可变 singleton | facade 保持调用面，逐个把外部服务和任务调度改为构造注入；不可一次删除全部旧 API | 组合根是具体实现唯一创建点；MainWindow/EditorTab 无供应商构造和 mutable service singleton 访问 |
-| DocumentState/Capabilities/typed position | revision、部分 capability 和 TextProjectionPositionMapper 已有基础；状态仍散落 EditorTab/Provider | 先引入纯 value state 和唯一 selection/position owner，旧 EditorTab API 只转发 | Plain/Secure/Text/Hex/只读 capability contract 与连续状态迁移通过 |
+| 模块化产品 targets | **已验证**：正式 exe 与 GUI harness 链接同一产品 targets；架构门禁拒绝测试重复列产品 `.cpp` 和禁止 include | 继续拆分尚未形成独立 target 的 app 内部职责，不改变已经收敛的链接规则 | `architecture_boundary`、正式/GUI target 构建 |
+| `AppComposition` 与手工 DI | **部分实现**：组合根注入 MainWindow，Security bundle、Tool/Document/Inference registries 从组合根创建；Find/Accounts/Security 页面首次使用创建。Session 与 Async singleton 尚未迁移 | 保留 facade，按外部副作用边界继续注入；不为纯算法机械造接口 | first-paint counting factory 已验证；在 singleton 清零前不得声称 DI 全部完成 |
+| DocumentState/Capabilities/typed position | **部分实现**：纯 DocumentState、SourceBytePosition/Range、EditorPosition 和单一 revision 已进入 EditorTab；旧 persistence/presentation 字段仍存在 | 旧 API 转发到 state/provider 后才能删除字段；selection owner 先由纯合同与 GUI 哨兵双重保护 | revision stale、连续 selection owner、Plain/Secure 工具能力已通过；EditorTab 全职责迁移尚未完成 |
 | Search 分层 | 搜索运行时可复用；FindReplaceDialog/SearchResultsDock 仍直接依赖 EditorTab，Dock 仍拥有 target/revision/navigation | 把 SearchSession/ResultStore/NavigationController 移出 Widget，Dock 保留 view/delegate | search target 无 QWidget；Dock 无 target watch/navigation；现有搜索旅程零回退 |
-| 静态 Provider/Persistence registry | 未实现，但现有打开、Provider 和 Save 分支可逐项包装为 descriptor/factory | 内容 Provider 与 Plain/Secure/Draft persistence adapter 正交注册；先覆盖现有 Text/Hex/Windowed，不引入新格式 | 新测试 Provider/adapter 不修改 MainWindow/EditorTab/Search UI；Secure 不形成第二套 EditorProvider |
-| DocumentTool/AnalysisArtifact | 未实现；当前没有通用文档工具 API | 本轮只实现合同、registry、Echo/StaticGraph 测试工具和修改提案，不接真实模型 | Plain/Secure 等价、Accounts denied、取消/stale/undo 合同通过；不得宣称已有 AI 功能 |
-| `IInferenceProvider`、本地/远程 AI、模型 manifest | 未实现，当前仓库无模型运行时或推理 Provider | 只冻结 port 与数据暴露/manifest schema；真实 Provider 必须另立功能批次和供应链准入 | 本轮最多声称“扩展合同可接入”，不得声称本地/远程 AI 可用或性能已验证 |
+| 静态 Provider/Persistence registry | **部分实现**：Text/Windowed/Hex 描述符与 lazy DocumentProviderRegistry 已落地；PersistenceAdapterRegistry 尚未落地，现有打开/保存仍由 facade 路由 | 内容 Provider 与 Plain/Secure/Draft persistence adapter 正交注册；不引入新格式 | 新测试 Provider无需修改 UI且 100 descriptor 零实例；持久化扩展性尚未完成 |
+| DocumentTool/AnalysisArtifact | **已实现扩展合同，未实现用户 AI 功能**：registry、snapshot、artifact、proposal、取消/进度和暴露策略已编译 | 真实工具以后只注册 descriptor/factory，不读取 EditorTab/MainWindow | Echo/StaticGraph、Plain/Secure 等价、Accounts denied、取消/stale 已通过；未宣称 AI 可用 |
+| `IInferenceProvider`、本地/远程 AI、模型 manifest | **已实现 port/schema/registry，未实现 adapter**；核心无模型运行时依赖 | 真实 Provider 另立功能批次和供应链准入 | 20 个未使用 Provider 零实例；只能声称扩展合同可接入 |
 | 账号秘密隔离 | SecretLease、受控剪贴板和 AccountService 有部分基础；MainWindow/EditorTab 仍混有 Secure/Accounts 条件逻辑 | 账户结构化服务保持独立，普通加密文档回归 Document 路径，工具策略默认拒绝 secret | Accounts contract、KDBX ON 正式 GUI、Plain/Secure 文档工具等价共同通过 |
-| KDBX OFF 架构门禁 | CMake 选项存在，但当前 OFF 不是绿色基线，具体安全类型仍泄漏到 MainWindow 生命周期 | 以窄 port/unavailable adapter 代替具体类型和 UI 宏分支 | ON/OFF 都编译；OFF 不发布、不宣称验证加密；ON 完整安全旅程通过 |
-| 最小启动 | main.cpp 已先 show/processEvents 并延迟 session；但 MainWindow 首帧前仍创建 Accounts/Security 页面、VaultDock、Find dialog、Security 服务和计时器 | 保留已验证首帧顺序，把页面/服务改为 descriptor+lazy factory，并新增 first paint/input instrumentation | 外部 <1500 ms 与相对基线、内部 <500 ms、factory 零调用、扩展规模和渐进恢复全部通过 |
-| 同组件和分级测试 | **部分实现**：`notepadsafe_editor_runtime` 已让正式 EXE 与 GUI 测试复用 Editor/Search/Session/Async 产品对象，`GUI_SMOKE_SHARED_SOURCES` 已删除；8 个本地真实样本由 `test_testfile_matrix` 做有界大小/类型/编码门禁。MainWindow/Vault Shell 仍有测试目标重复源码，CTest 仍按大型 exe 注册 | 继续拆分 Shell/Vault 产品 target，再逐函数 CTest 注册 quick/adjacent/release，并补历史哨兵失败有效性证据 | 两次历史回归证明会失败；默认 quick 可持续运行；无统一 3600 秒；正式 exe 旅程通过 |
-| 当前功能不回退 | 功能总账和大量历史测试存在，但两次用户发现的回归证明其尚未形成充分保护 | 冻结 FeatureId 基线，先失败测试，再 facade/differential/正式 GUI 迁移，最后删除旧路径 | 每个 FeatureId 有前后结果；任何未批准退化即整轮失败；不能承诺未来数学意义上的零缺陷 |
+| KDBX OFF 架构门禁 | **部分实现并已构建**：Security port/unavailable adapter 使 OFF 正式程序可编译；MainWindow 仍有后端条件 UI 分支 | 把文件凭据、探测和安全工作区 controller 移到 adapter 后删除 MainWindow 宏 | ON/OFF 编译已有证据；宏清零前不得声称完全解耦 |
+| 最小启动 | **已验证核心合同**：真实 paint 信号后才排队恢复，Find/Accounts/Security/KDBX service lazy；首帧前重型 factory=0 | 继续把 Session manifest 和低优先级维护分批，补固定基准机 P95/首次输入 | 内部 first paint <1500ms；100 Tool、20 DocumentProvider、20 InferenceProvider 零实例；外部冷/热 P95 尚需受控环境 |
+| 同组件和分级测试 | **已验证结构**：正式/GUI 共用产品 target；QtTest 按函数注册，quick/adjacent/release 逐项 timeout；真实八文件 matrix 已注册 | 保持覆盖矩阵与 FeatureId 同步，新增回归必须有失败有效性证明 | quick 约 3 秒且无统一 3600 秒；最终仍需运行全部 adjacent/release |
+| 当前功能不回退 | **机制已落地，最终结论待整轮回归**：运行时 QAction 绑定 FeatureId，未知入口 fail closed；现有功能总账见 `FEATURE_LEDGER.md` | 最终统一执行正式 GUI、数据结果、KDBX、testfiles、启动和发布门禁 | 只有最终矩阵全绿后才声称本轮无已发现回退；不能承诺未来数学意义上的零缺陷 |
 
 因此，本方案在当前 Qt/C++/CMake 技术栈内可以实施，但不是小改动，也没有任何一项因写入本文就自动完成。本轮合理边界是完成模块、状态所有权、测试组合、启动 lazy seam 和未来工具合同；真实 AI 模型、远程服务、第三方插件和脚本执行明确不属于本轮实现或完成声明。
 

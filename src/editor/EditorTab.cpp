@@ -880,6 +880,7 @@ void EditorTab::setModified(bool m)
             m_editor->setModified(false);
         }
         if (before != isModified()) {
+            m_documentState.dirty = isModified();
             emit modificationChanged(isModified());
             emit titleChanged(tabTitle());
         }
@@ -890,6 +891,7 @@ void EditorTab::setModified(bool m)
     if (!m)
         m_editor->setModified(false);
     if (before != isModified()) {
+        m_documentState.dirty = isModified();
         emit modificationChanged(isModified());
         emit titleChanged(tabTitle());
     }
@@ -908,6 +910,11 @@ QString EditorTab::filePath() const
 void EditorTab::setFilePath(const QString &path)
 {
     m_filePath = path;
+    m_documentState.location = path;
+    m_documentState.origin = path.isEmpty() ? DocumentOrigin::Untitled
+                                            : DocumentOrigin::File;
+    m_documentState.persistence = path.isEmpty() ? DocumentPersistence::None
+                                                 : DocumentPersistence::PlainFile;
     refreshDiskVersionBaseline();
     emit titleChanged(tabTitle());
 }
@@ -954,6 +961,12 @@ void EditorTab::initializeSecureDocument(const QUuid &id, const QString &title,
     m_filePath = filePath;
     m_autosavePath.clear();
     m_secureDocumentId = id;
+    m_documentState.id = id;
+    m_documentState.location = filePath;
+    m_documentState.origin = DocumentOrigin::SecureStore;
+    m_documentState.persistence = DocumentPersistence::SecureFile;
+    m_documentState.securityClass = DocumentSecurityClass::SecureDocument;
+    m_documentState.contentKind = DocumentContentKind::Text;
     m_secureDocumentTitle = title.trimmed();
     m_secureDocumentMasked = false;
     m_secureBinaryDocument = false;
@@ -1014,6 +1027,12 @@ bool EditorTab::initializeSecureBinaryDocument(const QUuid &id,
     m_filePath = filePath;
     m_autosavePath.clear();
     m_secureDocumentId = id;
+    m_documentState.id = id;
+    m_documentState.location = filePath;
+    m_documentState.origin = DocumentOrigin::SecureStore;
+    m_documentState.persistence = DocumentPersistence::SecureFile;
+    m_documentState.securityClass = DocumentSecurityClass::SecureDocument;
+    m_documentState.contentKind = DocumentContentKind::Binary;
     m_secureDocumentTitle = title.trimmed();
     m_secureDocumentMasked = false;
     m_secureBinaryDocument = true;
@@ -1171,6 +1190,12 @@ void EditorTab::convertToPlainDocument(const QString &filePath)
     m_secureBinaryDocument = false;
     setSecurePayloadLimitExclusive(0);
     m_filePath = filePath;
+    m_documentState.location = filePath;
+    m_documentState.origin = filePath.isEmpty() ? DocumentOrigin::Untitled
+                                                : DocumentOrigin::File;
+    m_documentState.persistence = filePath.isEmpty() ? DocumentPersistence::None
+                                                     : DocumentPersistence::PlainFile;
+    m_documentState.securityClass = DocumentSecurityClass::OrdinaryDocument;
     m_autosavePath.clear();
     m_editor->setReadOnly(false);
     m_editor->setModified(false);

@@ -2,13 +2,9 @@
 
 #include "FileTierPolicy.h"
 #include "TextEncoding.h"
+#include "DocumentState.h"
 
 #include <QString>
-
-enum class DocumentContentKind {
-    Text,
-    Binary,
-};
 
 struct FileContentProbeResult {
     bool exists = false;

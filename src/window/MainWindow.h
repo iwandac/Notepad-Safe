@@ -27,12 +27,16 @@ class VaultDock;
 class StatusBarTaskWidget;
 class ISecuritySessionService;
 class ISecureDocumentService;
+class AppComposition;
+class CommandRegistry;
+class QPaintEvent;
 struct SecureDocumentSnapshot;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
-    explicit MainWindow(QWidget *parent = nullptr);
+    explicit MainWindow(QWidget *parent = nullptr,
+                        AppComposition *composition = nullptr);
     ~MainWindow() override;
 
     // 从命令行/拖放等外部传入打开文件（支持多个）
@@ -44,6 +48,7 @@ protected:
     void dropEvent(QDropEvent *event) override;
     bool eventFilter(QObject *watched, QEvent *event) override;
     void showEvent(QShowEvent *event) override;
+    void paintEvent(QPaintEvent *event) override;
     bool nativeEvent(const QByteArray &eventType, void *message,
                      qintptr *result) override;
 
@@ -115,7 +120,14 @@ private slots:
     void lockSecureDocuments();
     void maskSecureDocuments();
 
+signals:
+    void firstPaintCompleted();
+
 private:
+    std::unique_ptr<AppComposition> m_ownedComposition;
+    AppComposition *m_composition = nullptr;
+    std::unique_ptr<CommandRegistry> m_commandRegistry;
+    bool m_firstPaintCompleted = false;
     QTabWidget *m_tabs = nullptr;
     QStackedWidget *m_workspaceStack = nullptr;
     QWidget *m_accountsPage = nullptr;
@@ -250,6 +262,9 @@ private:
     bool reloadTabFromDisk(EditorTab *tab);
     bool reloadSecureTabFromDisk(EditorTab *tab);
     void ensureSecurityServicesCreated();
+    void ensureFindDialogCreated();
+    void ensureAccountsWorkspaceCreated();
+    void ensureSecurityCenterCreated();
     // closingApp=true: 关闭整个应用，未命名文件走 autosave 不提示
     // closingApp=false (默认): 关闭单个标签，未命名文件且有内容也要提示是否保存
     bool maybeSaveTab(int index, bool closingApp = false);

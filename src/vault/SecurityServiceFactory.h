@@ -1,9 +1,9 @@
 #pragma once
 
-#include <memory>
+#include "SecureDocumentService.h"
+#include "SecuritySessionService.h"
 
-class ISecuritySessionService;
-class ISecureDocumentService;
+#include <memory>
 
 struct SecurityServiceBundle {
     std::unique_ptr<ISecuritySessionService> session;

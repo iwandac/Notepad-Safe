@@ -139,19 +139,25 @@ AnalysisArtifact
 - 通过 target include/link 可见性形成单向依赖；补充轻量 forbidden-include 检查作为辅助。
 - 建立最小启动 composition：首帧前只创建 Shell、核心 command descriptor 和 lazy factory；counting factory 证明零重型实例。
 
-当前检查点（2026-08-26）：基线 revision 为 `9a80eec`；Editor/Search/Session/Async 已机械收敛到
-`notepadsafe_editor_runtime`，正式 EXE 与 GUI harness 链接同一静态组件，测试专属代码只保留
-`notepadsafe_gui_test_support` 和各测试入口，旧 `GUI_SMOKE_SHARED_SOURCES` 已删除。统一打开的
-有界文件探测已从 MainWindow 提取为 `FileContentProbe`，8 个本地 `testfiles` 样本覆盖
-11–108 MiB、Text/Binary、S1/S2、GBK、UTF-8/BOM、UTF-16LE/BE。此检查点不代表 R1 完成：
-MainWindow/Vault Shell 仍有重复源码，target 依赖仍未收敛为单向，逐函数 CTest、最小启动
-composition 和 counting factory 尚未实现。
+当前实现（2026-08-26）：基线 revision 为 `9a80eec`。正式 EXE 与 GUI harness 链接同一组
+`notepadsafe_*_runtime`/`notepadsafe_app` 产品组件，测试 CMake 不再列举产品 `.cpp`；架构脚本
+检查单一源码归属和禁止依赖。CTest 已按 QtTest 函数拆分，并为 quick/adjacent/release 设置逐项
+30–300 秒 timeout，不再使用统一 3600 秒。`AppComposition` 与 `StartupCoordinator` 已进入正式
+启动路径；Find/Accounts/Security Center/KDBX service 首次使用创建。启动合同以实际 first paint
+信号证明首帧前重型 factory 为 0，100 个未使用 Tool、20 个未使用推理 Provider 和 20 个附加
+文档 Provider 均只注册 descriptor、实例化为 0。8 个本地 `testfiles` 样本覆盖 11–108 MiB、
+Text/Binary、S1/S2、GBK、UTF-8/BOM、UTF-16LE/BE。
 
 ### R2 状态所有权收敛
 
 - 先落地 DocumentState、Capabilities、typed positions 和单一 selection owner。
 - 旧 EditorTab API 暂时保留 facade，内部转发到新状态和 Provider；禁止同时写旧、新两份状态。
 - 纯逻辑路径在删除旧实现前运行 differential tests，比较旧/新输出。
+
+当前实现：`DocumentState` 已建立 DocumentId/revision/content/persistence/security/capabilities 单一值对象，
+source byte 与 editor position 使用不可互换类型；EditorTab 的旧 revision API 是对该状态的引用 facade，
+不保留第二份 revision。`ReadOnlySelectionModel` 对连续选择和无效 owner 切换提供纯合同哨兵。其余
+EditorTab persistence/presentation 旧字段仍在迁移期，不能声称 EditorTab 职责迁移已经全部完成。
 
 ### R3 搜索、命令和视图收敛
 
@@ -165,6 +171,12 @@ composition 和 counting factory 尚未实现。
 - Accounts 单独实现结构化服务和 SecretLease，通用工具 registry 默认拒绝账号秘密。
 - 用测试工具证明 Plain/Secure 快照等价、Accounts denied、取消、revision stale 和 edit proposal 单次 undo。
 - KDBX ON/OFF 均编译并运行适用合同。
+
+当前实现：`DocumentToolRegistry`、`DocumentProviderRegistry`、`InferenceProviderRegistry`、
+`DocumentSnapshot`、`AnalysisArtifact`、`EditProposal`、取消/进度、逐次远程暴露策略和版本化模型
+manifest 已成为无 Widgets/KDBX 依赖的编译合同。测试用 Echo/StaticGraph 证明 Plain/已解锁 Secure
+等价、Accounts denied、取消、artifact/proposal revision stale；没有接入真实模型或脚本执行器，
+因此只能声称扩展合同可接入，不能声称 AI 功能已经实现。
 
 ### R5 删除与发布复核
 
