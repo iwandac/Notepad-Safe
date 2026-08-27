@@ -186,10 +186,6 @@ struct MainWindow::PendingSessionRestore {
 // ============================================================================
 void MainWindow::deferredRestoreSession()
 {
-    // 此时 main.cpp 的 w.show() 已调用；但首次 paint 需要事件循环派发。
-    // 主动 AllEvents 派发一次，确保窗口立刻可见（用户不会"双击后以为没启动"）。
-    QApplication::processEvents(QEventLoop::AllEvents);
-
     QPointer<EditorTab> preferredActiveTab = currentTab();
     SessionData data = m_session->loadSession();
     if (data.tabs.isEmpty()) {
@@ -349,16 +345,11 @@ void MainWindow::restoreNextSessionTab()
     statusBar()->showMessage(
         QStringLiteral("正在恢复会话… %1/%2 个标签页").arg(done).arg(total), 0);
 
-    qDebug("[STARTUP][RESTORE tab %d/%d] 收尾(cursor/syntax/title/statusBar)耗时=%lld ms。调用 processEvents 让 UI 重绘…",
+    qDebug("[STARTUP][RESTORE tab %d/%d] 收尾(cursor/syntax/title/statusBar)耗时=%lld ms。",
            done, total, tabTimer.elapsed());
-    QElapsedTimer peTimer; peTimer.start();
-    // 仅重绘、不接受新用户输入（避免编辑态冲突），窗口可见性 + 状态栏进度会更新
-    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-    qDebug("[STARTUP][RESTORE tab %d/%d] processEvents(ExcludeUserInput) 耗时=%lld ms。"
-           "下一 tab 通过 singleShot(0) 入队，UI 线程先释放给 DWM 合成。",
-           done, total, peTimer.elapsed());
 
-    // 下一个 tab：入队（如果 L2 大文件，AsyncTaskManager 会在后台继续跑不阻塞）
+    // 下一个 tab 在新的事件循环 turn 入队；中间不嵌套 processEvents，用户输入、
+    // 重绘和 DWM 合成都可以按 Qt 正常顺序执行，避免恢复流程发生可重入状态修改。
     QTimer::singleShot(0, this, &MainWindow::restoreNextSessionTab);
 }
 

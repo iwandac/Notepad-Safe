@@ -2425,3 +2425,11 @@ B1 Hex 的编辑与保存以原始 byte/patch model 为唯一权威；字符区�
 主窗口/Hex/保存/会话 GUI 53/53，以及编码、搜索、PCRE2、大文件编码搜索和文件分级 CTest 5/5
 通过；正式 `notepad-safe.exe` 从同一干净对象集合重新链接。本章只宣告上述架构切片完成；
 Vault/KDBX、安全身份、安装包、签名和人工视觉发布矩阵仍按各自门禁执行。
+
+2026-08-27 架构收敛后的永久哨兵补充为：`quick.search_dock_compact` 固定验证所有搜索模式
+共用 `SearchResultsViewPolicy` 的单行、uniform-height、no-wrap/elide 几何；
+`quick.readonly_repeated_copy` 固定验证搜索选区之后的原生用户选区在每次 Copy 时重新取得所有权；
+KDBX backend 还以精确 1024-byte ChaCha20 stream payload 验证关闭时不得处理空尾块。QtTest case
+按函数注册并带 FeatureId label/逐项 timeout，KDBX 条件 case 与编译 capability 共用同一 CMake
+清单；测试 runner 对空选择使用 `--no-tests=error`。最终证据见
+`ARCHITECTURE_CONVERGENCE.md` 第 8 节；其中 ON 153/153、OFF 140/140 均来自独立 Release 构建。

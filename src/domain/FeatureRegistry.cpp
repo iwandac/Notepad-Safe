@@ -53,7 +53,97 @@ QList<FeatureDescriptor> FeatureRegistry::features()
          QStringLiteral("版本与产品说明")},
         {QStringLiteral("NSP-SHELL"), QStringLiteral("应用 Shell"),
          QStringLiteral("菜单、启动、会话与工作区")},
+        {QStringLiteral("NSP-LARGEFILE"), QStringLiteral("大文件"),
+         QStringLiteral("S2/S3 与 B2/B3 窗口化只读浏览")},
+        {QStringLiteral("NSP-SECURE"), QStringLiteral("安全文档"),
+         QStringLiteral("普通加密文档的打开、编辑、保存与恢复")},
     };
+}
+
+QStringList FeatureRegistry::requiredStartupCommandIds()
+{
+    QStringList result = {
+        QStringLiteral("menu.file"), QStringLiteral("file.new"),
+        QStringLiteral("file.open"), QStringLiteral("file.recent"),
+        QStringLiteral("file.reload"), QStringLiteral("file.save"),
+        QStringLiteral("file.saveAs"), QStringLiteral("file.close"),
+        QStringLiteral("file.closeAll"), QStringLiteral("file.exit"),
+        QStringLiteral("menu.edit"), QStringLiteral("edit.undo"),
+        QStringLiteral("edit.redo"), QStringLiteral("edit.cut"),
+        QStringLiteral("edit.copy"), QStringLiteral("edit.paste"),
+        QStringLiteral("edit.selectAll"), QStringLiteral("edit.hexInsertMode"),
+        QStringLiteral("edit.line.duplicate"), QStringLiteral("edit.line.delete"),
+        QStringLiteral("edit.line.moveUp"), QStringLiteral("edit.line.moveDown"),
+        QStringLiteral("edit.line.transpose"),
+        QStringLiteral("edit.multiSelect.next"),
+        QStringLiteral("edit.multiSelect.all"),
+        QStringLiteral("edit.selection.upper"),
+        QStringLiteral("edit.selection.lower"),
+        QStringLiteral("edit.lines.join"), QStringLiteral("edit.lines.split"),
+        QStringLiteral("edit.lines.sortAscending"),
+        QStringLiteral("edit.lines.sortDescending"),
+        QStringLiteral("edit.indentation"),
+        QStringLiteral("edit.indentation.useTabs"),
+        QStringLiteral("edit.indentation.tabWidth"),
+        QStringLiteral("edit.indentation.backspaceUnindents"),
+        QStringLiteral("edit.completion.words"),
+        QStringLiteral("menu.search"), QStringLiteral("search.find"),
+        QStringLiteral("search.replace"), QStringLiteral("search.next"),
+        QStringLiteral("search.previous"), QStringLiteral("search.brace.match"),
+        QStringLiteral("search.brace.select"), QStringLiteral("search.bookmarks"),
+        QStringLiteral("bookmark.toggle"), QStringLiteral("bookmark.next"),
+        QStringLiteral("bookmark.previous"), QStringLiteral("bookmark.clear"),
+        QStringLiteral("menu.language"), QStringLiteral("menu.view"),
+        QStringLiteral("view.appearance"),
+        QStringLiteral("view.appearance.system"),
+        QStringLiteral("view.appearance.light"),
+        QStringLiteral("view.appearance.dark"), QStringLiteral("view.wordWrap"),
+        QStringLiteral("view.split"), QStringLiteral("view.split.horizontal"),
+        QStringLiteral("view.split.vertical"), QStringLiteral("view.symbols"),
+        QStringLiteral("view.symbols.whitespace"),
+        QStringLiteral("view.symbols.eol"), QStringLiteral("view.folding"),
+        QStringLiteral("view.folding.toggleCurrent"),
+        QStringLiteral("view.folding.collapseAll"),
+        QStringLiteral("view.folding.expandAll"),
+        QStringLiteral("view.presentation"),
+        QStringLiteral("view.presentation.text"),
+        QStringLiteral("view.presentation.hex"),
+        QStringLiteral("view.presentation.toggle"), QStringLiteral("view.edge"),
+        QStringLiteral("view.edge.visible"), QStringLiteral("view.zoom"),
+        QStringLiteral("view.zoom.in"), QStringLiteral("view.zoom.out"),
+        QStringLiteral("view.zoom.reset"), QStringLiteral("view.panels"),
+        QStringLiteral("view.panel.searchResults"),
+        QStringLiteral("view.toolbar"), QStringLiteral("view.statusBar"),
+        QStringLiteral("menu.encoding"), QStringLiteral("encoding.eol"),
+        QStringLiteral("encoding.convert"), QStringLiteral("menu.tools"),
+        QStringLiteral("tools.accounts"),
+        QStringLiteral("tools.securityCenter"),
+        QStringLiteral("tools.lockNow"), QStringLiteral("tools.tasks"),
+        QStringLiteral("menu.help"), QStringLiteral("help.about"),
+    };
+    for (const int width : {2, 4, 8})
+        result.append(QStringLiteral("edit.indentation.tabWidth.%1").arg(width));
+    for (const int column : {72, 80, 100, 120, 150, 200})
+        result.append(QStringLiteral("view.edge.column.%1").arg(column));
+    for (const char *syntax : {
+             "plain", "cpp", "python", "json", "html", "xml", "sql",
+             "yaml", "markdown", "javascript", "java", "csharp", "css",
+             "bash", "batch", "cmake", "makefile", "lua", "ruby", "perl",
+             "diff", "properties", "asm"}) {
+        result.append(QStringLiteral("language.%1").arg(QLatin1String(syntax)));
+    }
+    for (const char *encoding : {
+             "gbk", "gb18030", "big5", "shiftjis", "windows1252", "utf8",
+             "utf8bom", "utf16le", "utf16be"}) {
+        result.append(QStringLiteral("encoding.display.%1").arg(
+            QLatin1String(encoding)));
+        result.append(QStringLiteral("encoding.convert.%1").arg(
+            QLatin1String(encoding)));
+    }
+    for (const char *eol : {"crlf", "lf", "cr"})
+        result.append(QStringLiteral("encoding.eol.%1").arg(QLatin1String(eol)));
+    result.sort();
+    return result;
 }
 
 QString FeatureRegistry::featureIdForCommand(const QString &commandId)

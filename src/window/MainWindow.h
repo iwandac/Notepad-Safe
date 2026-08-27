@@ -162,9 +162,6 @@ private:
     QMenu *m_displayEncodingMenu = nullptr;
 
     // L2 模式下禁用不适配菜单项（D001~D007 强制，L2 isL2Active=true 时 setEnabled(false) 变灰）
-    QAction *m_actSortAsc = nullptr;          // 编辑 → 行升序排序（全 Scintilla 代码，L2 空+超大文件不可排序）
-    QAction *m_actSortDesc = nullptr;         // 编辑 → 行降序排序
-    QVector<QAction *> m_convertEncodingActions;  // 转换为：另存新文件并自动打开，含大文件流式转换
 
     // 视图菜单 action（用于 loadSettings 后同步勾选状态，避免数据与UI不一致）
     QAction *m_actDarkMode = nullptr;
@@ -206,12 +203,6 @@ private:
     QLabel *m_securityRecoveryStatus = nullptr;
     QActionGroup *m_edgeColGroup = nullptr;   // 长行标尺列数组，遍历其 action 同步勾选
     QActionGroup *m_tabWidthGroup = nullptr;
-    QVector<QAction *> m_documentOnlyActions;
-    QVector<QAction *> m_textMutationActions;
-    QVector<QAction *> m_nativeTextActions;
-    QVector<QAction *> m_lexerActions;
-    QVector<QAction *> m_languageActions;
-    QVector<QAction *> m_displayEncodingActions;
 
     enum class AppearanceMode { System = 0, Light = 1, Dark = 2 };
     AppearanceMode m_appearanceMode = AppearanceMode::System;

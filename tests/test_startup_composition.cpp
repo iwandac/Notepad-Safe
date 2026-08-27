@@ -1,11 +1,14 @@
 #include "AppComposition.h"
 #include "EditorTab.h"
+#include "FeatureRegistry.h"
 #include "MainWindow.h"
+#include "StartupCoordinator.h"
 
 #include <QApplication>
 #include <QAction>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QSet>
 #include <QTemporaryDir>
 #include <QTest>
 
@@ -29,7 +32,7 @@ public:
     explicit NoopProvider(DocumentProviderDescriptor descriptor)
         : descriptor_(std::move(descriptor)) {}
     DocumentProviderDescriptor descriptor() const override { return descriptor_; }
-    bool open(EditorTab *, const QString &, std::optional<TextEncoding>,
+    bool open(IDocumentSurface *, const DocumentSurfaceOpenRequest &,
               QString *) override { return false; }
 private:
     DocumentProviderDescriptor descriptor_;
@@ -117,12 +120,30 @@ int main(int argc, char **argv)
         return 5;
 
     bool painted = false;
+    bool idleTurnCompleted = false;
+    qint64 firstIdleTurnMs = -1;
+    QElapsedTimer postPaintTimer;
+    StartupCoordinator startup;
+    startup.observe(&window, {});
     QObject::connect(&window, &MainWindow::firstPaintCompleted,
-                     [&painted] { painted = true; });
+                     [&] {
+                         painted = true;
+                         postPaintTimer.start();
+                     });
+    QObject::connect(&startup, &StartupCoordinator::postPaintIdleTurnCompleted,
+                     [&] {
+                         firstIdleTurnMs = postPaintTimer.elapsed();
+                         idleTurnCompleted = true;
+                     });
     window.show();
+    startup.releasePostPaintWork();
     if (!QTest::qWaitFor([&painted] { return painted; }, 1500))
         return 6;
     const qint64 firstPaintMs = timer.elapsed();
+    if (!QTest::qWaitFor([&idleTurnCompleted] { return idleTurnCompleted; }, 250)
+        || firstIdleTurnMs < 0 || firstIdleTurnMs >= 250) {
+        return 18;
+    }
 
     if (composition.heavyFactoryCalls() != 0
         || composition.documentTools().instantiatedCount() != 0
@@ -131,11 +152,20 @@ int main(int argc, char **argv)
         || composition.inferenceProviders().instantiatedCount() != 0)
         return 7;
     const auto actions = window.findChildren<QAction *>();
+    QSet<QString> actualCommandIds;
     for (QAction *action : actions) {
         if (!action->objectName().isEmpty()
             && action->property("featureId").toString().isEmpty()) {
             qCritical() << "Command missing FeatureId:" << action->objectName();
             return 9;
+        }
+        if (!action->objectName().isEmpty())
+            actualCommandIds.insert(action->objectName());
+    }
+    for (const QString &required : FeatureRegistry::requiredStartupCommandIds()) {
+        if (!actualCommandIds.contains(required)) {
+            qCritical() << "Required startup command disappeared:" << required;
+            return 15;
         }
     }
     if (firstPaintMs >= 1500)
@@ -167,16 +197,25 @@ int main(int argc, char **argv)
     fixture.close();
     EditorTab providerTab;
     QString providerError;
-    if (!composition.documentProviders().open(
-            QStringLiteral("text.editable"), &providerTab, providerFixture,
-            std::nullopt, &providerError)
+    const DocumentSurfaceOpenRequest request{
+        providerFixture, DocumentContentKind::Text, false,
+        DocumentPresentationKind::Text, std::nullopt};
+    if (!composition.documentProviders().openBest(
+            &providerTab, request, &providerError)
         || providerTab.filePath() != providerFixture
         || composition.documentProviders().instantiatedCount() != 1) {
         qCritical() << "Production document provider route failed:" << providerError;
         return 14;
     }
+    providerTab.setModified(true);
+    if (!providerTab.documentState().dirty)
+        return 16;
+    providerTab.setModified(false);
+    if (providerTab.documentState().dirty)
+        return 17;
 
-    qInfo("Startup composition: first paint %lld ms, heavy factories 0 before paint; lazy tool instantiated after paint",
-          static_cast<long long>(firstPaintMs));
+    qInfo("Startup composition: first paint %lld ms, first idle turn %lld ms, heavy factories 0 before paint; lazy tool instantiated after paint",
+          static_cast<long long>(firstPaintMs),
+          static_cast<long long>(firstIdleTurnMs));
     return 0;
 }

@@ -28,15 +28,36 @@ std::unique_ptr<IDocumentProvider> DocumentProviderRegistry::create(const QStrin
     return it->factory();
 }
 
-bool DocumentProviderRegistry::open(
-    const QString &id, EditorTab *tab, const QString &path,
-    std::optional<TextEncoding> forcedEncoding, QString *error) const
+bool DocumentProviderRegistry::openBest(
+    IDocumentSurface *surface, const DocumentSurfaceOpenRequest &request,
+    QString *error) const
 {
-    std::unique_ptr<IDocumentProvider> provider = create(id);
-    if (!provider) {
-        if (error)
-            *error = QStringLiteral("未注册文档提供器：%1").arg(id);
+    const Entry *selected = nullptr;
+    for (auto it = entries_.cbegin(); it != entries_.cend(); ++it) {
+        const DocumentProviderDescriptor &candidate = it->descriptor;
+        if (candidate.contentKind != request.contentKind
+            || candidate.windowed != request.windowed
+            || candidate.presentation != request.presentation) {
+            continue;
+        }
+        if (!selected || candidate.priority > selected->descriptor.priority
+            || (candidate.priority == selected->descriptor.priority
+                && candidate.id < selected->descriptor.id)) {
+            selected = &(*it);
+        }
+    }
+    if (!selected) {
+        if (error) {
+            *error = QStringLiteral("没有适用于当前文档请求的提供器。");
+        }
         return false;
     }
-    return provider->open(tab, path, forcedEncoding, error);
+    std::unique_ptr<IDocumentProvider> provider = create(selected->descriptor.id);
+    if (!provider) {
+        if (error)
+            *error = QStringLiteral("无法创建文档提供器：%1")
+                         .arg(selected->descriptor.id);
+        return false;
+    }
+    return provider->open(surface, request, error);
 }

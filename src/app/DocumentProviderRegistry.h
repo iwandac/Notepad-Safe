@@ -1,15 +1,10 @@
 #pragma once
 
-#include "DocumentState.h"
-#include "TextEncoding.h"
+#include "DocumentSurface.h"
 
 #include <QHash>
 #include <functional>
 #include <memory>
-
-class EditorTab;
-
-enum class DocumentPresentationKind { Text, Hex };
 
 struct DocumentProviderDescriptor {
     QString id;
@@ -17,14 +12,15 @@ struct DocumentProviderDescriptor {
     DocumentContentKind contentKind = DocumentContentKind::Text;
     bool windowed = false;
     DocumentPresentationKind presentation = DocumentPresentationKind::Text;
+    int priority = 0;
 };
 
 class IDocumentProvider {
 public:
     virtual ~IDocumentProvider() = default;
     virtual DocumentProviderDescriptor descriptor() const = 0;
-    virtual bool open(EditorTab *tab, const QString &path,
-                      std::optional<TextEncoding> forcedEncoding,
+    virtual bool open(IDocumentSurface *surface,
+                      const DocumentSurfaceOpenRequest &request,
                       QString *error) = 0;
 };
 
@@ -35,9 +31,9 @@ public:
     bool registerProvider(DocumentProviderDescriptor descriptor, Factory factory);
     QList<DocumentProviderDescriptor> descriptors() const;
     std::unique_ptr<IDocumentProvider> create(const QString &id) const;
-    bool open(const QString &id, EditorTab *tab, const QString &path,
-              std::optional<TextEncoding> forcedEncoding = std::nullopt,
-              QString *error = nullptr) const;
+    bool openBest(IDocumentSurface *surface,
+                  const DocumentSurfaceOpenRequest &request,
+                  QString *error = nullptr) const;
     int instantiatedCount() const noexcept { return instantiatedCount_; }
 
 private:

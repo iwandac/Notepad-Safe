@@ -22,5 +22,5 @@
 - GUI harness 必须链接与正式 EXE 相同产品 target；测试不能重复编译产品 `.cpp`。
 - 历史回归哨兵固定进入 quick：`quick.search_dock_compact` 与 `quick.readonly_repeated_copy`。
 - `testfiles` 八文件矩阵是本机验收 fixture，不清理、不提交；覆盖不同大小、Text/Binary 和 GBK/UTF-8/BOM/UTF-16LE/BE。
-- KDBX OFF 只验证 editor/search/tools 不依赖具体后端；安全行为必须由 KDBX ON 验收。
-
+- KDBX OFF 只验证 editor/search/tools 不依赖具体后端；安全行为必须由 KDBX ON 验收。只在 ON 编译的 case 必须由同一个 CMake capability 条件排除，禁止注册成“未知测试函数”制造伪失败或诱导跳过整个 OFF 门禁。
+- runner 的任何 label/regex 选择必须带 `--no-tests=error`；零测试不是通过。GUI case 的 `smoke/tier/FeatureId` labels 由注册 helper 一次生成，不能在批处理、CMake 和文档中维护三份漂移清单。

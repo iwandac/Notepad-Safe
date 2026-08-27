@@ -1,7 +1,5 @@
 #include "AppComposition.h"
-#include "EditorTab.h"
 #include "KdbxFormatProbe.h"
-#include "VirtualFileView.h"
 
 #include <QFileInfo>
 
@@ -16,27 +14,15 @@ public:
 
     DocumentProviderDescriptor descriptor() const override { return descriptor_; }
 
-    bool open(EditorTab *tab, const QString &path,
-              std::optional<TextEncoding> forcedEncoding,
+    bool open(IDocumentSurface *surface,
+              const DocumentSurfaceOpenRequest &request,
               QString *error) override
     {
-        if (!tab) {
+        if (!surface) {
             if (error) *error = QStringLiteral("文档视图不可用。");
             return false;
         }
-        if (!descriptor_.windowed)
-            return tab->loadFile(path, forcedEncoding);
-        const bool binary = descriptor_.contentKind == DocumentContentKind::Binary;
-        const bool hex = descriptor_.presentation == DocumentPresentationKind::Hex;
-        const L2Presentation presentation = hex
-            ? L2Presentation::Hex : L2Presentation::Text;
-        const L2ContentKind contentKind = binary
-            ? L2ContentKind::Binary : L2ContentKind::Text;
-        const bool opened = tab->openLargeFileL2(
-            path, error, presentation, contentKind, forcedEncoding);
-        if (opened && hex)
-            tab->setViewModeL2(ViewMode::Hex);
-        return opened;
+        return surface->openSurface(request, error);
     }
 
 private:
@@ -75,13 +61,13 @@ AppComposition::AppComposition()
 {
     const QList<DocumentProviderDescriptor> descriptors = {
         {QStringLiteral("text.editable"), QStringLiteral("Text"),
-         DocumentContentKind::Text, false},
+         DocumentContentKind::Text, false, DocumentPresentationKind::Text, 100},
         {QStringLiteral("text.windowed"), QStringLiteral("Large text"),
-         DocumentContentKind::Text, true},
+         DocumentContentKind::Text, true, DocumentPresentationKind::Text, 100},
         {QStringLiteral("binary.windowed"), QStringLiteral("Large hex"),
-         DocumentContentKind::Binary, true, DocumentPresentationKind::Hex},
+         DocumentContentKind::Binary, true, DocumentPresentationKind::Hex, 100},
         {QStringLiteral("binary.text-windowed"), QStringLiteral("Binary text"),
-         DocumentContentKind::Binary, true, DocumentPresentationKind::Text},
+         DocumentContentKind::Binary, true, DocumentPresentationKind::Text, 100},
     };
     for (const auto &descriptor : descriptors) {
         documentProviders_.registerProvider(descriptor, [descriptor]() {

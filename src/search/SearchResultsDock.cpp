@@ -1,6 +1,7 @@
 #include "SearchResultsDock.h"
 #include "SearchResultsController.h"
 #include "SearchResultsDelegate.h"
+#include "SearchResultsViewPolicy.h"
 #include "SearchResultsAggregateModel.h"
 #include "LineIndex.h"
 
@@ -58,23 +59,7 @@ SearchResultsDock::SearchResultsDock(SearchResultsController &controller,
 
     m_treeView = new QTreeView(m_stack);
     m_treeView->setObjectName(QStringLiteral("searchResultsTree"));
-    m_treeView->setAlternatingRowColors(true);
-    m_treeView->setUniformRowHeights(true);
-    m_treeView->setWordWrap(false);
-    m_treeView->setTextElideMode(Qt::ElideRight);
-    m_treeView->setMouseTracking(true);
-    m_treeView->viewport()->setAttribute(Qt::WA_Hover, true);
-    m_treeView->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_treeView->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    // 搜索结果的核心信息是上下文。禁止 QHeaderView 自动把最后一列（匹配数）
-    // 吞掉全部余量，明确让“内容”列占据可用宽度。
-    m_treeView->header()->setStretchLastSection(false);
-    m_treeView->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-    m_treeView->header()->setSectionResizeMode(1, QHeaderView::Stretch);
-    m_treeView->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    // One delegate owns the whole row so hover/selection geometry cannot
-    // diverge between the location, context and count columns.
-    m_treeView->setItemDelegate(createSearchResultsDelegate(m_treeView));
+    SearchResultsViewPolicy::configure(m_treeView);
     m_stack->addWidget(m_treeView);
 
     layout->addWidget(m_stack);
@@ -139,7 +124,7 @@ void SearchResultsDock::clearResults()
     m_singlePreviewMatches.clear();
     m_model = nullptr;
     if (m_treeView)
-        m_treeView->setModel(nullptr);
+        SearchResultsViewPolicy::bindModel(m_treeView, nullptr, false);
     if (oldSingleModel && oldSingleModel->QObject::parent() == this)
         delete oldSingleModel;
     delete m_multiModel;
@@ -161,22 +146,10 @@ void SearchResultsDock::setResultsModel(SearchResultsModel *model,
     m_model = model;
     // 切到 L2 视图
     m_stack->setCurrentIndex(0);
-    m_treeView->setModel(model);  // nullptr 时会清空
-    m_treeView->setRootIsDecorated(false);
+    SearchResultsViewPolicy::bindModel(m_treeView, model, false);
     if (oldModel && oldModel != model && oldModel->QObject::parent() == this)
         delete oldModel;
     if (model) {
-        // setModel() 会按新模型的列数重建 header section；构造阶段对尚不存在的
-        // 第 2/3 列设置 resize mode 在部分 Qt 版本中不会保留，因此必须在这里
-        // 再应用一次产品布局。
-        auto *header = m_treeView->header();
-        header->setStretchLastSection(false);
-        header->setSectionResizeMode(SearchResultsModel::COL_LINE,
-                                     QHeaderView::ResizeToContents);
-        header->setSectionResizeMode(SearchResultsModel::COL_CONTEXT,
-                                     QHeaderView::Stretch);
-        header->setSectionResizeMode(SearchResultsModel::COL_MATCHCOUNT,
-                                     QHeaderView::ResizeToContents);
         qint64 total = model->totalMatches();
         qint64 lines = model->groupedCount();
         const QString groupUnit = model->bytePositionMode()
@@ -276,7 +249,7 @@ void SearchResultsDock::invalidateResultsFor(const QUuid &documentId)
 
     SearchResultsModel *oldModel = m_model;
     m_model = nullptr;
-    m_treeView->setModel(nullptr);
+    SearchResultsViewPolicy::bindModel(m_treeView, nullptr, false);
     if (oldModel && oldModel->QObject::parent() == this)
         delete oldModel;
     const SearchResultTarget invalidated = m_controller->singleTarget();
@@ -296,7 +269,7 @@ void SearchResultsDock::closeResultsFor(const QUuid &documentId)
     }
     SearchResultsModel *oldModel = m_model;
     m_model = nullptr;
-    m_treeView->setModel(nullptr);
+    SearchResultsViewPolicy::bindModel(m_treeView, nullptr, false);
     if (oldModel && oldModel->QObject::parent() == this)
         oldModel->deleteLater();
     m_controller->clear();
@@ -309,19 +282,10 @@ void SearchResultsDock::beginMultiFileResults(const QString &pattern, int target
     setRerunAvailable(false);
     m_controller->beginMulti(pattern);
     m_stack->setCurrentIndex(0);
-    m_treeView->setModel(nullptr);
+    SearchResultsViewPolicy::bindModel(m_treeView, nullptr, false);
     delete m_multiModel;
     m_multiModel = new MultiSearchResultsModel(this);
-    m_treeView->setModel(m_multiModel);
-    m_treeView->setRootIsDecorated(true);
-    auto *header = m_treeView->header();
-    header->setStretchLastSection(false);
-    header->setSectionResizeMode(SearchResultsModel::COL_LINE,
-                                 QHeaderView::ResizeToContents);
-    header->setSectionResizeMode(SearchResultsModel::COL_CONTEXT,
-                                 QHeaderView::Stretch);
-    header->setSectionResizeMode(SearchResultsModel::COL_MATCHCOUNT,
-                                 QHeaderView::ResizeToContents);
+    SearchResultsViewPolicy::bindModel(m_treeView, m_multiModel, true);
     m_summary->setText(QStringLiteral("正在全部 %1 个打开文件中搜索 “%2”…")
                            .arg(targetCount).arg(pattern));
     show();

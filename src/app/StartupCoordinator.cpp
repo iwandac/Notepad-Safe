@@ -31,10 +31,13 @@ void StartupCoordinator::scheduleIfReady()
         return;
     scheduled_ = true;
     QMetaObject::invokeMethod(this, [this]() {
-        if (!window_)
-            return;
-        if (!externalFiles_.isEmpty())
-            window_->openFilesFromExternal(externalFiles_);
-        window_->deferredRestoreSession();
+        emit postPaintIdleTurnCompleted();
+        QMetaObject::invokeMethod(this, [this]() {
+            if (!window_)
+                return;
+            if (!externalFiles_.isEmpty())
+                window_->openFilesFromExternal(externalFiles_);
+            window_->deferredRestoreSession();
+        }, Qt::QueuedConnection);
     }, Qt::QueuedConnection);
 }

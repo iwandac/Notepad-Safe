@@ -1,6 +1,8 @@
 #include "KeePassXCVaultBackend.h"
 #include "VaultService.h"
+#include "streams/SymmetricCipherStream.h"
 
+#include <QBuffer>
 #include <QCoreApplication>
 #include <QDebug>
 #include <QDir>
@@ -55,6 +57,27 @@ void verifyUnlock(const char *name, const char *masterPassword)
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
+
+    {
+        // KDBX4 encrypts through a 1024-byte stream buffer. An exact multiple
+        // must reset without attempting to encrypt a zero-length tail block.
+        QBuffer encrypted;
+        check(encrypted.open(QIODevice::WriteOnly),
+              "stream-cipher regression buffer opens");
+        SymmetricCipherStream stream(&encrypted);
+        check(stream.init(SymmetricCipher::ChaCha20,
+                          SymmetricCipher::Encrypt,
+                          QByteArray(32, '\x11'), QByteArray(12, '\x22')),
+              "stream-cipher regression fixture initializes");
+        check(stream.open(QIODevice::WriteOnly),
+              "stream-cipher regression stream opens");
+        check(stream.write(QByteArray(1024, 'x')) == 1024,
+              "stream-cipher exact block is written");
+        check(stream.reset(),
+              "stream-cipher exact block resets without an empty tail");
+        check(encrypted.buffer().size() == 1024,
+              "stream-cipher exact block preserves output size");
+    }
 
     verifyUnlock("Format300.kdbx", "a");
     verifyUnlock("Format400.kdbx", "t");

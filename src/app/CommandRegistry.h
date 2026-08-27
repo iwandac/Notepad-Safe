@@ -23,6 +23,18 @@ struct CommandContext {
     bool accountCanSearch = false;
     bool reloadable = false;
     bool canCloseAll = false;
+    bool readOnlyByPolicy = false;
+    bool textMutationSupported = false;
+    bool nativeTextSurface = false;
+    bool lexerSupported = false;
+    bool editableHex = false;
+    bool hexInsertMode = false;
+    bool splitAvailable = false;
+    bool splitEnabled = false;
+    bool splitVertical = false;
+    bool displayEncodingAvailable = false;
+    bool conversionAvailable = false;
+    bool dualPresentation = false;
 };
 
 // One command identity is shared by menu, toolbar, shortcut and context entry.
@@ -40,6 +52,7 @@ public:
 
 private:
     void setEnabled(const QString &commandId, bool enabled) const;
+    void setChecked(const QString &commandId, bool checked) const;
     QHash<QString, QList<QAction *>> actions_;
     QStringList unboundCommandIds_;
 };

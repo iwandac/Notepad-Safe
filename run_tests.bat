@@ -25,9 +25,9 @@ if errorlevel 1 (
 
 pushd "%BUILD_DIR%"
 if exist "%VS_CTEST%" (
-    "%VS_CTEST%" --output-on-failure -E "^(gui_smoke_|e2e_)"
+    "%VS_CTEST%" --no-tests=error --output-on-failure -E "^(gui_smoke_|e2e_|quick\.)"
 ) else (
-    ctest --output-on-failure -E "^(gui_smoke_|e2e_)"
+    ctest --no-tests=error --output-on-failure -E "^(gui_smoke_|e2e_|quick\.)"
 )
 set "TEST_RC=%errorlevel%"
 popd

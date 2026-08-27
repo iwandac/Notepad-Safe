@@ -9,6 +9,11 @@ function Add-Failure([string]$message) {
     $failures.Add($message)
 }
 
+function Remove-CodeComments([string]$content) {
+    $withoutBlocks = $content -replace '(?s)/\*.*?\*/', ''
+    return $withoutBlocks -replace '(?m)//.*$', ''
+}
+
 $cmakePath = Join-Path $SourceRoot 'CMakeLists.txt'
 $cmakeLines = Get-Content -LiteralPath $cmakePath
 $activeCmake = $cmakeLines | Where-Object { $_ -notmatch '^\s*#' }
@@ -36,7 +41,8 @@ if ($testMarker -lt 0) {
 
 $lowerContracts = @(
     @{ Files = @('src/domain/FileTierPolicy.h', 'src/domain/FileTierPolicy.cpp'); Tokens = @('QWidget', 'MainWindow', 'EditorTab', 'KeePass', 'Windows.h') },
-    @{ Files = @('src/search/LargeFileSearch.h', 'src/search/LargeFileSearch.cpp', 'src/search/Pcre2Regex.h', 'src/search/Pcre2Regex.cpp', 'src/search/EncodedRegexCompiler.h', 'src/search/EncodedRegexCompiler.cpp'); Tokens = @('QWidget', 'MainWindow', 'EditorTab', 'SearchResultsDock', 'KeePass') }
+    @{ Files = @('src/search/LargeFileSearch.h', 'src/search/LargeFileSearch.cpp', 'src/search/Pcre2Regex.h', 'src/search/Pcre2Regex.cpp', 'src/search/EncodedRegexCompiler.h', 'src/search/EncodedRegexCompiler.cpp'); Tokens = @('QWidget', 'MainWindow', 'EditorTab', 'SearchResultsDock', 'KeePass') },
+    @{ Files = @('src/editor/DocumentSurface.h', 'src/app/DocumentProviderRegistry.h', 'src/app/DocumentProviderRegistry.cpp'); Tokens = @('MainWindow', 'EditorTab', 'QsciScintilla') }
 )
 foreach ($contract in $lowerContracts) {
     foreach ($relative in $contract.Files) {
@@ -44,8 +50,7 @@ foreach ($contract in $lowerContracts) {
         $content = Get-Content -LiteralPath $path -Raw
         # Dependency checks apply to code, not design notes in comments.  A
         # lower layer may document the UI type it deliberately does not use.
-        $codeContent = $content -replace '(?s)/\*.*?\*/', ''
-        $codeContent = $codeContent -replace '(?m)//.*$', ''
+        $codeContent = Remove-CodeComments $content
         foreach ($token in $contract.Tokens) {
             if ($codeContent.Contains($token)) {
                 Add-Failure "forbidden dependency '$token' in $relative"
@@ -61,7 +66,10 @@ foreach ($concrete in @('unique_ptr<SecuritySessionService>',
         Add-Failure "MainWindow owns concrete security adapter: $concrete"
     }
 }
-$mainSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'src/window/MainWindow.cpp') -Raw
+$mainSource = (Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src/window') `
+    -Filter 'MainWindow*.cpp' | ForEach-Object {
+        Get-Content -LiteralPath $_.FullName -Raw
+    }) -join "`n"
 foreach ($backendLeak in @('NOTEPADSAFE_HAS_KDBX_BACKEND',
                             'SecurityIdentity::',
                             'SecureDocumentService::inspect',
@@ -99,6 +107,20 @@ foreach ($forbiddenControllerWork in @('EditorTab', 'contentRevision()',
         Add-Failure "SearchResultsDock view performs controller work: $forbiddenControllerWork"
     }
 }
+foreach ($viewPolicyLeak in @('setSectionResizeMode(', 'm_treeView->setModel(')) {
+    if ($searchDockSource.Contains($viewPolicyLeak)) {
+        Add-Failure "SearchResultsDock bypasses SearchResultsViewPolicy: $viewPolicyLeak"
+    }
+}
+$searchViewPolicy = Get-Content -LiteralPath (
+    Join-Path $SourceRoot 'src/search/SearchResultsViewPolicy.cpp') -Raw
+foreach ($requiredPolicy in @('setUniformRowHeights(true)', 'setWordWrap(false)',
+                               'setTextElideMode(Qt::ElideRight)',
+                               'setSectionResizeMode')) {
+    if (-not $searchViewPolicy.Contains($requiredPolicy)) {
+        Add-Failure "compact search-results policy is incomplete: $requiredPolicy"
+    }
+}
 if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot 'src/search/SearchResultsController.cpp'))) {
     Add-Failure 'SearchResultsController implementation is missing'
 }
@@ -129,7 +151,8 @@ foreach ($duplicateSelectionState in @('m_selectionAnchor', 'm_selectionCaret'))
 $domainFiles = Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src/domain') -File |
     Where-Object Extension -in '.cpp', '.h'
 foreach ($domainFile in $domainFiles) {
-    $domainContent = Get-Content -LiteralPath $domainFile.FullName -Raw
+    $domainContent = Remove-CodeComments (
+        Get-Content -LiteralPath $domainFile.FullName -Raw)
     foreach ($token in @('QWidget', 'QAction', 'MainWindow', 'EditorTab',
                          'SearchResultsDock', 'KeePass', 'Windows.h')) {
         if ($domainContent.Contains($token)) {
@@ -148,23 +171,54 @@ if ($domainTargetText.Contains('DocumentProviderRegistry.cpp')) {
     Add-Failure 'domain target owns executable editor provider adapters'
 }
 
+$openWorkflow = Get-Content -LiteralPath (
+    Join-Path $SourceRoot 'src/app/DocumentOpenWorkflow.cpp') -Raw
+if (-not $openWorkflow.Contains('openBest(')) {
+    Add-Failure 'DocumentOpenWorkflow bypasses capability-based provider selection'
+}
+foreach ($providerId in @('text.editable', 'text.windowed', 'binary.windowed')) {
+    if ($openWorkflow.Contains($providerId)) {
+        Add-Failure "DocumentOpenWorkflow hard-codes provider id: $providerId"
+    }
+}
+$documentRuntimeLinks = [regex]::Match(
+    ($cmakeLines -join "`n"),
+    '(?s)target_link_libraries\(notepadsafe_document_runtime.*?\n\)').Value
+if ($documentRuntimeLinks.Contains('notepadsafe_editor_runtime')) {
+    Add-Failure 'document provider registry links back to concrete editor runtime'
+}
+
+foreach ($runner in @('run_tests.bat', 'run_all_gui_smoke.bat')) {
+    $runnerText = Get-Content -LiteralPath (Join-Path $SourceRoot $runner) -Raw
+    if (-not $runnerText.Contains('--no-tests=error')) {
+        Add-Failure "$runner can pass with an empty CTest selection"
+    }
+}
+if (-not ($cmakeLines -join "`n").Contains('gui;smoke;${tier};${feature}')) {
+    Add-Failure 'GUI tests are not registered under the smoke gate label'
+}
+
 # Complexity budgets are ratchets, not targets. They make responsibility
 # extraction durable: a future feature must go into a focused component rather
 # than silently growing the four legacy coordinators again.
 $complexityBudgets = @(
-    @{ File = 'src/window/MainWindow.cpp'; Lines = 3341; Branches = 348 },
-    @{ File = 'src/window/MainWindowDocuments.cpp'; Lines = 1873; Branches = 240 },
-    @{ File = 'src/window/MainWindowSession.cpp'; Lines = 563; Branches = 64 },
-    @{ File = 'src/editor/EditorTab.cpp'; Lines = 2684; Branches = 330 },
-    @{ File = 'src/editor/EditorTabLargeDocument.cpp'; Lines = 3320; Branches = 440 },
+    @{ File = 'src/window/MainWindow.cpp'; Lines = 1694; Branches = 128 },
+    @{ File = 'src/window/MainWindowCommands.cpp'; Lines = 1615; Branches = 204 },
+    @{ File = 'src/window/MainWindowDocuments.cpp'; Lines = 1870; Branches = 240 },
+    @{ File = 'src/window/MainWindowSession.cpp'; Lines = 551; Branches = 64 },
+    @{ File = 'src/editor/EditorTab.cpp'; Lines = 1897; Branches = 241 },
+    @{ File = 'src/editor/EditorTabCommands.cpp'; Lines = 764; Branches = 69 },
+    @{ File = 'src/editor/EditorTabLargeDocument.cpp'; Lines = 2618; Branches = 326 },
+    @{ File = 'src/editor/EditorTabLargeDocumentPersistence.cpp'; Lines = 727; Branches = 102 },
     @{ File = 'src/editor/EditorTabSearch.cpp'; Lines = 1683; Branches = 189 },
     @{ File = 'src/search/FindReplaceDialog.cpp'; Lines = 1499; Branches = 197 },
     @{ File = 'src/search/SearchResultsDock.cpp'; Lines = 523; Branches = 53 },
     @{ File = 'src/search/SearchResultsAggregateModel.h'; Lines = 293; Branches = 39 },
-    @{ File = 'src/app/DocumentOpenWorkflow.cpp'; Lines = 101; Branches = 14 },
+    @{ File = 'src/app/DocumentOpenWorkflow.cpp'; Lines = 111; Branches = 14 },
     @{ File = 'src/search/EditableTextSearch.cpp'; Lines = 110; Branches = 13 },
     @{ File = 'src/search/SearchResultsController.cpp'; Lines = 73; Branches = 4 },
     @{ File = 'src/search/SearchResultsDelegate.cpp'; Lines = 246; Branches = 17 },
+    @{ File = 'src/search/SearchResultsViewPolicy.cpp'; Lines = 55; Branches = 4 },
     @{ File = 'src/window/FileCredentialDialog.cpp'; Lines = 131; Branches = 4 },
     @{ File = 'src/window/SensitiveText.cpp'; Lines = 41; Branches = 4 }
 )
@@ -181,6 +235,35 @@ foreach ($budget in $complexityBudgets) {
     }
 }
 
+# Splitting a large file must not reset the complexity counter. These aggregate
+# ratchets cover every implementation fragment for the two legacy shells.
+$aggregateBudgets = @(
+    @{ Name = 'MainWindow'; Pattern = 'src/window/MainWindow*.cpp'; Lines = 5729; Branches = 636; Methods = 112 },
+    @{ Name = 'EditorTab'; Pattern = 'src/editor/EditorTab*.cpp'; Lines = 7687; Branches = 927; Methods = 176 }
+)
+foreach ($budget in $aggregateBudgets) {
+    $files = Get-ChildItem -Path (Join-Path $SourceRoot $budget.Pattern) -File
+    $lines = 0
+    $branches = 0
+    $methods = 0
+    foreach ($file in $files) {
+        $content = Get-Content -LiteralPath $file.FullName -Raw
+        $lines += @(Get-Content -LiteralPath $file.FullName).Count
+        $branches += [regex]::Matches($content, '\bif\s*\(').Count
+        $methods += [regex]::Matches(
+            $content, "\b$($budget.Name)::[A-Za-z_][A-Za-z0-9_]*\s*\(").Count
+    }
+    if ($lines -gt $budget.Lines) {
+        Add-Failure "$($budget.Name) aggregate exceeds line budget: $lines > $($budget.Lines)"
+    }
+    if ($branches -gt $budget.Branches) {
+        Add-Failure "$($budget.Name) aggregate exceeds branch budget: $branches > $($budget.Branches)"
+    }
+    if ($methods -gt $budget.Methods) {
+        Add-Failure "$($budget.Name) aggregate exceeds method budget: $methods > $($budget.Methods)"
+    }
+}
+
 # Global ceiling prevents a new unlisted mega-file from bypassing the named
 # ratchets. Existing responsibilities are now split below this ceiling.
 $productionSources = Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src') `
@@ -188,8 +271,8 @@ $productionSources = Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src') `
 foreach ($source in $productionSources) {
     $relative = $source.FullName.Substring($SourceRoot.Length + 1).Replace('\', '/')
     $sourceLines = @(Get-Content -LiteralPath $source.FullName).Count
-    if ($sourceLines -gt 3500) {
-        Add-Failure "$relative exceeds global source ceiling: $sourceLines > 3500"
+    if ($sourceLines -gt 3000) {
+        Add-Failure "$relative exceeds global source ceiling: $sourceLines > 3000"
     }
 }
 

@@ -13,6 +13,7 @@
 #include "SearchMatch.h"
 #include "DiskFileVersion.h"
 #include "DocumentState.h"
+#include "DocumentSurface.h"
 
 enum class ViewMode : int;  // 前置声明（定义在 VirtualFileView.h）
 
@@ -66,7 +67,7 @@ enum class Syntax {
     Asm,
 };
 
-class EditorTab : public QWidget {
+class EditorTab : public QWidget, public IDocumentSurface {
     Q_OBJECT
 public:
     using ExternalFileState = DiskFileState;
@@ -78,6 +79,8 @@ public:
 
     explicit EditorTab(QWidget *parent = nullptr);
     ~EditorTab() override;
+    bool openSurface(const DocumentSurfaceOpenRequest &request,
+                     QString *error) override;
 
     /** 关闭/退出前主动清理 L2 的异步构建任务 + mmap（MainWindow::closeEvent 开头调用）。
      *  此时 MainWindow 还完整，允许 processEvents，轮询到 AsyncTask 终态才返回，

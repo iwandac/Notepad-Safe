@@ -74,7 +74,7 @@ public:
     explicit CountingProvider(DocumentProviderDescriptor descriptor)
         : descriptor_(std::move(descriptor)) {}
     DocumentProviderDescriptor descriptor() const override { return descriptor_; }
-    bool open(EditorTab *, const QString &, std::optional<TextEncoding>,
+    bool open(IDocumentSurface *, const DocumentSurfaceOpenRequest &,
               QString *) override { return false; }
 private:
     DocumentProviderDescriptor descriptor_;
@@ -243,6 +243,14 @@ int main(int argc, char **argv)
           "accounts remain a distinct product feature boundary");
     check(FeatureRegistry::featureIdForCommand(QStringLiteral("unknown.command")).isEmpty(),
           "unknown commands fail closed instead of disappearing from the ledger");
+    for (const QString &commandId : FeatureRegistry::requiredStartupCommandIds()) {
+        check(!FeatureRegistry::featureIdForCommand(commandId).isEmpty(),
+              qPrintable(QStringLiteral("required command is registered: %1")
+                             .arg(commandId)));
+    }
+    check(FeatureRegistry::isKnownFeature(QStringLiteral("NSP-LARGEFILE"))
+              && FeatureRegistry::isKnownFeature(QStringLiteral("NSP-SECURE")),
+          "GUI coverage labels belong to the feature ledger");
     check(FeatureRegistry::featureIdForCommand(QStringLiteral("file.svae")).isEmpty()
               && FeatureRegistry::featureIdForCommand(
                      QStringLiteral("edit.indentation.tabWidth.3")).isEmpty()

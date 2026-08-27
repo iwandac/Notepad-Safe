@@ -262,7 +262,9 @@ endif()
 # the test harness out of this target; everything below is production code.
 set(NOTEPADSAFE_EDITOR_RUNTIME_SOURCES
     src/editor/EditorTab.cpp
+    src/editor/EditorTabCommands.cpp
     src/editor/EditorTabLargeDocument.cpp
+    src/editor/EditorTabLargeDocumentPersistence.cpp
     src/editor/EditorTabSearch.cpp
     src/editor/VirtualFileView.cpp
     src/editor/WindowedReadOnlyProvider.cpp
@@ -273,7 +275,11 @@ add_library(notepadsafe_editor_runtime STATIC
     ${NOTEPADSAFE_EDITOR_RUNTIME_SOURCES}
 )
 target_include_directories(notepadsafe_editor_runtime PUBLIC
-    ${APP_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/src/domain
+    ${CMAKE_SOURCE_DIR}/src/editor
+    ${CMAKE_SOURCE_DIR}/src/search
+    ${CMAKE_SOURCE_DIR}/src/async
+    ${CMAKE_SOURCE_DIR}/src/session
     ${QSCINTILLA_INCLUDE_DIR}
 )
 target_link_libraries(notepadsafe_editor_runtime PUBLIC
@@ -319,7 +325,8 @@ target_include_directories(notepadsafe_document_runtime PUBLIC
     ${CMAKE_SOURCE_DIR}/src/editor
 )
 target_link_libraries(notepadsafe_document_runtime PUBLIC
-    notepadsafe_editor_runtime
+    notepadsafe_domain
+    notepadsafe_file_runtime
     Qt6::Core
 )
 
@@ -336,11 +343,13 @@ add_library(notepadsafe_app STATIC
      src/window/SensitiveText.cpp
      src/window/FileCredentialDialog.cpp
      src/window/MainWindow.cpp
+     src/window/MainWindowCommands.cpp
      src/window/MainWindowDocuments.cpp
      src/window/MainWindowSession.cpp
     src/search/FindReplaceDialog.cpp
      src/search/SearchResultsController.cpp
      src/search/SearchResultsDelegate.cpp
+     src/search/SearchResultsViewPolicy.cpp
      src/search/SearchResultsDock.cpp
     src/async/StatusBarTaskWidget.cpp
     src/async/AsyncTaskPanelDialog.cpp
@@ -672,7 +681,10 @@ endif()
 
 if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     add_executable(test_kdbx_backend tests/test_kdbx_backend.cpp)
-    target_include_directories(test_kdbx_backend PRIVATE ${APP_INCLUDE_DIRS})
+    target_include_directories(test_kdbx_backend PRIVATE
+        ${APP_INCLUDE_DIRS}
+        "${NOTEPADSAFE_KEEPASSXC_SOURCE_DIR}/src"
+    )
     target_compile_definitions(test_kdbx_backend PRIVATE
         NOTEPADSAFE_KDBX_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/kdbx"
     )
@@ -1047,6 +1059,7 @@ add_custom_target(notepadsafe_gui_smoke_tests
 )
 
 function(notepadsafe_register_qt_cases target source tier timeout feature)
+    cmake_parse_arguments(CASE "" "" "KDBX_CASES" ${ARGN})
     file(STRINGS "${CMAKE_SOURCE_DIR}/${source}" qt_case_lines
         REGEX "^[ \t]*void[ \t]+[A-Za-z0-9_]+[ \t]*\\(\\)")
     foreach(qt_case_line IN LISTS qt_case_lines)
@@ -1060,10 +1073,14 @@ function(notepadsafe_register_qt_cases target source tier timeout feature)
            OR qt_case STREQUAL "lock")
             continue()
         endif()
+        if(NOT NOTEPADSAFE_ENABLE_KDBX_BACKEND
+           AND qt_case IN_LIST CASE_KDBX_CASES)
+            continue()
+        endif()
         set(test_name "${target}.${qt_case}")
         add_test(NAME "${test_name}" COMMAND ${target} ${qt_case})
         set_tests_properties("${test_name}" PROPERTIES
-            LABELS "gui;${tier};${feature}"
+            LABELS "gui;smoke;${tier};${feature}"
             RUN_SERIAL TRUE
             TIMEOUT ${timeout}
         )
@@ -1079,7 +1096,11 @@ notepadsafe_register_qt_cases(gui_smoke_large_readonly
 notepadsafe_register_qt_cases(gui_smoke_smallfixes
     tests/gui_smoke/smoke_smallfixes_menu_ui.cpp adjacent 180 NSP-SHELL)
 notepadsafe_register_qt_cases(gui_smoke_vault
-    tests/gui_smoke/smoke_vault.cpp adjacent 180 NSP-ACCOUNTS)
+    tests/gui_smoke/smoke_vault.cpp adjacent 180 NSP-ACCOUNTS
+    KDBX_CASES
+        productionExtendedAccountWorkflow
+        productionAccountHistoryCanRestorePassword
+        productionKdbxFixtureUnlocksIntoEditor)
 if(TARGET gui_smoke_secure_documents)
     notepadsafe_register_qt_cases(gui_smoke_secure_documents
         tests/gui_smoke/smoke_secure_documents.cpp adjacent 300 NSP-SECURE)

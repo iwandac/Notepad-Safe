@@ -203,7 +203,12 @@ qint64 SymmetricCipherStream::writeData(const char* data, qint64 maxSize)
 bool SymmetricCipherStream::writeBlock(bool lastBlock)
 {
     Q_ASSERT(m_streamCipher || lastBlock || (m_buffer.size() == blockSize()));
-
+    // Stream ciphers have no padding/final block. When the payload length is
+    // an exact multiple of the internal write buffer, close() reaches here
+    // with an empty buffer; processing that empty tail is an error, not data.
+    if (m_streamCipher && m_buffer.isEmpty()) {
+        return true;
+    }
     if (lastBlock && !m_streamCipher) {
         QByteArray end;
         if (!m_cipher->finish(m_buffer)) {

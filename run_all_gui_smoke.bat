@@ -67,9 +67,9 @@ if not "!BUILD_RC!"=="0" (
 :RUN_ALL
 pushd "%BUILD%"
 if exist "%VS_CTEST%" (
-    "%VS_CTEST%" --output-on-failure -L "^smoke$"
+    "%VS_CTEST%" --no-tests=error --output-on-failure -L "^smoke$"
 ) else (
-    ctest --output-on-failure -L "^smoke$"
+    ctest --no-tests=error --output-on-failure -L "^smoke$"
 )
 set EC=!errorlevel!
 popd

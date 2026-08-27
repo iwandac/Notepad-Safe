@@ -4,6 +4,7 @@
 
 #include <QAction>
 #include <QObject>
+#include <QSignalBlocker>
 
 void CommandRegistry::bind(QObject *root)
 {
@@ -39,9 +40,47 @@ void CommandRegistry::setEnabled(const QString &commandId, bool enabled) const
         action->setEnabled(enabled);
 }
 
+void CommandRegistry::setChecked(const QString &commandId, bool checked) const
+{
+    for (QAction *action : actions(commandId)) {
+        const QSignalBlocker blocker(action);
+        action->setChecked(checked);
+    }
+}
+
 void CommandRegistry::applyContext(const CommandContext &context) const
 {
     const bool document = context.hasDocument && context.document;
+    // Establish the common document-workspace baseline first.  Specialized
+    // capabilities below then override it.  Keeping this policy beside the
+    // command registry prevents menu, toolbar and shortcut surfaces from
+    // drifting into separate enablement implementations.
+    for (auto it = actions_.cbegin(); it != actions_.cend(); ++it) {
+        const QString &id = it.key();
+        const bool documentScoped = id == QLatin1String("menu.edit")
+            || id == QLatin1String("menu.language")
+            || id == QLatin1String("menu.encoding")
+            || id.startsWith(QLatin1String("edit."))
+            || id.startsWith(QLatin1String("language."))
+            || id.startsWith(QLatin1String("bookmark."))
+            || id == QLatin1String("search.replace")
+            || id == QLatin1String("search.next")
+            || id == QLatin1String("search.previous")
+            || id.startsWith(QLatin1String("search.brace."))
+            || id == QLatin1String("search.bookmarks")
+            || id == QLatin1String("view.wordWrap")
+            || id.startsWith(QLatin1String("view.split"))
+            || id.startsWith(QLatin1String("view.symbols"))
+            || id.startsWith(QLatin1String("view.folding"))
+            || id.startsWith(QLatin1String("view.presentation"))
+            || id.startsWith(QLatin1String("view.edge"))
+            || id.startsWith(QLatin1String("view.zoom"))
+            || id.startsWith(QLatin1String("encoding."));
+        if (documentScoped) {
+            for (QAction *action : it.value())
+                action->setEnabled(document);
+        }
+    }
     setEnabled(QStringLiteral("edit.undo"), document && context.canUndo);
     setEnabled(QStringLiteral("edit.redo"), document && context.canRedo);
     setEnabled(QStringLiteral("edit.cut"), document && context.canModify
@@ -64,6 +103,69 @@ void CommandRegistry::applyContext(const CommandContext &context) const
         || (context.accountsWorkspace && context.accountCanSearch));
     setEnabled(QStringLiteral("search.replace"), document);
     setEnabled(QStringLiteral("view.panel.searchResults"), document);
+
+    setEnabled(QStringLiteral("view.wordWrap"),
+               document && !context.readOnlyByPolicy);
+    setEnabled(QStringLiteral("edit.hexInsertMode"), context.editableHex);
+    setChecked(QStringLiteral("edit.hexInsertMode"),
+               context.editableHex && context.hexInsertMode);
+
+    for (auto it = actions_.cbegin(); it != actions_.cend(); ++it) {
+        const QString &id = it.key();
+        bool override = false;
+        bool enabled = false;
+        if (id.startsWith(QLatin1String("edit.line."))
+            || id.startsWith(QLatin1String("edit.multiSelect."))
+            || id == QLatin1String("edit.selection.upper")
+            || id == QLatin1String("edit.selection.lower")
+            || id == QLatin1String("edit.lines.join")
+            || id == QLatin1String("edit.lines.split")
+            || id == QLatin1String("encoding.eol")
+            || id.startsWith(QLatin1String("encoding.eol."))) {
+            override = true;
+            enabled = document && context.textMutationSupported;
+        } else if (id.startsWith(QLatin1String("search.brace."))) {
+            override = true;
+            enabled = context.nativeTextSurface;
+        } else if (id.startsWith(QLatin1String("view.folding"))) {
+            override = true;
+            enabled = document && context.lexerSupported;
+        } else if (id == QLatin1String("menu.language")
+                   || id.startsWith(QLatin1String("language."))) {
+            override = true;
+            enabled = context.nativeTextSurface;
+        } else if (id.startsWith(QLatin1String("encoding.display."))) {
+            override = true;
+            enabled = context.displayEncodingAvailable;
+        } else if (id.startsWith(QLatin1String("encoding.convert."))) {
+            override = true;
+            enabled = context.conversionAvailable;
+        }
+        if (override) {
+            for (QAction *action : it.value())
+                action->setEnabled(enabled);
+        }
+    }
+
+    setEnabled(QStringLiteral("edit.lines.sortAscending"),
+               document && context.canModify && !context.dualPresentation);
+    setEnabled(QStringLiteral("edit.lines.sortDescending"),
+               document && context.canModify && !context.dualPresentation);
+    setEnabled(QStringLiteral("view.split"), context.splitAvailable);
+    setEnabled(QStringLiteral("view.split.horizontal"), context.splitAvailable);
+    setEnabled(QStringLiteral("view.split.vertical"), context.splitAvailable);
+    setChecked(QStringLiteral("view.split.horizontal"),
+               context.splitEnabled && !context.splitVertical);
+    setChecked(QStringLiteral("view.split.vertical"),
+               context.splitEnabled && context.splitVertical);
+    setEnabled(QStringLiteral("view.presentation.text"),
+               context.dualPresentation);
+    setEnabled(QStringLiteral("view.presentation.hex"),
+               context.dualPresentation);
+    setEnabled(QStringLiteral("view.presentation.toggle"), document);
+    setEnabled(QStringLiteral("view.presentation"), document);
+    setEnabled(QStringLiteral("menu.encoding"),
+               context.displayEncodingAvailable || context.conversionAvailable);
 }
 
 bool CommandRegistry::allowedByDocument(const QString &commandId,
