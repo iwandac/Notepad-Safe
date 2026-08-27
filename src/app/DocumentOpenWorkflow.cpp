@@ -1,6 +1,7 @@
 #include "DocumentOpenWorkflow.h"
 
 #include "EditorTab.h"
+#include "DocumentProviderRegistry.h"
 #include "FileContentProbe.h"
 #include "FileTierPolicy.h"
 #include "SessionManager.h"
@@ -10,7 +11,8 @@
 
 #include <climits>
 
-bool openDocumentByPolicy(EditorTab *tab, const QString &path,
+bool openDocumentByPolicy(const DocumentProviderRegistry &providers,
+                          EditorTab *tab, const QString &path,
                           std::optional<TextEncoding> forcedEncoding)
 {
     if (!tab)
@@ -18,38 +20,38 @@ bool openDocumentByPolicy(EditorTab *tab, const QString &path,
     const FileContentProbeResult probe = probeFileContent(path);
     if (!forcedEncoding && probe.contentKind == DocumentContentKind::Binary) {
         QString error;
-        if (!tab->openLargeFileL2(path, &error,
-                                  L2Presentation::Hex,
-                                  L2ContentKind::Binary)) {
+        if (!providers.open(QStringLiteral("binary.windowed"), tab, path,
+                            forcedEncoding, &error)) {
             qWarning("[openDocumentByPolicy] binary mmap open failed: path='%s', error='%s'",
                      qUtf8Printable(path), qUtf8Printable(error));
             return false;
         }
-        tab->setViewModeL2(ViewMode::Hex);
         return true;
     }
     if (probe.tier.usesMappedPreview()) {
         QString error;
-        if (tab->openLargeFileL2(path, &error, L2Presentation::Text,
-                                 L2ContentKind::Text, forcedEncoding)) {
+        if (providers.open(QStringLiteral("text.windowed"), tab, path,
+                           forcedEncoding, &error)) {
             return true;
         }
         qWarning("[openDocumentByPolicy] mmap open failed without synchronous fallback: path='%s', error='%s'",
                  qUtf8Printable(path), qUtf8Printable(error));
         return false;
     }
-    return tab->loadFile(path, forcedEncoding);
+    QString error;
+    return providers.open(QStringLiteral("text.editable"), tab, path,
+                          forcedEncoding, &error);
 }
 
-bool openSessionDocument(EditorTab *tab, const SessionTab &state)
+bool openSessionDocument(const DocumentProviderRegistry &providers,
+                         EditorTab *tab, const SessionTab &state)
 {
     if (!tab || state.filePath.isEmpty())
         return false;
     if (state.presentation == QLatin1String("hex")) {
         QString error;
-        if (!tab->openLargeFileL2(state.filePath, &error,
-                                  L2Presentation::Hex,
-                                  L2ContentKind::Binary)) {
+        if (!providers.open(QStringLiteral("binary.windowed"), tab,
+                            state.filePath, std::nullopt, &error)) {
             qWarning("[session] explicit Hex restore failed: path='%s', error='%s'",
                      qUtf8Printable(state.filePath), qUtf8Printable(error));
             return false;
@@ -60,16 +62,17 @@ bool openSessionDocument(EditorTab *tab, const SessionTab &state)
         && probeFileContent(state.filePath).contentKind
                == DocumentContentKind::Binary) {
         QString error;
-        if (!tab->openLargeFileL2(state.filePath, &error,
-                                  L2Presentation::Text,
-                                  L2ContentKind::Binary)) {
+        // Explicit text view for a binary file is a distinct current-product
+        // route; it intentionally uses the text window provider.
+        if (!providers.open(QStringLiteral("binary.text-windowed"), tab,
+                            state.filePath, std::nullopt, &error)) {
             qWarning("[session] explicit Text restore failed: path='%s', error='%s'",
                      qUtf8Printable(state.filePath), qUtf8Printable(error));
             return false;
         }
         return true;
     }
-    return openDocumentByPolicy(tab, state.filePath);
+    return openDocumentByPolicy(providers, tab, state.filePath);
 }
 
 void restoreDocumentSessionView(EditorTab *tab, const SessionTab &state)

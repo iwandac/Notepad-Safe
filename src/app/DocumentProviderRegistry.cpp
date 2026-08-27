@@ -28,3 +28,15 @@ std::unique_ptr<IDocumentProvider> DocumentProviderRegistry::create(const QStrin
     return it->factory();
 }
 
+bool DocumentProviderRegistry::open(
+    const QString &id, EditorTab *tab, const QString &path,
+    std::optional<TextEncoding> forcedEncoding, QString *error) const
+{
+    std::unique_ptr<IDocumentProvider> provider = create(id);
+    if (!provider) {
+        if (error)
+            *error = QStringLiteral("未注册文档提供器：%1").arg(id);
+        return false;
+    }
+    return provider->open(tab, path, forcedEncoding, error);
+}

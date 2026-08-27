@@ -22,6 +22,7 @@ class QPoint;
 class EditorTab;
 class FindReplaceDialog;
 class SearchResultsDock;
+class SearchResultsController;
 class SessionManager;
 class VaultDock;
 class StatusBarTaskWidget;
@@ -136,6 +137,7 @@ private:
     QWidget *m_securityCenterPage = nullptr;
     FindReplaceDialog *m_findDialog = nullptr;
     SearchResultsDock *m_searchDock = nullptr;
+    std::unique_ptr<SearchResultsController> m_searchResultsController;
     VaultDock *m_vaultDock = nullptr;
     SessionManager *m_session = nullptr;
     std::unique_ptr<ISecuritySessionService> m_securitySession;

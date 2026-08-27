@@ -1,9 +1,11 @@
 #include "AppComposition.h"
+#include "EditorTab.h"
 #include "MainWindow.h"
 
 #include <QApplication>
 #include <QAction>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QTemporaryDir>
 #include <QTest>
 
@@ -27,6 +29,8 @@ public:
     explicit NoopProvider(DocumentProviderDescriptor descriptor)
         : descriptor_(std::move(descriptor)) {}
     DocumentProviderDescriptor descriptor() const override { return descriptor_; }
+    bool open(EditorTab *, const QString &, std::optional<TextEncoding>,
+              QString *) override { return false; }
 private:
     DocumentProviderDescriptor descriptor_;
 };
@@ -148,6 +152,28 @@ int main(int argc, char **argv)
             != DocumentToolResult::Status::Completed
         || composition.documentTools().instantiatedCount() != 1) {
         return 12;
+    }
+
+    // The provider registry is an executable production route, not descriptor
+    // scaffolding: after first paint a selected provider must open the document
+    // through the same EditorTab implementation used by MainWindow.
+    const QString providerFixture = dataDir.filePath(QStringLiteral("provider.txt"));
+    QFile fixture(providerFixture);
+    if (!fixture.open(QIODevice::WriteOnly)
+        || fixture.write("provider-route\n") != 15
+        || !fixture.flush()) {
+        return 13;
+    }
+    fixture.close();
+    EditorTab providerTab;
+    QString providerError;
+    if (!composition.documentProviders().open(
+            QStringLiteral("text.editable"), &providerTab, providerFixture,
+            std::nullopt, &providerError)
+        || providerTab.filePath() != providerFixture
+        || composition.documentProviders().instantiatedCount() != 1) {
+        qCritical() << "Production document provider route failed:" << providerError;
+        return 14;
     }
 
     qInfo("Startup composition: first paint %lld ms, heavy factories 0 before paint; lazy tool instantiated after paint",

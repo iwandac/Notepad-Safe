@@ -74,6 +74,8 @@ public:
     explicit CountingProvider(DocumentProviderDescriptor descriptor)
         : descriptor_(std::move(descriptor)) {}
     DocumentProviderDescriptor descriptor() const override { return descriptor_; }
+    bool open(EditorTab *, const QString &, std::optional<TextEncoding>,
+              QString *) override { return false; }
 private:
     DocumentProviderDescriptor descriptor_;
 };

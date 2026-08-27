@@ -1,7 +1,6 @@
 #pragma once
 
 #include <QDockWidget>
-#include <memory>
 #include "SearchResultTarget.h"
 #include "SearchMatch.h"
 #include "SearchResultsModel.h"
@@ -18,7 +17,8 @@ class LineIndex;
 class SearchResultsDock : public QDockWidget {
     Q_OBJECT
 public:
-    explicit SearchResultsDock(QWidget *parent = nullptr);
+    explicit SearchResultsDock(SearchResultsController &controller,
+                               QWidget *parent = nullptr);
     ~SearchResultsDock() override;
 
     // ---- Editable Text results are adapted to the canonical result model.
@@ -86,7 +86,7 @@ private:
     // 上次按下位置对应的"行 / 匹配索引"（用于双击时跳转到指定匹配）
     int m_lastHitMatchIdx = -1;
     int m_lastHitRow = -1;
-    std::unique_ptr<SearchResultsController> m_controller;
+    SearchResultsController *m_controller = nullptr; // application-owned
     QVector<LargeFileSearchMatch> m_singlePreviewMatches;
 
     void updateSummary(const QString &pattern, const QString &fileName,

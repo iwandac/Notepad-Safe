@@ -42,8 +42,12 @@ foreach ($contract in $lowerContracts) {
     foreach ($relative in $contract.Files) {
         $path = Join-Path $SourceRoot $relative
         $content = Get-Content -LiteralPath $path -Raw
+        # Dependency checks apply to code, not design notes in comments.  A
+        # lower layer may document the UI type it deliberately does not use.
+        $codeContent = $content -replace '(?s)/\*.*?\*/', ''
+        $codeContent = $codeContent -replace '(?m)//.*$', ''
         foreach ($token in $contract.Tokens) {
-            if ($content.Contains($token)) {
+            if ($codeContent.Contains($token)) {
                 Add-Failure "forbidden dependency '$token' in $relative"
             }
         }
@@ -74,6 +78,18 @@ foreach ($forbiddenState in @('EditorTab', 'QPointer<EditorTab>', 'TargetRevisio
     if ($searchDockHeader.Contains($forbiddenState)) {
         Add-Failure "SearchResultsDock view declares result-session state: $forbiddenState"
     }
+}
+foreach ($ownedSession in @('unique_ptr<SearchResultsController>',
+                             'SearchResultsController m_')) {
+    if ($searchDockHeader.Contains($ownedSession)) {
+        Add-Failure "SearchResultsDock owns search-session controller: $ownedSession"
+    }
+}
+$mainWindowHeaderForSearch = Get-Content -LiteralPath (
+    Join-Path $SourceRoot 'src/window/MainWindow.h') -Raw
+if (-not $mainWindowHeaderForSearch.Contains(
+        'unique_ptr<SearchResultsController> m_searchResultsController')) {
+    Add-Failure 'application shell does not own the search-session controller'
 }
 $searchDockSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'src/search/SearchResultsDock.cpp') -Raw
 foreach ($forbiddenControllerWork in @('EditorTab', 'contentRevision()',
@@ -122,15 +138,30 @@ foreach ($domainFile in $domainFiles) {
     }
 }
 
+$domainTargetText = [regex]::Match(
+    ($cmakeLines -join "`n"),
+    '(?s)add_library\(notepadsafe_domain\s+STATIC.*?\n\)').Value
+if ($domainTargetText.Contains('DraftStore.cpp')) {
+    Add-Failure 'domain target owns platform-encrypted draft persistence'
+}
+if ($domainTargetText.Contains('DocumentProviderRegistry.cpp')) {
+    Add-Failure 'domain target owns executable editor provider adapters'
+}
+
 # Complexity budgets are ratchets, not targets. They make responsibility
 # extraction durable: a future feature must go into a focused component rather
 # than silently growing the four legacy coordinators again.
 $complexityBudgets = @(
-    @{ File = 'src/window/MainWindow.cpp'; Lines = 5634; Branches = 652 },
-    @{ File = 'src/editor/EditorTab.cpp'; Lines = 7288; Branches = 926 },
+    @{ File = 'src/window/MainWindow.cpp'; Lines = 3341; Branches = 348 },
+    @{ File = 'src/window/MainWindowDocuments.cpp'; Lines = 1873; Branches = 240 },
+    @{ File = 'src/window/MainWindowSession.cpp'; Lines = 563; Branches = 64 },
+    @{ File = 'src/editor/EditorTab.cpp'; Lines = 2684; Branches = 330 },
+    @{ File = 'src/editor/EditorTabLargeDocument.cpp'; Lines = 3320; Branches = 440 },
+    @{ File = 'src/editor/EditorTabSearch.cpp'; Lines = 1683; Branches = 189 },
     @{ File = 'src/search/FindReplaceDialog.cpp'; Lines = 1499; Branches = 197 },
-    @{ File = 'src/search/SearchResultsDock.cpp'; Lines = 799; Branches = 92 },
-    @{ File = 'src/app/DocumentOpenWorkflow.cpp'; Lines = 98; Branches = 14 },
+    @{ File = 'src/search/SearchResultsDock.cpp'; Lines = 523; Branches = 53 },
+    @{ File = 'src/search/SearchResultsAggregateModel.h'; Lines = 293; Branches = 39 },
+    @{ File = 'src/app/DocumentOpenWorkflow.cpp'; Lines = 101; Branches = 14 },
     @{ File = 'src/search/EditableTextSearch.cpp'; Lines = 110; Branches = 13 },
     @{ File = 'src/search/SearchResultsController.cpp'; Lines = 73; Branches = 4 },
     @{ File = 'src/search/SearchResultsDelegate.cpp'; Lines = 246; Branches = 17 },
@@ -150,7 +181,23 @@ foreach ($budget in $complexityBudgets) {
     }
 }
 
+# Global ceiling prevents a new unlisted mega-file from bypassing the named
+# ratchets. Existing responsibilities are now split below this ceiling.
+$productionSources = Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src') `
+    -Recurse -File | Where-Object Extension -in '.cpp', '.h'
+foreach ($source in $productionSources) {
+    $relative = $source.FullName.Substring($SourceRoot.Length + 1).Replace('\', '/')
+    $sourceLines = @(Get-Content -LiteralPath $source.FullName).Count
+    if ($sourceLines -gt 3500) {
+        Add-Failure "$relative exceeds global source ceiling: $sourceLines > 3500"
+    }
+}
+
 $activeCmakeText = $activeCmake -join "`n"
+if ($activeCmakeText -match
+        'target_compile_definitions\(notepadsafe_vault\s+PUBLIC\s+NOTEPADSAFE_HAS_KDBX_BACKEND') {
+    Add-Failure 'KDBX backend macro leaks through the public vault interface'
+}
 if ($activeCmakeText -match '(?i)TIMEOUT\s+3600') {
     Add-Failure 'monolithic 3600-second test timeout is forbidden'
 }

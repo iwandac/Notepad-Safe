@@ -155,19 +155,28 @@ target_link_libraries(notepadsafe_search_runtime PUBLIC
 add_library(notepadsafe_domain STATIC
     src/domain/FileTierPolicy.cpp
     src/domain/DocumentToolRegistry.cpp
-    src/domain/DocumentProviderRegistry.cpp
     src/domain/FeatureRegistry.cpp
     src/domain/InferenceProviderRegistry.cpp
     src/domain/PersistenceAdapterRegistry.cpp
-    src/session/DraftStore.cpp
 )
 target_include_directories(notepadsafe_domain PUBLIC
     ${CMAKE_SOURCE_DIR}/src/domain
     ${CMAKE_SOURCE_DIR}/src/session
 )
 target_link_libraries(notepadsafe_domain PUBLIC Qt6::Core)
+
+# OS-backed recovery persistence is infrastructure, not product-domain policy.
+# Editor/session/security runtimes share this one implementation without
+# forcing Windows cryptography into the domain target.
+add_library(notepadsafe_recovery_runtime STATIC
+    src/session/DraftStore.cpp
+)
+target_include_directories(notepadsafe_recovery_runtime PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/session
+)
+target_link_libraries(notepadsafe_recovery_runtime PUBLIC Qt6::Core)
 if(WIN32)
-    target_link_libraries(notepadsafe_domain PRIVATE crypt32)
+    target_link_libraries(notepadsafe_recovery_runtime PRIVATE crypt32)
 endif()
 
 add_library(notepadsafe_vault STATIC
@@ -183,7 +192,7 @@ target_include_directories(notepadsafe_vault PUBLIC
 )
 target_link_libraries(notepadsafe_vault
     PUBLIC Qt6::Core
-    PRIVATE notepadsafe_domain
+    PRIVATE notepadsafe_domain notepadsafe_recovery_runtime
 )
 
 if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
@@ -196,7 +205,7 @@ if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     )
     set_property(TARGET notepadsafe_vault PROPERTY CXX_STANDARD 20)
     target_link_libraries(notepadsafe_vault PRIVATE notepadsafe_keepassxc_core)
-    target_compile_definitions(notepadsafe_vault PUBLIC NOTEPADSAFE_HAS_KDBX_BACKEND=1)
+    target_compile_definitions(notepadsafe_vault PRIVATE NOTEPADSAFE_HAS_KDBX_BACKEND=1)
     if(WIN32)
         target_link_libraries(notepadsafe_vault PRIVATE crypt32)
     endif()
@@ -253,6 +262,8 @@ endif()
 # the test harness out of this target; everything below is production code.
 set(NOTEPADSAFE_EDITOR_RUNTIME_SOURCES
     src/editor/EditorTab.cpp
+    src/editor/EditorTabLargeDocument.cpp
+    src/editor/EditorTabSearch.cpp
     src/editor/VirtualFileView.cpp
     src/editor/WindowedReadOnlyProvider.cpp
     src/search/SearchResultsModel.cpp
@@ -267,6 +278,7 @@ target_include_directories(notepadsafe_editor_runtime PUBLIC
 )
 target_link_libraries(notepadsafe_editor_runtime PUBLIC
     notepadsafe_domain
+    notepadsafe_recovery_runtime
     notepadsafe_file_runtime
     notepadsafe_async_runtime
     notepadsafe_search_runtime
@@ -295,6 +307,22 @@ target_link_libraries(notepadsafe_session_runtime PUBLIC
     Qt6::Widgets
 )
 
+# Executable document-open adapters sit above the editor surface.  Keeping
+# them out of notepadsafe_domain prevents UI types and policy values from
+# collapsing back into one dependency cycle.
+add_library(notepadsafe_document_runtime STATIC
+    src/app/DocumentProviderRegistry.cpp
+)
+target_include_directories(notepadsafe_document_runtime PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/app
+    ${CMAKE_SOURCE_DIR}/src/domain
+    ${CMAKE_SOURCE_DIR}/src/editor
+)
+target_link_libraries(notepadsafe_document_runtime PUBLIC
+    notepadsafe_editor_runtime
+    Qt6::Core
+)
+
 # ============ 应用 Shell ============
 
 # MainWindow and its platform-facing widgets are production code. Keep them in
@@ -308,6 +336,8 @@ add_library(notepadsafe_app STATIC
      src/window/SensitiveText.cpp
      src/window/FileCredentialDialog.cpp
      src/window/MainWindow.cpp
+     src/window/MainWindowDocuments.cpp
+     src/window/MainWindowSession.cpp
     src/search/FindReplaceDialog.cpp
      src/search/SearchResultsController.cpp
      src/search/SearchResultsDelegate.cpp
@@ -323,7 +353,14 @@ target_include_directories(notepadsafe_app PUBLIC
 target_compile_definitions(notepadsafe_app PUBLIC
     NOTEPADSAFE_VERSION="${PROJECT_VERSION}"
 )
+if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
+    # VaultDock is the only application UI adapter that compiles conditional
+    # KDBX controls. Do not leak the backend macro through every vault consumer.
+    target_compile_definitions(notepadsafe_app PRIVATE
+        NOTEPADSAFE_HAS_KDBX_BACKEND=1)
+endif()
 target_link_libraries(notepadsafe_app PUBLIC
+    notepadsafe_document_runtime
     notepadsafe_editor_runtime
     notepadsafe_session_runtime
     notepadsafe_async_runtime
@@ -565,7 +602,8 @@ endif()
 
 add_executable(test_architecture_contracts tests/test_architecture_contracts.cpp)
 target_include_directories(test_architecture_contracts PRIVATE ${APP_INCLUDE_DIRS})
-target_link_libraries(test_architecture_contracts PRIVATE notepadsafe_domain Qt6::Core)
+target_link_libraries(test_architecture_contracts PRIVATE
+    notepadsafe_domain notepadsafe_document_runtime Qt6::Core)
 if(WIN32)
     target_link_libraries(test_architecture_contracts PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
@@ -997,6 +1035,10 @@ set(NOTEPADSAFE_GUI_SMOKE_TARGETS
     gui_smoke_smallfixes
     gui_smoke_vault
 )
+if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
+    target_compile_definitions(gui_smoke_vault PRIVATE
+        NOTEPADSAFE_HAS_KDBX_BACKEND=1)
+endif()
 if(TARGET gui_smoke_secure_documents)
     list(APPEND NOTEPADSAFE_GUI_SMOKE_TARGETS gui_smoke_secure_documents)
 endif()

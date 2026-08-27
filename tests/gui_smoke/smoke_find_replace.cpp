@@ -46,6 +46,7 @@
 #include "LineIndex.h"
 #include "PatchList.h"
 #include "SearchResultsDock.h"
+#include "SearchResultsController.h"
 #include "SearchResultsModel.h"
 #include "AsyncTaskManager.h"
 
@@ -483,7 +484,9 @@ void SmokeFindReplace::tc_fr_005_unicode_long_line_find_all_and_double_click() {
     QString error;
     QVERIFY2(openL2(path, &error), qPrintable(error));
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1100, 320);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -584,7 +587,9 @@ void SmokeFindReplace::tc_fr_006_live_overlay_search_snapshot_highlight_and_inva
     QApplication::processEvents(QEventLoop::AllEvents, 120);
     QVERIFY(tab()->editor()->isModified());
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1050, 320);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -687,7 +692,9 @@ void SmokeFindReplace::tc_fr_007_all_open_files_incremental_results_and_target_j
     QTest::keyClicks(first->editor(), marker + QLatin1Char(' '));
     QApplication::processEvents(QEventLoop::AllEvents, 100);
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1050, 350);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -811,7 +818,9 @@ void SmokeFindReplace::tc_fr_008_multiline_regex_result_and_double_click()
     QString error;
     QVERIFY2(openL2(path, &error), qPrintable(error));
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1000, 300);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -887,7 +896,9 @@ void SmokeFindReplace::tc_fr_009_l1_pcre2_find_navigation_replace_and_error()
         return l1.editor()->text().toUtf8().mid(start, end - start);
     };
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1000, 300);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -967,7 +978,9 @@ void SmokeFindReplace::tc_fr_010_all_open_cancel_and_rerun()
     workspace.show();
     QVERIFY(QTest::qWaitForWindowExposed(&workspace));
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1000, 330);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -1057,7 +1070,9 @@ void SmokeFindReplace::tc_fr_011_hex_byte_find_all_highlight_and_double_click()
     QVERIFY(tab()->isBinaryDocument());
     QCOMPARE(tab()->viewModeL2(), ViewMode::Hex);
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1050, 330);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -1168,7 +1183,9 @@ void SmokeFindReplace::tc_fr_012_hex_byte_all_open_filters_text_targets()
     workspace.show();
     QVERIFY(QTest::qWaitForWindowExposed(&workspace));
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1050, 330);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -1345,7 +1362,9 @@ void SmokeFindReplace::tc_fr_014_invalidated_result_rerun_from_dock()
     QVERIFY(tab()->loadFile(path));
     QVERIFY(!tab()->isL2Mode());
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1050, 320);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -1455,7 +1474,9 @@ void SmokeFindReplace::tc_fr_015_all_open_replace_transaction_and_skip_summary()
     workspace.show();
     QVERIFY(QTest::qWaitForWindowExposed(&workspace));
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1050, 320);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -1588,7 +1609,8 @@ void SmokeFindReplace::tc_fr_016_large_search_starts_before_line_index_completes
     // Bind the early byte-position result to the real Dock, then complete the
     // line index.  The row must turn into a line number in place without a
     // second search, while the byte range remains the navigation authority.
-    SearchResultsDock dock(container_);
+    SearchResultsController resultsController;
+    SearchResultsDock dock(resultsController, container_);
     dock.setResultsModel(model, marker, tab()->fileName(), dockTarget(tab()));
     connect(tab(), &EditorTab::l2LineBuildFinished, &dock,
             [&dock, target = tab()](bool success) {
@@ -1640,7 +1662,9 @@ void SmokeFindReplace::tc_fr_017_regex_toggle_distinguishes_literal_and_regex()
     l1.show();
     QVERIFY(QTest::qWaitForWindowExposed(&l1));
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1000, 300);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -1713,7 +1737,9 @@ void SmokeFindReplace::tc_fr_018_regex_contract_model_runs_gui_variants()
         l1.show();
         QVERIFY2(QTest::qWaitForWindowExposed(&l1), variant.id);
 
-        SearchResultsDock dock;
+        SearchResultsController resultsController;
+
+        SearchResultsDock dock(resultsController);
         dock.resize(1000, 300);
         dock.show();
         QVERIFY2(QTest::qWaitForWindowExposed(&dock), variant.id);
@@ -1832,7 +1858,9 @@ void SmokeFindReplace::tc_fr_019_query_option_state_machine_exhaustive()
     workspace.show();
     QVERIFY(QTest::qWaitForWindowExposed(&workspace));
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     FindReplaceDialog dialog(&workspace);
     dialog.setTabWidget(&workspace);
     dialog.setSearchResultsDock(&dock);
@@ -2095,7 +2123,8 @@ void SmokeFindReplace::tc_fr_021_text_option_semantics_all_legal_combinations()
         QVERIFY2(editor.loadFile(path), variant.id);
         editor.show();
         QVERIFY2(QTest::qWaitForWindowExposed(&editor), variant.id);
-        SearchResultsDock dock;
+        SearchResultsController resultsController;
+        SearchResultsDock dock(resultsController);
         FindReplaceDialog dialog;
         dialog.setActiveTab(&editor);
         dialog.setSearchResultsDock(&dock);
@@ -2205,7 +2234,9 @@ void SmokeFindReplace::tc_fr_022_hex_query_formats_errors_and_navigation()
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(openError));
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     FindReplaceDialog dialog(container_);
     dialog.setActiveTab(tab());
     dialog.setSearchResultsDock(&dock);
@@ -2593,7 +2624,9 @@ void SmokeFindReplace::tc_fr_027_real_s3_find_all_dock_double_click()
     QVERIFY(provider);
     QCOMPARE(provider->fileSize(), size);
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1100, 360);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -2800,7 +2833,9 @@ void SmokeFindReplace::tc_fr_029_result_spool_virtual_tail_navigation()
         payload, QStringLiteral("fr-029-result-spool.log"));
     QVERIFY2(openL2(path), "unable to open result-spool fixture");
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1100, 420);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -2896,7 +2931,9 @@ void SmokeFindReplace::tc_fr_030_sparse_s3_text_regex_after_two_gib()
     QVERIFY(provider);
     QCOMPARE(provider->fileSize(), FileSize);
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1100, 360);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -3171,7 +3208,9 @@ void SmokeFindReplace::tc_fr_033_l1_find_all_and_navigation_are_async_independen
     l1.show();
     QVERIFY(QTest::qWaitForWindowExposed(&l1));
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(760, 300);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -3376,7 +3415,9 @@ void SmokeFindReplace::tc_fr_038_real_tinytestfile_replacement_literal_user_flow
                  qPrintable(task.title));
     }
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1000, 340);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -3612,7 +3653,9 @@ void SmokeFindReplace::tc_fr_039_multi_encoding_dock_models_are_independent()
         targets.append(target);
     }
 
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+
+    SearchResultsDock dock(resultsController);
     dock.resize(1000, 360);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
@@ -4023,7 +4066,8 @@ void SmokeFindReplace::tc_fr_040_l2_search_identity_includes_projection_snapshot
 
 void SmokeFindReplace::tc_fr_041_search_dock_rows_remain_compact_across_modes()
 {
-    SearchResultsDock dock;
+    SearchResultsController resultsController;
+    SearchResultsDock dock(resultsController);
     dock.resize(980, 360);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
