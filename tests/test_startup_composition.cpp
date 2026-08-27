@@ -57,6 +57,11 @@ public:
         : descriptor_(std::move(descriptor)) {}
     PersistenceAdapterDescriptor descriptor() const override { return descriptor_; }
     bool recognizes(const QString &) const override { return false; }
+    PersistenceResult save(IDocumentContentPort *,
+                           const PersistenceSaveRequest &) override
+    {
+        return {PersistenceStatus::Unsupported, {}, {}};
+    }
 private:
     PersistenceAdapterDescriptor descriptor_;
 };

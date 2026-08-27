@@ -17,7 +17,6 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QDir>
-#include <QSaveFile>
 #include <QDataStream>
 #include <QFont>
 #include <QColor>
@@ -178,7 +177,7 @@ SearchResultsModel* EditorTab::findAllL2(const QString& pattern, bool regex,
             mw->statusBar()->showMessage(QObject::tr("无法准备搜索快照：%1").arg(flushError), 5000);
         return nullptr;
     }
-    const quint64 searchRevision = m_documentState.revision;
+    const quint64 searchRevision = m_documentSession.state().revision;
     const TextEncoding searchEncoding = displayEncoding();
     const bool searchByteContext = isHexPresentation();
     const bool searchBytePosition = isBinaryDocument() || searchByteContext;
@@ -227,7 +226,7 @@ SearchResultsModel* EditorTab::findAllL2(const QString& pattern, bool regex,
         aw.loop.exec();
 
     QObject::disconnect(c1); QObject::disconnect(c2); QObject::disconnect(c3);
-    if (m_documentState.revision != searchRevision)
+    if (m_documentSession.state().revision != searchRevision)
         return nullptr;
     if (!aw.err.isEmpty() || aw.total <= 0) {
         // 0 匹配也返回空的 model（Dock 可以显示 0 结果）
@@ -247,7 +246,7 @@ SearchResultsModel* EditorTab::findAllL2(const QString& pattern, bool regex,
     m_l2SearchCacheHexBytes = hexBytes;
     m_l2SearchCacheEncoding = searchEncoding;
     m_l2SearchCacheByteContext = searchByteContext;
-    m_l2SearchCacheRevision = m_documentState.revision;
+    m_l2SearchCacheRevision = m_documentSession.state().revision;
     m_l2SearchCacheValid = aw.err.isEmpty();
     m_l2SearchHighlights.clear();
     m_l2SearchHighlights.reserve(s->memoryMatches().size());
@@ -288,8 +287,8 @@ bool EditorTab::l2ProjectionMatches(TextEncoding encoding,
 bool EditorTab::pendingL2SearchSourceIsCurrent() const
 {
     if (!m_pendingL2Search.active
-        || m_documentState.revision != m_pendingL2Search.contentRevision
-        || m_documentState.location != m_pendingL2Search.sourcePathAtStart
+        || m_documentSession.state().revision != m_pendingL2Search.contentRevision
+        || m_documentSession.state().location != m_pendingL2Search.sourcePathAtStart
         || contentSizeBytes() != m_pendingL2Search.sourceSizeAtStart) {
         return false;
     }
@@ -389,7 +388,7 @@ void EditorTab::startPendingL2Search()
          byteContextCopy](qint64 /*total*/) {
             if (!that) return;
             if (!that->pendingL2SearchSourceIsCurrent()
-                || that->m_documentState.revision != revisionCopy) {
+                || that->m_documentSession.state().revision != revisionCopy) {
                 that->clearSearchHighlights();
                 that->resetPendingL2Search();
                 emit that->findAllL2Finished(nullptr, patternCopy, fileNameCopy);
@@ -436,7 +435,7 @@ void EditorTab::startPendingL2Search()
          revisionCopy, encodingCopy, bytePositionCopy](const QString& msg) {
             if (!that) return;
             if (!that->pendingL2SearchSourceIsCurrent()
-                || that->m_documentState.revision != revisionCopy) {
+                || that->m_documentSession.state().revision != revisionCopy) {
                 that->clearSearchHighlights();
                 that->resetPendingL2Search();
                 emit that->findAllL2Finished(nullptr, patternCopy, fileNameCopy);
@@ -504,10 +503,10 @@ bool EditorTab::findAllL2Async(const QString& pattern, bool regex,
     m_pendingL2Search.tolerateInvalidEncodingAtStart =
         !m_pendingL2Search.byteContextModeAtStart
         && (isBinaryDocument() || encodingHasDecodeErrors());
-    m_pendingL2Search.sourcePathAtStart = m_documentState.location;
+    m_pendingL2Search.sourcePathAtStart = m_documentSession.state().location;
     m_pendingL2Search.sourceSizeAtStart = contentSizeBytes();
-    m_pendingL2Search.diskVersionAtStart = m_diskVersion;
-    m_pendingL2Search.contentRevision = m_documentState.revision;
+    m_pendingL2Search.diskVersionAtStart = m_documentSession.diskVersion();
+    m_pendingL2Search.contentRevision = m_documentSession.state().revision;
     m_pendingL2Search.parentForModel = parentForModel;
 
     if (m_l2View->isOpen()) {
@@ -598,7 +597,7 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
             return false;
         }
         const bool cacheMatches = m_l1SearchCacheValid
-            && m_l1SearchCacheRevision == m_documentState.revision
+            && m_l1SearchCacheRevision == m_documentSession.state().revision
             && m_l1SearchCachePattern == pattern
             && m_l1SearchCacheRegex == regex
             && m_l1SearchCacheCaseSensitive == caseSensitive
@@ -613,7 +612,7 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
                 ? qMax(selectionStart, selectionEnd)
                 : qMin(selectionStart, selectionEnd);
             const bool currentZeroLengthHit = m_l1NavigationHitValid
-                && m_l1NavigationRevision == m_documentState.revision
+                && m_l1NavigationRevision == m_documentSession.state().revision
                 && m_l1NavigationPattern == pattern
                 && m_l1NavigationRegex == regex
                 && m_l1NavigationCaseSensitive == caseSensitive
@@ -713,7 +712,7 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
             m_l1NavigationRegex = regex;
             m_l1NavigationCaseSensitive = caseSensitive;
             m_l1NavigationWholeWord = wholeWord;
-            m_l1NavigationRevision = m_documentState.revision;
+            m_l1NavigationRevision = m_documentSession.state().revision;
             m_l1NavigationHitValid = true;
             m_lastL1MatchIndex = -1;
             m_editor->SendScintilla(QsciScintillaBase::SCI_SETSEL,
@@ -778,7 +777,7 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
     // L2 路径：同一查询/同一内容修订复用已有结果。旧实现每按一次 F3
     // 都重新扫描整文件，在 2G+ 日志上等同于功能不可用。
     const bool cacheMatches = m_l2SearchCacheValid
-        && m_l2SearchCacheRevision == m_documentState.revision
+        && m_l2SearchCacheRevision == m_documentSession.state().revision
         && m_l2SearchCachePattern == pattern
         && m_l2SearchCacheRegex == regex
         && m_l2SearchCacheCaseSensitive == caseSensitive
@@ -797,7 +796,7 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
     if (!s) return false;
     LargeFileSearchMatch m;
     const bool navigationHitMatches = m_l2NavigationHitValid
-        && m_l2NavigationRevision == m_documentState.revision
+        && m_l2NavigationRevision == m_documentSession.state().revision
         && m_l2NavigationPattern == pattern
         && m_l2NavigationRegex == regex
         && m_l2NavigationCaseSensitive == caseSensitive
@@ -879,7 +878,7 @@ bool EditorTab::findNextL2Async(
             return false;
         }
         const bool cacheMatches = m_l1SearchCacheValid
-            && m_l1SearchCacheRevision == m_documentState.revision
+            && m_l1SearchCacheRevision == m_documentSession.state().revision
             && m_l1SearchCachePattern == pattern
             && m_l1SearchCacheRegex == regex
             && m_l1SearchCacheCaseSensitive == caseSensitive
@@ -900,7 +899,7 @@ bool EditorTab::findNextL2Async(
         qint64 boundary = forward
             ? qMax(selectionStart, selectionEnd)
             : qMin(selectionStart, selectionEnd);
-        const quint64 revision = m_documentState.revision;
+        const quint64 revision = m_documentSession.state().revision;
         const bool wipeSnapshot = isSecureDocument();
         QByteArray subject = m_editor->text().toUtf8();
         const bool currentZeroLengthHit = m_l1NavigationHitValid
@@ -1045,7 +1044,7 @@ bool EditorTab::findNextL2Async(
                             callback(false, QObject::tr("文档已关闭。"));
                             return;
                         }
-                        if (that->m_documentState.revision != revision) {
+                        if (that->m_documentSession.state().revision != revision) {
                             that->m_lastSearchError = QObject::tr(
                                 "文档已变更，请重新查找。");
                             callback(false, that->m_lastSearchError);
@@ -1079,7 +1078,7 @@ bool EditorTab::findNextL2Async(
     }
 
     const bool cacheMatches = m_l2SearchCacheValid
-        && m_l2SearchCacheRevision == m_documentState.revision
+        && m_l2SearchCacheRevision == m_documentSession.state().revision
         && m_l2SearchCachePattern == pattern
         && m_l2SearchCacheRegex == regex
         && m_l2SearchCacheCaseSensitive == caseSensitive
@@ -1173,7 +1172,7 @@ bool EditorTab::findNextL2Async(
 
     qint64 from = m_lastL2Byte;
     const bool navigationHitMatches = m_l2NavigationHitValid
-        && m_l2NavigationRevision == m_documentState.revision
+        && m_l2NavigationRevision == m_documentSession.state().revision
         && m_l2NavigationPattern == pattern
         && m_l2NavigationRegex == regex
         && m_l2NavigationCaseSensitive == caseSensitive
@@ -1212,7 +1211,7 @@ bool EditorTab::findNextL2Async(
     opts.caseSensitive = hexBytes ? true : caseSensitive;
     opts.wholeWord = hexBytes ? false : wholeWord;
     opts.textEncoding = displayEncoding();
-    const quint64 revision = m_documentState.revision;
+    const quint64 revision = m_documentSession.state().revision;
     const TextEncoding searchEncoding = opts.textEncoding;
     const bool searchByteContext = opts.byteContextMode;
     QPointer<EditorTab> guard(this);
@@ -1225,7 +1224,7 @@ bool EditorTab::findNextL2Async(
             bool found, LargeFileSearchMatch match, QString error) mutable {
             if (!guard)
                 return;
-            if (guard->m_documentState.revision != revision) {
+            if (guard->m_documentSession.state().revision != revision) {
                 error = QObject::tr("文档已变化，请重新查找。");
                 found = false;
             } else if (!guard->l2ProjectionMatches(searchEncoding,
@@ -1323,7 +1322,7 @@ bool EditorTab::currentSelectionMatchesSearch(
         if (end <= start)
             return false;
         if (m_l1NavigationHitValid
-            && m_l1NavigationRevision == m_documentState.revision
+            && m_l1NavigationRevision == m_documentSession.state().revision
             && m_l1NavigationPattern == pattern
             && m_l1NavigationRegex == regex
             && m_l1NavigationCaseSensitive == caseSensitive
@@ -1333,7 +1332,7 @@ bool EditorTab::currentSelectionMatchesSearch(
             return true;
         }
         if (!m_l1SearchCacheValid
-            || m_l1SearchCacheRevision != m_documentState.revision
+            || m_l1SearchCacheRevision != m_documentSession.state().revision
             || m_l1SearchCachePattern != pattern
             || m_l1SearchCacheRegex != regex
             || m_l1SearchCacheCaseSensitive != caseSensitive
@@ -1365,7 +1364,7 @@ bool EditorTab::currentSelectionMatchesSearch(
     if (end <= start)
         return false;
     if (m_l2NavigationHitValid
-        && m_l2NavigationRevision == m_documentState.revision
+        && m_l2NavigationRevision == m_documentSession.state().revision
         && m_l2NavigationPattern == pattern
         && m_l2NavigationRegex == regex
         && m_l2NavigationCaseSensitive == caseSensitive
@@ -1378,7 +1377,7 @@ bool EditorTab::currentSelectionMatchesSearch(
         return true;
     }
     if (!m_l2SearchCacheValid
-        || m_l2SearchCacheRevision != m_documentState.revision
+        || m_l2SearchCacheRevision != m_documentSession.state().revision
         || m_l2SearchCachePattern != pattern
         || m_l2SearchCacheRegex != regex
         || m_l2SearchCacheCaseSensitive != caseSensitive

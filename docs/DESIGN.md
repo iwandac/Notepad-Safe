@@ -167,7 +167,7 @@ flowchart TB
 
 Notepad Safe 保持一个本地桌面进程和一个正式产品安装单元。这里的“模块”是编译与职责边界，不是微服务、IPC 拆分或为了抽象而拆出的细粒度库。依赖方向由 CMake target 的 `PUBLIC/PRIVATE` include 和 link 关系执行；仅在文档里约定目录名称不算完成。
 
-`AppComposition` 是唯一组合根，也是唯一允许选择具体 adapter、创建应用服务、controller 和 registry 的位置。正式 `main.cpp` 只建立平台生命周期并调用组合根；MainWindow、EditorTab、Dock 和后台任务不得自行查找或构造文件、搜索、KDBX、账号、模型和平台服务。
+`AppComposition` 是唯一允许选择具体外部 adapter、创建外部副作用服务和扩展 registry 的组合根。纯 UI controller（例如 SearchResultsController）可由其唯一 Widget owner 创建，但不得选择后端。正式 `main.cpp` 只建立平台生命周期并调用组合根；MainWindow、EditorTab、Dock 和后台任务不得自行查找或构造文件、KDBX、DPAPI、模型和平台 adapter。
 
 依赖注入采用普通构造函数参数：
 
@@ -180,7 +180,7 @@ Notepad Safe 保持一个本地桌面进程和一个正式产品安装单元。�
 
 `DocumentProviderRegistry` 在组合根静态注册 Text、Hex、Windowed ReadOnly 和未来内容/呈现 Provider。每个 descriptor 声明 ContentKind、SizeTier、Capabilities、SearchSnapshot、PositionMapper 和有界 snapshot reader；新增 Provider 不能在 MainWindow、FindReplaceDialog 或 SearchResultsDock 增加模式特判。
 
-`PersistenceAdapterRegistry` 独立注册 PlainFile、SecureKdbx 和后续持久化类型，本轮只负责格式探测优先级、`DocumentPersistence` 路由和 capability 描述。Plain 的打开/会话恢复由 `DocumentOpenWorkflow` 协调，Secure 的打开/保存继续经注入的安全服务 port；load/save/conflict/recovery 尚未统一成可插拔 adapter 合同。Secure 绝不是一种 EditorProvider，KDBX=OFF 只让对应 persistence capability unavailable，不能改变 Text/Hex/Tool 语义。
+`PersistenceAdapterRegistry` 独立注册 PlainFile、SecureKdbx 和后续持久化类型，负责格式探测优先级、`DocumentPersistence` 路由和强类型保存入口。Plain 保存的 snapshot、原子替换、外部冲突和 commit 由 `PlainFilePersistence` 完成；Secure 保存由 `ISecureDocumentPersistence` 完成。打开/会话恢复仍由 `DocumentOpenWorkflow` 协调，凭据提示与跨页面交互属于 UI application controller。Secure 绝不是一种 EditorProvider，KDBX=OFF 只让对应 persistence capability unavailable，不能改变 Text/Hex/Tool 语义。当前没有第三方动态 persistence 插件，也不把 save 合同夸大为任意新格式已经自动具备 load/recovery。
 
 `DocumentToolRegistry` 静态注册格式化、转换、摘要、AI 辅助和脚本可视化工具。每个 descriptor 声明输入 ContentKind、只读或修改型、选区/全文范围、是否允许远程 Provider、结果类型和资源预算。菜单、命令面板和上下文入口只根据 registry 与当前 DocumentCapabilities 生成，不分别维护工具清单。
 
@@ -267,7 +267,7 @@ flowchart LR
 
 启动计时使用正式 Release、固定基准机和相同用户数据 fixture，记录 process entry、MainWindow constructed、show requested、first paint、first input accepted 和 session restore started/completed。普通自动化只把每次新建进程称为“外部进程启动”，不能假称清除了 Windows 文件缓存；首轮/重复轮次分别报告，真正“冷缓存”数字只有在记录受控重启/缓存协议时才允许使用。诊断只记录阶段、耗时和计数，不记录路径、正文、查询或账号数据。
 
-### 3.8 当前实现可行性与状态（2026-08-26 审计）
+### 3.8 当前实现可行性与状态（2026-08-27 审计）
 
 状态词固定为：`已有基础` 表示存在可复用实现；`部分实现` 表示只覆盖局部路径；`未实现` 表示只有设计或测试替身；`已验证` 还必须给出本轮正式证据。任何一行的局部完成不得上推为整行或整体架构完成。
 
@@ -275,9 +275,9 @@ flowchart LR
 |---|---|---|---|
 | 模块化产品 targets | **已验证**：正式 exe 与 GUI harness 链接同一产品 targets；架构门禁拒绝测试重复列产品 `.cpp` 和禁止 include | 继续拆分尚未形成独立 target 的 app 内部职责，不改变已经收敛的链接规则 | `architecture_boundary`、正式/GUI target 构建 |
 | `AppComposition` 与手工 DI | **目标边界已实现，非全类 DI**：组合根注入 MainWindow，Security bundle、Tool/Document/Persistence/Inference registries 从组合根创建；Find/Accounts/Security 页面首次使用创建。SessionManager 与 AsyncTaskManager 仍是内部运行时 facade，不承担 adapter 选择 | 只在外部副作用或可替换实现边界继续注入；不把“清零所有 singleton”当目标，也不为纯算法机械造接口 | first-paint counting factory 验证 Security/Tool/Document/Persistence/Inference 均为零重型实例 |
-| DocumentState/Capabilities/typed position | **目标状态真值已实现**：DocumentId、location、origin、persistence、content kind、security class、capabilities、revision、dirty 已由 EditorTab 内唯一 DocumentState 持有；SourceBytePosition/Range 与 EditorPosition 不可互换；窗口化只读选择由 ReadOnlySelectionModel 唯一持有 | presentation window、mmap 和编辑器控件状态继续由具体 Provider 持有，不复制成第二份领域真值；旧 API 只作转发 facade | revision stale、反向/连续 selection owner、连续复制、Plain/Secure 工具能力已通过；不把 EditorTab 的全部 UI facade 误称为已迁移 |
-| Search 分层 | **已实现目标/修订生命周期分层**：`SearchResultsController` 是无 QObject/Widget/EditorTab 依赖的结果会话值状态，独占 target、revision、stale/incomplete；MainWindow 解析 DocumentId 并处理正文变化、关闭、索引完成和导航；Dock 只呈现 model/delegate、提取点击行并发出带 revision 的意图 | 后续新增搜索 provider 只提交 canonical model/preview，不在 Dock 新增文档生命周期或模式特判 | 搜索门禁覆盖单/多文件、Text/Hex、S1/S2/S3、紧凑行高、失效和索引后装饰；架构脚本禁止 EditorTab/revision watch 回流 Dock/Controller |
-| 静态 Provider/Persistence registry | **内容打开 Provider 已可执行，通用持久化插件仍未实现**：组合根注册 Text S1、Text windowed、Binary Hex windowed、Binary Text windowed；`DocumentOpenWorkflow` 的普通打开和 session 恢复都调用 `IDocumentProvider::open`，不再只消费 descriptor。PersistenceAdapterRegistry 按优先级返回强类型 `DocumentPersistence` 描述符；Secure 打开/保存仍经安全服务 port | 新内容呈现可注册 executable provider；新增完全不同的持久化格式仍需先扩展 adapter 的 load/save/conflict/recovery 合同，不能声称今天已零修改接入 | 测试 Provider 首帧前零实例且随后通过生产 EditorTab 实际打开 fixture；Binary Text 恢复、ON/OFF 统一打开入口通过；不冒充完整持久化插件完成 |
+| DocumentState/Capabilities/typed position | **目标状态真值已实现**：`DocumentSession` 唯一持有 DocumentId、location、origin、persistence、content kind、security class、capabilities、revision、dirty、恢复路径、安全 backing path 和遮罩/迁移状态；不暴露可变引用，EditorTab 不保留平行字段。SourceBytePosition/Range 与 EditorPosition 不可互换；窗口化只读选择由 ReadOnlySelectionModel 唯一持有 | presentation window、mmap 和编辑器控件状态继续由具体 Provider 持有，不复制成第二份领域真值；EditorTab 通过内容/会话/打开/搜索四个 port 投影能力 | lifecycle 原子转换、revision stale、反向/连续 selection owner、连续复制、Plain/Secure 工具能力已通过 |
+| Search 分层 | **已实现目标/修订生命周期分层**：`SearchResultsController` 独占 target、revision、stale/incomplete；`SearchSession` 独占 query/scope/generation/cancel/pending/skip；FindReplaceDialog 只依赖 DocumentSearchSurface，不识别 EditorTab；MainWindow 按 DocumentId 解析可见标签；Dock 只呈现 model/delegate 并发出导航意图 | 后续新增搜索 provider 只提交 canonical model/preview，不在 Dock 新增文档生命周期或模式特判 | 搜索门禁覆盖单/多文件、Text/Hex、S1/S2/S3、紧凑行高、失效、取消、重复执行和索引后装饰；架构脚本禁止具体 Widget/revision watch 回流 Dock/Controller/Dialog |
+| 静态 Provider/Persistence registry | **内容打开 Provider 与保存路由均可执行**：组合根注册 Text S1、Text windowed、Binary Hex windowed、Binary Text windowed；普通打开和 session 恢复都调用 `IDocumentProvider::open`。PersistenceAdapterRegistry 提供 typed `saveFor`；Plain adapter 承担 snapshot/原子替换/冲突/commit，Secure adapter 经安全 port 承担保存与转换 | 新内容呈现可注册 executable provider；新增持久化格式可复用 save 合同，但仍需显式实现自身 open/recovery/credential 行为，不能声称任意格式零代码接入 | 测试 Provider/adapter 首帧前零实例；生产 Plain 连续两次保存、外部冲突 fail-closed、Binary Text 恢复、ON/OFF 统一打开入口通过 |
 | DocumentTool/AnalysisArtifact | **已实现扩展合同，未实现用户 AI 功能**：EditorTab 可按明确字节预算创建不含路径的不可变 snapshot；registry 在 factory 实例化前统一检查注册、数据暴露、Accounts/锁定、取消，并校验 artifact/proposal 的 id 与 revision | 真实工具以后只注册 descriptor/factory，经组合根统一调用，不读取 EditorTab/MainWindow；大文档必须继续采用有界选区或后续流式 reader | 生产组合链验证首次运行才实例化 Tool；Echo/StaticGraph、Plain/Secure 等价、Accounts denied、取消、预算拒绝和 stale 已通过；未宣称 AI 可用 |
 | `IInferenceProvider`、本地/远程 AI、模型 manifest | **已实现 port/schema/registry，未实现 adapter**；核心无模型运行时依赖 | 真实 Provider 另立功能批次和供应链准入 | 20 个未使用 Provider 零实例；只能声称扩展合同可接入 |
 | 账号秘密隔离 | SecretLease、受控剪贴板和 AccountService 保持独立；普通加密文档仍复用 Document/EditorProvider 路径，Accounts 不成为通用 DocumentTool target | 继续把账号结构化交互限制在 AccountsWorkspace 和安全服务 port；工具策略默认拒绝 secret | Accounts contract、KDBX ON 正式 GUI、Plain/Secure 文档工具等价共同通过；不夸大普通文档运行态秘密等级 |
@@ -1801,7 +1801,7 @@ CTest 注册到具体 QtTest 函数，而不是只注册包含大量场景的可
 
 ## 15. 现有代码逐项改造
 
-本节是后续实现清单。重构期间允许适配器临时桥接旧接口，但任何新功能不得继续扩展 VaultDock、`.nsk` 或 PatchList 生产路径。
+本节记录目标职责而不是要求类名逐字存在。2026-08-27 的本轮完成映射与最终证据以 `ARCHITECTURE_CONVERGENCE.md` 第 8 节为准；下表中的 `SaveRouter`、`SecuritySessionController` 等名称表示职责边界，不得把尚未存在的同名类写成已实现事实。任何新功能不得继续扩展 VaultDock、`.nsk` 或 PatchList 生产路径。
 
 ### 15.1 MainWindow 和用户命令
 
@@ -1815,7 +1815,7 @@ CTest 注册到具体 QtTest 函数，而不是只注册包含大量场景的可
 | `saveAsFile()` | 调用统一 `SaveAsCommand`，对话框选择 Secure/Text/Raw Binary | 转换后更新路径和 PersistenceKind；不删除源文件 |
 | `toggleHexViewMode()` | 改为 `ReopenPresentationCommand(Text/Hex)` | 仅改变解释；脏文档有保存/放弃/取消保护 |
 | `syncL2SensitiveActions()` | 改为通用 `CommandStateController`，依据 DocumentCapabilities | S1/S2/S3/B1/B2/B3/Account 均正确启停 |
-| `openSecureNote()`、`saveSecureTab()`、`secureTitleFrom()` | 删除；安全文档走普通 Document/SaveRouter | MainWindow 不知道 KDBX Entry 或 FileKey |
+| 安全文档打开/保存/title 协调 | UI application controller 只处理凭据/冲突/对话框，通过 `ISecureDocumentPersistence` 与 `SecuritySessionPort` 调用；不得包含或构造具体安全 service/factory | MainWindow 不知道 KDBX Entry、FileKey、DPAPI blob 或供应商 API；架构门禁禁止具体头文件回流 |
 | `lockSecureDocuments()`、`maskSecureDocuments()` | 合并为 `SecuritySessionController::endSession/handleLocked` | 一个全局状态转换，不逐标签操作 Vault |
 | `m_vaultDock`/`createDock()` 中 Vault 创建 | 删除；SearchResultsDock 保留，新增中央 AccountsWorkspace | 主界面无保险箱 Dock |
 | `m_secureAutosaveTimer` | 合并为按 DocumentCapabilities 调度的 DraftCoordinator | 安全、明文恢复使用同一队列但不同 writer |

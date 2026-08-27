@@ -124,7 +124,7 @@ void driveIdentityCreationDialog(MainWindow *window)
                 password->setText(QStringLiteral("correct horse battery staple"));
                 confirmation->setText(QStringLiteral("correct horse battery staple"));
                 driver->setProperty("stage", 1);
-                QTest::mouseClick(ok, Qt::LeftButton);
+                ok->click();
                 return;
             }
         } else if (dialog && stage == 1) {
@@ -147,7 +147,7 @@ void driveIdentityCreationDialog(MainWindow *window)
                                     QStringLiteral("complete"));
                 driver->stop();
                 driver->deleteLater();
-                QTest::mouseClick(ok, Qt::LeftButton);
+                ok->click();
                 return;
             }
         }
@@ -1150,7 +1150,10 @@ private slots:
         QAction *lockAction = actionWithText(window.get(), QStringLiteral("立即锁定"));
         QVERIFY(lockAction);
         lockAction->trigger();
-        QVERIFY(tab->isSecureDocumentMasked());
+        QVERIFY2(tab->isSecureDocumentMasked(),
+                 qPrintable(QStringLiteral("manual lock did not mask; enabled=%1 status=%2")
+                                .arg(lockAction->isEnabled())
+                                .arg(window->statusBar()->currentMessage())));
         QCOMPARE(QApplication::clipboard()->text(), externalReplacement);
 #endif
 

@@ -12,14 +12,15 @@
 #include "AsyncSerialQueue.h"
 #include "AsyncUiOperation.h"
 #include "VaultDock.h"
-#include "SecureDocumentService.h"
-#include "SecurityServiceFactory.h"
-#include "SecuritySessionService.h"
+#include "SecureDocumentContract.h"
+#include "SecuritySessionPort.h"
 #include "AppComposition.h"
 #include "FileCredentialDialog.h"
 #include "SensitiveText.h"
 #include "CommandRegistry.h"
 #include "DocumentOpenWorkflow.h"
+#include "SecureDocumentPersistencePort.h"
+#include "SaveAsDialog.h"
 
 #include <QTabWidget>
 #include <QTabBar>
@@ -99,11 +100,12 @@
 
 void MainWindow::ensureSecurityServicesCreated()
 {
-    if (m_securitySession && m_secureDocuments)
+    if (m_securitySession && m_securePersistence)
         return;
-    SecurityServiceBundle services = m_composition->createSecurityServices();
-    m_securitySession = std::move(services.session);
-    m_secureDocuments = std::move(services.documents);
+    AppComposition::SecurityRuntime runtime =
+        m_composition->createSecurityRuntime();
+    m_securitySession = std::move(runtime.session);
+    m_securePersistence = runtime.documents;
 }
 void MainWindow::ensureFindDialogCreated()
 {
@@ -127,13 +129,13 @@ bool MainWindow::ensureSecuritySessionInteractive()
 {
     ensureSecurityServicesCreated();
     if (!m_securitySession || !m_securitySession->available()
-        || !m_secureDocuments || !m_secureDocuments->available()) {
+        || !m_securePersistence || !m_securePersistence->available()) {
         QMessageBox::critical(this, QStringLiteral("安全功能不可用"),
                               QStringLiteral("当前构建未包含 KDBX 安全后端。"));
         return false;
     }
     const auto restoreMaskedTabs = [this]() {
-        if (m_secureDocuments) {
+        if (m_securePersistence) {
             const int activeIndex = m_tabs ? m_tabs->currentIndex() : -1;
             for (int i = 0; m_tabs && i < m_tabs->count(); ++i) {
                 auto *masked = qobject_cast<EditorTab *>(m_tabs->widget(i));
@@ -142,7 +144,7 @@ bool MainWindow::ensureSecuritySessionInteractive()
                     continue;
                 }
                 const QString backing = masked->filePath().isEmpty()
-                                            ? masked->autosavePath() : masked->filePath();
+                                            ? masked->secureBackingPath() : masked->filePath();
                 if (backing.isEmpty() || !QFileInfo::exists(backing))
                     continue;
                 SecureDocumentSnapshot restored;
@@ -150,7 +152,7 @@ bool MainWindow::ensureSecuritySessionInteractive()
                     this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
                     QStringLiteral("正在恢复安全文档"),
                     [this, backing, &restored] {
-                        return m_secureDocuments->open(backing, &restored);
+                        return m_securePersistence->open(backing, &restored);
                     });
                 if (!restoreError.isError()) {
                     adoptSecureSnapshot(restored, masked);
@@ -303,7 +305,7 @@ bool MainWindow::ensureSecuritySessionInteractive()
 void MainWindow::newFile()
 {
     ensureSecurityServicesCreated();
-    if (!m_secureDocuments || !m_secureDocuments->available()) {
+    if (!m_securePersistence || !m_securePersistence->available()) {
         addNewTab();
         return;
     }
@@ -313,7 +315,7 @@ void MainWindow::newFile()
     const VaultError error = runSerializedSecurityOperation(
         this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
         QStringLiteral("正在建立加密草稿"),
-        [this, &snapshot] { return m_secureDocuments->newDraft(&snapshot); });
+        [this, &snapshot] { return m_securePersistence->newDraft(&snapshot); });
     if (error.isError()) {
         QMessageBox::critical(this, QStringLiteral("无法新建文档"), error.userMessage);
         return;
@@ -321,7 +323,7 @@ void MainWindow::newFile()
     auto *tab = addNewTab();
     tab->initializeSecureDocument(snapshot.documentId, snapshot.title,
                                   snapshot.text, snapshot.filePath);
-    tab->setAutosavePath(snapshot.backingPath);
+    tab->setSecureBackingPath(snapshot.backingPath);
     m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
     statusBar()->showMessage(QStringLiteral("已新建文档"), 1800);
 }
@@ -524,7 +526,7 @@ QString MainWindow::secureTitleFrom(EditorTab *tab)
 
 bool MainWindow::saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool showErrors)
 {
-    if (!tab || !tab->isSecureDocument() || !m_secureDocuments || !m_securitySession)
+    if (!tab || !tab->isSecureDocument() || !m_securePersistence || !m_securitySession)
         return false;
     if (tab->isSecureDocumentMasked()) {
         if (showErrors)
@@ -544,7 +546,7 @@ bool MainWindow::saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool
         }
     }
 
-    const DiskFileState diskState = m_secureDocuments->externalFileState(
+    const DiskFileState diskState = m_securePersistence->externalFileState(
         tab->secureDocumentId());
     if (diskState == DiskFileState::Changed
         || diskState == DiskFileState::Missing
@@ -568,40 +570,20 @@ bool MainWindow::saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool
     // file. Ordinary Save commits that same persistence kind silently; only
     // Save As chooses a portable path or converts the document format.
     const QString targetPath;
-    VaultError error;
-    if (tab->isSecureBinaryDocument()) {
-        QByteArray body;
-        QString exportError;
-        if (!tab->exportBinaryPayloadBytes(&body, &exportError)) {
-            if (showErrors)
-                QMessageBox::critical(this, QStringLiteral("加密保存失败"), exportError);
-            return false;
-        }
+    SecurePersistencePayload payload;
+    VaultError error = m_securePersistence->capture(tab, &payload);
+    if (!error.isError()) {
         error = runSerializedSecurityOperation(
             this, AsyncTaskType::SecureSave,
             showErrors ? AsyncTaskPriority::High : AsyncTaskPriority::Low,
             showErrors ? QStringLiteral("正在安全保存")
                        : QStringLiteral("正在保存加密恢复点"),
-            [this, tab, &body, title, targetPath, showErrors] {
-                return m_secureDocuments->saveBinary(
-                    tab->secureDocumentId(), body, title, targetPath, showErrors);
+            [this, &payload, title, targetPath, showErrors] {
+                return m_securePersistence->saveExisting(
+                    payload, title, targetPath, showErrors);
             }, showErrors);
-        scrubByteArray(body);
-    } else {
-        QString body = tab->editor()->text();
-        error = runSerializedSecurityOperation(
-            this, AsyncTaskType::SecureSave,
-            showErrors ? AsyncTaskPriority::High : AsyncTaskPriority::Low,
-            showErrors ? QStringLiteral("正在安全保存")
-                       : QStringLiteral("正在保存加密恢复点"),
-            [this, tab, &body, title, targetPath, showErrors] {
-                return m_secureDocuments->save(
-                    tab->secureDocumentId(), body, title, targetPath, showErrors);
-            }, showErrors);
-        if (!body.isEmpty())
-            body.fill(QChar(0));
-        body.clear();
     }
+    payload.clear();
     if (error.isError()) {
         QString recoveryError;
         const bool recovered = checkpointSecureTab(tab, &recoveryError);
@@ -635,7 +617,8 @@ bool MainWindow::saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool
         return false;
     }
     tab->setSecureDocumentTitle(title);
-    tab->setAutosavePath(m_secureDocuments->backingPath(tab->secureDocumentId()));
+    tab->setSecureBackingPath(
+        m_securePersistence->backingPath(tab->secureDocumentId()));
     tab->setModified(false);
     const int index = m_tabs->indexOf(tab);
     if (index >= 0)
@@ -650,42 +633,23 @@ bool MainWindow::checkpointSecureTab(EditorTab *tab, QString *errorMessage)
     if (errorMessage)
         errorMessage->clear();
     if (!tab || !tab->isSecureDocument() || tab->isSecureDocumentMasked()
-        || !m_secureDocuments) {
+        || !m_securePersistence) {
         if (errorMessage)
             *errorMessage = QStringLiteral("文档当前不可恢复。");
         return false;
     }
 
-    VaultError error;
-    if (tab->isSecureBinaryDocument()) {
-        QByteArray body;
-        QString exportError;
-        if (!tab->exportBinaryPayloadBytes(&body, &exportError)) {
-            if (errorMessage)
-                *errorMessage = exportError;
-            return false;
-        }
+    SecurePersistencePayload payload;
+    VaultError error = m_securePersistence->capture(tab, &payload);
+    if (!error.isError()) {
         error = runSerializedSecurityOperation(
             this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
             QStringLiteral("正在建立本机加密恢复点"),
-            [this, tab, &body] {
-                return m_secureDocuments->checkpointBinary(
-                    tab->secureDocumentId(), body);
+            [this, &payload] {
+                return m_securePersistence->checkpoint(payload);
             }, false);
-        scrubByteArray(body);
-    } else {
-        QString body = tab->editor()->text();
-        error = runSerializedSecurityOperation(
-            this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
-            QStringLiteral("正在建立本机加密恢复点"),
-            [this, tab, &body] {
-                return m_secureDocuments->checkpointText(
-                    tab->secureDocumentId(), body);
-            }, false);
-        if (!body.isEmpty())
-            body.fill(QChar(0));
-        body.clear();
     }
+    payload.clear();
     if (error.isError() && errorMessage)
         *errorMessage = error.userMessage;
     return !error.isError();
@@ -693,13 +657,13 @@ bool MainWindow::checkpointSecureTab(EditorTab *tab, QString *errorMessage)
 
 void MainWindow::closeSecureDocumentOnSecurityLane(const QUuid &documentId)
 {
-    if (!m_secureDocuments || documentId.isNull())
+    if (!m_securePersistence || documentId.isNull())
         return;
     (void)runSerializedSecurityOperation(
         this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
         QStringLiteral("正在关闭安全文档"),
         [this, documentId] {
-            m_secureDocuments->close(documentId);
+            m_securePersistence->close(documentId);
             return VaultError{};
         },
         false);
@@ -707,13 +671,13 @@ void MainWindow::closeSecureDocumentOnSecurityLane(const QUuid &documentId)
 
 void MainWindow::closeAllSecureDocumentsOnSecurityLane()
 {
-    if (!m_secureDocuments)
+    if (!m_securePersistence)
         return;
     (void)runSerializedSecurityOperation(
         this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
         QStringLiteral("正在清理安全文档"),
         [this] {
-            m_secureDocuments->closeAll();
+            m_securePersistence->closeAll();
             return VaultError{};
         },
         false);
@@ -931,13 +895,13 @@ void MainWindow::maskSecureDocuments()
 EditorTab *MainWindow::adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
                                           EditorTab *reuseTab)
 {
-    if (!m_secureDocuments || !m_secureDocuments->available())
+    if (!m_securePersistence || !m_securePersistence->available())
         return nullptr;
     showDocumentWorkspace();
     EditorTab *tab = reuseTab ? reuseTab : addNewTab();
     if (reuseTab && reuseTab->isSecureDocument()
         && reuseTab->secureDocumentId() != snapshot.documentId
-        && m_secureDocuments) {
+        && m_securePersistence) {
         closeSecureDocumentOnSecurityLane(reuseTab->secureDocumentId());
     }
     if (snapshot.payloadKind == SecureDocumentPayloadKind::Binary) {
@@ -962,7 +926,7 @@ EditorTab *MainWindow::adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
             snapshot.text.fill(QChar(0));
         snapshot.text.clear();
     }
-    tab->setAutosavePath(snapshot.backingPath);
+    tab->setSecureBackingPath(snapshot.backingPath);
     tab->setModified(snapshot.recoveredUnsaved);
     const int index = m_tabs->indexOf(tab);
     if (index >= 0) {
@@ -983,7 +947,7 @@ EditorTab *MainWindow::adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
 bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
 {
     ensureSecurityServicesCreated();
-    if (!m_secureDocuments || !m_secureDocuments->available())
+    if (!m_securePersistence || !m_securePersistence->available())
         return false;
     const QString absolutePath = QFileInfo(path).absoluteFilePath();
     for (int i = 0; i < m_tabs->count(); ++i) {
@@ -992,7 +956,7 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
             continue;
 
         const QString backing = openTab->filePath().isEmpty()
-                                    ? openTab->autosavePath() : openTab->filePath();
+                                    ? openTab->secureBackingPath() : openTab->filePath();
         if (QFileInfo(backing).absoluteFilePath().compare(absolutePath,
                                                           Qt::CaseInsensitive) == 0) {
             showDocumentWorkspace();
@@ -1008,7 +972,7 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
     VaultError error = runSerializedSecurityOperation(
         this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
         QStringLiteral("正在打开安全文档"),
-        [this, path, &snapshot] { return m_secureDocuments->open(path, &snapshot); });
+        [this, path, &snapshot] { return m_securePersistence->open(path, &snapshot); });
     if (!error.isError()) {
         if (!adoptSecureSnapshot(snapshot, reuseTab))
             return false;
@@ -1039,7 +1003,7 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
                 this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
                 QStringLiteral("正在恢复安全文档"),
                 [this, path, &recoveryText, &snapshot] {
-                    return m_secureDocuments->openWithRecovery(path, recoveryText,
+                    return m_securePersistence->openWithRecovery(path, recoveryText,
                                                                &snapshot);
                 });
             recoveryText.fill(QChar(0));
@@ -1054,7 +1018,7 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
                 this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
                 QStringLiteral("正在解锁安全文档"),
                 [this, path, &buffer, &snapshot] {
-                    return m_secureDocuments->openWithPassphrase(path, buffer, &snapshot);
+                    return m_securePersistence->openWithPassphrase(path, buffer, &snapshot);
                 });
             buffer.clear();
         }
@@ -1081,7 +1045,7 @@ bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
     if (persistenceAdapter
         && persistenceAdapter->persistence == DocumentPersistence::SecureFile) {
         ensureSecurityServicesCreated();
-        if (!m_secureDocuments || !m_secureDocuments->available()) {
+        if (!m_securePersistence || !m_securePersistence->available()) {
             QMessageBox::critical(this, QStringLiteral("安全文件不可用"),
                                   QStringLiteral("当前构建未包含 KDBX 安全后端。"));
             return false;
@@ -1089,7 +1053,7 @@ bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
         QString documentType;
         QUuid documentId;
         SecurityIdentityParameters fileParameters;
-        const VaultError probe = m_secureDocuments->inspectFile(
+        const VaultError probe = m_securePersistence->inspectFile(
             path, &documentType, &documentId, &fileParameters);
         if (!probe.isError() && documentType == QStringLiteral("SecureDocument")) {
             // A copied or hard-linked .nsafe still carries the same document id.
@@ -1250,7 +1214,7 @@ bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
     showDocumentWorkspace();
     EditorTab *tab = reuseTab ? reuseTab : addNewTab();
     if (reuseTab && reuseTab->isSecureDocument()) {
-        if (m_secureDocuments)
+        if (m_securePersistence)
             closeSecureDocumentOnSecurityLane(reuseTab->secureDocumentId());
         // External Open may reuse the single empty default secure draft. The
         // reused tab must stop being a secure document before ordinary routing.
@@ -1348,13 +1312,18 @@ bool MainWindow::saveFile()
     case ExternalSaveDisposition::Proceed:
         break;
     }
-    QString err;
-    if (!tab->saveFile(&err)) {
+    const PersistenceSaveRequest request{
+        tab->filePath(), {}, tab->persistenceBaseline(), true};
+    const PersistenceResult result = m_composition->persistenceAdapters().saveFor(
+        DocumentPersistence::PlainFile, tab, request);
+    if (!result.succeeded()) {
+        const QString err = result.error;
         QString detail = err.isEmpty() ? tab->filePath() : QStringLiteral("%1\n\n详细信息：%2").arg(tab->filePath(), err);
         QMessageBox::warning(this, QStringLiteral("错误"),
                              QStringLiteral("无法保存文件：\n%1").arg(detail));
         return false;
     }
+    m_session->discardRecovery(tab);
     return true;
 }
 
@@ -1410,10 +1379,10 @@ MainWindow::ExternalSaveDisposition MainWindow::resolveExternalSaveConflict(Edit
 MainWindow::ExternalSaveDisposition MainWindow::resolveSecureExternalSaveConflict(
     EditorTab *tab)
 {
-    if (!tab || !tab->isSecureDocument() || !m_secureDocuments
-        || !m_secureDocuments->available())
+    if (!tab || !tab->isSecureDocument() || !m_securePersistence
+        || !m_securePersistence->available())
         return ExternalSaveDisposition::Cancelled;
-    const DiskFileState state = m_secureDocuments->externalFileState(
+    const DiskFileState state = m_securePersistence->externalFileState(
         tab->secureDocumentId());
 
     QMessageBox box(QMessageBox::Warning,
@@ -1458,15 +1427,15 @@ MainWindow::ExternalSaveDisposition MainWindow::resolveSecureExternalSaveConflic
 
 bool MainWindow::reloadSecureTabFromDisk(EditorTab *tab)
 {
-    if (!tab || !tab->isSecureDocument() || !m_secureDocuments
-        || !m_secureDocuments->available())
+    if (!tab || !tab->isSecureDocument() || !m_securePersistence
+        || !m_securePersistence->available())
         return false;
     SecureDocumentSnapshot snapshot;
     const VaultError error = runSerializedSecurityOperation(
         this, AsyncTaskType::SecureOpen, AsyncTaskPriority::Highest,
         QStringLiteral("正在重新加载安全文档"),
         [this, tab, &snapshot] {
-            return m_secureDocuments->reload(tab->secureDocumentId(), &snapshot);
+            return m_securePersistence->reload(tab->secureDocumentId(), &snapshot);
         });
     if (error.isError()) {
         QMessageBox box(QMessageBox::Critical, QStringLiteral("无法重新加载安全文档"),
@@ -1549,10 +1518,6 @@ bool MainWindow::saveAsFile()
     auto *tab = currentTab();
     if (!tab)
         return false;
-    const QString secureFilter = QStringLiteral("Notepad Safe 安全文档 (*.nsafe)");
-    const QString plainFilter = QStringLiteral("未加密文件 (*)");
-    QString selectedFilter = tab->isSecureDocument() ? secureFilter
-                                                      : plainFilter;
     QString suggestion;
     if (!tab->filePath().isEmpty())
         suggestion = tab->filePath();
@@ -1560,102 +1525,16 @@ bool MainWindow::saveAsFile()
         suggestion = secureTitleFrom(tab) + (tab->isSecureDocument()
                                                   ? QStringLiteral(".nsafe")
                                                   : QStringLiteral(".txt"));
-    QDialog saveAsDialog(this);
-    saveAsDialog.setObjectName(QStringLiteral("saveAsDialog"));
-    saveAsDialog.setWindowTitle(QStringLiteral("另存为"));
-    saveAsDialog.resize(940, 650);
-    auto *saveAsLayout = new QVBoxLayout(&saveAsDialog);
-    saveAsLayout->setContentsMargins(10, 10, 10, 10);
-    saveAsLayout->setSpacing(8);
-
-    auto *fileDialog = new QFileDialog(
-        &saveAsDialog, QString(), suggestion,
-        secureFilter + QStringLiteral(";;") + plainFilter);
-    fileDialog->setObjectName(QStringLiteral("saveAsFileDialog"));
-    fileDialog->setWindowFlags(Qt::Widget);
-    fileDialog->setAcceptMode(QFileDialog::AcceptSave);
-    fileDialog->setFileMode(QFileDialog::AnyFile);
-    // The product requires one dialog with an explicit, always-visible
-    // encryption consequence. Native dialogs do not allow that content.
-    fileDialog->setOption(QFileDialog::DontUseNativeDialog, true);
-    fileDialog->setLabelText(QFileDialog::LookIn, QStringLiteral("位置："));
-    fileDialog->setLabelText(QFileDialog::FileName, QStringLiteral("文件名："));
-    fileDialog->setLabelText(QFileDialog::FileType, QStringLiteral("保存类型："));
-    fileDialog->setLabelText(QFileDialog::Accept, QStringLiteral("保存"));
-    fileDialog->setLabelText(QFileDialog::Reject, QStringLiteral("取消"));
-    fileDialog->selectNameFilter(selectedFilter);
-    saveAsLayout->addWidget(fileDialog, 1);
-
-    auto *securityNotice = new QLabel(&saveAsDialog);
-    securityNotice->setObjectName(QStringLiteral("saveAsSecurityNotice"));
-    securityNotice->setWordWrap(true);
-    securityNotice->setContentsMargins(8, 6, 8, 6);
-    securityNotice->setMinimumHeight(42);
-    saveAsLayout->addWidget(securityNotice);
-    const QString plainSuffix = tab->isBinaryDocument()
-                                    ? QStringLiteral("bin") : QStringLiteral("txt");
-    const auto updateSaveAsNotice = [fileDialog, securityNotice, secureFilter,
-                                     plainSuffix](const QString &filter) {
-        if (filter == secureFilter) {
-            fileDialog->setDefaultSuffix(QStringLiteral("nsafe"));
-            securityNotice->setText(QStringLiteral(
-                "将保存为离线加密的 Notepad Safe 文档。普通保存会继续保持此格式。"));
-            securityNotice->setStyleSheet(QStringLiteral(
-                "QLabel { color: #246b45; background: #eaf7ef; border: 1px solid #b9dfc8; "
-                "border-radius: 4px; }"));
-            const QStringList selected = fileDialog->selectedFiles();
-            if (!selected.isEmpty()
-                && !selected.constFirst().endsWith(QStringLiteral(".nsafe"),
-                                                    Qt::CaseInsensitive)) {
-                fileDialog->selectFile(selected.constFirst()
-                                       + QStringLiteral(".nsafe"));
-            }
-        } else {
-            fileDialog->setDefaultSuffix(plainSuffix);
-            securityNotice->setText(QStringLiteral(
-                "将创建未加密文件，其他程序可以直接读取其内容。普通保存会继续保持此格式。"));
-            securityNotice->setStyleSheet(QStringLiteral(
-                "QLabel { color: #7a4b00; background: #fff5dd; border: 1px solid #e8c77a; "
-                "border-radius: 4px; }"));
-
-            // .nsafe is reserved for KDBX-backed encrypted documents. When a
-            // user changes the explicit type selector, update the inherited
-            // suggestion immediately instead of silently writing plaintext
-            // behind an encrypted-looking extension.
-            const QStringList selected = fileDialog->selectedFiles();
-            if (!selected.isEmpty()
-                && selected.constFirst().endsWith(QStringLiteral(".nsafe"),
-                                                   Qt::CaseInsensitive)) {
-                QString plainName = selected.constFirst();
-                plainName.chop(QStringLiteral(".nsafe").size());
-                plainName += QLatin1Char('.') + plainSuffix;
-                fileDialog->selectFile(plainName);
-            }
-        }
-    };
-    connect(fileDialog, &QFileDialog::filterSelected,
-            &saveAsDialog, updateSaveAsNotice);
-    connect(fileDialog, &QFileDialog::accepted,
-            &saveAsDialog, &QDialog::accept);
-    connect(fileDialog, &QFileDialog::rejected,
-            &saveAsDialog, &QDialog::reject);
-    updateSaveAsNotice(selectedFilter);
-
-    if (saveAsDialog.exec() != QDialog::Accepted
-        || fileDialog->selectedFiles().isEmpty()) {
+    const auto selection = SaveAsDialog::choose(
+        this, suggestion,
+        tab->isSecureDocument() ? DocumentPersistence::SecureFile
+                                : DocumentPersistence::PlainFile,
+        tab->isBinaryDocument());
+    if (!selection)
         return false;
-    }
-    QString fileName = fileDialog->selectedFiles().constFirst();
-    selectedFilter = fileDialog->selectedNameFilter();
-
-    // The explicit type selector is authoritative. An extension is a display
-    // hint only and must never silently change the security boundary.
-    const bool saveSecure = selectedFilter == secureFilter;
-    if (!saveSecure
-        && fileName.endsWith(QStringLiteral(".nsafe"), Qt::CaseInsensitive)) {
-        fileName.chop(QStringLiteral(".nsafe").size());
-        fileName += QLatin1Char('.') + plainSuffix;
-    }
+    QString fileName = selection->path;
+    const bool saveSecure = selection->persistence
+        == DocumentPersistence::SecureFile;
     if (saveSecure) {
         const bool binaryPayload = tab->isBinaryDocument();
         if (tab->isLargeDocument() && !binaryPayload) {
@@ -1665,84 +1544,42 @@ bool MainWindow::saveAsFile()
                                "当前文本处于大文件模式，未写入任何目标文件。"));
             return false;
         }
-        if (!ensureSecuritySessionInteractive() || !m_secureDocuments)
+        if (!ensureSecuritySessionInteractive() || !m_securePersistence)
             return false;
         if (!fileName.endsWith(QStringLiteral(".nsafe"), Qt::CaseInsensitive))
             fileName += QStringLiteral(".nsafe");
         const QString title = secureTitleFrom(tab);
-        VaultError error;
-        if (binaryPayload) {
-            QByteArray body;
-            QString exportError;
-            if (!tab->exportBinaryPayloadBytes(&body, &exportError)) {
-                QMessageBox::critical(this, QStringLiteral("另存为失败"), exportError);
-                return false;
+        SecurePersistencePayload payload;
+        VaultError error = m_securePersistence->capture(tab, &payload);
+        if (!error.isError() && tab->isSecureDocument()) {
+            error = runSerializedSecurityOperation(
+                this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
+                QStringLiteral("正在另存安全文档"),
+                [this, &payload, title, fileName] {
+                    return m_securePersistence->saveExisting(
+                        payload, title, fileName);
+                });
+            if (!error.isError()) {
+                tab->acceptSecurePersistenceCommit(
+                    tab->secureDocumentId(), title,
+                    QFileInfo(fileName).absoluteFilePath(),
+                    m_securePersistence->backingPath(tab->secureDocumentId()));
             }
-            if (tab->isSecureDocument()) {
-                error = runSerializedSecurityOperation(
-                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
-                    QStringLiteral("正在另存安全文档"),
-                    [this, tab, &body, title, fileName] {
-                        return m_secureDocuments->saveBinary(
-                            tab->secureDocumentId(), body, title, fileName);
-                    });
-                if (!error.isError()) {
-                    tab->setFilePath(QFileInfo(fileName).absoluteFilePath());
-                    tab->setAutosavePath(
-                        m_secureDocuments->backingPath(tab->secureDocumentId()));
-                    tab->setSecureDocumentTitle(title);
-                    tab->setModified(false);
-                }
-            } else {
-                SecureDocumentSnapshot snapshot;
-                error = runSerializedSecurityOperation(
-                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
-                    QStringLiteral("正在创建安全文档"),
-                    [this, &body, title, fileName, &snapshot] {
-                        return m_secureDocuments->saveAsSecureBinary(
-                            body, title, fileName, &snapshot);
-                    });
-                if (!error.isError() && !adoptSecureSnapshot(snapshot, tab)) {
-                    scrubByteArray(body);
-                    return false;
-                }
-            }
-            scrubByteArray(body);
         } else {
-            QString body = tab->editor()->text();
-            if (tab->isSecureDocument()) {
-                error = runSerializedSecurityOperation(
-                    this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
-                    QStringLiteral("正在另存安全文档"),
-                    [this, tab, &body, title, fileName] {
-                        return m_secureDocuments->save(
-                            tab->secureDocumentId(), body, title, fileName);
-                    });
-                if (!error.isError()) {
-                    tab->setFilePath(QFileInfo(fileName).absoluteFilePath());
-                    tab->setAutosavePath(
-                        m_secureDocuments->backingPath(tab->secureDocumentId()));
-                    tab->setSecureDocumentTitle(title);
-                    tab->setModified(false);
-                }
-            } else {
+            if (!error.isError()) {
                 SecureDocumentSnapshot snapshot;
                 error = runSerializedSecurityOperation(
                     this, AsyncTaskType::SecureSave, AsyncTaskPriority::Highest,
                     QStringLiteral("正在创建安全文档"),
-                    [this, &body, title, fileName, &snapshot] {
-                        return m_secureDocuments->saveAsSecure(
-                            body, title, fileName, &snapshot);
+                    [this, &payload, title, fileName, &snapshot] {
+                        return m_securePersistence->saveAsSecure(
+                            payload, title, fileName, &snapshot);
                     });
-                if (!error.isError() && !adoptSecureSnapshot(snapshot, tab)) {
-                    body.fill(QChar(0));
+                if (!error.isError() && !adoptSecureSnapshot(snapshot, tab))
                     return false;
-                }
             }
-            if (!body.isEmpty())
-                body.fill(QChar(0));
-            body.clear();
         }
+        payload.clear();
         if (error.isError()) {
             QMessageBox box(QMessageBox::Critical, QStringLiteral("另存为失败"),
                             error.userMessage, QMessageBox::Ok, this);
@@ -1754,36 +1591,23 @@ bool MainWindow::saveAsFile()
         const QUuid previousSecureId = tab->isSecureDocument()
                                            ? tab->secureDocumentId() : QUuid();
         QString err;
-        if (tab->isSecureDocument()) {
-            if (tab->isSecureBinaryDocument()) {
-                QByteArray raw;
-                if (!tab->exportBinaryPayloadBytes(&raw, &err)) {
-                    // export supplied the actionable validation message.
-                } else {
-                    QSaveFile output(fileName);
-                    output.setDirectWriteFallback(false);
-                    const bool written = output.open(QIODevice::WriteOnly)
-                                         && output.write(raw) == raw.size()
-                                         && output.commit();
-                    scrubByteArray(raw);
-                    if (!written)
-                        err = output.errorString().isEmpty()
-                                  ? QStringLiteral("无法原子写入文件。")
-                                  : output.errorString();
-                }
-                if (err.isEmpty() && !openPathUnified(fileName, tab))
-                    err = QStringLiteral("文件已写入，但无法重新打开目标文件。");
-                // Re-enter through the unified opener so the newly created raw
-                // file receives its mmap/Hex backing store and disk baseline.
-            } else if (!tab->exportToFile(fileName)) {
-                err = QStringLiteral("无法写入文件。");
-            } else {
-                if (m_secureDocuments)
-                    closeSecureDocumentOnSecurityLane(previousSecureId);
-                tab->convertToPlainDocument(QFileInfo(fileName).absoluteFilePath());
-            }
-        } else if (!tab->saveAsFile(fileName, &err)) {
-            // err is populated by the text writer.
+        const bool secureBinary = tab->isSecureBinaryDocument();
+        const PersistenceSaveRequest request{
+            fileName, {}, tab->persistenceBaseline(),
+            !tab->isSecureDocument()
+                && sameDiskFilePath(tab->filePath(), fileName)};
+        const PersistenceResult result =
+            m_composition->persistenceAdapters().saveFor(
+                DocumentPersistence::PlainFile, tab, request);
+        if (!result.succeeded()) {
+            err = result.error;
+        } else {
+            m_session->discardRecovery(tab);
+        }
+        if (err.isEmpty() && secureBinary && !openPathUnified(fileName, tab)) {
+            err = QStringLiteral("文件已写入，但无法重新打开目标文件。");
+        } else if (err.isEmpty() && !previousSecureId.isNull()) {
+            closeSecureDocumentOnSecurityLane(previousSecureId);
         }
         if (!err.isEmpty()) {
             QMessageBox::warning(this, QStringLiteral("错误"),

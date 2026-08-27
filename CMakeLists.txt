@@ -131,10 +131,12 @@ target_link_libraries(notepadsafe_file_runtime PUBLIC
 )
 
 add_library(notepadsafe_search_runtime STATIC
+    src/search/SearchSession.h
     src/search/EditableTextSearch.cpp
     src/search/EncodedRegexCompiler.cpp
     src/search/Pcre2Regex.cpp
     src/search/LargeFileSearch.cpp
+    src/search/LargeFileSearchTasks.cpp
 )
 target_include_directories(notepadsafe_search_runtime PUBLIC
     ${CMAKE_SOURCE_DIR}/src/search
@@ -153,6 +155,8 @@ target_link_libraries(notepadsafe_search_runtime PUBLIC
 # Stable product-domain policies. Keep file-tier and draft-storage rules free of
 # QWidget/QScintilla dependencies so they can be tested at exact byte boundaries.
 add_library(notepadsafe_domain STATIC
+    src/domain/DocumentSession.h
+    src/domain/SessionDocumentPort.h
     src/domain/FileTierPolicy.cpp
     src/domain/DocumentToolRegistry.cpp
     src/domain/FeatureRegistry.cpp
@@ -180,7 +184,9 @@ if(WIN32)
 endif()
 
 add_library(notepadsafe_vault STATIC
+    src/vault/SecureDocumentContract.h
     src/vault/SecureBuffer.cpp
+    src/vault/SecuritySessionPort.h
     src/vault/VaultService.cpp
     src/vault/KdbxFormatProbe.cpp
     src/vault/VaultBackendFactory.cpp
@@ -261,9 +267,13 @@ endif()
 # The application and GUI tests must execute the same product objects.  Keep
 # the test harness out of this target; everything below is production code.
 set(NOTEPADSAFE_EDITOR_RUNTIME_SOURCES
-    src/editor/EditorTab.cpp
-    src/editor/EditorTabCommands.cpp
+    src/editor/DocumentSearchSurface.h
+      src/editor/EditorTab.cpp
+      src/editor/EditorTabPersistence.cpp
+      src/editor/EditorTabCommands.cpp
     src/editor/EditorTabLargeDocument.cpp
+    src/editor/EditorTabHex.cpp
+    src/editor/HexProjection.cpp
     src/editor/EditorTabLargeDocumentPersistence.cpp
     src/editor/EditorTabSearch.cpp
     src/editor/VirtualFileView.cpp
@@ -304,13 +314,12 @@ add_library(notepadsafe_session_runtime STATIC
 )
 target_include_directories(notepadsafe_session_runtime PUBLIC
     ${CMAKE_SOURCE_DIR}/src/session
-    ${CMAKE_SOURCE_DIR}/src/editor
+    ${CMAKE_SOURCE_DIR}/src/domain
 )
 target_link_libraries(notepadsafe_session_runtime PUBLIC
     notepadsafe_domain
-    notepadsafe_editor_runtime
+    notepadsafe_recovery_runtime
     Qt6::Core
-    Qt6::Widgets
 )
 
 # Executable document-open adapters sit above the editor surface.  Keeping
@@ -318,6 +327,7 @@ target_link_libraries(notepadsafe_session_runtime PUBLIC
 # collapsing back into one dependency cycle.
 add_library(notepadsafe_document_runtime STATIC
     src/app/DocumentProviderRegistry.cpp
+    src/app/PlainFilePersistence.cpp
 )
 target_include_directories(notepadsafe_document_runtime PUBLIC
     ${CMAKE_SOURCE_DIR}/src/app
@@ -337,10 +347,14 @@ target_link_libraries(notepadsafe_document_runtime PUBLIC
 # compile different implementations.
 add_library(notepadsafe_app STATIC
     src/app/AppComposition.cpp
+    src/app/SecureDocumentPersistence.cpp
+    src/app/SecureDocumentPersistencePort.h
     src/app/StartupCoordinator.cpp
      src/app/CommandRegistry.cpp
-     src/app/DocumentOpenWorkflow.cpp
-     src/window/SensitiveText.cpp
+    src/app/DocumentOpenWorkflow.cpp
+    src/app/DocumentSessionView.cpp
+    src/app/SaveAsDialog.cpp
+    src/app/SensitiveText.cpp
      src/window/FileCredentialDialog.cpp
      src/window/MainWindow.cpp
      src/window/MainWindowCommands.cpp
@@ -354,6 +368,8 @@ add_library(notepadsafe_app STATIC
     src/async/StatusBarTaskWidget.cpp
     src/async/AsyncTaskPanelDialog.cpp
     src/vault/VaultDock.cpp
+    src/vault/VaultDockEntries.cpp
+    src/vault/VaultDockSupport.cpp
 )
 target_include_directories(notepadsafe_app PUBLIC
     ${APP_INCLUDE_DIRS}
@@ -856,6 +872,7 @@ target_include_directories(notepadsafe_gui_test_support PUBLIC
     ${CMAKE_SOURCE_DIR}/tests/gui_smoke
 )
 target_link_libraries(notepadsafe_gui_test_support PUBLIC
+    notepadsafe_document_runtime
     notepadsafe_editor_runtime
     Qt6::Test
 )

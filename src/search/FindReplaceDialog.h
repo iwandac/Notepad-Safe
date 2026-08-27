@@ -5,6 +5,7 @@
 #include <QPointer>
 #include <QUuid>
 #include <QVector>
+#include "SearchSession.h"
 
 class QCheckBox;
 class QLineEdit;
@@ -13,7 +14,7 @@ class QPushButton;
 class QComboBox;
 class QTabWidget;
 class QWidget;
-class EditorTab;
+class DocumentSearchSurface;
 class SearchResultsDock;
 
 // 非模态查找/替换对话框
@@ -22,12 +23,12 @@ class FindReplaceDialog : public QDialog {
 public:
     explicit FindReplaceDialog(QWidget *parent = nullptr);
 
-    void setActiveTab(EditorTab *tab);
+    void setActiveTab(DocumentSearchSurface *tab);
     void setSearchResultsDock(SearchResultsDock *dock);
     void setTabWidget(QTabWidget *tabs);
     // Adds a document opened while an all-open Find All generation is still
     // running. Completed searches remain stable until the user reruns them.
-    void notifyTabOpened(EditorTab *tab);
+    void notifyTabOpened(DocumentSearchSurface *tab);
     void setReplaceMode(bool replace);
     void showFindMode();
     void showReplaceMode();
@@ -77,11 +78,11 @@ private:
     QLabel    *m_statusLabel = nullptr;   // 异步搜索状态提示（L2 搜索中显示"搜索 42%…"）
     QComboBox *m_scopeCombo = nullptr;
 
-    EditorTab *m_tab = nullptr;
+    DocumentSearchSurface *m_tab = nullptr;
     SearchResultsDock *m_resultsDock = nullptr;
     QTabWidget *m_tabWidget = nullptr;
 
-    // 上一个 EditorTab 的 L2 信号连接（切换 tab 时需要 disconnect）
+    // 上一个文档搜索表面的异步信号连接（切换 tab 时断开）
     QMetaObject::Connection m_l2ProgressConn;
     QMetaObject::Connection m_l2PartialConn;
     QMetaObject::Connection m_l2FinishedConn;
@@ -90,20 +91,10 @@ private:
     bool m_navigationInProgress = false;
     bool m_allowNavigationDuringBusy = false;
     bool m_replaceMode = false;
-    int m_multiSearchGeneration = 0;
-    int m_pendingMultiL2 = 0;
+    SearchSession m_searchSession;
     QVector<QMetaObject::Connection> m_multiConnections;
-    QVector<QPointer<EditorTab>> m_multiTabs;
+    QVector<QPointer<DocumentSearchSurface>> m_multiTabs;
     int m_multiNextIndex = 0;
-    QString m_multiPattern;
-    bool m_multiRegex = false;
-    bool m_multiCaseSensitive = false;
-    bool m_multiWholeWord = false;
-    bool m_multiHexBytes = false;
-    int m_multiSkippedTextTargets = 0;
-    int m_multiSkippedLockedTargets = 0;
-    bool m_multiDispatchComplete = false;
-    bool m_multiCancelRequested = false;
 
     void buildUi();
     QString currentFindText() const;
@@ -118,7 +109,7 @@ private:
     void updateQueryUi();
     void insertRegexTemplate(const QString &prefix, const QString &suffix,
                              const QString &placeholder);
-    QList<EditorTab *> openTabs() const;
+    QList<DocumentSearchSurface *> openTabs() const;
     void findAcrossTabs(bool forward);
     void startAllOpenFindAll();
     void dispatchNextMultiTarget(int generation);

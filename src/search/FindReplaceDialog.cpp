@@ -1,5 +1,5 @@
 #include "FindReplaceDialog.h"
-#include "EditorTab.h"
+#include "DocumentSearchSurface.h"
 #include "SearchResultsDock.h"
 #include "SearchResultsModel.h"
 #include "LargeFileSearch.h"
@@ -29,13 +29,13 @@
 #include <utility>
 
 namespace {
-bool isSearchableDocument(EditorTab *tab)
+bool isSearchableDocument(DocumentSearchSurface *tab)
 {
     return tab && !tab->isSecureDocumentMasked()
         && !tab->isSecureDocumentTransitioning();
 }
 
-SearchResultTarget resultTarget(EditorTab *tab)
+SearchResultTarget resultTarget(DocumentSearchSurface *tab)
 {
     return tab ? searchResultTarget(tab->documentState(), tab->fileName())
                : SearchResultTarget{};
@@ -62,22 +62,16 @@ FindReplaceDialog::FindReplaceDialog(QWidget *parent)
 void FindReplaceDialog::clearSensitiveState()
 {
     if (m_l2SearchInProgress) {
-        m_multiCancelRequested = true;
-        for (EditorTab *tab : openTabs())
+        m_searchSession.requestCancel();
+        for (DocumentSearchSurface *tab : openTabs())
             tab->cancelFindAllL2();
     }
-    ++m_multiSearchGeneration;
+    m_searchSession.reset();
     for (const QMetaObject::Connection &connection : std::as_const(m_multiConnections))
         disconnect(connection);
     m_multiConnections.clear();
-    m_pendingMultiL2 = 0;
     m_multiTabs.clear();
     m_multiNextIndex = 0;
-    if (!m_multiPattern.isEmpty())
-        m_multiPattern.fill(QChar(0));
-    m_multiPattern.clear();
-    m_multiDispatchComplete = true;
-    m_multiCancelRequested = false;
     if (m_findEdit)
         m_findEdit->clear();
     if (m_replaceEdit)
@@ -330,7 +324,7 @@ void FindReplaceDialog::buildUi()
     });
 }
 
-void FindReplaceDialog::setActiveTab(EditorTab *tab)
+void FindReplaceDialog::setActiveTab(DocumentSearchSurface *tab)
 {
     // 切换 tab：先断开上一个 EditorTab 的 L2 搜索信号
     QObject::disconnect(m_l2ProgressConn);
@@ -348,10 +342,10 @@ void FindReplaceDialog::setActiveTab(EditorTab *tab)
     if (m_tab) {
         // 连接新 tab 的 L2 异步搜索信号（即使当前是 L1 也连接，切换到 L2 时正常工作）
         m_l2ProgressConn = QObject::connect(
-            m_tab, &EditorTab::findAllL2Progress,
+            m_tab, &DocumentSearchSurface::findAllL2Progress,
             this,  &FindReplaceDialog::onL2FindAllProgress);
         m_l2PartialConn = QObject::connect(
-            m_tab, &EditorTab::findAllL2Partial, this,
+            m_tab, &DocumentSearchSurface::findAllL2Partial, this,
             [this, tab](const QVector<LargeFileSearchMatch> &batch,
                         const QString &, const QString &,
                         TextEncoding encoding, bool bytePositionMode) {
@@ -360,7 +354,7 @@ void FindReplaceDialog::setActiveTab(EditorTab *tab)
                         resultTarget(tab), batch, encoding, bytePositionMode);
             });
         m_l2FinishedConn = QObject::connect(
-            m_tab, &EditorTab::findAllL2Finished,
+            m_tab, &DocumentSearchSurface::findAllL2Finished,
             this,  &FindReplaceDialog::onL2FindAllFinished);
     }
     updateQueryUi();
@@ -383,9 +377,9 @@ void FindReplaceDialog::rerunInvalidatedSearch(
     Q_UNUSED(expectedRevision);
     if (m_l2SearchInProgress)
         return;
-    EditorTab *preferredTarget = nullptr;
+    DocumentSearchSurface *preferredTarget = nullptr;
     if (!preferredDocumentId.isNull()) {
-        for (EditorTab *candidate : openTabs()) {
+        for (DocumentSearchSurface *candidate : openTabs()) {
             if (candidate
                 && candidate->documentState().id == preferredDocumentId) {
                 preferredTarget = candidate;
@@ -416,45 +410,46 @@ void FindReplaceDialog::setTabWidget(QTabWidget *tabs)
     m_tabWidget = tabs;
 }
 
-void FindReplaceDialog::notifyTabOpened(EditorTab *tab)
+void FindReplaceDialog::notifyTabOpened(DocumentSearchSurface *tab)
 {
     if (!tab || !m_l2SearchInProgress || !allOpenScope()
-        || m_multiCancelRequested || m_multiPattern.isEmpty()) {
+        || m_searchSession.cancelRequested()
+        || m_searchSession.query().pattern.isEmpty()) {
         return;
     }
-    for (const QPointer<EditorTab> &known : std::as_const(m_multiTabs)) {
+    for (const QPointer<DocumentSearchSurface> &known : std::as_const(m_multiTabs)) {
         if (known == tab)
             return;
     }
     if (!isSearchableDocument(tab)) {
-        ++m_multiSkippedLockedTargets;
+        m_searchSession.skipLockedTarget();
         if (m_statusLabel) {
             m_statusLabel->setText(
                 QStringLiteral("新打开的锁定文档不属于当前搜索；已跳过 %1 个锁定文档。")
-                    .arg(m_multiSkippedLockedTargets));
+                    .arg(m_searchSession.skippedLockedTargets()));
         }
         return;
     }
-    if (m_multiHexBytes && !tab->isHexPresentation()) {
-        ++m_multiSkippedTextTargets;
+    if (m_searchSession.query().hexBytes && !tab->isHexPresentation()) {
+        m_searchSession.skipTextTarget();
         if (m_statusLabel) {
             m_statusLabel->setText(
                 QStringLiteral("新打开的文本文件不属于当前字节搜索；已跳过 %1 个文本文件。")
-                    .arg(m_multiSkippedTextTargets));
+                    .arg(m_searchSession.skippedTextTargets()));
         }
         return;
     }
 
-    const bool needsRestart = m_multiDispatchComplete;
+    const bool needsRestart = m_searchSession.dispatchComplete();
     m_multiTabs.push_back(tab);
-    m_multiDispatchComplete = false;
+    m_searchSession.setDispatchComplete(false);
     if (m_statusLabel) {
         m_statusLabel->setText(
             QStringLiteral("已将新打开的文件加入搜索；当前共 %1 个目标…")
                 .arg(m_multiTabs.size()));
     }
     if (needsRestart) {
-        const int generation = m_multiSearchGeneration;
+        const int generation = m_searchSession.generation();
         QTimer::singleShot(0, this, [this, generation]() {
             dispatchNextMultiTarget(generation);
         });
@@ -597,7 +592,7 @@ void FindReplaceDialog::updateQueryUi()
         }
     }
     int searchableTargetCount = 0;
-    for (EditorTab *tab : openTabs()) {
+    for (DocumentSearchSurface *tab : openTabs()) {
         if (isSearchableDocument(tab))
             ++searchableTargetCount;
     }
@@ -615,7 +610,7 @@ void FindReplaceDialog::updateQueryUi()
     if (allOpenScope()) {
         hasBinaryTarget = false;
         hasSearchableTarget = false;
-        for (EditorTab *tab : openTabs()) {
+        for (DocumentSearchSurface *tab : openTabs()) {
             if (!isSearchableDocument(tab))
                 continue;
             hasSearchableTarget = true;
@@ -671,7 +666,7 @@ void FindReplaceDialog::updateQueryUi()
     m_findPrevBtn->setEnabled(navigationAllowed && queryExecutable);
     m_findAllBtn->setEnabled(!busy && queryExecutable);
 
-    const auto replaceableTextTarget = [](EditorTab *tab) {
+    const auto replaceableTextTarget = [](DocumentSearchSurface *tab) {
         return tab && !tab->isReadOnlyByPolicy() && !tab->isBinaryDocument()
             && !tab->isSecureDocumentMasked()
             && !tab->isSecureDocumentTransitioning();
@@ -681,7 +676,7 @@ void FindReplaceDialog::updateQueryUi()
                                        && currentTargetReplaceable;
     bool allOpenReplaceAllowed = false;
     if (!busy && hasQuery && allOpenScope() && !hex) {
-        for (EditorTab *tab : openTabs()) {
+        for (DocumentSearchSurface *tab : openTabs()) {
             if (replaceableTextTarget(tab)) {
                 allOpenReplaceAllowed = true;
                 break;
@@ -697,7 +692,7 @@ void FindReplaceDialog::updateQueryUi()
     bool scopeHasReplaceableTarget = currentTargetReplaceable;
     if (allOpenScope()) {
         scopeHasReplaceableTarget = false;
-        for (EditorTab *tab : openTabs()) {
+        for (DocumentSearchSurface *tab : openTabs()) {
             if (replaceableTextTarget(tab)) {
                 scopeHasReplaceableTarget = true;
                 break;
@@ -722,13 +717,13 @@ void FindReplaceDialog::updateQueryUi()
     }
 }
 
-QList<EditorTab *> FindReplaceDialog::openTabs() const
+QList<DocumentSearchSurface *> FindReplaceDialog::openTabs() const
 {
-    QList<EditorTab *> result;
+    QList<DocumentSearchSurface *> result;
     if (!m_tabWidget)
         return result;
     for (int i = 0; i < m_tabWidget->count(); ++i) {
-        if (auto *tab = qobject_cast<EditorTab *>(m_tabWidget->widget(i)))
+        if (auto *tab = dynamic_cast<DocumentSearchSurface *>(m_tabWidget->widget(i)))
             result.push_back(tab);
     }
     return result;
@@ -755,7 +750,7 @@ void FindReplaceDialog::findAcrossTabs(bool forward)
                 m_statusLabel->setText(QStringLiteral("字节搜索仅适用于 Hex 文档。"));
             return;
         }
-        QPointer<EditorTab> target(m_tab);
+        QPointer<DocumentSearchSurface> target(m_tab);
         setNavigationUiBusy(true, forward ? QObject::tr("查找下一个…")
                                           : QObject::tr("查找上一个…"));
         const bool started = m_tab->findNextL2Async(
@@ -781,14 +776,14 @@ void FindReplaceDialog::findAcrossTabs(bool forward)
             setNavigationUiBusy(false);
         return;
     }
-    const QList<EditorTab *> tabs = openTabs();
+    const QList<DocumentSearchSurface *> tabs = openTabs();
     if (tabs.isEmpty())
         return;
     int start = tabs.indexOf(m_tab);
     if (start < 0)
         start = 0;
     struct NavigationAttempt {
-        QPointer<EditorTab> tab;
+        QPointer<DocumentSearchSurface> tab;
         bool reset = false;
     };
     auto attempts = QSharedPointer<QVector<NavigationAttempt>>::create();
@@ -822,7 +817,7 @@ void FindReplaceDialog::findAcrossTabs(bool forward)
             return;
         while (*nextIndex < attempts->size()) {
             const NavigationAttempt attempt = attempts->at((*nextIndex)++);
-            EditorTab *candidate = attempt.tab.data();
+            DocumentSearchSurface *candidate = attempt.tab.data();
             if (!isSearchableDocument(candidate)
                 || (hex && !candidate->isHexPresentation())) {
                 continue;
@@ -832,7 +827,7 @@ void FindReplaceDialog::findAcrossTabs(bool forward)
             const bool started = candidate->findNextL2Async(
                 pattern, m_regexCheck->isChecked(), m_caseCheck->isChecked(),
                 m_wordCheck->isChecked(), forward, false, hex, this,
-                [this, candidate = QPointer<EditorTab>(candidate), continuation]
+                [this, candidate = QPointer<DocumentSearchSurface>(candidate), continuation]
                 (bool found, QString error) {
                     if (!error.isEmpty() && error != QStringLiteral("已取消。")) {
                         setNavigationUiBusy(false);
@@ -923,7 +918,7 @@ void FindReplaceDialog::onReplaceAll()
 
     if (allOpenScope()) {
         struct PlannedTarget {
-            QPointer<EditorTab> tab;
+            QPointer<DocumentSearchSurface> tab;
             quint64 revision = 0;
             int matches = 0;
         };
@@ -936,7 +931,7 @@ void FindReplaceDialog::onReplaceAll()
         // Freeze and preflight the complete manifest before touching any tab.
         // A query/preflight error aborts the whole transaction; policy-
         // incompatible targets are explicitly summarized as skips.
-        for (EditorTab *tab : openTabs()) {
+        for (DocumentSearchSurface *tab : openTabs()) {
             if (!tab)
                 continue;
             if (tab->isSecureDocumentMasked() || tab->isSecureDocumentTransitioning()) {
@@ -994,11 +989,11 @@ void FindReplaceDialog::onReplaceAll()
             return;
         }
 
-        QVector<QPointer<EditorTab>> changed;
+        QVector<QPointer<DocumentSearchSurface>> changed;
         qint64 replacedTotal = 0;
         QString failure;
         for (const PlannedTarget &target : std::as_const(plan)) {
-            EditorTab *tab = target.tab.data();
+            DocumentSearchSurface *tab = target.tab.data();
             if (!tab || tab->contentRevision() != target.revision) {
                 failure = tab
                     ? QStringLiteral("“%1”在确认后发生变化").arg(tab->fileName())
@@ -1159,7 +1154,7 @@ void FindReplaceDialog::onFindAll()
     // S1 is already UTF-8 inside QScintilla, but a near-threshold in-memory
     // scan is still real work. Snapshot on the UI thread, then compile, scan
     // and shape rows in the central scheduler.
-    QPointer<EditorTab> target(m_tab);
+    QPointer<DocumentSearchSurface> target(m_tab);
     setL2SearchUiBusy(true, QObject::tr("正在搜索…"), true);
     const bool started = m_tab->findAllL1Async(
         pattern, m_regexCheck->isChecked(), m_caseCheck->isChecked(),
@@ -1198,43 +1193,39 @@ void FindReplaceDialog::startAllOpenFindAll()
     if (!m_resultsDock)
         return;
     const QString pattern = currentFindText();
-    const QList<EditorTab *> rawTabs = openTabs();
+    const QList<DocumentSearchSurface *> rawTabs = openTabs();
+    const bool hex = hexBytesMode();
 
-    ++m_multiSearchGeneration;
-    const int generation = m_multiSearchGeneration;
+    SearchQuery query;
+    query.pattern = pattern;
+    query.scope = SearchScope::AllOpenDocuments;
+    query.regex = m_regexCheck->isChecked();
+    query.caseSensitive = m_caseCheck->isChecked();
+    query.wholeWord = m_wordCheck->isChecked();
+    query.hexBytes = hex;
+    const int generation = m_searchSession.begin(std::move(query));
     for (const auto &connection : std::as_const(m_multiConnections))
         QObject::disconnect(connection);
     m_multiConnections.clear();
-    m_pendingMultiL2 = 0;
     m_multiTabs.clear();
     m_multiTabs.reserve(rawTabs.size());
-    const bool hex = hexBytesMode();
-    m_multiSkippedTextTargets = 0;
-    m_multiSkippedLockedTargets = 0;
-    for (EditorTab *tab : rawTabs) {
+    for (DocumentSearchSurface *tab : rawTabs) {
         if (!isSearchableDocument(tab)) {
-            ++m_multiSkippedLockedTargets;
+            m_searchSession.skipLockedTarget();
             continue;
         }
         if (hex && (!tab || !tab->isHexPresentation())) {
-            ++m_multiSkippedTextTargets;
+            m_searchSession.skipTextTarget();
             continue;
         }
         m_multiTabs.push_back(tab);
     }
     m_multiNextIndex = 0;
-    m_multiPattern = pattern;
-    m_multiRegex = m_regexCheck->isChecked();
-    m_multiCaseSensitive = m_caseCheck->isChecked();
-    m_multiWholeWord = m_wordCheck->isChecked();
-    m_multiHexBytes = hex;
-    m_multiDispatchComplete = false;
-    m_multiCancelRequested = false;
     m_resultsDock->beginMultiFileResults(pattern, m_multiTabs.size());
     const QString startStatus = QStringLiteral(
         "正在搜索 %1 个打开文件；已跳过文本 %2 个、锁定 %3 个…")
-        .arg(m_multiTabs.size()).arg(m_multiSkippedTextTargets)
-        .arg(m_multiSkippedLockedTargets);
+        .arg(m_multiTabs.size()).arg(m_searchSession.skippedTextTargets())
+        .arg(m_searchSession.skippedLockedTargets());
     setL2SearchUiBusy(true, startStatus);
     QTimer::singleShot(0, this, [this, generation]() {
         dispatchNextMultiTarget(generation);
@@ -1243,64 +1234,68 @@ void FindReplaceDialog::startAllOpenFindAll()
 
 void FindReplaceDialog::dispatchNextMultiTarget(int generation)
 {
-    if (generation != m_multiSearchGeneration)
+    if (!m_searchSession.isCurrent(generation))
         return;
-    if (m_multiCancelRequested || m_multiNextIndex >= m_multiTabs.size()) {
-        m_multiDispatchComplete = true;
+    if (m_searchSession.cancelRequested()
+        || m_multiNextIndex >= m_multiTabs.size()) {
+        m_searchSession.setDispatchComplete(true);
         finishMultiSearchIfReady(generation);
         return;
     }
 
-    const QPointer<EditorTab> guard = m_multiTabs.at(m_multiNextIndex++);
-    EditorTab *tab = guard.data();
+    const QPointer<DocumentSearchSurface> guard = m_multiTabs.at(m_multiNextIndex++);
+    DocumentSearchSurface *tab = guard.data();
     if (tab && !tab->isL2Mode()) {
-        ++m_pendingMultiL2;
-        QPointer<EditorTab> target(tab);
+        m_searchSession.scheduleTarget();
+        QPointer<DocumentSearchSurface> target(tab);
         const bool started = tab->findAllL1Async(
-            m_multiPattern, m_multiRegex, m_multiCaseSensitive,
-            m_multiWholeWord, this,
+            m_searchSession.query().pattern, m_searchSession.query().regex,
+            m_searchSession.query().caseSensitive,
+            m_searchSession.query().wholeWord, this,
             [this, target, generation](QVector<SearchMatch> matches,
                                        bool truncated, QString error) mutable {
-                if (generation == m_multiSearchGeneration && target) {
+                if (!m_searchSession.isCurrent(generation))
+                    return;
+                if (target) {
                     target->setSearchHighlights(matches);
                     if (m_resultsDock)
                         m_resultsDock->appendMultiFileResults(
                             resultTarget(target), matches,
                             truncated || !error.isEmpty());
                 }
-                m_pendingMultiL2 = qMax(0, m_pendingMultiL2 - 1);
+                m_searchSession.settleTarget();
                 finishMultiSearchIfReady(generation);
             });
         if (!started) {
-            m_pendingMultiL2 = qMax(0, m_pendingMultiL2 - 1);
+            m_searchSession.settleTarget();
             if (m_resultsDock)
                 m_resultsDock->appendMultiFileResults(
                     resultTarget(tab), QVector<SearchMatch>{}, true);
         }
     } else if (tab) {
-        ++m_pendingMultiL2;
-        QPointer<EditorTab> target(tab);
+        m_searchSession.scheduleTarget();
+        QPointer<DocumentSearchSurface> target(tab);
         const TextEncoding encodingAtStart = tab->displayEncoding();
         const bool bytePositionModeAtStart =
             tab->isBinaryDocument() || tab->isHexPresentation();
         auto settled = QSharedPointer<bool>::create(false);
         const auto partialConnection = connect(
-            tab, &EditorTab::findAllL2Partial, this,
+            tab, &DocumentSearchSurface::findAllL2Partial, this,
             [this, target, generation](const QVector<LargeFileSearchMatch> &batch,
                                        const QString &, const QString &,
                                        TextEncoding encoding,
                                        bool bytePositionMode) {
-                if (generation == m_multiSearchGeneration && target && m_resultsDock)
+                if (m_searchSession.isCurrent(generation) && target && m_resultsDock)
                     m_resultsDock->appendMultiFilePreview(
                         resultTarget(target), batch, encoding,
                         bytePositionMode);
             });
         m_multiConnections.push_back(partialConnection);
         const auto finishedConnection = connect(
-            tab, &EditorTab::findAllL2Finished, this,
+            tab, &DocumentSearchSurface::findAllL2Finished, this,
             [this, target, generation, settled](SearchResultsModel *model,
                                                 const QString &, const QString &) {
-                if (generation != m_multiSearchGeneration || *settled) {
+                if (!m_searchSession.isCurrent(generation) || *settled) {
                     if (model) model->deleteLater();
                     return;
                 }
@@ -1315,31 +1310,33 @@ void FindReplaceDialog::dispatchNextMultiTarget(int generation)
                 }
                 if (model)
                     model->deleteLater();
-                m_pendingMultiL2 = qMax(0, m_pendingMultiL2 - 1);
+                m_searchSession.settleTarget();
                 finishMultiSearchIfReady(generation);
             });
         m_multiConnections.push_back(finishedConnection);
         const auto destroyedConnection = connect(
             tab, &QObject::destroyed, this,
             [this, generation, settled]() {
-                if (generation != m_multiSearchGeneration || *settled)
+                if (!m_searchSession.isCurrent(generation) || *settled)
                     return;
                 *settled = true;
-                m_pendingMultiL2 = qMax(0, m_pendingMultiL2 - 1);
+                m_searchSession.settleTarget();
                 finishMultiSearchIfReady(generation);
             });
         m_multiConnections.push_back(destroyedConnection);
 
-        if (tab->findAllL2Async(m_multiPattern, m_multiRegex,
-                                m_multiCaseSensitive, m_multiWholeWord,
-                                m_resultsDock, m_multiHexBytes)) {
+        if (tab->findAllL2Async(m_searchSession.query().pattern,
+                                m_searchSession.query().regex,
+                                m_searchSession.query().caseSensitive,
+                                m_searchSession.query().wholeWord,
+                                m_resultsDock, m_searchSession.query().hexBytes)) {
             if (m_resultsDock)
                 m_resultsDock->beginMultiFileTarget(
                     resultTarget(tab), encodingAtStart,
                     bytePositionModeAtStart);
         } else {
             *settled = true;
-            m_pendingMultiL2 = qMax(0, m_pendingMultiL2 - 1);
+            m_searchSession.settleTarget();
             if (m_resultsDock) {
                 auto *incomplete = new SearchResultsModel(m_resultsDock);
                 incomplete->setIncompleteReason(QStringLiteral("搜索任务未能启动。"));
@@ -1358,30 +1355,30 @@ void FindReplaceDialog::dispatchNextMultiTarget(int generation)
 
 void FindReplaceDialog::finishMultiSearchIfReady(int generation)
 {
-    if (generation != m_multiSearchGeneration
-        || !m_multiDispatchComplete || m_pendingMultiL2 > 0) {
+    if (!m_searchSession.isCurrent(generation)
+        || !m_searchSession.dispatchComplete()
+        || m_searchSession.pendingTargets() > 0) {
         return;
     }
     for (const auto &connection : std::as_const(m_multiConnections))
         QObject::disconnect(connection);
     m_multiConnections.clear();
     if (m_resultsDock)
-        m_resultsDock->finishMultiFileResults(m_multiCancelRequested);
-    const bool cancelled = m_multiCancelRequested;
+        m_resultsDock->finishMultiFileResults(m_searchSession.cancelRequested());
+    const bool cancelled = m_searchSession.cancelRequested();
     m_multiTabs.clear();
-    if (!m_multiPattern.isEmpty())
-        m_multiPattern.fill(QChar(0));
-    m_multiPattern.clear();
+    m_searchSession.clearQuery();
     setL2SearchUiBusy(false);
     if (cancelled && m_statusLabel)
         m_statusLabel->setText(QStringLiteral("搜索已取消，已保留完成的结果。"));
-    else if ((m_multiSkippedTextTargets > 0 || m_multiSkippedLockedTargets > 0)
+    else if ((m_searchSession.skippedTextTargets() > 0
+              || m_searchSession.skippedLockedTargets() > 0)
              && m_statusLabel)
         m_statusLabel->setText(
             QStringLiteral("搜索完成：跳过文本 %1 个、锁定文档 %2 个。")
-                .arg(m_multiSkippedTextTargets)
-                .arg(m_multiSkippedLockedTargets));
-    m_multiCancelRequested = false;
+                .arg(m_searchSession.skippedTextTargets())
+                .arg(m_searchSession.skippedLockedTargets()));
+    m_searchSession.clearCancelRequest();
 }
 
 void FindReplaceDialog::cancelActiveSearch()
@@ -1389,12 +1386,12 @@ void FindReplaceDialog::cancelActiveSearch()
     if (!m_l2SearchInProgress)
         return;
     if (allOpenScope()) {
-        m_multiCancelRequested = true;
-        for (EditorTab *tab : openTabs())
+        m_searchSession.requestCancel();
+        for (DocumentSearchSurface *tab : openTabs())
             tab->cancelFindAllL2();
         if (m_multiNextIndex >= m_multiTabs.size())
-            m_multiDispatchComplete = true;
-        finishMultiSearchIfReady(m_multiSearchGeneration);
+            m_searchSession.setDispatchComplete(true);
+        finishMultiSearchIfReady(m_searchSession.generation());
     } else if (m_tab) {
         m_tab->cancelFindAllL2();
     }
@@ -1481,7 +1478,7 @@ void FindReplaceDialog::onL2FindAllFinished(SearchResultsModel* model,
     if (allOpenScope())
         return;
     setL2SearchUiBusy(false);
-    auto *target = qobject_cast<EditorTab *>(sender());
+    auto *target = qobject_cast<DocumentSearchSurface *>(sender());
     if (!m_resultsDock) {
         // Dock 不存在：model 的 QObject parent 为空（因为我们传 m_resultsDock=nullptr），此时手动删除
         if (model && static_cast<const QObject*>(model)->parent() == nullptr) delete model;

@@ -7,27 +7,7 @@
 #include <QDateTime>
 #include <QUuid>
 #include <memory>
-
-class EditorTab;
-
-// 单个标签的会话数据
-struct SessionTab {
-    QString filePath;        // 原始文件路径（空表示未命名）
-    QString encoding;        // 编码名称
-    int syntax = 0;          // Syntax 枚举值
-    int cursorLine = 0;
-    int cursorIndex = 0;
-    qint64 cursorByteOffset = -1;
-    qint64 selectionStartByte = -1;
-    qint64 selectionEndByte = -1;
-    bool modified = false;
-    QString autosavePath;    // 未保存内容的临时文件路径
-    bool secureDocument = false;
-    QString documentId;
-    QString presentation;   // "text" / "hex"; empty means legacy auto routing
-    bool splitView = false;
-    QString splitOrientation; // "horizontal" / "vertical"
-};
+#include "SessionDocumentPort.h"
 
 // 完整会话
 struct SessionData {
@@ -53,24 +33,24 @@ public:
 
     // 保存当前所有标签的状态
     // tabs: 所有标签列表，activeIndex: 当前活动标签索引
-    bool saveSession(const QVector<EditorTab *> &tabs, int activeIndex,
+    bool saveSession(const QVector<ISessionDocumentPort *> &tabs, int activeIndex,
                      bool forceSnapshots = false);
 
     // UI-owned state is captured synchronously; encryption, filesystem I/O
     // and cleanup operate only on the detached plan in a worker.
     std::shared_ptr<AsyncSavePlan> captureAsyncSave(
-        const QVector<EditorTab *> &tabs, int activeIndex,
+        const QVector<ISessionDocumentPort *> &tabs, int activeIndex,
         bool forceSnapshots = false);
     std::shared_ptr<AsyncSaveResult> writeAsyncSave(
         const std::shared_ptr<AsyncSavePlan> &plan) const;
     bool asyncSaveSucceeded(
         const std::shared_ptr<AsyncSaveResult> &result) const;
     void applyAsyncSave(const std::shared_ptr<AsyncSaveResult> &result,
-                        const QVector<EditorTab *> &tabs);
+                        const QVector<ISessionDocumentPort *> &tabs);
 
     // 恢复内部快照。新版 .ndraft 在内存中解密后直接交给编辑器；旧版 .tmp
     // 仅作为迁移读取路径保留，不再产生新的 S1 明文快照。
-    bool restoreAutosave(EditorTab *tab, const QString &autosavePath,
+    bool restoreAutosave(ISessionDocumentPort *tab, const QString &autosavePath,
                          const QString &realFilePath = QString()) const;
 
     // 加载上次会话
@@ -88,6 +68,7 @@ public:
     // 清理单个 autosave 文件（用户正式保存后调用）。仅允许删除本实例
     // autosave 目录内、由 SessionManager 命名的恢复文件。
     void removeAutosaveFile(const QString &path) const;
+    void discardRecovery(ISessionDocumentPort *document) const;
 
 private:
     QString m_dataDir;

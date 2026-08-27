@@ -98,6 +98,28 @@
 #include "SessionManager.h"
 #include "DraftStore.h"
 #include "GuiContractMatrix.h"
+#include "PlainFilePersistence.h"
+
+static bool persistPlain(EditorTab *tab, const QString &target, QString *error)
+{
+    if (!tab) {
+        if (error) *error = QStringLiteral("文档不可用");
+        return false;
+    }
+    if (!tab->isModified()
+        && QFileInfo(tab->filePath()).absoluteFilePath()
+            == QFileInfo(target).absoluteFilePath()) {
+        return true;
+    }
+    PlainFilePersistence persistence;
+    const bool sameTarget = QFileInfo(tab->filePath()).absoluteFilePath()
+        == QFileInfo(target).absoluteFilePath();
+    const PersistenceResult result = persistence.save(
+        tab, {target, {}, tab->persistenceBaseline(), sameTarget});
+    if (!result.succeeded() && error)
+        *error = result.error;
+    return result.succeeded();
+}
 
 // Mnemonic / 省略号去除：「替换(&R)...」→「替换」
 //   关键：不能只 remove '&'，否则留下 "替换(R)"；必须**整个匹配 `(&[A-Za-z0-9])` 模式全删**。
@@ -894,7 +916,8 @@ private slots:
         QCOMPARE(captureDiskFileVersion(sourcePath, &unchangedBefore),
                  DiskFileState::Unchanged);
         QString unchangedSaveError;
-        QVERIFY2(tab->saveFile(&unchangedSaveError), qPrintable(unchangedSaveError));
+        QVERIFY2(persistPlain(tab, tab->filePath(), &unchangedSaveError),
+                 qPrintable(unchangedSaveError));
         DiskFileVersion unchangedAfter;
         QCOMPARE(captureDiskFileVersion(sourcePath, &unchangedAfter),
                  DiskFileState::Unchanged);
@@ -976,7 +999,7 @@ private slots:
         // MainWindow dispatcher used by Open/recent/drag-drop/session paths.
         const QString copyPath = tmpDir_.filePath(QStringLiteral("hex-roundtrip-copy.dat"));
         QString saveAsError;
-        QVERIFY2(tab->saveAsFile(copyPath, &saveAsError), qPrintable(saveAsError));
+        QVERIFY2(persistPlain(tab, copyPath, &saveAsError), qPrintable(saveAsError));
         QTRY_VERIFY_WITH_TIMEOUT(tab->l2View()->isOpen(), 5000);
         QCOMPARE(QFileInfo(tab->filePath()).absoluteFilePath(),
                  QFileInfo(copyPath).absoluteFilePath());
@@ -1528,7 +1551,7 @@ private slots:
         QVERIFY(tab->isModified());
 
         QString saveError;
-        QVERIFY2(tab->saveFile(&saveError), qPrintable(saveError));
+        QVERIFY2(persistPlain(tab, tab->filePath(), &saveError), qPrintable(saveError));
         QFile saved(path);
         QVERIFY(saved.open(QIODevice::ReadOnly));
         QCOMPARE(saved.readAll(), expected);
@@ -1591,7 +1614,7 @@ private slots:
                                       expected, 1000);
 
             QString saveError;
-            QVERIFY2(tab->saveFile(&saveError), qPrintable(saveError));
+            QVERIFY2(persistPlain(tab, tab->filePath(), &saveError), qPrintable(saveError));
             QFile saved(path);
             QVERIFY(saved.open(QIODevice::ReadOnly));
             QCOMPARE(saved.readAll(), expected);
@@ -1705,7 +1728,7 @@ private slots:
                                       formattedAscii(expected, row), 1000);
 
             QString saveError;
-            QVERIFY2(tab->saveFile(&saveError), qPrintable(saveError));
+            QVERIFY2(persistPlain(tab, tab->filePath(), &saveError), qPrintable(saveError));
             QFile saved(path);
             QVERIFY(saved.open(QIODevice::ReadOnly));
             QCOMPARE(saved.readAll(), expected);
@@ -2219,7 +2242,7 @@ private slots:
             QVERIFY(!tab->editor()->testAttribute(Qt::WA_InputMethodEnabled));
 
             QString saveError;
-            QVERIFY2(tab->saveFile(&saveError), qPrintable(saveError));
+            QVERIFY2(persistPlain(tab, tab->filePath(), &saveError), qPrintable(saveError));
             QFile saved(path);
             QVERIFY(saved.open(QIODevice::ReadOnly));
             QCOMPARE(saved.readAll(), expected);
@@ -2526,7 +2549,7 @@ private slots:
         QCOMPARE(captureDiskFileVersion(sourcePath, &before),
                  DiskFileState::Unchanged);
         QString error;
-        QVERIFY2(tab->saveFile(&error), qPrintable(error));
+        QVERIFY2(persistPlain(tab, tab->filePath(), &error), qPrintable(error));
         DiskFileVersion after;
         QCOMPARE(captureDiskFileVersion(sourcePath, &after),
                  DiskFileState::Unchanged);

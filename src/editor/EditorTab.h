@@ -1,6 +1,5 @@
 #pragma once
 
-#include <QWidget>
 #include <QTimer>
 #include <QByteArray>
 #include <QVector>
@@ -13,7 +12,11 @@
 #include "SearchMatch.h"
 #include "DiskFileVersion.h"
 #include "DocumentState.h"
+#include "DocumentSession.h"
 #include "DocumentSurface.h"
+#include "DocumentContentPort.h"
+#include "SessionDocumentPort.h"
+#include "DocumentSearchSurface.h"
 
 enum class ViewMode : int;  // 前置声明（定义在 VirtualFileView.h）
 
@@ -39,6 +42,8 @@ class QKeyEvent;
 class QInputMethodEvent;
 class QPlainTextEdit;
 class QSplitter;
+class EditorTab;
+SessionTab captureEditorSessionTab(const EditorTab *tab);
 
 // 语法类型
 enum class Syntax {
@@ -67,7 +72,8 @@ enum class Syntax {
     Asm,
 };
 
-class EditorTab : public QWidget, public IDocumentSurface {
+class EditorTab : public DocumentSearchSurface, public IDocumentSurface,
+                  public IDocumentContentPort, public ISessionDocumentPort {
     Q_OBJECT
 public:
     using ExternalFileState = DiskFileState;
@@ -81,6 +87,43 @@ public:
     ~EditorTab() override;
     bool openSurface(const DocumentSurfaceOpenRequest &request,
                      QString *error) override;
+    DocumentState persistenceState() const noexcept override { return documentState(); }
+    TextEncoding persistenceEncoding() const noexcept override { return m_encoding; }
+    DiskFileVersion persistenceBaseline() const override {
+        return m_documentSession.diskVersion();
+    }
+    bool createPersistenceSnapshot(qint64 maximumBytes,
+                                   DocumentSnapshot *snapshot,
+                                   QString *error) override;
+    bool suspendPersistenceBacking(QString *error) override;
+    bool resumePersistenceBacking(const QString &absolutePath,
+                                  QString *error) override;
+    void acceptPersistenceCommit(const QString &absolutePath,
+                                 DiskFileVersion version) override;
+    void acceptSecurePersistenceCommit(const QUuid &documentId,
+                                       const QString &title,
+                                       const QString &absolutePath,
+                                       const QString &backingPath) override;
+    SessionTab captureSessionTab() const override {
+        return captureEditorSessionTab(this);
+    }
+    quint64 sessionRevision() const override { return contentRevision(); }
+    bool needsRecoverySnapshot() const override {
+        return isUntitled() || isModified();
+    }
+    bool isEmptyUntitledDocument() const override {
+        return isUntitled() && !isModified() && !isLargeDocument()
+            && editor() && editor()->length() == 0;
+    }
+    bool isLargeRecoveryDocument() const override { return isLargeDocument(); }
+    QString recoveryPath() const override {
+        return m_documentSession.recoveryPath();
+    }
+    void acceptRecoveryPath(const QString &path) override { setAutosavePath(path); }
+    bool captureRecoveryPayload(SessionRecoveryPayload *payload,
+                                QString *error) override;
+    bool restoreSessionRecovery(const SessionRestoreRequest &request,
+                                QString *error) override;
 
     /** 关闭/退出前主动清理 L2 的异步构建任务 + mmap（MainWindow::closeEvent 开头调用）。
      *  此时 MainWindow 还完整，允许 processEvents，轮询到 AsyncTask 终态才返回，
@@ -95,8 +138,6 @@ public:
     bool loadAutosave(const QString &autosavePath);  // 兼容旧版明文恢复文件
     // 从已解密的内部恢复快照加载，不把正文再次落入临时文件。
     bool loadAutosaveBytes(const QByteArray &data, const QString &backingPath);
-    bool saveFile(QString *errMsg = nullptr);
-    bool saveAsFile(const QString &path, QString *errMsg = nullptr);
     bool isModified() const;
     void setModified(bool m);
     bool isUntitled() const;
@@ -110,7 +151,7 @@ public:
     QString fileName() const;
     QString tabTitle() const;
     QUuid sessionInstanceId() const { return m_sessionInstanceId; }
-    quint64 contentRevision() const { return m_documentState.revision; }
+    quint64 contentRevision() const { return m_documentSession.state().revision; }
     DocumentState documentState() const noexcept;
     // Produces the immutable, bounded input accepted by document tools. The
     // snapshot never includes a path or account-workspace secret.
@@ -119,14 +160,14 @@ public:
     // Secure notes use the same QScintilla editor but are persisted through
     // VaultService instead of a plaintext filesystem path.
     bool isSecureDocument() const {
-        return m_documentState.securityClass == DocumentSecurityClass::SecureDocument;
+        return m_documentSession.state().securityClass == DocumentSecurityClass::SecureDocument;
     }
     bool isSecureBinaryDocument() const {
         return isSecureDocument()
-            && m_documentState.contentKind == DocumentContentKind::Binary;
+            && m_documentSession.state().contentKind == DocumentContentKind::Binary;
     }
     bool isBinaryDocument() const {
-        return m_documentState.contentKind == DocumentContentKind::Binary;
+        return m_documentSession.state().contentKind == DocumentContentKind::Binary;
     }
     // Content classification and the active representation are independent.
     // A Binary document shown as Text participates in decoded text search;
@@ -134,12 +175,12 @@ public:
     bool isHexPresentation() const;
     bool hexOverwriteMode() const { return m_hexOverwriteMode; }
     void toggleHexOverwriteMode();
-    bool isSecureDocumentMasked() const { return m_secureDocumentMasked; }
-    bool isSecureDocumentTransitioning() const { return m_secureDocumentTransitioning; }
+    bool isSecureDocumentMasked() const { return m_documentSession.secureMasked(); }
+    bool isSecureDocumentTransitioning() const { return m_documentSession.secureTransitioning(); }
     QUuid secureDocumentId() const {
-        return isSecureDocument() ? m_documentState.id : QUuid{};
+        return isSecureDocument() ? m_documentSession.state().id : QUuid{};
     }
-    QString secureDocumentTitle() const { return m_secureDocumentTitle; }
+    QString secureDocumentTitle() const { return m_documentSession.secureTitle(); }
     void initializeSecureDocument(const QUuid &id, const QString &title,
                                   const QString &plainText = {},
                                   const QString &filePath = {});
@@ -147,9 +188,8 @@ public:
                                         QByteArray bytes,
                                         const QString &filePath = {},
                                         QString *error = nullptr);
-    bool exportBinaryPayloadBytes(QByteArray *bytes, QString *error = nullptr);
     qint64 securePayloadLimitExclusive() const {
-        return m_securePayloadLimitExclusive;
+        return m_documentSession.securePayloadLimitExclusive();
     }
     void setSecurePayloadLimitExclusive(qint64 limit);
     void maskSecureDocument();
@@ -157,7 +197,7 @@ public:
     void cancelSecureDocumentLocking();
     void setSecureDocumentTitle(const QString &title);
     void convertToPlainDocument(const QString &filePath);
-    TextEncoding encoding() const;
+    TextEncoding encoding() const { return m_encoding; }
     void setEncoding(TextEncoding enc);
     EncodingOrigin encodingOrigin() const { return m_encodingOrigin; }
     EncodingConfidence encodingConfidence() const { return m_encodingConfidence; }
@@ -273,7 +313,6 @@ public:
     // 长行标尺
     void setEdgeColumn(int column);
     void setEdgeVisible(bool visible);
-    bool isEdgeVisible() const;
 
     // 自动换行
     void setWordWrap(bool on);
@@ -300,9 +339,6 @@ public:
     Qt::Orientation splitOrientation() const;
     void setSplitView(bool enabled, Qt::Orientation orientation = Qt::Horizontal);
 
-    // 编码重新加载（保持内容不变，仅改变编码解释方式）
-    void reloadWithEncoding(TextEncoding enc);
-
     // 以指定编码显示（Notepad++ 风格：不修改文件内容，仅改变显示解码方式）
     // L1 模式：重新以指定编码解码并加载到 QsciScintilla
     // L2 模式：设置 VirtualFileView 的 displayEncoding，重绘
@@ -316,9 +352,15 @@ public:
     bool isL2Active() const;
 
     // 内部 autosave 路径（用于会话恢复时对用户透明）
-    QString autosavePath() const { return m_autosavePath; }
-    void setAutosavePath(const QString &path) { m_autosavePath = path; }
-    void clearAutosaveFile() const;
+    // Compatibility-facing path: secure documents historically expose their
+    // encrypted backing file as the autosave path. Session recovery uses the
+    // distinct recoveryPath() port above, so discard cannot delete ciphertext.
+    QString autosavePath() const;
+    void setAutosavePath(const QString &path) { m_documentSession.setRecoveryPath(path); }
+    QString secureBackingPath() const { return m_documentSession.secureBackingPath(); }
+    void setSecureBackingPath(const QString &path) {
+        m_documentSession.setSecureBackingPath(path);
+    }
 
     // ---- 统一分流的剪贴板/编辑操作（L1/L2 都正确，推荐外部统一走这些，不要调 editor()->xxx()）----
     void selectAll();
@@ -369,11 +411,9 @@ public:
                          L2ContentKind contentKind = L2ContentKind::Text,
                          std::optional<TextEncoding> forcedEncoding = std::nullopt);
     // 仅供 S1 兼容 Hex 路径保存；32 MiB 以上由策略门禁拒绝。
-    bool saveL2As(const QString &path, QString *errMsg = nullptr);
 
     // ==== 会话恢复/保存专用：零副作用 + S1/只读 mmap 自动分流 ====
     // · exportToFile：S1 导出编辑内容；只读 mmap 仅复制原文件，不存在 patch。
-    bool exportToFile(const QString &destPath) const;
     // S1 恢复专用：导出原编码字节到内存，交给 DraftStore 立即加密。
     // 大文件必须走后续分块恢复日志，避免构造 GiB 级 QByteArray。
     bool exportSnapshotBytes(QByteArray *data) const;
@@ -433,33 +473,22 @@ signals:
     void largeDocumentRuntimeStateChanged(EditorTab::LargeDocumentRuntimeState state,
                                           const QString &reason);
 
-    // L2 findAllL2Async 结果 / 进度信号（纯异步，不阻塞）
-    void findAllL2Progress(int percent, qint64 done, qint64 total);
-    void findAllL2Partial(const QVector<LargeFileSearchMatch>& batch,
-                          const QString& pattern,
-                          const QString& fileName,
-                          TextEncoding encoding,
-                          bool bytePositionMode);
-    void findAllL2Finished(class SearchResultsModel* model,
-                           const QString& pattern,
-                           const QString& fileName);
-
 private:
+    bool createDocumentSnapshotImpl(qint64 maximumBytes,
+                                    DocumentSnapshot *snapshot,
+                                    QString *error,
+                                    bool allowSecureTransition) const;
+
     QsciScintilla *m_editor;
     QsciScintilla *m_splitEditor = nullptr;
     QSplitter *m_l1Splitter = nullptr;
     QStackedWidget *m_stack = nullptr;  // 0: m_editor (L1), 1: m_l2View (L2)
     QWidget *m_secureLockingPage = nullptr;
-    QString m_autosavePath;   // 内部 autosave 临时路径（对用户透明）
     QUuid m_sessionInstanceId = QUuid::createUuid();
-    DocumentState m_documentState;
+    DocumentSession m_documentSession;
     mutable quint64 m_characterCountRevision = std::numeric_limits<quint64>::max();
     mutable qint64 m_cachedCharacterCount = 0;
     mutable bool m_cachedCharacterCountHex = false;
-    QString m_secureDocumentTitle;
-    bool m_secureDocumentMasked = false;
-    qint64 m_securePayloadLimitExclusive = 0;
-    bool m_secureDocumentTransitioning = false;
     TextEncoding m_encoding = TextEncoding::Utf8;
     EncodingOrigin m_encodingOrigin = EncodingOrigin::Fallback;
     EncodingConfidence m_encodingConfidence = EncodingConfidence::Low;
@@ -509,7 +538,6 @@ private:
     // ---- L2 私有（懒创建 VirtualFileView，避免影响 L1 默认路径）----
     bool               m_l2Mode = false;
     bool               m_l2ReadOnlyByPolicy = false;
-    DiskFileVersion    m_diskVersion;
     // Scintilla has a save-point model for text edits but cannot be forced
     // dirty by metadata-only changes such as an encoding conversion.
     bool m_metadataModified = false;

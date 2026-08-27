@@ -200,6 +200,9 @@ private:
     bool reserveWorker();
     void releaseWorker();
     void stopWorkers(bool permanent);
+    static bool preparePattern(const QString &pattern, const Options &opts,
+                               QByteArray *literal, bool *usePcre2,
+                               QString *error);
 
     bool scanAllBounded(qint64 virtualSize, const QString &pattern,
                         const Options &opts,

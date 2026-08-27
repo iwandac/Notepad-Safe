@@ -14,6 +14,16 @@ function Remove-CodeComments([string]$content) {
     return $withoutBlocks -replace '(?m)//.*$', ''
 }
 
+function Get-NonEmptyLineCount([string]$path) {
+    $count = 0
+    foreach ($line in [System.IO.File]::ReadLines($path)) {
+        if (-not [string]::IsNullOrWhiteSpace($line)) {
+            ++$count
+        }
+    }
+    return $count
+}
+
 $cmakePath = Join-Path $SourceRoot 'CMakeLists.txt'
 $cmakeLines = Get-Content -LiteralPath $cmakePath
 $activeCmake = $cmakeLines | Where-Object { $_ -notmatch '^\s*#' }
@@ -66,17 +76,32 @@ foreach ($concrete in @('unique_ptr<SecuritySessionService>',
         Add-Failure "MainWindow owns concrete security adapter: $concrete"
     }
 }
+if ($mainHeader -match '(?m)^\s*SecureDocumentPersistence\s*\*\s*m_') {
+    Add-Failure 'MainWindow owns concrete security adapter: SecureDocumentPersistence'
+}
 $mainSource = (Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src/window') `
     -Filter 'MainWindow*.cpp' | ForEach-Object {
         Get-Content -LiteralPath $_.FullName -Raw
     }) -join "`n"
+if (($mainSource.Contains('make_unique<SecureDocumentPersistence>')) -or
+    ($mainSource.Contains('createSecurityServiceBundle('))) {
+    Add-Failure 'MainWindow constructs the secure persistence runtime outside AppComposition'
+}
 foreach ($backendLeak in @('NOTEPADSAFE_HAS_KDBX_BACKEND',
+                            '#include "SecureDocumentService.h"',
+                            '#include "SecuritySessionService.h"',
+                            '#include "SecurityServiceFactory.h"',
                             'SecurityIdentity::',
                             'SecureDocumentService::inspect',
                             'KdbxFormatProbe',
                             'secure.kdbx')) {
     if ($mainSource.Contains($backendLeak)) {
         Add-Failure "MainWindow contains backend selection/business token: $backendLeak"
+    }
+}
+foreach ($persistenceLeak in @('plain.file', 'saveAsSecurityNotice')) {
+    if ($mainSource.Contains($persistenceLeak)) {
+        Add-Failure "MainWindow bypasses typed persistence/UI boundary: $persistenceLeak"
     }
 }
 
@@ -133,8 +158,39 @@ foreach ($widgetLeak in @('EditorTab', 'QWidget', 'QPointer')) {
         Add-Failure "SearchResultsController depends on UI lifetime token: $widgetLeak"
     }
 }
+$findDialogCode = @(
+    (Get-Content -LiteralPath (Join-Path $SourceRoot 'src/search/FindReplaceDialog.h') -Raw),
+    (Get-Content -LiteralPath (Join-Path $SourceRoot 'src/search/FindReplaceDialog.cpp') -Raw)
+) -join "`n"
+$findDialogCode = Remove-CodeComments $findDialogCode
+if ($findDialogCode.Contains('EditorTab')) {
+    Add-Failure 'FindReplaceDialog depends on the concrete EditorTab instead of DocumentSearchSurface'
+}
+foreach ($parallelSearchState in @('m_multiSearchGeneration',
+                                    'm_multiPattern',
+                                    'm_multiCancelRequested',
+                                    'm_pendingMultiL2')) {
+    if ($findDialogCode.Contains($parallelSearchState)) {
+        Add-Failure "FindReplaceDialog retains parallel search-session state: $parallelSearchState"
+    }
+}
+if (-not $findDialogCode.Contains('SearchSession m_searchSession')) {
+    Add-Failure 'FindReplaceDialog does not delegate query generation state to SearchSession'
+}
+$editorHeaderForSearch = Remove-CodeComments (Get-Content -LiteralPath (
+    Join-Path $SourceRoot 'src/editor/EditorTab.h') -Raw)
+if (-not $editorHeaderForSearch.Contains('public DocumentSearchSurface')) {
+    Add-Failure 'EditorTab does not implement the shared document-search surface port'
+}
 if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot 'src/domain/PersistenceAdapterRegistry.cpp'))) {
     Add-Failure 'PersistenceAdapterRegistry implementation is missing'
+}
+$persistenceRegistryCode = @(
+    (Get-Content -LiteralPath (Join-Path $SourceRoot 'src/domain/PersistenceAdapterRegistry.h') -Raw),
+    (Get-Content -LiteralPath (Join-Path $SourceRoot 'src/domain/PersistenceAdapterRegistry.cpp') -Raw)
+) -join "`n"
+if (-not $persistenceRegistryCode.Contains('saveFor(')) {
+    Add-Failure 'persistence registry has no typed DocumentPersistence save route'
 }
 
 $windowedProviderHeader = Get-Content -LiteralPath (
@@ -188,6 +244,59 @@ if ($documentRuntimeLinks.Contains('notepadsafe_editor_runtime')) {
     Add-Failure 'document provider registry links back to concrete editor runtime'
 }
 
+$sessionRuntimeLinks = [regex]::Match(
+    ($cmakeLines -join "`n"),
+    '(?s)target_link_libraries\(notepadsafe_session_runtime.*?\n\)').Value
+if ($sessionRuntimeLinks.Contains('notepadsafe_editor_runtime')) {
+    Add-Failure 'session persistence links back to the concrete editor runtime'
+}
+$sessionManagerCode = Remove-CodeComments (Get-Content -LiteralPath (
+    Join-Path $SourceRoot 'src/session/SessionManager.cpp') -Raw)
+foreach ($uiLeak in @('EditorTab', 'QsciScintilla', 'VirtualFileView')) {
+    if ($sessionManagerCode.Contains($uiLeak)) {
+        Add-Failure "session persistence depends on editor detail: $uiLeak"
+    }
+}
+$editorPersistenceCode = (Get-ChildItem -LiteralPath (
+    Join-Path $SourceRoot 'src/editor') -Filter 'EditorTab*.cpp' | ForEach-Object {
+        Remove-CodeComments (Get-Content -LiteralPath $_.FullName -Raw)
+    }) -join "`n"
+foreach ($writeLeak in @('QSaveFile', 'QFile::remove', 'writeTextAsEncoding',
+                         'ReplaceFileW', 'MoveFileExW')) {
+    if ($editorPersistenceCode.Contains($writeLeak)) {
+        Add-Failure "EditorTab owns filesystem persistence operation: $writeLeak"
+    }
+}
+$editorHeader = Remove-CodeComments (Get-Content -LiteralPath (
+    Join-Path $SourceRoot 'src/editor/EditorTab.h') -Raw)
+$documentSessionHeader = Remove-CodeComments (Get-Content -LiteralPath (
+    Join-Path $SourceRoot 'src/domain/DocumentSession.h') -Raw)
+if (-not $editorHeader.Contains('DocumentSession m_documentSession')) {
+    Add-Failure 'EditorTab does not delegate lifecycle state to DocumentSession'
+}
+foreach ($parallelState in @('DocumentState m_documentState',
+                              'QString m_filePath',
+                              'QUuid m_secureDocumentId',
+                              'QString m_autosavePath')) {
+    if ($editorHeader.Contains($parallelState)) {
+        Add-Failure "EditorTab retains parallel document lifecycle state: $parallelState"
+    }
+}
+foreach ($mutableEscape in @('(?m)^\s*DocumentState\s*&state\s*\(',
+                              '(?m)^\s*QString\s*&recoveryPath\s*\(',
+                              '(?m)^\s*DiskFileVersion\s*&diskVersion\s*\(',
+                              '(?m)^\s*bool\s*&secureMasked\s*\(')) {
+    if ($documentSessionHeader -match $mutableEscape) {
+        Add-Failure "DocumentSession exposes mutable state escape: $mutableEscape"
+    }
+}
+foreach ($saveFacade in @('bool saveFile(', 'bool saveAsFile(',
+                           'bool saveL2As(', 'bool exportToFile(')) {
+    if ($editorHeader.Contains($saveFacade)) {
+        Add-Failure "EditorTab retains filesystem persistence facade: $saveFacade"
+    }
+}
+
 foreach ($runner in @('run_tests.bat', 'run_all_gui_smoke.bat')) {
     $runnerText = Get-Content -LiteralPath (Join-Path $SourceRoot $runner) -Raw
     if (-not $runnerText.Contains('--no-tests=error')) {
@@ -202,29 +311,30 @@ if (-not ($cmakeLines -join "`n").Contains('gui;smoke;${tier};${feature}')) {
 # extraction durable: a future feature must go into a focused component rather
 # than silently growing the four legacy coordinators again.
 $complexityBudgets = @(
-    @{ File = 'src/window/MainWindow.cpp'; Lines = 1694; Branches = 128 },
-    @{ File = 'src/window/MainWindowCommands.cpp'; Lines = 1615; Branches = 204 },
-    @{ File = 'src/window/MainWindowDocuments.cpp'; Lines = 1870; Branches = 240 },
-    @{ File = 'src/window/MainWindowSession.cpp'; Lines = 551; Branches = 64 },
-    @{ File = 'src/editor/EditorTab.cpp'; Lines = 1897; Branches = 241 },
-    @{ File = 'src/editor/EditorTabCommands.cpp'; Lines = 764; Branches = 69 },
-    @{ File = 'src/editor/EditorTabLargeDocument.cpp'; Lines = 2618; Branches = 326 },
-    @{ File = 'src/editor/EditorTabLargeDocumentPersistence.cpp'; Lines = 727; Branches = 102 },
-    @{ File = 'src/editor/EditorTabSearch.cpp'; Lines = 1683; Branches = 189 },
-    @{ File = 'src/search/FindReplaceDialog.cpp'; Lines = 1499; Branches = 197 },
-    @{ File = 'src/search/SearchResultsDock.cpp'; Lines = 523; Branches = 53 },
-    @{ File = 'src/search/SearchResultsAggregateModel.h'; Lines = 293; Branches = 39 },
-    @{ File = 'src/app/DocumentOpenWorkflow.cpp'; Lines = 111; Branches = 14 },
-    @{ File = 'src/search/EditableTextSearch.cpp'; Lines = 110; Branches = 13 },
-    @{ File = 'src/search/SearchResultsController.cpp'; Lines = 73; Branches = 4 },
-    @{ File = 'src/search/SearchResultsDelegate.cpp'; Lines = 246; Branches = 17 },
-    @{ File = 'src/search/SearchResultsViewPolicy.cpp'; Lines = 55; Branches = 4 },
-    @{ File = 'src/window/FileCredentialDialog.cpp'; Lines = 131; Branches = 4 },
-    @{ File = 'src/window/SensitiveText.cpp'; Lines = 41; Branches = 4 }
+    @{ File = 'src/window/MainWindow.cpp'; Lines = 1574; Branches = 128 },
+    @{ File = 'src/window/MainWindowCommands.cpp'; Lines = 1493; Branches = 204 },
+    @{ File = 'src/window/MainWindowDocuments.cpp'; Lines = 1625; Branches = 220 },
+    @{ File = 'src/window/MainWindowSession.cpp'; Lines = 498; Branches = 64 },
+    @{ File = 'src/editor/EditorTab.cpp'; Lines = 1576; Branches = 208 },
+    @{ File = 'src/editor/EditorTabCommands.cpp'; Lines = 706; Branches = 69 },
+    @{ File = 'src/editor/EditorTabLargeDocument.cpp'; Lines = 1200; Branches = 133 },
+    @{ File = 'src/editor/EditorTabHex.cpp'; Lines = 1299; Branches = 180 },
+    @{ File = 'src/editor/EditorTabLargeDocumentPersistence.cpp'; Lines = 560; Branches = 70 },
+    @{ File = 'src/editor/EditorTabSearch.cpp'; Lines = 1617; Branches = 189 },
+    @{ File = 'src/search/FindReplaceDialog.cpp'; Lines = 1427; Branches = 196 },
+    @{ File = 'src/search/SearchResultsDock.cpp'; Lines = 455; Branches = 53 },
+    @{ File = 'src/search/SearchResultsAggregateModel.h'; Lines = 267; Branches = 39 },
+    @{ File = 'src/app/DocumentOpenWorkflow.cpp'; Lines = 80; Branches = 10 },
+    @{ File = 'src/search/EditableTextSearch.cpp'; Lines = 102; Branches = 13 },
+    @{ File = 'src/search/SearchResultsController.cpp'; Lines = 64; Branches = 4 },
+    @{ File = 'src/search/SearchResultsDelegate.cpp'; Lines = 225; Branches = 17 },
+    @{ File = 'src/search/SearchResultsViewPolicy.cpp'; Lines = 51; Branches = 4 },
+    @{ File = 'src/window/FileCredentialDialog.cpp'; Lines = 118; Branches = 4 },
+    @{ File = 'src/app/SensitiveText.cpp'; Lines = 36; Branches = 4 }
 )
 foreach ($budget in $complexityBudgets) {
     $path = Join-Path $SourceRoot $budget.File
-    $lines = @(Get-Content -LiteralPath $path).Count
+    $lines = Get-NonEmptyLineCount $path
     $content = Get-Content -LiteralPath $path -Raw
     $branches = [regex]::Matches($content, '\bif\s*\(').Count
     if ($lines -gt $budget.Lines) {
@@ -238,8 +348,8 @@ foreach ($budget in $complexityBudgets) {
 # Splitting a large file must not reset the complexity counter. These aggregate
 # ratchets cover every implementation fragment for the two legacy shells.
 $aggregateBudgets = @(
-    @{ Name = 'MainWindow'; Pattern = 'src/window/MainWindow*.cpp'; Lines = 5729; Branches = 636; Methods = 112 },
-    @{ Name = 'EditorTab'; Pattern = 'src/editor/EditorTab*.cpp'; Lines = 7687; Branches = 927; Methods = 176 }
+    @{ Name = 'MainWindow'; Pattern = 'src/window/MainWindow*.cpp'; Lines = 5190; Branches = 616; Methods = 112 },
+    @{ Name = 'EditorTab'; Pattern = 'src/editor/EditorTab*.cpp'; Lines = 7115; Branches = 865; Methods = 176 }
 )
 foreach ($budget in $aggregateBudgets) {
     $files = Get-ChildItem -Path (Join-Path $SourceRoot $budget.Pattern) -File
@@ -248,11 +358,12 @@ foreach ($budget in $aggregateBudgets) {
     $methods = 0
     foreach ($file in $files) {
         $content = Get-Content -LiteralPath $file.FullName -Raw
-        $lines += @(Get-Content -LiteralPath $file.FullName).Count
+        $lines += Get-NonEmptyLineCount $file.FullName
         $branches += [regex]::Matches($content, '\bif\s*\(').Count
         $methods += [regex]::Matches(
             $content, "\b$($budget.Name)::[A-Za-z_][A-Za-z0-9_]*\s*\(").Count
     }
+    Write-Host "Architecture complexity $($budget.Name): $lines lines, $branches branches, $methods methods"
     if ($lines -gt $budget.Lines) {
         Add-Failure "$($budget.Name) aggregate exceeds line budget: $lines > $($budget.Lines)"
     }
@@ -270,9 +381,9 @@ $productionSources = Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src') `
     -Recurse -File | Where-Object Extension -in '.cpp', '.h'
 foreach ($source in $productionSources) {
     $relative = $source.FullName.Substring($SourceRoot.Length + 1).Replace('\', '/')
-    $sourceLines = @(Get-Content -LiteralPath $source.FullName).Count
-    if ($sourceLines -gt 3000) {
-        Add-Failure "$relative exceeds global source ceiling: $sourceLines > 3000"
+    $sourceLines = Get-NonEmptyLineCount $source.FullName
+    if ($sourceLines -gt 2000) {
+        Add-Failure "$relative exceeds global source ceiling: $sourceLines > 2000"
     }
 }
 

@@ -2,6 +2,7 @@
 #include "AppComposition.h"
 #include "AsyncSerialQueue.h"
 #include "DocumentOpenWorkflow.h"
+#include "DocumentSessionView.h"
 #include "EditorTab.h"
 #include "FileTierPolicy.h"
 #include "SessionManager.h"
@@ -41,8 +42,6 @@ std::unique_ptr<QSettings> createAppSettings()
                                        QStringLiteral("NotepadSafe"));
 }
 } // namespace
-
-// ============ 会话 ============
 
 void MainWindow::restoreSession()
 {
@@ -90,7 +89,7 @@ void MainWindow::saveSessionNow(bool forceSnapshots)
     if (!forceSnapshots && AsyncSerialQueue::session().busy())
         return; // Coalesce periodic autosaves; the next timer captures the latest revision.
 
-    QVector<EditorTab *> tabs;
+    QVector<ISessionDocumentPort *> tabs;
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
         // SessionManager only records secure document ids and encrypted backing
@@ -122,7 +121,7 @@ void MainWindow::saveSessionNow(bool forceSnapshots)
         request.completed = [guarded, result](AsyncTaskState state) {
             if (!guarded || !guarded->m_session)
                 return;
-            QVector<EditorTab *> currentTabs;
+            QVector<ISessionDocumentPort *> currentTabs;
             for (int i = 0; i < guarded->m_tabs->count(); ++i) {
                 if (auto *tab = qobject_cast<EditorTab *>(guarded->m_tabs->widget(i)))
                     currentTabs.append(tab);
@@ -145,7 +144,7 @@ void MainWindow::saveSessionNow(bool forceSnapshots)
     QEventLoop loop;
     request.completed = [guarded, result, &loop, &progress](AsyncTaskState state) {
         if (guarded && guarded->m_session) {
-            QVector<EditorTab *> currentTabs;
+            QVector<ISessionDocumentPort *> currentTabs;
             for (int i = 0; i < guarded->m_tabs->count(); ++i) {
                 if (auto *tab = qobject_cast<EditorTab *>(guarded->m_tabs->widget(i)))
                     currentTabs.append(tab);
@@ -537,7 +536,7 @@ void MainWindow::closeEvent(QCloseEvent *event)
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
         if (!tab) continue;
         if (!tab->isSecureDocument() && !tab->isUntitled() && !tab->isModified()) {
-            tab->clearAutosaveFile();
+            m_session->discardRecovery(tab);
         }
     }
 

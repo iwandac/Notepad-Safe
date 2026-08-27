@@ -291,7 +291,7 @@ void test_secure_note_never_enters_plaintext_session()
     secureTab->editor()->append(QStringLiteral("\nmodified"));
     secureTab->setModified(true);
 
-    QVector<EditorTab *> tabs{secureTab.get()};
+    QVector<ISessionDocumentPort *> tabs{secureTab.get()};
     CHECK(sm.saveSession(tabs, 0), "保存混合会话操作应成功");
     const SessionData loaded = sm.loadSession();
     CHECK(loaded.tabs.size() == 1 && loaded.tabs.first().secureDocument,
@@ -324,7 +324,7 @@ void test_plain_s1_recovery_is_encrypted_and_restorable()
     source->editor()->setText(marker);
     source->setModified(true);
 
-    QVector<EditorTab *> tabs{source.get()};
+    QVector<ISessionDocumentPort *> tabs{source.get()};
     CHECK(sm.saveSession(tabs, 0, true), "保存 S1 加密恢复会话成功");
     const SessionData session = sm.loadSession();
     CHECK(session.tabs.size() == 1, "会话记录一个普通恢复标签");
@@ -434,7 +434,7 @@ void test_binary_hex_patch_recovery_is_encrypted_and_restorable()
     CHECK(source->l2View()->replaceBytes(20, replacement.size(), replacement, &error),
           "修改 4 个原始字节");
     source->gotoByteOffset(20, replacement.size());
-    QVector<EditorTab *> tabs{source.get()};
+    QVector<ISessionDocumentPort *> tabs{source.get()};
     CHECK(sm.saveSession(tabs, 0, true), "保存 Binary/Hex 加密恢复会话");
 
     const SessionData state = sm.loadSession();

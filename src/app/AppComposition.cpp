@@ -1,7 +1,12 @@
 #include "AppComposition.h"
+#include "DocumentContentPort.h"
+#include "FileTierPolicy.h"
 #include "KdbxFormatProbe.h"
+#include "PlainFilePersistence.h"
+#include "SecureDocumentPersistence.h"
+#include "SecurityServiceFactory.h"
 
-#include <QFileInfo>
+#include <utility>
 
 namespace {
 
@@ -29,31 +34,7 @@ private:
     DocumentProviderDescriptor descriptor_;
 };
 
-class PlainFilePersistenceAdapter final : public IPersistenceAdapter {
-public:
-    PersistenceAdapterDescriptor descriptor() const override
-    {
-        return {QStringLiteral("plain.file"), QStringLiteral("Plain file"),
-                0, DocumentPersistence::PlainFile};
-    }
-    bool recognizes(const QString &path) const override
-    {
-        return QFileInfo(path).isFile();
-    }
-};
 
-class KdbxPersistenceAdapter final : public IPersistenceAdapter {
-public:
-    PersistenceAdapterDescriptor descriptor() const override
-    {
-        return {QStringLiteral("secure.kdbx"), QStringLiteral("KDBX"),
-                100, DocumentPersistence::SecureFile};
-    }
-    bool recognizes(const QString &path) const override
-    {
-        return KdbxFormatProbe::inspectFile(path).recognized;
-    }
-};
 
 } // namespace
 
@@ -75,17 +56,30 @@ AppComposition::AppComposition()
         });
     }
     persistenceAdapters_.registerAdapter(
-        KdbxPersistenceAdapter().descriptor(), [] {
-            return std::make_unique<KdbxPersistenceAdapter>();
+        PlainFilePersistence().descriptor(), [] {
+            return std::make_unique<PlainFilePersistence>();
         });
-    persistenceAdapters_.registerAdapter(
-        PlainFilePersistenceAdapter().descriptor(), [] {
-            return std::make_unique<PlainFilePersistenceAdapter>();
+    persistenceAdapters_.registerRoute(
+        {QStringLiteral("secure.kdbx"), QStringLiteral("KDBX"),
+         100, DocumentPersistence::SecureFile},
+        [](const QString &path) {
+            return path.endsWith(QLatin1String(".nsafe"), Qt::CaseInsensitive)
+                || path.endsWith(QLatin1String(".kdbx"), Qt::CaseInsensitive)
+                || KdbxFormatProbe::inspectFile(path).recognized;
         });
 }
 
-SecurityServiceBundle AppComposition::createSecurityServices()
+AppComposition::SecurityRuntime AppComposition::createSecurityRuntime()
 {
     heavyFactoryCalls_.fetch_add(1, std::memory_order_relaxed);
-    return createSecurityServiceBundle();
+    SecurityServiceBundle services = createSecurityServiceBundle();
+    auto persistence = std::make_unique<SecureDocumentPersistence>(
+        std::move(services.documents));
+    ISecureDocumentPersistence *documents = persistence.get();
+    const QString id = persistence->descriptor().id;
+    if (!persistenceAdapters_.registerAdapter(std::move(persistence))) {
+        documents = dynamic_cast<ISecureDocumentPersistence *>(
+            persistenceAdapters_.adapter(id));
+    }
+    return {std::move(services.session), documents};
 }

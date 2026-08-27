@@ -29,6 +29,7 @@
 #include <QWidget>
 
 #include "EditorTab.h"
+#include "PlainFilePersistence.h"
 #include "ByteClipboard.h"
 #include "FindReplaceDialog.h"
 #include "WindowedReadOnlyProvider.h"
@@ -1152,7 +1153,11 @@ private slots:
         const QString forbiddenSave = temporary.filePath(
             QStringLiteral("s2-forbidden-save.log"));
         QString saveError;
-        QVERIFY(!tab->saveL2As(forbiddenSave, &saveError));
+        PlainFilePersistence persistence;
+        const PersistenceResult save = persistence.save(
+            tab, {forbiddenSave, {}, tab->persistenceBaseline(), false});
+        saveError = save.error;
+        QVERIFY(!save.succeeded());
         QVERIFY(saveError.contains(QStringLiteral("只读")));
         QVERIFY(!QFileInfo::exists(forbiddenSave));
         window.close();

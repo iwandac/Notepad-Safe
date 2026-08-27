@@ -10,14 +10,12 @@
 #include "EditableTextSearch.h"
 #include "AsyncTaskManager.h"
 #include "DraftStore.h"
-
 #include <QVBoxLayout>
 #include <QLabel>
 #include <QStackedWidget>
 #include <QFile>
 #include <QFileInfo>
 #include <QDir>
-#include <QSaveFile>
 #include <QDataStream>
 #include <QFont>
 #include <QColor>
@@ -125,32 +123,32 @@ QsciScintilla::EolMode detectLineEndingMode(const QString &text)
 
 EditorTab::ExternalFileState EditorTab::externalFileState() const
 {
-    if (isSecureDocument() || m_documentState.location.isEmpty())
+    if (isSecureDocument() || m_documentSession.state().location.isEmpty())
         return ExternalFileState::NotTracked;
-    return compareDiskFileVersion(m_documentState.location, m_diskVersion);
+    return compareDiskFileVersion(m_documentSession.state().location, m_documentSession.diskVersion());
 }
 
 void EditorTab::refreshDiskVersionBaseline()
 {
-    m_diskVersion = {};
-    if (isSecureDocument() || m_documentState.location.isEmpty())
+    m_documentSession.clearDiskVersion();
+    if (isSecureDocument() || m_documentSession.state().location.isEmpty())
         return;
     DiskFileVersion captured;
-    if (captureDiskFileVersion(m_documentState.location, &captured) == ExternalFileState::Unchanged)
-        m_diskVersion = std::move(captured);
+    if (captureDiskFileVersion(m_documentSession.state().location, &captured) == ExternalFileState::Unchanged)
+        m_documentSession.setDiskVersion(std::move(captured));
 }
 
 bool EditorTab::representsDiskFile(const DiskFileVersion &candidate) const
 {
-    if (isSecureDocument() || m_documentState.location.isEmpty() || !candidate.valid)
+    if (isSecureDocument() || m_documentSession.state().location.isEmpty() || !candidate.valid)
         return false;
-    if (sameDiskFile(m_diskVersion, candidate))
+    if (sameDiskFile(m_documentSession.diskVersion(), candidate))
         return true;
-    return sameDiskFilePath(m_documentState.location, candidate.absolutePath);
+    return sameDiskFilePath(m_documentSession.state().location, candidate.absolutePath);
 }
 
 EditorTab::EditorTab(QWidget *parent)
-    : QWidget(parent)
+    : DocumentSearchSurface(parent)
 {
     m_editor = new QsciScintilla(this);
     m_stack  = new QStackedWidget(this);
@@ -345,8 +343,8 @@ void EditorTab::setupEditor()
     connect(m_editor, &QsciScintilla::modificationChanged,
             this, [this](bool m) {
         Q_UNUSED(m);
-        m_documentState.dirty = isModified();
-        emit modificationChanged(m_documentState.dirty);
+        m_documentSession.setDirty(isModified());
+        emit modificationChanged(isModified());
         emit titleChanged(tabTitle());
     });
     connect(m_editor, &QsciScintilla::SCN_MODIFIED, this,
@@ -376,7 +374,7 @@ bool EditorTab::loadFile(const QString &path,
                          std::optional<TextEncoding> forcedEncoding)
 {
     m_metadataModified = false;
-    m_documentState.contentKind = DocumentContentKind::Text;
+    m_documentSession.setContentKind(DocumentContentKind::Text);
     QElapsedTimer t; t.start();
     const qint64 size = QFileInfo(path).size();
     const FileTierDecision tier = FileTierPolicy::classify(size);
@@ -412,8 +410,8 @@ bool EditorTab::loadFile(const QString &path,
     m_encodingConfidence = result.confidence;
     m_encodingDecodeErrors = result.decodeErrors;
     m_editor->setEolMode(detectLineEndingMode(result.text));
-    m_documentState.location = QFileInfo(path).absoluteFilePath();
-    m_autosavePath.clear();  // 加载正式文件，清除 autosave 关联
+    m_documentSession.setLocation(QFileInfo(path).absoluteFilePath());
+    m_documentSession.clearRecoveryPath();  // 加载正式文件，清除 autosave 关联
 
     // 大文件分块加载：避免 setText() 一次性重建整个文档导致 UI 长时间卡死
     // This bounded chunk append belongs to the S1 path only.
@@ -494,7 +492,7 @@ bool EditorTab::loadAutosave(const QString &autosavePath)
 bool EditorTab::loadAutosaveBytes(const QByteArray &data, const QString &backingPath)
 {
     m_metadataModified = false;
-    m_documentState.contentKind = DocumentContentKind::Text;
+    m_documentSession.setContentKind(DocumentContentKind::Text);
     if (data.size() >= FileTierPolicy::StandardEditLimitBytes)
         return false;
 
@@ -504,9 +502,9 @@ bool EditorTab::loadAutosaveBytes(const QByteArray &data, const QString &backing
     m_encodingConfidence = result.confidence;
     m_encodingDecodeErrors = result.decodeErrors;
     m_editor->setEolMode(detectLineEndingMode(result.text));
-    // 关键：不设置 m_documentState.location，保持未命名状态，对用户透明
-    m_autosavePath = backingPath;
-    m_diskVersion = {};
+    // 关键：不设置 m_documentSession.state().location，保持未命名状态，对用户透明
+    m_documentSession.setRecoveryPath(backingPath);
+    m_documentSession.clearDiskVersion();
 
     // 设置文本（但不清除 modified 标记，让用户知道内容是上次未保存的）
     const int largeThreshold = 2 * 1024 * 1024;
@@ -533,57 +531,6 @@ bool EditorTab::loadAutosaveBytes(const QByteArray &data, const QString &backing
     return true;
 }
 
-bool EditorTab::saveFile(QString *errMsg)
-{
-    if (isUntitled()) {
-        if (errMsg) *errMsg = QObject::tr("未命名文件，请先指定保存路径。");
-        return false;
-    }
-    // Match native editor semantics: Save on an unchanged named document is a
-    // no-op. Binary files are routed through the mapped provider even at 9 MiB;
-    // rewriting that entire backing file merely because Ctrl+S was pressed
-    // created a visible sibling temporary copy for no user-visible change.
-    if (!isModified())
-        return true;
-    if (isL2Mode())
-        return saveL2As(m_documentState.location, errMsg);
-    return saveAsFile(m_documentState.location, errMsg);
-}
-
-bool EditorTab::saveAsFile(const QString &path, QString *errMsg)
-{
-    if (sameDiskFilePath(m_documentState.location, path)) {
-        const ExternalFileState diskState = externalFileState();
-        if (diskState == ExternalFileState::Changed
-            || diskState == ExternalFileState::Missing
-            || diskState == ExternalFileState::Unreadable) {
-            if (errMsg) {
-                *errMsg = QObject::tr(
-                    "目标仍是已被外部修改的原文件。请选择其他路径，或先重新加载磁盘版本。");
-            }
-            return false;
-        }
-    }
-    if (isL2Mode())
-        return saveL2As(path, errMsg);
-
-    // Ordinary Save and explicit encoding conversion share the same strict
-    // encoder. Legacy code pages must never replace an unrepresentable edit
-    // with '?' or a best-fit character without telling the user.
-    if (!writeTextAsEncoding(path, m_editor->text(), m_encoding, errMsg))
-        return false;
-
-    m_documentState.location = QFileInfo(path).absoluteFilePath();
-    setModified(false);
-
-    // 保存成功：自动清理 autosave 临时文件（自清理机制）
-    clearAutosaveFile();
-    m_autosavePath.clear();
-    refreshDiskVersionBaseline();
-
-    emit titleChanged(tabTitle());
-    return true;
-}
 
 bool EditorTab::isModified() const
 {
@@ -604,7 +551,7 @@ void EditorTab::setModified(bool m)
             m_editor->setModified(false);
         }
         if (before != isModified()) {
-            m_documentState.dirty = isModified();
+            m_documentSession.setDirty(isModified());
             emit modificationChanged(isModified());
             emit titleChanged(tabTitle());
         }
@@ -615,7 +562,7 @@ void EditorTab::setModified(bool m)
     if (!m)
         m_editor->setModified(false);
     if (before != isModified()) {
-        m_documentState.dirty = isModified();
+        m_documentSession.setDirty(isModified());
         emit modificationChanged(isModified());
         emit titleChanged(tabTitle());
     }
@@ -623,12 +570,12 @@ void EditorTab::setModified(bool m)
 
 bool EditorTab::isUntitled() const
 {
-    return m_documentState.location.isEmpty();
+    return m_documentSession.state().location.isEmpty();
 }
 
 DocumentState EditorTab::documentState() const noexcept
 {
-    DocumentState state = m_documentState;
+    DocumentState state = m_documentSession.state();
     // Dirty state is owned by the editing surface.  QScintilla, metadata and
     // windowed overlays can each change it, so snapshots must observe the
     // current aggregate instead of a stale cached transition.
@@ -652,86 +599,14 @@ DocumentState EditorTab::documentState() const noexcept
     return state;
 }
 
-bool EditorTab::createDocumentSnapshot(qint64 maximumBytes,
-                                       DocumentSnapshot *snapshot,
-                                       QString *error) const
-{
-    if (!snapshot) {
-        if (error)
-            *error = tr("文档快照输出为空。");
-        return false;
-    }
-    *snapshot = {};
-    const DocumentState state = documentState();
-    if (m_secureDocumentMasked || m_secureDocumentTransitioning
-        || !state.capabilities.testFlag(DocumentCapability::Read)) {
-        if (error)
-            *error = tr("文档当前未解锁或不可读取。");
-        return false;
-    }
-    const qint64 size = contentSizeBytes();
-    if (maximumBytes <= 0 || size < 0 || size > maximumBytes
-        || size > std::numeric_limits<qsizetype>::max()) {
-        if (error) {
-            *error = tr("文档大小 %1 字节超过本次工具快照上限 %2 字节；请缩小处理范围。")
-                         .arg(size).arg(maximumBytes);
-        }
-        return false;
-    }
-
-    DocumentSnapshot result;
-    result.documentId = state.id;
-    result.revision = state.revision;
-    result.contentKind = state.contentKind;
-    result.securityClass = state.securityClass;
-    result.capabilities = state.capabilities;
-    result.encodingName = encodingName(encoding());
-    if (!isL2Mode() && state.contentKind == DocumentContentKind::Text) {
-        result.text = m_editor->text();
-        const qint64 utf8Size = result.text.toUtf8().size();
-        if (utf8Size > maximumBytes) {
-            if (error)
-                *error = tr("编辑后的文本超过本次工具快照上限；请缩小处理范围。");
-            return false;
-        }
-        result.sourceRange = {{0}, {utf8Size}};
-        result.encodingName = QStringLiteral("UTF-8 working text");
-    } else {
-        QByteArray source;
-        if (m_windowedReadOnlyProvider) {
-            source = m_windowedReadOnlyProvider->sourceBytes(
-                0, static_cast<qsizetype>(size));
-        } else if (m_l2View) {
-            source = m_l2View->readByteRange(0, size);
-        }
-        if (source.size() != size) {
-            if (error)
-                *error = tr("无法建立完整且一致的文档快照。");
-            return false;
-        }
-        result.sourceRange = {{0}, {size}};
-        if (state.contentKind == DocumentContentKind::Binary) {
-            result.bytes = std::move(source);
-        } else {
-            result.text = decodeBytesWithEncoding(source, encoding()).text;
-        }
-    }
-    *snapshot = std::move(result);
-    return true;
-}
-
 QString EditorTab::filePath() const
 {
-    return m_documentState.location;
+    return m_documentSession.state().location;
 }
 
 void EditorTab::setFilePath(const QString &path)
 {
-    m_documentState.location = path;
-    m_documentState.origin = path.isEmpty() ? DocumentOrigin::Untitled
-                                            : DocumentOrigin::File;
-    m_documentState.persistence = path.isEmpty() ? DocumentPersistence::None
-                                                 : DocumentPersistence::PlainFile;
+    m_documentSession.bindPlainFile(path);
     refreshDiskVersionBaseline();
     emit titleChanged(tabTitle());
 }
@@ -739,16 +614,16 @@ void EditorTab::setFilePath(const QString &path)
 QString EditorTab::fileName() const
 {
     if (isSecureDocument()) {
-        if (m_secureDocumentMasked)
+        if (m_documentSession.secureMasked())
             return QStringLiteral("已锁定文档");
-        if (!m_documentState.location.isEmpty())
-            return QFileInfo(m_documentState.location).fileName();
-        return m_secureDocumentTitle.isEmpty() ? QStringLiteral("未命名")
-                                               : m_secureDocumentTitle;
+        if (!m_documentSession.state().location.isEmpty())
+            return QFileInfo(m_documentSession.state().location).fileName();
+        return m_documentSession.secureTitle().isEmpty() ? QStringLiteral("未命名")
+                                               : m_documentSession.secureTitle();
     }
-    if (m_documentState.location.isEmpty())
+    if (m_documentSession.state().location.isEmpty())
         return QStringLiteral("未命名");
-    return QFileInfo(m_documentState.location).fileName();
+    return QFileInfo(m_documentSession.state().location).fileName();
 }
 
 QString EditorTab::tabTitle() const
@@ -765,7 +640,7 @@ void EditorTab::initializeSecureDocument(const QUuid &id, const QString &title,
 {
     Q_ASSERT(!id.isNull());
     m_metadataModified = false;
-    m_secureDocumentTransitioning = true;
+    m_documentSession.setSecureTransitioning(true);
     bridgeReparentEditorToStack();
     clearL2BridgeBaseline();
     if (m_l2View && m_l2View->isOpen())
@@ -775,17 +650,13 @@ void EditorTab::initializeSecureDocument(const QUuid &id, const QString &title,
     if (m_l2View)
         m_l2View->setVirtualSizeLimitExclusive(0);
     m_l2Mode = false;
-    m_autosavePath.clear();
-    m_documentState.id = id;
-    m_documentState.location = filePath;
-    m_documentState.origin = DocumentOrigin::SecureStore;
-    m_documentState.persistence = DocumentPersistence::SecureFile;
-    m_documentState.securityClass = DocumentSecurityClass::SecureDocument;
-    m_documentState.contentKind = DocumentContentKind::Text;
-    m_secureDocumentTitle = title.trimmed();
-    m_secureDocumentMasked = false;
+    m_documentSession.clearRecoveryPath();
+    m_documentSession.clearSecureBackingPath();
+    m_documentSession.bindSecureFile(id, filePath, DocumentContentKind::Text);
+    m_documentSession.setSecureTitle(title.trimmed());
+    m_documentSession.setSecureMasked(false);
     setSecurePayloadLimitExclusive(32LL * 1024 * 1024);
-    m_diskVersion = {};
+    m_documentSession.clearDiskVersion();
     m_encoding = TextEncoding::Utf8;
     m_editor->setEolMode(detectLineEndingMode(plainText));
     m_editor->setScrollWidth(1);
@@ -800,7 +671,7 @@ void EditorTab::initializeSecureDocument(const QUuid &id, const QString &title,
     m_editor->SendScintilla(QsciScintillaBase::SCI_EMPTYUNDOBUFFER);
     m_editor->SendScintilla(QsciScintillaBase::SCI_SETSAVEPOINT);
     m_editor->setModified(false);
-    m_secureDocumentTransitioning = false;
+    m_documentSession.setSecureTransitioning(false);
     if (m_stack)
         m_stack->setCurrentWidget(l1Page());
     setSyntax(Syntax::Markdown);
@@ -822,7 +693,7 @@ bool EditorTab::initializeSecureBinaryDocument(const QUuid &id,
             bytes.fill(0);
         return false;
     }
-    m_secureDocumentTransitioning = true;
+    m_documentSession.setSecureTransitioning(true);
     bridgeReparentEditorToStack();
     clearL2BridgeBaseline();
     m_l2Mode = false;
@@ -830,23 +701,19 @@ bool EditorTab::initializeSecureBinaryDocument(const QUuid &id,
     VirtualFileView *view = ensureL2View();
     QString localError;
     if (!view->openMemory(std::move(bytes), ViewMode::Hex, &localError)) {
-        m_secureDocumentTransitioning = false;
+        m_documentSession.setSecureTransitioning(false);
         if (error)
             *error = localError;
         return false;
     }
     setSecurePayloadLimitExclusive(32LL * 1024 * 1024);
 
-    m_autosavePath.clear();
-    m_documentState.id = id;
-    m_documentState.location = filePath;
-    m_documentState.origin = DocumentOrigin::SecureStore;
-    m_documentState.persistence = DocumentPersistence::SecureFile;
-    m_documentState.securityClass = DocumentSecurityClass::SecureDocument;
-    m_documentState.contentKind = DocumentContentKind::Binary;
-    m_secureDocumentTitle = title.trimmed();
-    m_secureDocumentMasked = false;
-    m_diskVersion = {};
+    m_documentSession.clearRecoveryPath();
+    m_documentSession.clearSecureBackingPath();
+    m_documentSession.bindSecureFile(id, filePath, DocumentContentKind::Binary);
+    m_documentSession.setSecureTitle(title.trimmed());
+    m_documentSession.setSecureMasked(false);
+    m_documentSession.clearDiskVersion();
     m_encoding = TextEncoding::Utf8;
     m_l2Mode = true;
     m_l2ReadOnlyByPolicy = false;
@@ -857,7 +724,7 @@ bool EditorTab::initializeSecureBinaryDocument(const QUuid &id,
     m_syntax = Syntax::Plain;
     activateL2Overlay(view);
     m_editor->setModified(false);
-    m_secureDocumentTransitioning = false;
+    m_documentSession.setSecureTransitioning(false);
     emit l2ModeStatusChanged();
     emit encodingChanged(m_encoding);
     emit syntaxChanged(m_syntax);
@@ -866,49 +733,24 @@ bool EditorTab::initializeSecureBinaryDocument(const QUuid &id,
     return true;
 }
 
-bool EditorTab::exportBinaryPayloadBytes(QByteArray *bytes, QString *error)
-{
-    if (bytes)
-        bytes->clear();
-    if (!bytes || !isBinaryDocument() || isSecureDocumentMasked()
-        || !m_l2View || !m_l2View->isOpen()) {
-        if (error)
-            *error = tr("安全二进制文档当前不可读取。");
-        return false;
-    }
-    if (!bridgeFlushOverlayToPatches(error))
-        return false;
-    const qint64 size = m_l2View->virtualFileSize();
-    if (size < 0 || size >= 32LL * 1024 * 1024) {
-        if (error)
-            *error = tr("安全文档必须小于 32 MiB。");
-        return false;
-    }
-    *bytes = m_l2View->readByteRange(0, size);
-    return bytes->size() == size;
-}
-
 void EditorTab::setSecurePayloadLimitExclusive(qint64 limit)
 {
-    m_securePayloadLimitExclusive = qMax<qint64>(0, limit);
+    m_documentSession.setSecurePayloadLimitExclusive(qMax<qint64>(0, limit));
     if (m_l2View)
-        m_l2View->setVirtualSizeLimitExclusive(m_securePayloadLimitExclusive);
+        m_l2View->setVirtualSizeLimitExclusive(m_documentSession.securePayloadLimitExclusive());
 }
 
 void EditorTab::maskSecureDocument()
 {
-    if (!isSecureDocument() || m_secureDocumentMasked)
+    if (!isSecureDocument() || m_documentSession.secureMasked())
         return;
     setSplitView(false);
-    m_secureDocumentTransitioning = true;
-    m_secureDocumentMasked = true;
+    m_documentSession.setSecureTransitioning(true);
+    m_documentSession.setSecureMasked(true);
     // A note title is commonly derived from its first plaintext line. Do not
     // leave that content resident or visible in the tab strip while locked;
     // the encrypted backing store restores it on the next unlock.
-    if (!m_secureDocumentTitle.isEmpty()) {
-        m_secureDocumentTitle.fill(QChar(0));
-        m_secureDocumentTitle.clear();
-    }
+    m_documentSession.clearSecureTitle();
     if (isSecureBinaryDocument()) {
         bridgeReparentEditorToStack();
         if (m_l2View && m_l2View->isOpen())
@@ -934,15 +776,15 @@ void EditorTab::maskSecureDocument()
     m_editor->setReadOnly(true);
     if (m_stack)
         m_stack->setCurrentWidget(l1Page());
-    m_secureDocumentTransitioning = false;
+    m_documentSession.setSecureTransitioning(false);
     emit titleChanged(tabTitle());
 }
 
 void EditorTab::beginSecureDocumentLocking()
 {
-    if (!isSecureDocument() || m_secureDocumentMasked || m_secureDocumentTransitioning)
+    if (!isSecureDocument() || m_documentSession.secureMasked() || m_documentSession.secureTransitioning())
         return;
-    m_secureDocumentTransitioning = true;
+    m_documentSession.setSecureTransitioning(true);
     if (!m_secureLockingPage) {
         m_secureLockingPage = new QWidget(m_stack);
         m_secureLockingPage->setObjectName(QStringLiteral("secureDocumentLockingPage"));
@@ -965,9 +807,9 @@ void EditorTab::beginSecureDocumentLocking()
 
 void EditorTab::cancelSecureDocumentLocking()
 {
-    if (!isSecureDocument() || m_secureDocumentMasked || !m_secureDocumentTransitioning)
+    if (!isSecureDocument() || m_documentSession.secureMasked() || !m_documentSession.secureTransitioning())
         return;
-    m_secureDocumentTransitioning = false;
+    m_documentSession.setSecureTransitioning(false);
     if (m_stack) {
         if (isSecureBinaryDocument() && m_l2View)
             m_stack->setCurrentWidget(m_l2View);
@@ -982,38 +824,27 @@ void EditorTab::setSecureDocumentTitle(const QString &title)
     if (!isSecureDocument())
         return;
     const QString normalized = title.trimmed();
-    if (m_secureDocumentTitle == normalized)
+    if (m_documentSession.secureTitle() == normalized)
         return;
-    m_secureDocumentTitle = normalized;
+    m_documentSession.setSecureTitle(normalized);
     emit titleChanged(tabTitle());
 }
 
 void EditorTab::convertToPlainDocument(const QString &filePath)
 {
     m_metadataModified = false;
-    m_secureDocumentTransitioning = true;
+    m_documentSession.setSecureTransitioning(true);
     clearL2BridgeBaseline();
-    m_documentState.id = QUuid::createUuid();
-    m_secureDocumentTitle.clear();
-    m_secureDocumentMasked = false;
+    m_documentSession.clearSecureTitle();
+    m_documentSession.setSecureMasked(false);
     setSecurePayloadLimitExclusive(0);
-    m_documentState.location = filePath;
-    m_documentState.origin = filePath.isEmpty() ? DocumentOrigin::Untitled
-                                                : DocumentOrigin::File;
-    m_documentState.persistence = filePath.isEmpty() ? DocumentPersistence::None
-                                                     : DocumentPersistence::PlainFile;
-    m_documentState.securityClass = DocumentSecurityClass::OrdinaryDocument;
-    m_autosavePath.clear();
+    m_documentSession.bindPlainFile(filePath, true);
+    m_documentSession.clearRecoveryPath();
     m_editor->setReadOnly(false);
     m_editor->setModified(false);
-    m_secureDocumentTransitioning = false;
+    m_documentSession.setSecureTransitioning(false);
     refreshDiskVersionBaseline();
     emit titleChanged(tabTitle());
-}
-
-TextEncoding EditorTab::encoding() const
-{
-    return m_encoding;
 }
 
 void EditorTab::setEncoding(TextEncoding enc)
@@ -1166,31 +997,7 @@ void EditorTab::applySyntax(Syntax syntax)
 
 // ============ 行操作 ============
 
-void EditorTab::reloadWithEncoding(TextEncoding enc)
-{
-    if (m_encoding == enc)
-        return;
-    // 重新解释内容：当前 Unicode 文本 → 用旧编码还原字节 → 用新编码解码
-    // 但更实用的做法是：如果磁盘上有文件，从磁盘按新编码重读；否则保持文本不变只改编码标记
-    if (!isUntitled() && QFileInfo::exists(m_documentState.location)) {
-        // 只有在用户确认后才重载（由上层调用 saveFile 检查），这里简单切换编码标记
-        m_encoding = enc;
-        emit encodingChanged(m_encoding);
-        return;
-    }
-    // 未命名/内存中：简单切换编码标记（下次保存用新编码）
-    m_encoding = enc;
-    emit encodingChanged(m_encoding);
-}
-
 // ============ autosave 自清理 ============
-
-void EditorTab::clearAutosaveFile() const
-{
-    if (!m_autosavePath.isEmpty() && QFile::exists(m_autosavePath)) {
-        QFile::remove(m_autosavePath);
-    }
-}
 
 // ============ 大文件分块加载 ============
 
@@ -1588,10 +1395,10 @@ void EditorTab::setDisplayEncoding(TextEncoding enc)
             bridgePopulateScintilla(start, end);
         emit encodingChanged(m_encoding);
     } else {
-        // Secure Text is a logical UTF-8 payload; m_documentState.location points to its
+        // Secure Text is a logical UTF-8 payload; m_documentSession.state().location points to its
         // encrypted KDBX container and must never be decoded as document text.
-        if (m_documentState.location.isEmpty() || isSecureDocument()) return;
-        QFile f(m_documentState.location);
+        if (m_documentSession.state().location.isEmpty() || isSecureDocument()) return;
+        QFile f(m_documentSession.state().location);
         if (!f.open(QIODevice::ReadOnly)) return;
         QByteArray raw = f.readAll();
         f.close();
@@ -1640,7 +1447,7 @@ void EditorTab::selectAll()
 
 bool EditorTab::canModifyCommand() const
 {
-    if (m_secureDocumentMasked || isSecureDocumentTransitioning()
+    if (m_documentSession.secureMasked() || isSecureDocumentTransitioning()
         || windowedReadOnlyActive() || isReadOnlyByPolicy() || !m_editor) {
         return false;
     }
@@ -1681,7 +1488,7 @@ bool EditorTab::canRedoCommand() const
 
 bool EditorTab::hasSelectionCommand() const
 {
-    if (m_secureDocumentMasked)
+    if (m_documentSession.secureMasked())
         return false;
     if (windowedReadOnlyActive()) {
         return m_windowedReadOnlyProvider->selectionEndOffset()

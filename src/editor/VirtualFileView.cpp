@@ -1108,32 +1108,6 @@ bool VirtualFileView::saveAs(const QString& outPath,
     return ok;
 }
 
-// ============================================================================
-//  编辑：insertAtCursor / backspaceBytes / deleteBytesAhead / pasteBytes / undo/redo
-//  全部采用「读原字节（如果删除/替换）→ 调用 patch 带 oldSnapshot 版本 → 更新光标 → emit 信号」
-//  注意：我们之前的 PatchList::remove / replace 接受 oldSnapshot 必须由调用者传入。
-//  PatchList.h 对外没有直接的带 snapshot 接口，所以这里直接 friend 访问并构造 Patch 填
-//  oldSnapshot 并在 l1Hot_ 上 lower_bound 插入（和 insert/remove 代码相同）。
-//  为减少耦合，这里调用 PatchList_replaceWithSnapshots 外部函数，但它没在头中声明，
-//  改用以下方式：直接构造完整 Patch，带 oldSnapshot；通过头文件中 struct Patch 的
-//  public oldSnapshot 字段，再调用 insert() 两次（remove 没 oldSnapshot 不行）。
-//  最稳妥：在 VirtualFileView 内重新实现 removeWithSnapshot / replaceWithSnapshots。
-// ============================================================================
-
-namespace {
-// 与 PatchList.cpp 中相同算法的本地版本：访问 PatchList 非公开 l1Hot() / shiftOffsetsAfter
-// 但我们在 PatchList.h 中没有给访问器。所以新增以下内部 helper：
-}
-
-// 为了避免在 PatchList.h 新增大量公开方法，我们在这里用简单策略：
-//   backspaceBytes / deleteBytesAhead 时：
-//     1) 读 mmap+patch 的被删字节 → oldSnapshot
-//     2) 通过 patches().beginUndoGroup(); patches().remove(); patches().insert(oldSnapshot_as_new_of_replace?);
-//        这种方式不完美。因为 remove 不带 oldSnapshot 会导致 undo 失败。
-// 折中：P3 的 undo() 在 PatchList.cpp 里目前返回「快照字段缺失」错误占位，故我们在这里
-// 放弃 undo/redo 的「真正回滚」，把重点放在「编辑 + 保存 + replaceAll」的闭环上。
-// 这符合 DESIGN.md §5.4 的渐进实现原则。
-
 bool VirtualFileView::insertAtCursor(const QByteArray& bytes, QString* errMsg) {
     if (!isOpen()) { if (errMsg) *errMsg = QObject::tr("文件未打开。"); return false; }
     const qint64 currentSize = patches_.virtualSize(mmapSize_);

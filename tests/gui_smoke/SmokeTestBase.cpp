@@ -15,6 +15,7 @@
 #include "VirtualFileView.h"
 #include "LineIndex.h"
 #include "PatchList.h"
+#include "PlainFilePersistence.h"
 
 SmokeTestBase::SmokeTestBase(QObject* parent) : QObject(parent) {}
 SmokeTestBase::~SmokeTestBase() = default;
@@ -84,7 +85,11 @@ QString SmokeTestBase::cloneToTemp(const QString& srcPath) {
 QString SmokeTestBase::saveAsTempAndReopen(QString* errMsg) {
     QString err;
     const QString tmp = tmpDir_.filePath(QStringLiteral("saved-%1.bin").arg(quint64(this) & 0xFFFF, 4, 16, QLatin1Char('0')));
-    if (!tab_->saveAsFile(tmp, &err)) {
+    PlainFilePersistence persistence;
+    const PersistenceResult save = persistence.save(
+        tab_, {tmp, {}, tab_->persistenceBaseline(), false});
+    if (!save.succeeded()) {
+        err = save.error;
         if (errMsg) *errMsg = err;
         return {};
     }

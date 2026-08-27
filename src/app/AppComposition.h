@@ -1,10 +1,11 @@
 #pragma once
 
-#include "SecurityServiceFactory.h"
 #include "DocumentProviderRegistry.h"
 #include "DocumentToolRegistry.h"
 #include "InferenceProviderRegistry.h"
 #include "PersistenceAdapterRegistry.h"
+#include "SecureDocumentPersistencePort.h"
+#include "SecuritySessionPort.h"
 
 #include <atomic>
 
@@ -13,9 +14,13 @@
 // so startup tests can prove that first paint did not instantiate heavy work.
 class AppComposition final {
 public:
+    struct SecurityRuntime {
+        std::unique_ptr<ISecuritySessionService> session;
+        ISecureDocumentPersistence *documents = nullptr;
+    };
     AppComposition();
 
-    SecurityServiceBundle createSecurityServices();
+    SecurityRuntime createSecurityRuntime();
     void recordHeavyFactoryCall() noexcept
     {
         heavyFactoryCalls_.fetch_add(1, std::memory_order_relaxed);

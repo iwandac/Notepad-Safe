@@ -12,9 +12,8 @@
 #include "AsyncSerialQueue.h"
 #include "AsyncUiOperation.h"
 #include "VaultDock.h"
-#include "SecureDocumentService.h"
-#include "SecurityServiceFactory.h"
-#include "SecuritySessionService.h"
+#include "SecureDocumentContract.h"
+#include "SecuritySessionPort.h"
 #include "AppComposition.h"
 #include "FileCredentialDialog.h"
 #include "SensitiveText.h"
@@ -1100,10 +1099,10 @@ void MainWindow::closeTabUnchecked(int index)
     if (tab) {
         if (m_searchDock)
             m_searchDock->closeResultsFor(tab->documentState().id);
-        if (tab->isSecureDocument() && m_secureDocuments)
+        if (tab->isSecureDocument() && m_securePersistence)
             closeSecureDocumentOnSecurityLane(tab->secureDocumentId());
         else
-            tab->clearAutosaveFile();
+            m_session->discardRecovery(tab);
         tab->shutdownL2BeforeClose();
     }
     m_tabs->removeTab(index);
@@ -1165,7 +1164,7 @@ bool MainWindow::maybeSaveTab(int index, bool closingApp)
     if (!tab->isModified()) {
         // 空内容的未命名文件：直接清 autosave（没内容就没必要缓存）
         if (tab->isUntitled() && tab->editor()->text().trimmed().isEmpty())
-            tab->clearAutosaveFile();
+            m_session->discardRecovery(tab);
         return true;
     }
 
@@ -1206,7 +1205,7 @@ bool MainWindow::maybeSaveTab(int index, bool closingApp)
         return false;
     // Discard: 丢弃改动
     if (!tab->isSecureDocument())
-        tab->clearAutosaveFile();
+        m_session->discardRecovery(tab);
     return true;
 }
 

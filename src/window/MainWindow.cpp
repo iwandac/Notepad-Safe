@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "SecureDocumentPersistencePort.h"
 #include "EditorTab.h"
 #include "FileContentProbe.h"
 #include "FindReplaceDialog.h"
@@ -12,9 +13,8 @@
 #include "AsyncSerialQueue.h"
 #include "AsyncUiOperation.h"
 #include "VaultDock.h"
-#include "SecureDocumentService.h"
-#include "SecurityServiceFactory.h"
-#include "SecuritySessionService.h"
+#include "SecureDocumentContract.h"
+#include "SecuritySessionPort.h"
 #include "AppComposition.h"
 #include "FileCredentialDialog.h"
 #include "SensitiveText.h"
@@ -210,7 +210,7 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
             m_secureAutosaveTimer.start(1000);
             return;
         }
-        if (!m_secureDocuments || !m_securitySession
+        if (!m_securePersistence || !m_securitySession
             || !m_securitySession->hasActiveSession())
             return;
         bool retryNeeded = false;

@@ -17,7 +17,6 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QDir>
-#include <QSaveFile>
 #include <QDataStream>
 #include <QFont>
 #include <QColor>
@@ -78,6 +77,7 @@
 #include <Qsci/qscilexermarkdown.h>
 #include <Qsci/qscilexerjavascript.h>
 #include <Qsci/qscilexerjava.h>
+
 #include <Qsci/qscilexercsharp.h>
 #include <Qsci/qscilexercss.h>
 #include <Qsci/qscilexerbash.h>
@@ -91,53 +91,103 @@
 #include <Qsci/qscilexerproperties.h>
 #include <Qsci/qscilexermasm.h>
 
+SessionTab captureEditorSessionTab(const EditorTab *tab)
+{
+    SessionTab state;
+    if (!tab)
+        return state;
+    state.filePath = tab->filePath();
+    state.encoding = encodingName(tab->encoding());
+    state.syntax = static_cast<int>(tab->syntax());
+    tab->getCursorPosition(&state.cursorLine, &state.cursorIndex);
+    if (tab->isL2Mode() && tab->l2View()) {
+        state.cursorByteOffset = tab->currentByteOffset();
+        state.selectionStartByte = tab->l2View()->selectionStart();
+        state.selectionEndByte = tab->l2View()->selectionEnd();
+        state.presentation = tab->viewModeL2() == ViewMode::Hex
+            ? QStringLiteral("hex") : QStringLiteral("text");
+    } else if (tab->editor()) {
+        state.cursorByteOffset = tab->editor()->SendScintilla(
+            QsciScintillaBase::SCI_GETCURRENTPOS);
+        state.selectionStartByte = tab->editor()->SendScintilla(
+            QsciScintillaBase::SCI_GETSELECTIONSTART);
+        state.selectionEndByte = tab->editor()->SendScintilla(
+            QsciScintillaBase::SCI_GETSELECTIONEND);
+        state.presentation = QStringLiteral("text");
+    }
+    state.modified = tab->isModified();
+    state.splitView = tab->splitViewEnabled();
+    if (state.splitView) {
+        state.splitOrientation = tab->splitOrientation() == Qt::Vertical
+            ? QStringLiteral("vertical") : QStringLiteral("horizontal");
+    }
+    state.secureDocument = tab->isSecureDocument();
+    if (state.secureDocument)
+        state.documentId = tab->secureDocumentId().toString(QUuid::WithoutBraces);
+    state.autosavePath = state.secureDocument
+        ? tab->secureBackingPath() : tab->autosavePath();
+    return state;
+}
+
+bool EditorTab::captureRecoveryPayload(SessionRecoveryPayload *payload,
+                                       QString *error)
+{
+    if (!payload) {
+        if (error)
+            *error = tr("恢复载荷目标不可用。");
+        return false;
+    }
+    payload->bytes.clear();
+    payload->encoding = int(encoding());
+    if (isBinaryDocument()) {
+        payload->kind = SessionRecoveryKind::BinaryPatchJournal;
+        QBuffer buffer(&payload->bytes);
+        buffer.open(QIODevice::WriteOnly);
+        return exportBinaryRecoveryJournal(&buffer, error);
+    }
+    payload->kind = SessionRecoveryKind::SmallOrJournal;
+    if (exportRecoveryPayload(&payload->bytes, error))
+        return true;
+    if (!isLargeDocument() || isL2Mode())
+        return false;
+    payload->bytes.clear();
+    payload->kind = SessionRecoveryKind::FullCheckpoint;
+    QBuffer buffer(&payload->bytes);
+    buffer.open(QIODevice::WriteOnly);
+    return exportRecoveryCheckpoint(&buffer, error);
+}
+
+bool EditorTab::restoreSessionRecovery(const SessionRestoreRequest &request,
+                                       QString *error)
+{
+    bool loaded = false;
+    if (request.legacyPlaintextFile) {
+        loaded = openAutosaveAutoMode(request.encryptedPath,
+                                      request.realFilePath);
+    } else if (request.kind == SessionRecoveryKind::BinaryPatchJournal) {
+        loaded = restoreBinaryRecoveryJournal(
+            request.encryptedPath, request.realFilePath, error);
+    } else if (request.kind == SessionRecoveryKind::FullCheckpoint) {
+        loaded = restoreRecoveryCheckpoint(
+            request.encryptedPath, request.realFilePath,
+            TextEncoding(request.encoding), request.plaintextBytes, error);
+    } else {
+        loaded = restoreRecoveryPayload(request.plaintext,
+                                        request.realFilePath, error);
+    }
+    if (loaded && !request.realFilePath.isEmpty()) {
+        setFilePath(request.realFilePath);
+        setModified(true);
+    }
+    return loaded;
+}
+
 namespace {
 
 constexpr char LargeRecoveryMagic[] = "NotepadSafe.LargeEditJournal.v1";
 constexpr char BinaryRecoveryMagic[] = "NotepadSafe.BinaryPatchJournal.v1";
 constexpr quint32 BinaryRecoveryVersion = 1;
 
-bool replaceFileAtomically(const QString &temporaryPath, const QString &targetPath,
-                           QString *error)
-{
-#ifdef Q_OS_WIN
-    const std::wstring temporary = QDir::toNativeSeparators(temporaryPath).toStdWString();
-    const std::wstring target = QDir::toNativeSeparators(targetPath).toStdWString();
-    const BOOL replaced = QFileInfo::exists(targetPath)
-        ? ::ReplaceFileW(target.c_str(), temporary.c_str(), nullptr,
-                         REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)
-        : ::MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH);
-    if (replaced)
-        return true;
-    if (error) {
-        *error = QObject::tr("Windows 原子替换失败（错误 %1）；恢复副本保留在 %2")
-                     .arg(::GetLastError()).arg(temporaryPath);
-    }
-    return false;
-#else
-    QFile input(temporaryPath);
-    QSaveFile output(targetPath);
-    output.setDirectWriteFallback(false);
-    if (!input.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly)) {
-        if (error) *error = QObject::tr("无法打开原子替换文件。");
-        return false;
-    }
-    QByteArray chunk;
-    while (!(chunk = input.read(4 * 1024 * 1024)).isEmpty()) {
-        if (output.write(chunk) != chunk.size()) {
-            output.cancelWriting();
-            if (error) *error = QObject::tr("原子替换写入不完整。");
-            return false;
-        }
-    }
-    if (input.error() != QFileDevice::NoError || !output.commit()) {
-        if (error) *error = QObject::tr("原子替换提交失败。");
-        return false;
-    }
-    QFile::remove(temporaryPath);
-    return true;
-#endif
-}
 
 } // namespace
 
@@ -162,8 +212,8 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
         return false;
     }
     const bool binaryHex = presentation == L2Presentation::Hex;
-    m_documentState.contentKind = contentKind == L2ContentKind::Binary
-        ? DocumentContentKind::Binary : DocumentContentKind::Text;
+    m_documentSession.setContentKind(contentKind == L2ContentKind::Binary
+        ? DocumentContentKind::Binary : DocumentContentKind::Text);
     if (isBinaryDocument()) {
         // Binary and mixed-byte documents have one predictable default text
         // projection: UTF-8 multibyte decoding with U+FFFD for malformed
@@ -212,7 +262,7 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
         return false;
     }
     // 成功：切到 L2 视图并标记模式
-    m_documentState.location = fi.absoluteFilePath();
+    m_documentSession.setLocation(fi.absoluteFilePath());
     refreshDiskVersionBaseline();
     m_l2Mode = true;
     // S2 and S3 intentionally expose the same capability: bounded mmap browse,
@@ -268,187 +318,6 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
     return true;
 }
 
-bool EditorTab::saveL2As(const QString &path, QString *errMsg)
-{
-    if (!m_l2Mode || !m_l2View) {
-        if (errMsg) *errMsg = QObject::tr("当前非 L2 模式");
-        return false;
-    }
-    if (isReadOnlyByPolicy()) {
-        if (errMsg) {
-            *errMsg = QObject::tr(
-                "32 MiB 以上文件为只读分析模式，不能保存或另存编辑结果。");
-        }
-        return false;
-    }
-    if (sameDiskFilePath(m_documentState.location, path)) {
-        const ExternalFileState diskState = externalFileState();
-        if (diskState == ExternalFileState::Changed
-            || diskState == ExternalFileState::Missing
-            || diskState == ExternalFileState::Unreadable) {
-            if (errMsg) {
-                *errMsg = QObject::tr(
-                    "磁盘文件在打开后已变化或当前不可读取。为避免覆盖外部内容，保存已停止。");
-            }
-            return false;
-        }
-    }
-    // 以下 patch 保存路径只服务 32 MiB 以下的 B1 兼容 Hex 编辑。
-    // 上面的策略门禁保证 S2/S3 永远不能进入这里。
-    QString flushErr;
-    bridgeFlushOverlayToPatches(&flushErr);
-    if (!flushErr.isEmpty()) {
-        if (errMsg) *errMsg = QObject::tr("保存前回写窗口修改失败：%1").arg(flushErr);
-        return false;
-    }
-    std::atomic<bool> cancel{false};
-    QString localErr;
-
-    // 判断是否保存到当前 mmap 映射的同一文件
-    const bool sameFile = !m_documentState.location.isEmpty() &&
-        QFileInfo(path).absoluteFilePath() == QFileInfo(m_documentState.location).absoluteFilePath();
-
-    if (sameFile
-        && m_l2View->virtualFileSize() < FileTierPolicy::StandardEditLimitBytes) {
-        // B1 is deliberately bounded below 32 MiB. Materialize the authoritative
-        // byte model once, write through QSaveFile, release the source mapping
-        // only for the atomic commit, then reopen. This removes the legacy
-        // user-visible ".notepad-safe-save-tmp" copy used by the large-file
-        // streaming path while retaining crash-safe replacement semantics.
-        QByteArray snapshot = m_l2View->readByteRange(
-            0, m_l2View->virtualFileSize());
-        if (snapshot.size() != m_l2View->virtualFileSize()) {
-            if (errMsg)
-                *errMsg = QObject::tr("无法生成完整的 Binary 保存快照。");
-            if (!snapshot.isEmpty()) snapshot.fill(0);
-            return false;
-        }
-        QSaveFile output(path);
-        output.setDirectWriteFallback(false);
-        if (!output.open(QIODevice::WriteOnly)
-            || output.write(snapshot) != snapshot.size()) {
-            if (errMsg)
-                *errMsg = QObject::tr("无法写入 Binary 原子保存数据：%1")
-                              .arg(output.errorString());
-            output.cancelWriting();
-            if (!snapshot.isEmpty()) snapshot.fill(0);
-            return false;
-        }
-        const ViewMode presentation = m_l2View->viewMode();
-        m_l2View->closeFile();
-        if (!output.commit()) {
-            const QString commitError = output.errorString();
-            QString reopenError;
-            m_l2View->setViewMode(presentation);
-            m_l2View->openFile(path, &reopenError);
-            if (errMsg)
-                *errMsg = QObject::tr("Binary 原子保存失败：%1").arg(commitError);
-            if (!snapshot.isEmpty()) snapshot.fill(0);
-            return false;
-        }
-        if (!snapshot.isEmpty()) snapshot.fill(0);
-        QString reopenError;
-        m_l2View->setViewMode(presentation);
-        if (!m_l2View->openFile(path, &reopenError)) {
-            if (errMsg)
-                *errMsg = QObject::tr("保存成功但重新打开失败：%1").arg(reopenError);
-            return false;
-        }
-        m_documentState.location = QFileInfo(path).absoluteFilePath();
-    } else if (sameFile) {
-        // ---- Windows 关键修复：mmap 活跃时 QSaveFile::commit() 无法替换文件 ----
-        // 方案：先写到同目录临时文件（mmapBase 仍有效，applyAndSave 可读原文），
-        //       再 closeFile 释放 mmap（含取消后台 LineIndex 构建），
-        //       然后 rename 临时文件 → 目标路径（失败 fallback copy+remove），最后 openFile 重新映射。
-        const QString tempPath = path + QStringLiteral(".notepad-safe-save-tmp");
-        QFile::remove(tempPath);
-
-        bool ok = m_l2View->saveAs(tempPath, {}, &cancel, &localErr);
-        if (!ok) {
-            if (errMsg) *errMsg = localErr;
-            QFile::remove(tempPath);
-            return false;
-        }
-        // 释放 mmap（closeFile 内部取消后台构建 + unmap + resetAfterSave）
-        m_l2View->closeFile();
-        // 原文件已解锁，用平台原子替换，禁止“先删除原文件再复制”的数据丢失窗口。
-        QString replaceError;
-        if (!replaceFileAtomically(tempPath, path, &replaceError)) {
-            if (errMsg) *errMsg = replaceError;
-            QString reopenErr;
-            m_l2View->openFile(path, &reopenErr);
-            return false;
-        }
-        // 重新映射已保存的文件
-        QString reopenErr;
-        ok = m_l2View->openFile(path, &reopenErr);
-        if (!ok) {
-            if (errMsg) *errMsg = QObject::tr("保存成功但重新打开失败：%1").arg(reopenErr);
-            return false;
-        }
-        m_documentState.location = path;  // sameFile 路径也同步（openFile 可能没更新 EditorTab::m_documentState.location，确保 tab 标题/后续状态正确）
-    } else {
-        // 不同文件：先流式保存，再把新文件切成当前 backing store。否则后续编辑
-        // 仍依赖旧文件 mmap，旧文件被移动/修改后会破坏“另存为”文档。
-        bool ok = m_l2View->saveAs(path, {}, &cancel, &localErr);
-        if (!ok) {
-            if (errMsg) *errMsg = localErr;
-            return false;
-        }
-        m_l2View->closeFile();
-        QString reopenErr;
-        ok = m_l2View->openFile(path, &reopenErr);
-        if (!ok) {
-            if (errMsg)
-                *errMsg = QObject::tr("文件已另存为，但无法切换到新文件：%1").arg(reopenErr);
-            return false;
-        }
-        m_documentState.location = QFileInfo(path).absoluteFilePath();
-    }
-
-    setModified(false);
-    clearAutosaveFile();
-    m_autosavePath.clear();
-    refreshDiskVersionBaseline();
-    emit titleChanged(tabTitle());
-    // Saving a mapped document closes and reopens its provider. During the
-    // short closed interval the projection length is not the payload length;
-    // refresh permanent UI only after the authoritative provider is open.
-    emit cursorPositionChanged(m_lastL2Line, m_lastL2Col);
-    return true;
-}
-
-// ============================================================================
-//  会话专用：exportToFile（零副作用写盘）+ openAutosaveAutoMode（L1/L2 恢复分流）
-// ============================================================================
-
-bool EditorTab::exportToFile(const QString &destPath) const
-{
-    if (isL2Mode() && m_l2View && m_l2View->isOpen()) {
-        QString error;
-        std::atomic<bool> cancel{false};
-        auto *view = const_cast<VirtualFileView *>(m_l2View);
-        return view->saveAs(destPath, {}, &cancel, &error);
-    }
-
-
-    QSaveFile output(destPath);
-    output.setDirectWriteFallback(false);
-    if (!output.open(QIODevice::WriteOnly))
-        return false;
-    QString text = m_editor->text();
-    QByteArray data = encodeText(text, m_encoding);
-    const bool complete = output.write(data) == data.size();
-    if (!text.isEmpty())
-        text.fill(QChar(0));
-    if (!data.isEmpty())
-        data.fill(0);
-    if (!complete) {
-        output.cancelWriting();
-        return false;
-    }
-    return output.commit();
-}
 
 bool EditorTab::exportSnapshotBytes(QByteArray *data) const
 {
@@ -518,7 +387,7 @@ bool EditorTab::restoreRecoveryCheckpoint(const QString &checkpointPath,
 bool EditorTab::exportBinaryRecoveryJournal(QIODevice *output, QString *error)
 {
     if (!output || !output->isWritable() || !isBinaryDocument() || isSecureDocument()
-        || !isL2Mode() || !m_l2View || m_documentState.location.isEmpty() || isReadOnlyByPolicy()) {
+        || !isL2Mode() || !m_l2View || m_documentSession.state().location.isEmpty() || isReadOnlyByPolicy()) {
         if (error) *error = QObject::tr("当前文档不能生成 Binary/Hex 恢复日志。");
         return false;
     }
@@ -531,7 +400,7 @@ bool EditorTab::exportBinaryRecoveryJournal(QIODevice *output, QString *error)
         if (error) *error = QObject::tr("Binary/Hex 文档没有需要恢复的编辑。");
         return false;
     }
-    if (externalFileState() != ExternalFileState::Unchanged || !m_diskVersion.valid) {
+    if (externalFileState() != ExternalFileState::Unchanged || !m_documentSession.diskVersion().valid) {
         if (error) *error = QObject::tr("原始二进制文件已经变化，不能建立可安全重放的恢复日志。");
         return false;
     }
@@ -539,8 +408,8 @@ bool EditorTab::exportBinaryRecoveryJournal(QIODevice *output, QString *error)
     QDataStream stream(output);
     stream.setByteOrder(QDataStream::LittleEndian);
     stream << QByteArray(BinaryRecoveryMagic, sizeof(BinaryRecoveryMagic))
-           << BinaryRecoveryVersion << m_diskVersion.size << m_diskVersion.modifiedMs
-           << m_diskVersion.fileIdentity << m_diskVersion.sampleHash;
+           << BinaryRecoveryVersion << m_documentSession.diskVersion().size << m_documentSession.diskVersion().modifiedMs
+           << m_documentSession.diskVersion().fileIdentity << m_documentSession.diskVersion().sampleHash;
     if (stream.status() != QDataStream::Ok) {
         if (error) *error = QObject::tr("写入 Binary/Hex 恢复元数据失败。");
         return false;
@@ -693,7 +562,7 @@ bool EditorTab::openAutosaveAutoMode(const QString &autosavePath, const QString 
                ok ? 1 : 0, t.elapsed());
         if (ok && !realFilePath.isEmpty()) {
             // 已有真实路径：对用户显示原名 + 标记"有未保存修改"
-            m_documentState.location = realFilePath;
+            m_documentSession.setLocation(realFilePath);
             refreshDiskVersionBaseline();
             // 注意：loadAutosave 已经 setModified(true)，所以无需再调
             emit titleChanged(tabTitle());
@@ -716,9 +585,9 @@ bool EditorTab::openAutosaveAutoMode(const QString &autosavePath, const QString 
         return false;
     }
 
-    m_documentState.location = realFilePath;
+    m_documentSession.setLocation(realFilePath);
     refreshDiskVersionBaseline();
-    m_autosavePath = autosavePath;
+    m_documentSession.setRecoveryPath(autosavePath);
     m_l2SaveNeeded = true;
     emit modificationChanged(true);
     emit titleChanged(tabTitle());

@@ -1,13 +1,19 @@
 #include "DocumentProviderRegistry.h"
+#include "DocumentSession.h"
+#include "DocumentContentPort.h"
 #include "DocumentToolRegistry.h"
 #include "ReadOnlySelectionModel.h"
+#include "SearchSession.h"
 #include "FeatureRegistry.h"
 #include "InferenceProviderRegistry.h"
 #include "PersistenceAdapterRegistry.h"
+#include "PlainFilePersistence.h"
 
 #include <QCoreApplication>
 #include <QDebug>
 #include <QElapsedTimer>
+#include <QFile>
+#include <QTemporaryDir>
 
 namespace {
 
@@ -89,8 +95,65 @@ public:
     {
         return path.contains(descriptor_.id);
     }
+    PersistenceResult save(IDocumentContentPort *,
+                           const PersistenceSaveRequest &) override
+    {
+        return {PersistenceStatus::Success, {}, {}};
+    }
 private:
     PersistenceAdapterDescriptor descriptor_;
+};
+
+class MemoryContentPort final : public IDocumentContentPort {
+public:
+    DocumentState persistenceState() const noexcept override { return state; }
+    TextEncoding persistenceEncoding() const noexcept override { return encoding; }
+    DiskFileVersion persistenceBaseline() const override { return baseline; }
+    bool createPersistenceSnapshot(qint64 maximumBytes, DocumentSnapshot *out,
+                                   QString *error) override
+    {
+        const QByteArray encoded = text.toUtf8();
+        if (!out || encoded.size() > maximumBytes) {
+            if (error) *error = QStringLiteral("snapshot refused");
+            return false;
+        }
+        *out = {};
+        out->documentId = state.id;
+        out->revision = state.revision;
+        out->contentKind = DocumentContentKind::Text;
+        out->securityClass = state.securityClass;
+        out->capabilities = state.capabilities;
+        out->text = text;
+        out->sourceRange = {{0}, {encoded.size()}};
+        ++snapshotCount;
+        return true;
+    }
+    bool suspendPersistenceBacking(QString *) override { return true; }
+    bool resumePersistenceBacking(const QString &, QString *) override
+    {
+        return true;
+    }
+    void acceptPersistenceCommit(const QString &path,
+                                 DiskFileVersion version) override
+    {
+        state.location = path;
+        state.persistence = DocumentPersistence::PlainFile;
+        baseline = std::move(version);
+        ++plainCommitCount;
+    }
+    void acceptSecurePersistenceCommit(const QUuid &, const QString &,
+                                       const QString &, const QString &) override
+    {
+        ++secureCommitCount;
+    }
+
+    DocumentState state;
+    TextEncoding encoding = TextEncoding::Utf8;
+    DiskFileVersion baseline;
+    QString text;
+    int snapshotCount = 0;
+    int plainCommitCount = 0;
+    int secureCommitCount = 0;
 };
 
 DocumentSnapshot snapshot(DocumentSecurityClass security)
@@ -130,6 +193,32 @@ int main(int argc, char **argv)
               && selection.anchor().value == 18
               && selection.caret().value == 12,
           "reverse selection preserves direction and exposes a normalized range");
+
+    SearchSession searchSession;
+    SearchQuery firstQuery{QStringLiteral("first"),
+                           SearchScope::AllOpenDocuments,
+                           false, true, false, false};
+    const int firstSearchGeneration = searchSession.begin(std::move(firstQuery));
+    searchSession.scheduleTarget();
+    searchSession.scheduleTarget();
+    searchSession.settleTarget();
+    searchSession.requestCancel();
+    check(searchSession.pendingTargets() == 1
+              && searchSession.cancelRequested(),
+          "search session owns target count and cancellation together");
+    SearchQuery secondQuery{QStringLiteral("second"),
+                            SearchScope::AllOpenDocuments,
+                            true, false, false, false};
+    const int secondSearchGeneration = searchSession.begin(std::move(secondQuery));
+    check(secondSearchGeneration != firstSearchGeneration
+              && !searchSession.isCurrent(firstSearchGeneration)
+              && searchSession.pendingTargets() == 0
+              && !searchSession.cancelRequested()
+              && searchSession.query().pattern == QLatin1String("second"),
+          "a new search atomically invalidates all prior generation state");
+    searchSession.settleTarget();
+    check(searchSession.pendingTargets() == 0,
+          "late or duplicate target completion cannot underflow session state");
 
     DocumentToolRegistry tools;
     check(tools.registerTool(EchoDocumentTool().descriptor(), [] {
@@ -234,6 +323,102 @@ int main(int argc, char **argv)
                999, DocumentPersistence::PlainFile},
               [] { return std::unique_ptr<IPersistenceAdapter>{}; }),
           "duplicate persistence adapter ids fail closed");
+
+    PersistenceAdapterRegistry routedPersistence;
+    check(routedPersistence.registerRoute(
+              {QStringLiteral("test.secure"), QStringLiteral("Secure"), 100,
+               DocumentPersistence::SecureFile},
+              [](const QString &path) {
+                  return path.endsWith(QLatin1String(".safe"));
+              }),
+          "register descriptor-only persistence route");
+    const auto secureRoute = routedPersistence.resolve(QStringLiteral("note.safe"));
+    check(secureRoute
+              && secureRoute->persistence == DocumentPersistence::SecureFile
+              && routedPersistence.instantiatedCount() == 0,
+          "format routing is available without constructing a heavy adapter");
+    auto routedAdapter = std::make_unique<CountingPersistenceAdapter>(
+        PersistenceAdapterDescriptor{QStringLiteral("test.secure"),
+                                     QStringLiteral("Secure"), 100,
+                                     DocumentPersistence::SecureFile});
+    IPersistenceAdapter *routedAdapterAddress = routedAdapter.get();
+    check(routedPersistence.registerAdapter(std::move(routedAdapter))
+              && routedPersistence.adapter(QStringLiteral("test.secure"))
+                  == routedAdapterAddress
+              && routedPersistence.instantiatedCount() == 1,
+          "lazy route is completed by its runtime adapter without duplicate registration");
+
+    DocumentSession lifecycle;
+    const QUuid originalId = lifecycle.state().id;
+    lifecycle.bindPlainFile(QStringLiteral("plain.txt"));
+    check(lifecycle.state().id == originalId
+              && lifecycle.state().persistence == DocumentPersistence::PlainFile
+              && lifecycle.state().securityClass
+                  == DocumentSecurityClass::OrdinaryDocument,
+          "plain binding is one atomic lifecycle transition");
+    const QUuid secureId = QUuid::createUuid();
+    lifecycle.setRecoveryPath(QStringLiteral("draft.recovery"));
+    lifecycle.setSecureBackingPath(QStringLiteral("cipher.nsafe"));
+    lifecycle.bindSecureFile(secureId, QStringLiteral("note.nsafe"),
+                             DocumentContentKind::Text);
+    lifecycle.clearRecoveryPath();
+    check(lifecycle.state().id == secureId
+              && lifecycle.state().persistence == DocumentPersistence::SecureFile
+              && lifecycle.recoveryPath().isEmpty()
+              && lifecycle.secureBackingPath() == QLatin1String("cipher.nsafe"),
+          "discarding recovery never discards the secure backing identity");
+    lifecycle.bindPlainFile(QStringLiteral("export.txt"), true);
+    check(lifecycle.state().id != secureId
+              && lifecycle.state().securityClass
+                  == DocumentSecurityClass::OrdinaryDocument,
+          "secure-to-plain conversion renews identity and clears classification");
+
+    QTemporaryDir persistenceDir;
+    check(persistenceDir.isValid(), "persistence contract temp directory exists");
+    MemoryContentPort memory;
+    memory.state.capabilities = DocumentCapability::Read
+        | DocumentCapability::Edit | DocumentCapability::Save;
+    memory.text = QStringLiteral("first\n");
+    const QString persistencePath = persistenceDir.filePath(
+        QStringLiteral("twice.txt"));
+    PersistenceAdapterRegistry realPersistence;
+    check(realPersistence.registerAdapter(
+              std::make_unique<PlainFilePersistence>()),
+          "register the production plain persistence adapter");
+    PersistenceSaveRequest firstSave{persistencePath, QString(), {}, false};
+    const PersistenceResult firstCommit = realPersistence.saveFor(
+        DocumentPersistence::PlainFile, &memory, firstSave);
+    check(firstCommit.succeeded() && memory.plainCommitCount == 1
+              && memory.snapshotCount == 1,
+          "first persistence operation snapshots and commits exactly once");
+    memory.text = QStringLiteral("second\n");
+    ++memory.state.revision;
+    PersistenceSaveRequest secondSave{
+        persistencePath, QString(), firstCommit.committedVersion, true};
+    const PersistenceResult secondCommit = realPersistence.saveFor(
+        DocumentPersistence::PlainFile, &memory, secondSave);
+    QFile committedFile(persistencePath);
+    check(secondCommit.succeeded() && memory.plainCommitCount == 2
+              && memory.snapshotCount == 2 && committedFile.open(QIODevice::ReadOnly)
+              && committedFile.readAll() == QByteArray("second\n"),
+          "second persistence operation observes new revision and replaces atomically");
+    committedFile.close();
+    QFile externalWriter(persistencePath);
+    check(externalWriter.open(QIODevice::WriteOnly | QIODevice::Truncate)
+              && externalWriter.write("external\n") == 9,
+          "conflict fixture changes the committed file");
+    externalWriter.close();
+    memory.text = QStringLiteral("must-not-overwrite\n");
+    const int commitsBeforeConflict = memory.plainCommitCount;
+    const PersistenceResult conflict = realPersistence.saveFor(
+        DocumentPersistence::PlainFile, &memory,
+        {persistencePath, QString(), secondCommit.committedVersion, true});
+    QFile conflictFile(persistencePath);
+    check(conflict.status == PersistenceStatus::Conflict
+              && memory.plainCommitCount == commitsBeforeConflict
+              && conflictFile.open(QIODevice::ReadOnly)
+              && conflictFile.readAll() == QByteArray("external\n"),
+          "conflict fails closed without committing state or overwriting bytes");
 
     check(FeatureRegistry::featureIdForCommand(QStringLiteral("edit.copy"))
               == QLatin1String("NSP-EDIT"),

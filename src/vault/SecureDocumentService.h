@@ -1,5 +1,6 @@
 #pragma once
 
+#include "SecureDocumentContract.h"
 #include "SecuritySessionService.h"
 #include "VaultTypes.h"
 #include "DiskFileVersion.h"
@@ -11,23 +12,6 @@
 
 #include <memory>
 #include <vector>
-
-enum class SecureDocumentPayloadKind {
-    Text,
-    Binary,
-};
-
-struct SecureDocumentSnapshot {
-    QUuid documentId;
-    QString filePath;
-    QString backingPath;
-    QString title;
-    QString text;
-    QByteArray binary;
-    SecureDocumentPayloadKind payloadKind = SecureDocumentPayloadKind::Text;
-    bool draft = false;
-    bool recoveredUnsaved = false;
-};
 
 class ISecureDocumentService {
 public:

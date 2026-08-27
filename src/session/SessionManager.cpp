@@ -1,7 +1,5 @@
 #include "SessionManager.h"
 #include "DraftStore.h"
-#include "EditorTab.h"
-#include "VirtualFileView.h"
 
 #include <QDir>
 #include <QFile>
@@ -146,251 +144,71 @@ void SessionManager::removeAutosaveFile(const QString &path) const
         QFile::remove(path);
 }
 
-bool SessionManager::restoreAutosave(EditorTab *tab, const QString &autosavePath,
-                                     const QString &realFilePath) const
+void SessionManager::discardRecovery(ISessionDocumentPort *document) const
+{
+    if (!document)
+        return;
+    removeAutosaveFile(document->recoveryPath());
+    document->acceptRecoveryPath({});
+}
+
+bool SessionManager::restoreAutosave(
+    ISessionDocumentPort *tab, const QString &autosavePath,
+    const QString &realFilePath) const
 {
     if (!tab || !isManagedAutosavePath(autosavePath)
-        || !QFileInfo::exists(autosavePath))
+        || !QFileInfo::exists(autosavePath)) {
         return false;
-    bool loaded = false;
+    }
+
+    SessionRestoreRequest request;
+    request.encryptedPath = autosavePath;
+    request.realFilePath = realFilePath;
+    QString error;
     if (DraftStore::isEncryptedDraft(autosavePath)) {
-        QString error;
         DraftStore::SnapshotInfo info;
         if (!DraftStore::inspect(autosavePath, &info, &error)) {
             qWarning("[SessionManager] encrypted draft restore failed: %s",
                      qUtf8Printable(error));
             return false;
         }
+        request.encoding = info.encoding;
+        request.plaintextBytes = info.plaintextBytes;
         if (info.kind == DraftStore::PayloadKind::BinaryPatchJournal) {
-            loaded = tab->restoreBinaryRecoveryJournal(
-                autosavePath, realFilePath, &error);
+            request.kind = SessionRecoveryKind::BinaryPatchJournal;
         } else if (info.kind == DraftStore::PayloadKind::FullCheckpoint) {
-            loaded = tab->restoreRecoveryCheckpoint(
-                autosavePath, realFilePath, TextEncoding(info.encoding),
-                info.plaintextBytes, &error);
+            request.kind = SessionRecoveryKind::FullCheckpoint;
         } else {
-            QByteArray plaintext;
-            if (!DraftStore::readSnapshot(autosavePath, &plaintext, &error)) {
+            request.kind = SessionRecoveryKind::SmallOrJournal;
+            if (!DraftStore::readSnapshot(autosavePath, &request.plaintext, &error)) {
                 qWarning("[SessionManager] encrypted draft restore failed: %s",
                          qUtf8Printable(error));
                 return false;
             }
-            loaded = tab->restoreRecoveryPayload(plaintext, realFilePath, &error);
-            scrubSnapshot(plaintext);
         }
-        if (!loaded && !error.isEmpty())
-            qWarning("[SessionManager] recovery payload rejected: %s", qUtf8Printable(error));
-        if (loaded)
-            tab->setAutosavePath(autosavePath);
     } else {
-        // Backward-compatible reader for snapshots written before DraftStore v1.
-        loaded = tab->openAutosaveAutoMode(autosavePath, realFilePath);
+        request.legacyPlaintextFile = true;
     }
-    if (loaded && !realFilePath.isEmpty()) {
-        tab->setFilePath(realFilePath);
-        tab->setModified(true);
+
+    const bool loaded = tab->restoreSessionRecovery(request, &error);
+    scrubSnapshot(request.plaintext);
+    if (!loaded && !error.isEmpty()) {
+        qWarning("[SessionManager] recovery payload rejected: %s",
+                 qUtf8Printable(error));
     }
+    if (loaded)
+        tab->acceptRecoveryPath(autosavePath);
     return loaded;
 }
 
-bool SessionManager::saveSession(const QVector<EditorTab *> &tabs, int activeIndex,
-                                 bool forceSnapshots)
+bool SessionManager::saveSession(
+    const QVector<ISessionDocumentPort *> &tabs, int activeIndex,
+    bool forceSnapshots)
 {
-    ensureDirs();
-
-    // 先收集本次需要保留的 autosave 路径，再删除其他的（避免先清空导致恢复时偶发失败）
-    QStringList toKeep;
-    for (EditorTab *tab : tabs) {
-        if (tab->isSecureDocument()) {
-            if (!tab->autosavePath().isEmpty())
-                toKeep << tab->autosavePath();
-            continue;
-        }
-        if (!tab->autosavePath().isEmpty())
-            toKeep << tab->autosavePath();
-    }
-
-    QJsonArray tabsArray;
-    QSet<QUuid> activeInstances;
-    constexpr qint64 largeSnapshotIntervalMs = 5LL * 60 * 1000;
-    const QDateTime now = QDateTime::currentDateTimeUtc();
-    for (int i = 0; i < tabs.size(); ++i) {
-        EditorTab *tab = tabs[i];
-        const QUuid instanceId = tab->sessionInstanceId();
-        activeInstances.insert(instanceId);
-        SessionTab st;
-        st.filePath = tab->filePath();
-        st.encoding = encodingName(tab->encoding());
-        st.syntax = static_cast<int>(tab->syntax());
-        tab->getCursorPosition(&st.cursorLine, &st.cursorIndex);
-        if (tab->isL2Mode() && tab->l2View()) {
-            st.cursorByteOffset = tab->currentByteOffset();
-            st.selectionStartByte = tab->l2View()->selectionStart();
-            st.selectionEndByte = tab->l2View()->selectionEnd();
-            st.presentation = tab->viewModeL2() == ViewMode::Hex
-                ? QStringLiteral("hex") : QStringLiteral("text");
-        } else if (tab->editor()) {
-            st.cursorByteOffset = tab->editor()->SendScintilla(
-                QsciScintillaBase::SCI_GETCURRENTPOS);
-            st.selectionStartByte = tab->editor()->SendScintilla(
-                QsciScintillaBase::SCI_GETSELECTIONSTART);
-            st.selectionEndByte = tab->editor()->SendScintilla(
-                QsciScintillaBase::SCI_GETSELECTIONEND);
-            st.presentation = QStringLiteral("text");
-        }
-        st.modified = tab->isModified();
-        st.splitView = tab->splitViewEnabled();
-        if (st.splitView) {
-            st.splitOrientation = tab->splitOrientation() == Qt::Vertical
-                ? QStringLiteral("vertical") : QStringLiteral("horizontal");
-        }
-        st.secureDocument = tab->isSecureDocument();
-        if (st.secureDocument) {
-            st.documentId = tab->secureDocumentId().toString(QUuid::WithoutBraces);
-            st.autosavePath = tab->autosavePath();
-        }
-
-        // 如果有未保存内容，写入 autosave 文件
-        if (!st.secureDocument && (tab->isUntitled() || tab->isModified())) {
-            const bool emptyUntitled = tab->isUntitled() && !tab->isModified()
-                                       && !tab->isLargeDocument()
-                                       && tab->editor()->length() == 0;
-            if (emptyUntitled) {
-                st.autosavePath.clear();
-            } else {
-            const bool largeDocument = tab->isLargeDocument();
-            const QString previousPath = isManagedAutosavePath(tab->autosavePath())
-                ? tab->autosavePath() : QString();
-            const bool previousExists = !previousPath.isEmpty()
-                                        && QFileInfo::exists(previousPath);
-            QString ap = previousPath;
-            if (!previousExists || !DraftStore::isEncryptedDraft(ap)) {
-                // 新写入永远迁移到加密 .ndraft；旧 .tmp 仅在新快照提交失败时保留。
-                ap = generateAutosavePath();
-            }
-            st.autosavePath = ap;
-
-            const bool existingSnapshot = QFileInfo::exists(ap);
-            const quint64 revision = tab->contentRevision();
-            const bool sameRevision = existingSnapshot
-                                      && m_snapshotRevisions.contains(instanceId)
-                                      && m_snapshotRevisions.value(instanceId) == revision;
-            const QDateTime previous = m_snapshotTimes.value(instanceId);
-            const bool largeThrottled = tab->isLargeDocument() && existingSnapshot
-                                        && previous.isValid()
-                                        && previous.msecsTo(now) < largeSnapshotIntervalMs;
-            const bool writeSnapshot = !existingSnapshot
-                                       || (!sameRevision
-                                           && (forceSnapshots || !largeThrottled));
-
-            if (!writeSnapshot) {
-                toKeep << ap;
-                tab->setAutosavePath(ap);
-            } else {
-                bool snapshotWritten = false;
-                QByteArray plaintext;
-                QString draftError;
-                if (tab->isBinaryDocument()) {
-                    snapshotWritten = DraftStore::writeBinaryPatchJournal(
-                        ap, [tab](QIODevice *output, QString *writerError) {
-                            return tab->exportBinaryRecoveryJournal(output, writerError);
-                        }, &draftError);
-                } else {
-                    const bool payloadReady = tab->exportRecoveryPayload(&plaintext,
-                                                                          &draftError);
-                    if (payloadReady) {
-                        snapshotWritten = DraftStore::writeSnapshot(ap, plaintext,
-                                                                     &draftError);
-                    } else if (largeDocument && !tab->isL2Mode()) {
-                    draftError.clear();
-                    snapshotWritten = DraftStore::writeCheckpoint(
-                        ap, int(tab->encoding()),
-                        [tab](QIODevice *output, QString *writerError) {
-                            return tab->exportRecoveryCheckpoint(output, writerError);
-                        }, &draftError);
-                    }
-                }
-                scrubSnapshot(plaintext);
-                if (!snapshotWritten && !draftError.isEmpty())
-                    qWarning("[SessionManager] encrypted draft write failed: %s",
-                             qUtf8Printable(draftError));
-                if (snapshotWritten) {
-                toKeep << ap;
-                tab->setAutosavePath(ap);
-                m_snapshotRevisions.insert(instanceId, tab->contentRevision());
-                m_snapshotTimes.insert(instanceId, now);
-                // 原子提交成功后立即删除旧版明文快照，完成无损迁移。
-                if (previousExists && previousPath != ap) {
-                    toKeep.removeAll(previousPath);
-                    QFile::remove(previousPath);
-                }
-                } else if (existingSnapshot) {
-                // 新快照失败时保留最后一个可恢复版本，不能把唯一副本从会话中移除。
-                toKeep << ap;
-                tab->setAutosavePath(ap);
-                } else if (previousExists) {
-                    st.autosavePath = previousPath;
-                    toKeep << previousPath;
-                    tab->setAutosavePath(previousPath);
-                } else {
-                st.autosavePath.clear();
-                }
-            }
-            }
-        }
-
-        QJsonObject obj;
-        obj["filePath"] = st.filePath;
-        obj["encoding"] = st.encoding;
-        obj["syntax"] = st.syntax;
-        obj["cursorLine"] = st.cursorLine;
-        obj["cursorIndex"] = st.cursorIndex;
-        obj["cursorByteOffset"] = QString::number(st.cursorByteOffset);
-        obj["selectionStartByte"] = QString::number(st.selectionStartByte);
-        obj["selectionEndByte"] = QString::number(st.selectionEndByte);
-        obj["modified"] = st.modified;
-        obj["autosavePath"] = st.autosavePath;
-        obj["secureDocument"] = st.secureDocument;
-        obj["documentId"] = st.documentId;
-        obj["presentation"] = st.presentation;
-        obj["splitView"] = st.splitView;
-        obj["splitOrientation"] = st.splitOrientation;
-        tabsArray.append(obj);
-    }
-
-    for (auto it = m_snapshotRevisions.begin(); it != m_snapshotRevisions.end();) {
-        if (!activeInstances.contains(it.key()))
-            it = m_snapshotRevisions.erase(it);
-        else
-            ++it;
-    }
-    for (auto it = m_snapshotTimes.begin(); it != m_snapshotTimes.end();) {
-        if (!activeInstances.contains(it.key()))
-            it = m_snapshotTimes.erase(it);
-        else
-            ++it;
-    }
-
-    // 清理不在保留列表里的旧 autosave
-    QDir dir(m_autosaveDir);
-    auto oldFiles = dir.entryInfoList({"autosave_*.ndraft", "autosave_*.tmp", "tab_*.tmp"},
-                                      QDir::Files);
-    for (const QFileInfo &fi : oldFiles) {
-        if (!toKeep.contains(fi.absoluteFilePath()))
-            QFile::remove(fi.absoluteFilePath());
-    }
-
-    QJsonObject root;
-    root["version"] = 2;
-    root["tabs"] = tabsArray;
-    root["activeTab"] = activeIndex;
-
-    QJsonDocument doc(root);
-    QSaveFile f(sessionFilePath());
-    if (!f.open(QIODevice::WriteOnly))
-        return false;
-    f.write(doc.toJson());
-    return f.commit();
+    const auto plan = captureAsyncSave(tabs, activeIndex, forceSnapshots);
+    const auto result = writeAsyncSave(plan);
+    applyAsyncSave(result, tabs);
+    return asyncSaveSucceeded(result);
 }
 
 struct SessionManager::AsyncSavePlan {
@@ -433,7 +251,8 @@ struct SessionManager::AsyncSaveResult {
 };
 
 std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSave(
-    const QVector<EditorTab *> &tabs, int activeIndex, bool forceSnapshots)
+    const QVector<ISessionDocumentPort *> &tabs, int activeIndex,
+    bool forceSnapshots)
 {
     ensureDirs();
     auto plan = std::make_shared<AsyncSavePlan>();
@@ -443,62 +262,32 @@ std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSave(
     plan->sessionPath = sessionFilePath();
     constexpr qint64 largeSnapshotIntervalMs = 5LL * 60 * 1000;
 
-    for (EditorTab *tab : tabs) {
+    for (ISessionDocumentPort *tab : tabs) {
         if (!tab)
             continue;
         AsyncSavePlan::Item item;
         item.instanceId = tab->sessionInstanceId();
-        item.revision = tab->contentRevision();
+        item.revision = tab->sessionRevision();
         plan->activeInstances.insert(item.instanceId);
         SessionTab &st = item.state;
-        st.filePath = tab->filePath();
-        st.encoding = encodingName(tab->encoding());
-        st.syntax = static_cast<int>(tab->syntax());
-        tab->getCursorPosition(&st.cursorLine, &st.cursorIndex);
-        if (tab->isL2Mode() && tab->l2View()) {
-            st.cursorByteOffset = tab->currentByteOffset();
-            st.selectionStartByte = tab->l2View()->selectionStart();
-            st.selectionEndByte = tab->l2View()->selectionEnd();
-            st.presentation = tab->viewModeL2() == ViewMode::Hex
-                ? QStringLiteral("hex") : QStringLiteral("text");
-        } else if (tab->editor()) {
-            st.cursorByteOffset = tab->editor()->SendScintilla(
-                QsciScintillaBase::SCI_GETCURRENTPOS);
-            st.selectionStartByte = tab->editor()->SendScintilla(
-                QsciScintillaBase::SCI_GETSELECTIONSTART);
-            st.selectionEndByte = tab->editor()->SendScintilla(
-                QsciScintillaBase::SCI_GETSELECTIONEND);
-            st.presentation = QStringLiteral("text");
-        }
-        st.modified = tab->isModified();
-        st.splitView = tab->splitViewEnabled();
-        if (st.splitView) {
-            st.splitOrientation = tab->splitOrientation() == Qt::Vertical
-                ? QStringLiteral("vertical") : QStringLiteral("horizontal");
-        }
-        st.secureDocument = tab->isSecureDocument();
+        st = tab->captureSessionTab();
         if (st.secureDocument) {
-            st.documentId = tab->secureDocumentId().toString(QUuid::WithoutBraces);
-            st.autosavePath = tab->autosavePath();
             plan->items.append(std::move(item));
             continue;
         }
 
-        if (!(tab->isUntitled() || tab->isModified())) {
+        if (!tab->needsRecoverySnapshot()) {
             plan->items.append(std::move(item));
             continue;
         }
-        const bool emptyUntitled = tab->isUntitled() && !tab->isModified()
-                                   && !tab->isLargeDocument() && tab->editor()
-                                   && tab->editor()->length() == 0;
-        if (emptyUntitled) {
+        if (tab->isEmptyUntitledDocument()) {
             st.autosavePath.clear();
             plan->items.append(std::move(item));
             continue;
         }
 
-        item.previousPath = isManagedAutosavePath(tab->autosavePath())
-            ? tab->autosavePath() : QString();
+        item.previousPath = isManagedAutosavePath(tab->recoveryPath())
+            ? tab->recoveryPath() : QString();
         item.previousExists = !item.previousPath.isEmpty()
                               && QFileInfo::exists(item.previousPath);
         item.targetPath = item.previousPath;
@@ -508,10 +297,11 @@ std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSave(
         item.existingSnapshot = QFileInfo::exists(item.targetPath);
         const bool sameRevision = item.existingSnapshot
                                   && m_snapshotRevisions.value(item.instanceId,
-                                                               std::numeric_limits<quint64>::max())
+                                                               (std::numeric_limits<quint64>::max)())
                                          == item.revision;
         const QDateTime previousTime = m_snapshotTimes.value(item.instanceId);
-        const bool largeThrottled = tab->isLargeDocument() && item.existingSnapshot
+        const bool largeThrottled = tab->isLargeRecoveryDocument()
+                                    && item.existingSnapshot
                                     && previousTime.isValid()
                                     && previousTime.msecsTo(plan->capturedAtUtc)
                                            < largeSnapshotIntervalMs;
@@ -519,26 +309,17 @@ std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSave(
                              || (!sameRevision && (forceSnapshots || !largeThrottled));
 
         if (item.writeSnapshot) {
-            if (tab->isBinaryDocument()) {
-                QBuffer buffer(&item.payload);
-                buffer.open(QIODevice::WriteOnly);
-                item.payloadReady = tab->exportBinaryRecoveryJournal(
-                    &buffer, &item.exportError);
+            SessionRecoveryPayload payload;
+            item.payloadReady = tab->captureRecoveryPayload(
+                &payload, &item.exportError);
+            item.payload = std::move(payload.bytes);
+            item.payloadEncoding = payload.encoding;
+            if (payload.kind == SessionRecoveryKind::FullCheckpoint) {
+                item.payloadKind = DraftStore::PayloadKind::FullCheckpoint;
+            } else if (payload.kind == SessionRecoveryKind::BinaryPatchJournal) {
                 item.payloadKind = DraftStore::PayloadKind::BinaryPatchJournal;
             } else {
-                item.payloadReady = tab->exportRecoveryPayload(&item.payload,
-                                                                &item.exportError);
                 item.payloadKind = DraftStore::PayloadKind::SmallOrJournal;
-                if (!item.payloadReady && tab->isLargeDocument() && !tab->isL2Mode()) {
-                    item.exportError.clear();
-                    item.payload.clear();
-                    QBuffer buffer(&item.payload);
-                    buffer.open(QIODevice::WriteOnly);
-                    item.payloadReady = tab->exportRecoveryCheckpoint(
-                        &buffer, &item.exportError);
-                    item.payloadKind = DraftStore::PayloadKind::FullCheckpoint;
-                    item.payloadEncoding = int(tab->encoding());
-                }
             }
         }
         plan->items.append(std::move(item));
@@ -660,18 +441,18 @@ bool SessionManager::asyncSaveSucceeded(
 
 void SessionManager::applyAsyncSave(
     const std::shared_ptr<AsyncSaveResult> &result,
-    const QVector<EditorTab *> &tabs)
+    const QVector<ISessionDocumentPort *> &tabs)
 {
     if (!result)
         return;
-    QHash<QUuid, EditorTab *> tabsByInstance;
-    for (EditorTab *tab : tabs) {
+    QHash<QUuid, ISessionDocumentPort *> tabsByInstance;
+    for (ISessionDocumentPort *tab : tabs) {
         if (tab)
             tabsByInstance.insert(tab->sessionInstanceId(), tab);
     }
     for (const auto &item : result->items) {
-        if (EditorTab *tab = tabsByInstance.value(item.instanceId, nullptr))
-            tab->setAutosavePath(item.autosavePath);
+        if (ISessionDocumentPort *tab = tabsByInstance.value(item.instanceId, nullptr))
+            tab->acceptRecoveryPath(item.autosavePath);
         if (item.snapshotWritten) {
             m_snapshotRevisions.insert(item.instanceId, item.revision);
             m_snapshotTimes.insert(item.instanceId, result->capturedAtUtc);
@@ -720,7 +501,8 @@ SessionData SessionManager::loadSession() const
         SessionTab st;
         st.filePath = obj["filePath"].toString();
         st.encoding = obj["encoding"].toString();
-        st.syntax = qBound(0, obj["syntax"].toInt(0), int(Syntax::Asm));
+        st.syntax = qBound(0, obj["syntax"].toInt(0),
+                           SessionTab::MaximumPersistedSyntaxValue);
         st.cursorLine = qMax(0, obj["cursorLine"].toInt(0));
         st.cursorIndex = qMax(0, obj["cursorIndex"].toInt(0));
         bool cursorOk = false;

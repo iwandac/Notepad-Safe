@@ -14,7 +14,7 @@
 4. 文档中的模块、Document、Provider、CommandRegistry 和 typed position 尚未成为编译边界。
 5. Plain/Secure、Text/Hex、S1/S2/S3 和 Accounts 通过条件分支组合，新增能力容易只接入部分模式。
 6. 测试覆盖“函数能工作”，但没有系统覆盖第二次操作、状态所有权切换、revision 失效和跨模式一致性。
-7. 当前架构没有稳定的文档快照与工具合同，未来 AI、文本处理和脚本可视化若直接接入 EditorTab/MainWindow，会继续扩大耦合。
+7. 当前架构没有稳定的文档快照与工具合同，后续任何文档处理能力若直接接入 EditorTab/MainWindow，都会继续扩大耦合。
 8. 组合根和启动流程尚未把轻量 descriptor 与重型实现生命周期分开，未来增加 Provider、Tool、账号和模型可能把初始化成本线性加入冷启动。
 
 **当前功能不回退是本轮独立的 P0 约束。** 除非用户对具体 FeatureId 明确批准删除、降级或改变行为，重构不得减少当前已存在的功能、支持模式、快捷键、文件兼容性、数据恢复能力、可见交互质量或性能等级。“新架构更整洁”“测试总数更多”以及“主要路径可用”均不能抵消任何未批准的功能回退。
@@ -63,14 +63,14 @@ notepadsafe_secure / accounts / session / platform
 
 ### 3.2 唯一组合根与依赖注入
 
-`AppComposition` 是唯一创建具体服务、adapter、controller 和 registry 的位置。采用普通构造函数参数：
+`AppComposition` 是唯一选择具体外部服务/adapter 并建立扩展 registry 的位置。采用普通构造函数参数；纯 UI controller 可由其唯一 Widget owner 创建：
 
 - QObject 视图由 Qt parent 管理；
 - 非 QObject 服务由组合根使用 `std::unique_ptr` 管理；
 - 只有文件系统、剪贴板、时钟、模型 Provider、KDBX/DPAPI 和编辑内核等外部边界定义接口；
 - 禁止 Service Locator、全局可变单例、隐式查找 MainWindow 和为每个类机械创建接口。
 
-### 3.3 文档与工具扩展合同
+### 3.3 文档与工具扩展合同（架构边界，不是本轮产品功能）
 
 ```text
 DocumentState
@@ -90,29 +90,19 @@ AnalysisArtifact
 ```
 
 - `DocumentProviderRegistry` 静态注册 Text、Hex、Windowed 和后续格式 Provider。
-- `DocumentToolRegistry` 静态注册格式化、摘要、AI 辅助和脚本可视化工具。
+- `DocumentToolRegistry` 静态注册文档处理工具；本轮只验证合同，不交付新的用户工具。
 - 工具只接收不可变快照，不能直接持有 EditorTab 或修改 Scintilla。
 - 修改型工具返回带基线 revision 的 edit proposal，由统一 DocumentCommand 预检后形成一个 undo transaction。
 - 只读分析结果绑定 revision；正文变化、标签关闭或锁定后标为 stale，不得套用旧位置。
 - Plain 与已解锁 Secure 使用同一合同；Accounts workspace 不实现通用 DocumentTool target。
-- 本轮只需实现测试用 `EchoDocumentTool` 和 `StaticGraphTool` 证明扩展点，不引入真实模型依赖或脚本执行器。
-
-### 3.4 后续 AI 与脚本可视化的适配边界
-
-- `IInferenceProvider` 只负责模型调用、流式输出、取消和错误归一化；它不读取标签、路径、账号数据库或剪贴板。
-- 本地进程、独立本地服务和未来远程服务都实现同一接口。选择哪一种由用户设置和本次数据授权决定，不在文档模式中写条件分支。
-- AI 提示词由 `DocumentTool` 从用户批准的 DocumentSnapshot 构造；Provider 不自行扩大到全文、其他标签或最近文件。
-- 加密文档的 AI 中间结果默认只在内存中；用户明确保存的结果走普通 DocumentCommand/SaveRouter。该限制保护离线静态文件，不把正文误归类为账号秘密。
-- 脚本可视化工具默认只解析文本并产生 graph/chart/annotation artifact，不执行被分析脚本。未来如增加执行能力，必须作为独立的进程与权限边界立项。
-- 模型权重、分词器和本地运行时使用独立的版本化 manifest，记录来源、许可证、hash、格式和硬件要求；核心安装和离线编辑不得依赖启动时下载模型。
-- AI 任务复用统一任务中心，但任务类型使用可注册的稳定 kind id，不能继续依赖每增加一种任务就修改多个 `AsyncTaskType` switch 的封闭枚举。
+- 测试用 `EchoDocumentTool` 和 `StaticGraphTool` 只证明扩展点无需修改核心 Widget；它们不是产品功能，也不引入模型或脚本执行器。
 
 ## 4. 现有大类的收敛目标
 
 | 当前对象 | 保留职责 | 移出职责 |
 |---|---|---|
-| MainWindow | 布局、菜单和视图状态呈现 | 打开/保存路由、账号/KDBX 调用、搜索协调、命令能力计算 |
-| EditorTab | 文档表面的 Qt 容器 | 文档身份/持久化、搜索执行、Secure 特判、工具执行、跨 Provider 命令语义 |
+| MainWindow | 布局、菜单、对话框、页面/标签解析和跨页面用户旅程 | 文档生命周期真值、文件写入、KDBX/DPAPI/供应商调用、搜索会话真值、后端选择 |
+| EditorTab | Qt 文档 surface、具体 Provider 适配和编辑事件投影 | 文档生命周期真值、文件写入、会话序列化策略、搜索查询会话、KDBX/账号业务、工具编排 |
 | WindowedReadOnlyProvider | 窗口化只读 Qt 适配 | WindowedByteSource、TextProjection、ReadOnlySelectionModel、搜索快照 |
 | SearchResultsDock | 一行结果视图和用户事件 | model 存储、target watch、revision 失效、打开与导航 |
 | VaultDock/AccountsWorkspace | 账号页面 | 文档编辑、通用搜索/工具 target、共享 EditorTab 状态 |
@@ -154,12 +144,14 @@ Text/Binary、S1/S2、GBK、UTF-8/BOM、UTF-16LE/BE。
 - 旧 EditorTab API 暂时保留 facade，内部转发到新状态和 Provider；禁止同时写旧、新两份状态。
 - 纯逻辑路径在删除旧实现前运行 differential tests，比较旧/新输出。
 
-当前实现：`DocumentState` 已建立 DocumentId/location/origin/revision/content/persistence/security/
-capabilities/dirty 单一值对象，source byte 与 editor position 使用不可互换类型；EditorTab 的旧 API
-只转发到该状态，不保留第二份 identity、location、revision、content kind 或 security class。
-`WindowedReadOnlyProvider` 的生产选择路径使用唯一 `ReadOnlySelectionModel`，反向选择、连续用户选择和
-重复复制由纯合同与正式 GUI 双哨兵保护。presentation window、mmap 和控件状态仍正确属于 Provider；
-EditorTab 仍是较大的 UI facade，因此不能把“状态真值单一化”上推为全部 UI 职责迁移完成。
+当前实现：`DocumentSession` 是 identity/location/origin/revision/content/persistence/security/dirty、
+恢复路径、安全 backing path 和安全遮罩/迁移状态的唯一非视觉 owner；EditorTab 不再保留平行字段，
+且 `DocumentSession` 不暴露可变引用。EditorTab 只通过 `IDocumentContentPort`、
+`ISessionDocumentPort`、`IDocumentSurface` 和 `DocumentSearchSurface` 向应用用例投影视图能力。
+`SessionManager` 不包含 EditorTab/QScintilla/VirtualFileView，普通文件写入由
+`PlainFilePersistence` 执行，EditorTab 源码中不存在 QSaveFile/ReplaceFileW/MoveFileExW。
+`WindowedReadOnlyProvider` 使用唯一 `ReadOnlySelectionModel`；反向选择、连续用户选择和重复复制由
+纯合同与正式 GUI 双哨兵保护。
 
 ### R3 搜索、命令和视图收敛
 
@@ -173,9 +165,9 @@ FeatureId，并由一个 `CommandContext` 计算 enable/check 状态；命令只
 和 GUI 查询各认一套身份。SearchResultsDock 不再持有 EditorTab，所有 model 绑定、header resize、
 uniform row height、禁换行和 elide 规则由 `SearchResultsViewPolicy` 唯一设置；架构门禁禁止 Dock 绕过
 该策略。非视觉 `SearchResultsController` 是纯值状态，持有 target/revision/stale/incomplete，MainWindow
-负责按 DocumentId 解析标签并处理正文变化、关闭、索引完成和导航。FindReplaceDialog 到 EditorTab 的
-搜索执行仍是迁移 facade；本轮完成的是导致模式不一致的结果会话、视图与文档生命周期分离，不虚构
-全局 SearchController/NavigationController 已全部改写。
+负责按 DocumentId 解析标签并处理正文变化、关闭、索引完成和导航。`FindReplaceDialog` 只依赖
+`DocumentSearchSurface`，不再识别 EditorTab；查询、scope、generation、cancel、pending 与 skip 计数
+由唯一 `SearchSession` 持有。新一轮查询原子失效上一 generation，晚到 completion 不能让计数下溢。
 
 ### R4 安全与未来扩展边界
 
@@ -191,13 +183,21 @@ manifest 已成为无 Widgets/KDBX 依赖的编译合同。测试用 Echo/Static
 因此只能声称扩展合同可接入，不能声称 AI 功能已经实现。文档打开的生产边界进一步收敛为
 `IDocumentSurface + DocumentSurfaceOpenRequest`：registry 按 capability/priority 选择 provider，
 `DocumentOpenWorkflow` 不再硬编码 provider 字符串，也不依赖 EditorTab/QScintilla；具体 EditorTab
-适配只存在于组合根。该变化属于当前文档打开解耦，不把未来 AI 算作本轮交付功能。
+适配只存在于组合根。安全会话和安全文档快照分别通过 `SecuritySessionPort` 与
+`SecureDocumentContract` 暴露；MainWindow 的实现文件禁止包含 `SecuritySessionService`、
+`SecureDocumentService` 或 `SecurityServiceFactory`。该变化属于当前职责解耦，不把未来 AI 算作
+本轮交付功能。
 
 ### R5 删除与发布复核
 
 - 只有替代路径的行为矩阵全部通过后才能删除 facade 和旧字段。
 - 删除重复 model、重复位置换算、模式专用 UI 分支和过时文档。
 - 重跑正式程序核心 GUI、数据完整性、失败注入、性能、供应链和安装包验证。
+
+当前实现：旧的 EditorTab 文件写入 facade、平行生命周期字段、FindReplaceDialog 的 EditorTab 依赖、
+SearchResultsDock 的 target/revision owner、SessionManager 的 Widget 依赖均已删除。Hex 投影、大文档
+搜索任务、账号条目逻辑和大类实现分别拆入有明确职责的编译单元；全局产品源码硬上限为 2,000 行，
+MainWindow/EditorTab 还受跨文件 line/branch/method 聚合预算，不能通过继续拆文件重置复杂度计数。
 
 ## 6. 防止测试再次“看起来很多但没有保护”
 
@@ -261,23 +261,23 @@ CTest 按具体 QtTest 函数注册：
 
 已验证：
 
-- KDBX ON 正式 Release 与全部测试目标从空目录重建成功；修复循环后的串行 CTest 全矩阵 **153/153** 通过，实耗 **281.40 秒**。其中包含 136 个真实窗口 GUI case、搜索、大文件、Shell、Accounts、Secure、供应链与 E2E；单项 timeout 为 30–300 秒，没有统一 3600 秒等待。条件测试清单修复后 ON 仍注册 153 项，受影响的 KDBX/账号/架构/两个历史哨兵复核 **8/8**。
-- KDBX OFF 从另一个空目录构建正式 EXE 和全部适用测试成功；条件编译专属的 3 个生产 KDBX GUI case 不再被错误注册，最终适用矩阵 **140/140** 通过，实耗 **229.32 秒**。OFF 证明基础编辑产品没有编译期绑定 KDBX 后端；它不替代 ON 配置的加密与账号验证。
+- KDBX ON 正式 Release 与全部测试目标构建成功；最终串行 CTest 全矩阵 **153/153** 通过，实耗 **255.39 秒**。其中包含 136 个真实窗口 GUI case、搜索、大文件、Shell、Accounts、Secure、供应链与 E2E；单项 timeout 为 30–300 秒，没有统一 3600 秒等待。此前一轮 Hex 打开/编辑/另存/重开用例出现一次无诊断红灯，随后该用例连续 **20/20** 通过，并在最终 153 项同轮矩阵中通过；这次波动保留为测试稳定性事实，不冒充可复现产品缺陷。
+- KDBX OFF 在独立构建目录中构建正式 EXE 和全部适用测试成功；最终适用矩阵 **140/140** 通过，实耗 **259.29 秒**。OFF 证明基础编辑产品不需要在 MainWindow/EditorTab 中编译 KDBX 后端分支；它不替代 ON 配置的加密与账号验证。
 - KDBX 保存测试暴露出 KeePassXC 2.7.12 流加密在 payload 恰好填满 1024-byte buffer 时会对空尾块再次调用 cipher，因随机 XML 长度呈概率失败。vendored patch 现将空 stream tail 作为 no-op，并增加精确 1024-byte 确定性断言；修复后 KDBX 后端连续 **50/50** 通过。patch、source-tree SHA-256 和供应链锁同步更新。
 - 搜索 Dock 单行紧凑和窗口化只读连续复制两个历史回归哨兵均固定进入 quick；`run_tests.bat`、`run_all_gui_smoke.bat` 使用 `--no-tests=error`，GUI label 由同一注册 helper 生成，空选择和条件编译清单漂移不能再伪绿。
 - 真实 `testfiles` 八文件矩阵通过：11–108 MiB，Text/Binary、S1/S2、GBK、UTF-8、UTF-8 BOM、UTF-16LE/BE；每个样本同时核对冻结字节数、大小分层、内容路由、编码和 BOM。
-- 正式 Release 外部进程启动 E2E：100 MiB 真实文件 session **211 ms** 可见，100 MiB autosave session **217 ms** 可见，均 exit=0 且未走 L1 阻塞路径；L2 40 MiB 正文连续三帧可见 E2E 通过。数据是普通新进程启动，不宣称受控冷缓存 P95。
-- 内部启动合同通过（测试进程 0.29 秒，合同内 first paint <1500 ms、first-paint 后首个干净 idle turn <250 ms）：first paint 前 Security 重型 factory=0；100 个 Tool、24 个 DocumentProvider（4 内建+20 测试）、22 个 PersistenceAdapter（2 内建+20 测试）和 20 个 InferenceProvider 均实例化为 0。`StartupCoordinator` 等待真实 paint，再让出一个事件循环回合，之后才排队外部打开和 session 恢复；测试还通过生产 `EditorTab` 实际打开 fixture，防止把只登记 descriptor 冒充可执行 Provider。
+- 正式 Release 外部进程启动 E2E：100 MiB 真实文件 session **521 ms** 可见，100 MiB autosave session **284 ms** 可见，均 exit=0 且未走 L1 阻塞路径；L2 40 MiB `openDocumentByPolicy` **65 ms**，正文连续三帧可见。数据是普通新进程启动，不宣称受控冷缓存 P95。
+- 内部启动合同通过（CTest 进程 **0.76 秒**，合同内 first paint <1500 ms、first-paint 后首个干净 idle turn <250 ms）：first paint 前 Security 重型 factory=0；100 个 Tool、24 个 DocumentProvider（4 内建+20 测试）、22 个 PersistenceAdapter（2 内建+20 测试）和 20 个 InferenceProvider 均实例化为 0。`StartupCoordinator` 等待真实 paint，再让出一个事件循环回合，之后才排队外部打开和 session 恢复；测试还通过生产 `EditorTab` 实际打开 fixture，防止把只登记 descriptor 冒充可执行 Provider。
 - 已确认两类历史回归均有正式产品哨兵：搜索 Dock 单行紧凑几何；窗口化只读文本在搜索选择后连续用户选择并重复复制。
 - 文档打开不再只由 registry 返回描述信息：`DocumentOpenWorkflow` 对普通打开和 session 恢复都调用同一个 capability-based `openBest(IDocumentSurface, request)`。Text S1、Text windowed、Binary Hex windowed、Binary Text windowed 四种路由分别注册，Binary Text 的内容类型与呈现类型不再混为一项；对应恢复回归在全矩阵中通过。
 - `notepadsafe_domain` 不再编译 `DraftStore`、`DocumentProviderRegistry` 或链接 `crypt32`/`EditorTab`；恢复存储和文档运行时分别由 `notepadsafe_recovery_runtime`、`notepadsafe_document_runtime` 承担。KDBX 宏只在 vault 实现和需要显示 capability 的 UI adapter 内私有定义，架构门禁拒绝经公共链接接口泄漏。
-- 当前最大产品源码为 `EditorTabLargeDocument.cpp` **2,618 行**，全局硬上限由 3,500 收紧为 **3,000 行**。`MainWindow.cpp` 从 3,337 行降到 **1,694**，命令/菜单移入 `MainWindowCommands.cpp`（1,614）；`EditorTab.cpp` 从 2,680 行降到 **1,897**，命令和大文档持久化分别移入 764/727 行单元；`SearchResultsDock.cpp` 为 **485 行**。文件级 line/branch ratchet 之外，MainWindow 全部片段还受 5,729 行/636 branches/112 methods 聚合预算，EditorTab 受 7,687/927/176 聚合预算，不能靠继续拆文件隐藏总复杂度。
-- 这次拆分降低了单文件认知负担和编译耦合，但不伪称 MainWindow/EditorTab 的全部行为复杂度已经很低：它们仍是功能密集的 UI controller/facade。完成结论来自职责边界、依赖方向和聚合 ratchet，而不是把总 LOC 搬到更多文件。
+- 当前最大产品源码为 `VirtualFileView.cpp` **1,983 个物理行**，所有产品 `.cpp/.h` 均低于 **2,000 行**硬上限。`MainWindow.cpp` 为 1,694 行，`EditorTab.cpp` 为 1,704 行，`SearchResultsDock.cpp` 为 523 行；原 2,618 行大文档实现、LargeFileSearch、VaultDock 与 Hex 逻辑已按职责拆分。
+- 复杂度门禁使用跨 PowerShell 版本一致的“非空行 + branch + method”计数。MainWindow 四个片段当前/上限为 **5,190/616/112**，EditorTab 七个片段为 **7,115/865/176**；20 个重点文件也各自锁定当前 line/branch 上限。未来修改若增加旧协调器复杂度必须先提取职责，不能靠新文件、空行差异或提高单文件阈值绕过。
 
 完成声明的精确边界：
 
-- 本轮完成的是**当前产品路径的职责拆分、依赖方向、可执行打开 Provider、搜索状态所有权、启动延迟加载和防回退门禁**。未来 AI、模型、远程服务、脚本执行及其产品功能明确不属于本轮重构，也不作为完成度加分项。
-- MainWindow 仍是 UI application controller，负责跨页面用户旅程；EditorTab 仍是具体编辑器 facade。二者不被虚假描述为微型类，但其实现已按命令/文档/会话和命令/大文档持久化/搜索拆成受 3,000 行硬门禁及聚合预算约束的责任单元。继续机械拆接口不会自动降低行为复杂度。
+- 本轮完成的是**当前产品路径的状态与持久化职责下沉、依赖方向、可执行打开 Provider、搜索状态所有权、启动延迟加载和防回退门禁**。未来 AI、模型、远程服务、脚本执行及其产品功能明确不属于本轮重构，也不作为完成度加分项。
+- MainWindow 仍是 UI application controller，负责对话框、页面和跨文档用户旅程，但只通过应用/安全端口操作持久化与安全状态，不包含具体安全服务、工厂、KDBX/DPAPI 或普通文件写入实现。EditorTab 仍是具体 Qt 文档 surface/facade，但生命周期真值在 `DocumentSession`，文件写入在 Persistence adapter，会话序列化在 `SessionManager + ISessionDocumentPort`，搜索查询真值在 `SearchSession`。这就是本轮“职责下沉”的完成边界，不虚构两个类已经变成无逻辑的被动 Widget。
 - 搜索 target/revision/stale 状态由 `SearchResultsController` 独占，`SearchResultsDock` 不拥有目标生命周期；Dock 保留 Qt model/delegate、选中行解释和导航意图信号，这些属于呈现职责。
-- Plain/Binary 打开与恢复已经走可执行 Provider；现有普通保存仍由 EditorTab 的 provider facade 完成，Secure 打开/保存仍经安全服务 port。`PersistenceAdapterRegistry` 目前负责探测和强类型描述，不宣称任意新格式已经具备零改动 load/save/conflict/recovery 插件能力。
-- 153 项 ON 矩阵、140 项 OFF 适用矩阵、八个真实测试文件、两个历史哨兵、KDBX 50 次压力验证和启动合同共同证明已登记当前功能在本轮未发现回退。门禁能显著降低未来回退漏检概率，但不构成“任何未来修改永远不会产生缺陷”的不可验证承诺。
+- Plain/Binary 打开与恢复走可执行 Provider；普通保存、原子替换和冲突检测走 `PlainFilePersistence`，Secure 文档走 `ISecureDocumentPersistence`，两者都由 `PersistenceAdapterRegistry` 提供强类型路由。当前合同完整覆盖 save/Save As/conflict/commit；没有实现任意第三方动态插件，也不宣称未知格式已经自动具备 load/recovery 能力。
+- 153 项 ON 矩阵、140 项 OFF 适用矩阵、八个真实测试文件、两个历史哨兵、KDBX 50 次压力验证和启动合同共同证明已登记当前功能在本轮最终版本未发现回退。门禁能显著降低未来回退漏检概率，但不构成“任何未来修改永远不会产生缺陷”的不可验证承诺。

@@ -27,7 +27,7 @@ class SessionManager;
 class VaultDock;
 class StatusBarTaskWidget;
 class ISecuritySessionService;
-class ISecureDocumentService;
+class ISecureDocumentPersistence;
 class AppComposition;
 class CommandRegistry;
 class QPaintEvent;
@@ -141,7 +141,7 @@ private:
     VaultDock *m_vaultDock = nullptr;
     SessionManager *m_session = nullptr;
     std::unique_ptr<ISecuritySessionService> m_securitySession;
-    std::unique_ptr<ISecureDocumentService> m_secureDocuments;
+    ISecureDocumentPersistence *m_securePersistence = nullptr;
 
     // 状态栏
     QLabel *m_statusPos = nullptr;

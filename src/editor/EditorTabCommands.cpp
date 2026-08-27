@@ -17,7 +17,6 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QDir>
-#include <QSaveFile>
 #include <QDataStream>
 #include <QFont>
 #include <QColor>
@@ -460,7 +459,7 @@ QVector<SearchMatch> EditorTab::findAll(const QString &pattern, bool regex,
     m_l1SearchCacheRegex = regex;
     m_l1SearchCacheCaseSensitive = caseSensitive;
     m_l1SearchCacheWholeWord = wholeWord;
-    m_l1SearchCacheRevision = m_documentState.revision;
+    m_l1SearchCacheRevision = m_documentSession.state().revision;
     m_l1SearchCacheValid = true;
     return matches;
 }
@@ -474,7 +473,7 @@ bool EditorTab::findAllL1Async(
     if (isL2Mode() || pattern.isEmpty() || m_l1FindAllTaskId > 0)
         return false;
 
-    const quint64 revision = m_documentState.revision;
+    const quint64 revision = m_documentSession.state().revision;
     const bool wipeSnapshot = isSecureDocument();
     QByteArray subject = m_editor->text().toUtf8();
     const qint64 snapshotSize = subject.size();
@@ -620,7 +619,7 @@ bool EditorTab::findAllL1Async(
                     }
                     if (that->m_l1FindAllTaskId == taskId)
                         that->m_l1FindAllTaskId = 0;
-                    if (that->m_documentState.revision != revision) {
+                    if (that->m_documentSession.state().revision != revision) {
                         that->m_lastSearchError = QObject::tr(
                             "文档已变更，请重新查找。");
                         callback({}, false, that->m_lastSearchError);
@@ -754,11 +753,6 @@ void EditorTab::setEdgeVisible(bool visible)
 {
     m_edgeVisible = visible;
     applyEdgeSettings();
-}
-
-bool EditorTab::isEdgeVisible() const
-{
-    return m_edgeVisible;
 }
 
 // ============ 编码切换 ============
