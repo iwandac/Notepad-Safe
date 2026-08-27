@@ -23,7 +23,7 @@ public:
     PersistenceAdapterDescriptor descriptor() const override
     {
         return {QStringLiteral("plain.file"), QStringLiteral("Plain file"),
-                0, false};
+                0, DocumentPersistence::PlainFile};
     }
     bool recognizes(const QString &path) const override
     {
@@ -36,7 +36,7 @@ public:
     PersistenceAdapterDescriptor descriptor() const override
     {
         return {QStringLiteral("secure.kdbx"), QStringLiteral("KDBX"),
-                100, true};
+                100, DocumentPersistence::SecureFile};
     }
     bool recognizes(const QString &path) const override
     {

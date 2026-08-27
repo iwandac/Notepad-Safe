@@ -168,11 +168,12 @@ EditorTab 仍是较大的 UI facade，因此不能把“状态真值单一化”
 - CommandRegistry 根据当前 DocumentCapabilities 统一启停和分派菜单、快捷键、工具栏和上下文菜单。
 
 当前实现：`CommandRegistry` 已将菜单/工具栏/快捷键共享的 command objectName 绑定到稳定
-FeatureId，并提供统一 DocumentCapabilities 基线；启动合同拒绝任何未登记 QAction。
-SearchResultsDock 头文件已不再声明 target/revision/stale/rerun 状态，这些状态由非视觉
-`SearchResultsController` 持有，架构脚本阻止其回流；42 个单/多文件、Text/Hex、S1/S2/S3 搜索 GUI
-旅程通过。FindReplaceDialog 到 EditorTab 的执行协调仍是迁移 facade；本轮完成的是导致模式不一致的
-结果会话状态与视图分离，不虚构全局 SearchController/NavigationController 已全部改写。
+FeatureId，并提供统一 DocumentCapabilities 基线；命令只接受显式固定项或受控参数集合，拼写错误和
+未登记后缀 fail closed。SearchResultsDock 不再持有 EditorTab，单行绘制、尺寸和 hit-test 已收敛到同一
+delegate；非视觉 `SearchResultsController` 是纯值状态，持有 target/revision/stale/incomplete，MainWindow
+负责按 DocumentId 解析标签并处理正文变化、关闭、索引完成和导航。FindReplaceDialog 到 EditorTab 的
+搜索执行仍是迁移 facade；本轮完成的是导致模式不一致的结果会话、视图与文档生命周期分离，不虚构
+全局 SearchController/NavigationController 已全部改写。
 
 ### R4 安全与未来扩展边界
 
@@ -255,19 +256,21 @@ CTest 按具体 QtTest 函数注册：
 
 已验证：
 
-- 最终 revision `895fe94` 的 KDBX ON 正式 Release 构建成功；CTest 全矩阵 **153/153** 通过，总实耗 **315.62 秒**。其中 adjacent 133、GUI 136、搜索 42、大文件 24、Shell 51、Accounts 6、Secure 6、E2E 2；单项 timeout 为 30–300 秒，没有统一 3600 秒等待。
-- KDBX OFF 正式 EXE、架构/启动合同、smallfixes 与窗口化只读 GUI harness 编译成功；架构、启动、生命周期动作、Hex 保存重开和连续复制代表旅程 **5/5** 通过（8.86 秒）。OFF 只证明编译和 capability 解耦，不表示安全发布验证。
-- quick **5/5**，累计测试时间 1.47 秒；两个历史回归哨兵均在其中。架构、供应链和真实 `testfiles` 合同也包含在 153 项最终矩阵中。
+- 本轮删除可再生对象后，KDBX ON 正式 Release 与全部测试目标从零重建成功；CTest 全矩阵 **153/153** 通过，总实耗 **374.88 秒**。其中 adjacent 133、GUI 136、搜索 42、大文件 24、Shell 51、Accounts 6、Secure 6、E2E 2；单项 timeout 为 30–300 秒，没有统一 3600 秒等待。
+- KDBX OFF 隔离构建的正式 EXE、架构/启动合同、smallfixes 与窗口化只读 GUI harness 编译成功；架构、启动、生命周期动作、Hex 保存重开和连续复制代表旅程 **5/5** 通过（11.77 秒）。OFF 只证明编译和 capability 解耦，不表示安全发布验证。
+- quick **5/5**，累计测试时间 2.05 秒；两个历史回归哨兵均在其中。架构、供应链和真实 `testfiles` 合同也包含在 153 项最终矩阵中。
 - 真实 `testfiles` 八文件矩阵通过：11–108 MiB，Text/Binary、S1/S2、GBK、UTF-8、UTF-8 BOM、UTF-16LE/BE；每个样本同时核对冻结字节数、大小分层、内容路由、编码和 BOM。
 - 正式 Release 外部进程启动 E2E：100 MiB 真实文件 session **223 ms** 可见，100 MiB autosave session **213 ms** 可见，均 exit=0 且未走 L1 阻塞路径；L2 40 MiB 正文连续三帧可见 E2E 通过。数据是普通新进程启动，不宣称受控冷缓存 P95。
 - 内部启动合同通过（整个测试进程 0.45 秒，合同内 first paint <1500 ms）：first paint 前 Security 重型 factory=0；100 个 Tool、24 个 DocumentProvider（4 内建+20 测试）、22 个 PersistenceAdapter（2 内建+20 测试）和 20 个 InferenceProvider 均实例化为 0。
 - 已确认两类历史回归均有正式产品哨兵：搜索 Dock 单行紧凑几何；窗口化只读文本在搜索选择后连续用户选择并重复复制。
+- 完整矩阵后补强 DocumentSnapshot capability fail-closed 合同；最终受影响的架构、启动、真实快照、Dock 和复制门禁 **6/6** 通过（4.28 秒），并在 KDBX OFF 的上述 5 项中重新构建验证。未为这一局部合同改动重复支付与影响范围不成比例的完整大文件矩阵。
+- 四个遗留大协调文件由 15,747 行降至 15,220 行（净减 527）：MainWindow -226、EditorTab -67、SearchResultsDock -263、FindReplaceDialog +29。新增职责组件均为 41–246 行；架构脚本同时锁定这十个文件的当前行数和分支数，后续不能把复杂度塞回旧文件或让本轮拆出的组件无门槛膨胀。该指标证明职责拆分和复杂度 ratchet 已落地，不声称总代码行数必然下降。
 - GUI 测试驱动原先在模态对话框尚未出现时执行一次性 timer，断言返回后会把对话框永久留住直至 300 秒超时；现改为有界轮询状态机和 8 秒 watchdog，失败会关闭模态框并给出明确原因，不再用长超时掩盖测试机制错误。
 
 不得上推为完成的边界：
 
-- MainWindow 已清除 KDBX 编译宏、KdbxFormatProbe 和 SecurityIdentity/SecureDocument 静态后端调用；安全能力通过 port/factory 和运行时 capability 表达。它仍协调凭据对话框、打开/保存用户旅程，是较大的 UI application controller，不能称为整体低复杂度完成态。
-- 搜索 target/revision/watch/stale 生命周期已从 SearchResultsDock 移入 `SearchResultsController`；Dock 仅保留模型呈现、点击命中计算和导航信号适配。
+- MainWindow 已清除 KDBX 编译宏、KdbxFormatProbe 和 SecurityIdentity/SecureDocument 静态后端调用；凭据对话框、敏感文本 helper、Plain/Binary 打开和会话恢复已移出。它仍协调部分保存与安全用户旅程，是较大的 UI application controller，不能称为已经彻底小型化。
+- 搜索 target/revision/stale 状态已从 SearchResultsDock 移入纯值 `SearchResultsController`；文档监听与导航解析由 MainWindow 统一承担，Dock 仅保留模型呈现、统一 delegate 和导航意图信号。
 - EditorTab 的 durable identity/location/revision/content/security 真值已单一化到 DocumentState，窗口化只读选择已单一化到 ReadOnlySelectionModel；presentation/provider 控件状态和搜索执行 facade 尚未全部移出。
-- Document/Inference/Tool registry 已落地；PersistenceAdapterRegistry 已接管格式探测优先级与延迟实例化，但 adapter 尚未统一 load/save/conflict/recovery，新增完全不同的持久化格式仍需修改应用协调层，不能声称完整持久化插件化。
+- Document/Inference/Tool registry 已落地；PersistenceAdapterRegistry 已接管格式探测优先级并返回强类型持久化描述符，Plain 打开/会话恢复已抽到 `DocumentOpenWorkflow`。adapter 尚未统一 load/save/conflict/recovery，新增完全不同的持久化格式仍需扩展应用协调层，不能声称完整持久化插件化。
 - 当前 153 项正式矩阵与 KDBX OFF 代表旅程证明已登记功能未发现本轮回退，并建立了更强门禁；它不构成“未来永不回退”的数学保证，也不能把尚未迁移的职责称为低复杂度完成态。

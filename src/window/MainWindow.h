@@ -116,7 +116,9 @@ private slots:
 
     // 搜索结果
     void onJumpToByteOffset(qint64 byteOffset, int length);
-    void onJumpToTabByteOffset(EditorTab *tab, qint64 byteOffset, int length);
+    void onJumpToDocumentByteOffset(const QUuid &documentId,
+                                    quint64 expectedRevision,
+                                    qint64 byteOffset, int length);
     void lockSecureDocuments();
     void maskSecureDocuments();
 

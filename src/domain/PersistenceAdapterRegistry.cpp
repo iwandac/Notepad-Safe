@@ -30,7 +30,8 @@ QList<PersistenceAdapterDescriptor> PersistenceAdapterRegistry::descriptors() co
     return result;
 }
 
-QString PersistenceAdapterRegistry::resolve(const QString &path)
+std::optional<PersistenceAdapterDescriptor>
+PersistenceAdapterRegistry::resolve(const QString &path)
 {
     for (const auto &descriptor : descriptors()) {
         const auto found = std::find_if(
@@ -45,7 +46,7 @@ QString PersistenceAdapterRegistry::resolve(const QString &path)
             ++instantiatedCount_;
         }
         if (entry.instance && entry.instance->recognizes(path))
-            return descriptor.id;
+            return descriptor;
     }
-    return {};
+    return std::nullopt;
 }

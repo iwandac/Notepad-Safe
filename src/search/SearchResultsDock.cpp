@@ -1,6 +1,7 @@
 #include "SearchResultsDock.h"
 #include "SearchResultsController.h"
-#include "VirtualFileView.h"
+#include "SearchResultsDelegate.h"
+#include "LineIndex.h"
 
 #include <QTreeView>
 #include <QVBoxLayout>
@@ -8,11 +9,7 @@
 #include <QPushButton>
 #include <QHeaderView>
 #include <QStackedWidget>
-#include <QStyledItemDelegate>
-#include <QPainter>
-#include <QTextLayout>
-#include <QApplication>
-#include <QPalette>
+#include <QPointer>
 #include <QMouseEvent>
 #include <QHoverEvent>
 #include <QUuid>
@@ -43,142 +40,6 @@ QVector<LargeFileSearchMatch> canonicalResults(
     return results;
 }
 
-struct VisualMatchRange {
-    int start = 0;
-    int length = 0;
-    int sourceIndex = -1;
-};
-
-struct PreparedContext {
-    QString text;
-    QVector<VisualMatchRange> matches;
-};
-
-int previousUtf16Boundary(const QString &text, int position)
-{
-    int candidate = qMax(0, position - 1);
-    if (candidate > 0 && text.at(candidate).isLowSurrogate()
-        && text.at(candidate - 1).isHighSurrogate()) {
-        --candidate;
-    }
-    return candidate;
-}
-
-PreparedContext prepareContext(const QModelIndex &index, int maxWidth,
-                               const QFontMetrics &metrics)
-{
-    PreparedContext prepared;
-    const QString text = index.data(SearchResultsModel::ContextRole).toString();
-    const QVariantList ranges =
-        index.data(SearchResultsModel::MatchPositionsRole).toList();
-    if (text.isEmpty() || ranges.isEmpty() || maxWidth <= 0) {
-        prepared.text = metrics.elidedText(text, Qt::ElideRight, qMax(0, maxWidth));
-        return prepared;
-    }
-
-    const QVariantMap primary = ranges.first().toMap();
-    const int primaryStart = qBound(
-        0, primary.value(QStringLiteral("start")).toInt(), text.size());
-    const int primaryLength = qBound(
-        0, primary.value(QStringLiteral("length")).toInt(),
-        text.size() - primaryStart);
-    const int primaryEnd = primaryStart + primaryLength;
-    const QString ellipsis(QChar(0x2026));
-    const int matchWidth = metrics.horizontalAdvance(
-        text.mid(primaryStart, primaryLength));
-    const int ellipsisWidth = metrics.horizontalAdvance(ellipsis);
-    const bool hasLeading = primaryStart > 0;
-    const bool hasTrailing = primaryEnd < text.size();
-    int decorationBudget = qMax(0, maxWidth - matchWidth);
-    bool showLeadingEllipsis = false;
-    bool showTrailingEllipsis = false;
-    if (hasLeading && hasTrailing && decorationBudget >= 2 * ellipsisWidth) {
-        showLeadingEllipsis = true;
-        showTrailingEllipsis = true;
-        decorationBudget -= 2 * ellipsisWidth;
-    } else if (hasLeading && decorationBudget >= ellipsisWidth) {
-        showLeadingEllipsis = true;
-        decorationBudget -= ellipsisWidth;
-    } else if (hasTrailing && decorationBudget >= ellipsisWidth) {
-        showTrailingEllipsis = true;
-        decorationBudget -= ellipsisWidth;
-    }
-    // Build the visible window around the match explicitly.  Passing the
-    // complete tail to elidedText() lets the platform elider cut through the
-    // match when font shaping and QFontMetrics disagree by a few pixels.  The
-    // match is the result row's primary information, so context yields first.
-    const int contextBudget = decorationBudget;
-    const int prefixBudget = contextBudget * 2 / 5;
-    const int suffixBudget = contextBudget - prefixBudget;
-    int sourceStart = primaryStart;
-    while (sourceStart > 0) {
-        const int candidate = previousUtf16Boundary(text, sourceStart);
-        if (metrics.horizontalAdvance(
-                text.mid(candidate, primaryStart - candidate)) > prefixBudget) {
-            break;
-        }
-        sourceStart = candidate;
-    }
-
-    int sourceEnd = primaryEnd;
-    while (sourceEnd < text.size()) {
-        int candidate = sourceEnd + 1;
-        if (candidate < text.size() && text.at(sourceEnd).isHighSurrogate()
-            && text.at(candidate).isLowSurrogate()) {
-            ++candidate;
-        }
-        if (metrics.horizontalAdvance(
-                text.mid(primaryEnd, candidate - primaryEnd)) > suffixBudget) {
-            break;
-        }
-        sourceEnd = candidate;
-    }
-
-    const QString leading = sourceStart > 0 && showLeadingEllipsis
-        ? ellipsis : QString();
-    const QString trailing = sourceEnd < text.size() && showTrailingEllipsis
-        ? ellipsis : QString();
-    prepared.text = leading + text.mid(sourceStart, sourceEnd - sourceStart)
-        + trailing;
-    const int visibleContentEnd = prepared.text.size() - trailing.size();
-
-    for (int i = 0; i < ranges.size(); ++i) {
-        const QVariantMap range = ranges.at(i).toMap();
-        const int start = qBound(0, range.value(QStringLiteral("start")).toInt(),
-                                 text.size());
-        const int length = qMax(0, range.value(QStringLiteral("length")).toInt());
-        const int end = qBound(start, start + length, text.size());
-        int visualStart = leading.size() + start - sourceStart;
-        int visualEnd = leading.size() + end - sourceStart;
-        if (visualEnd <= 0 || visualStart >= visibleContentEnd)
-            continue;
-        visualStart = qBound(0, visualStart, visibleContentEnd);
-        visualEnd = qBound(visualStart, visualEnd, visibleContentEnd);
-        if (visualEnd > visualStart)
-            prepared.matches.append({visualStart, visualEnd - visualStart, i});
-    }
-    return prepared;
-}
-
-int hitTestModelMatch(const QModelIndex &index, int xInColumn,
-                      int columnWidth, const QFontMetrics &metrics)
-{
-    constexpr int HorizontalPadding = 6;
-    const int x = xInColumn - HorizontalPadding;
-    const PreparedContext prepared = prepareContext(
-        index, qMax(0, columnWidth - 2 * HorizontalPadding), metrics);
-    if (x < 0)
-        return -1;
-    for (const VisualMatchRange &range : prepared.matches) {
-        const int startX = metrics.horizontalAdvance(
-            prepared.text.left(range.start));
-        const int endX = metrics.horizontalAdvance(
-            prepared.text.left(range.start + range.length));
-        if (x >= startX && x <= endX)
-            return range.sourceIndex;
-    }
-    return -1;
-}
 } // namespace
 
 // One hierarchical model serves mixed Scintilla and mmap results.  Top-level
@@ -187,9 +48,7 @@ int hitTestModelMatch(const QModelIndex &index, int xInColumn,
 class MultiSearchResultsModel final : public QAbstractItemModel {
 public:
     struct Group {
-        QPointer<EditorTab> tab;
-        QString targetId;
-        QString displayName;
+        SearchResultTarget target;
         QPointer<SearchResultsModel> results;
         QVector<LargeFileSearchMatch> preview;
         qint64 totalMatches = 0;
@@ -266,7 +125,7 @@ public:
         const Group *group = groupFor(index);
         if (!group) return {};
         if (!isChild(index)) {
-            if (role == TargetRole) return group->targetId;
+            if (role == TargetRole) return group->target.key();
             if (role == StaleRole) return group->stale;
             if (role == Qt::ToolTipRole && !group->incompleteReason.isEmpty())
                 return group->incompleteReason;
@@ -277,7 +136,7 @@ public:
             }
             if (role != Qt::DisplayRole) return {};
             if (index.column() == 0) {
-                return group->displayName;
+                return group->target.displayName;
             }
             if (index.column() == SearchResultsModel::COL_CONTEXT)
                 return group->stale
@@ -290,20 +149,18 @@ public:
         }
 
         if (group->stale) return {};
-        if (role == TargetRole) return group->targetId;
+        if (role == TargetRole) return group->target.key();
         if (role == StaleRole) return false;
         if (!group->results) return {};
         const QModelIndex source = group->results->index(index.row(), index.column());
         return group->results->data(source, role);
     }
 
-    void addL1(EditorTab *tab, const QString &targetId,
+    void addL1(const SearchResultTarget &target,
                const QVector<SearchMatch> &matches, bool incomplete = false)
     {
         auto *group = new Group;
-        group->tab = tab;
-        group->targetId = targetId;
-        group->displayName = tab ? tab->fileName() : QString();
+        group->target = target;
         auto *model = new SearchResultsModel(this);
         model->setTextEncoding(TextEncoding::Utf8);
         model->setResults(canonicalResults(matches), {}, 0);
@@ -317,13 +174,11 @@ public:
         endInsertRows();
     }
 
-    void addModel(EditorTab *tab, const QString &targetId,
+    void addModel(const SearchResultTarget &target,
                   SearchResultsModel *model)
     {
         auto *group = new Group;
-        group->tab = tab;
-        group->targetId = targetId;
-        group->displayName = tab ? tab->fileName() : QString();
+        group->target = target;
         group->results = model;
         group->totalMatches = model ? model->totalMatches() : 0;
         group->incompleteReason = model ? model->incompleteReason() : QString();
@@ -334,10 +189,10 @@ public:
         endInsertRows();
     }
 
-    void addPreview(EditorTab *tab, const QString &targetId,
+    void addPreview(const SearchResultTarget &target,
                     SearchResultsModel *model)
     {
-        addModel(tab, targetId, model);
+        addModel(target, model);
     }
 
     bool appendPreview(const QString &targetId,
@@ -394,7 +249,7 @@ public:
     {
         for (int row = 0; row < groups_.size(); ++row) {
             Group *group = groups_.at(row);
-            if (group->targetId != targetId || group->stale) continue;
+            if (group->target.key() != targetId || group->stale) continue;
             const QModelIndex groupIndex = index(row, 0);
             const int count = childCount(group);
             if (count > 0)
@@ -421,7 +276,7 @@ private:
     Group *findGroup(const QString &targetId) const
     {
         for (Group *group : groups_) {
-            if (group->targetId == targetId) return group;
+            if (group->target.key() == targetId) return group;
         }
         return nullptr;
     }
@@ -442,117 +297,11 @@ private:
 };
 
 // ============================================================================
-//  自定义 delegate：对上下文列中的匹配关键词染色
-// ============================================================================
-class SearchResultItemDelegate : public QStyledItemDelegate {
-    Q_OBJECT
-public:
-    explicit SearchResultItemDelegate(QObject* parent = nullptr)
-        : QStyledItemDelegate(parent) {}
-
-    void paint(QPainter* painter, const QStyleOptionViewItem& option,
-               const QModelIndex& index) const override
-    {
-        const auto *tree = qobject_cast<const QTreeView *>(parent());
-        const bool trackedHover = tree
-            && tree->property("searchHoverRow").toInt() == index.row()
-            && tree->property("searchHoverHasParent").toBool()
-                   == index.parent().isValid()
-            && (!index.parent().isValid()
-                || tree->property("searchHoverParentRow").toInt()
-                       == index.parent().row());
-        const bool hoveredRow = trackedHover
-            || (option.state & QStyle::State_MouseOver);
-        const bool selected = option.state & QStyle::State_Selected;
-        const auto paintHover = [&] {
-            if (!hoveredRow || selected)
-                return;
-            QColor hover = option.palette.color(QPalette::Highlight);
-            hover.setAlpha(34);
-            painter->fillRect(option.rect, hover);
-        };
-        // 只对 COL_CONTEXT 列做特殊绘制
-        if (index.column() != SearchResultsModel::COL_CONTEXT) {
-            QStyledItemDelegate::paint(painter, option, index);
-            paintHover();
-            return;
-        }
-
-        const QVariantList encodedRanges =
-            index.data(SearchResultsModel::MatchPositionsRole).toList();
-        if (index.data(SearchResultsModel::ContextRole).isNull()
-            || encodedRanges.isEmpty()) {
-            QStyledItemDelegate::paint(painter, option, index);
-            paintHover();
-            return;
-        }
-
-        painter->save();
-
-        QStyleOptionViewItem opt = option;
-        initStyleOption(&opt, index);
-        // 让当前平台样式一次性绘制交替色、悬停、整行选择和焦点边框。
-        // 之后只覆盖文字，不再手工拼接几块不同高度的背景。
-        opt.text.clear();
-        opt.icon = QIcon();
-        QStyle *style = opt.widget ? opt.widget->style() : QApplication::style();
-        style->drawControl(QStyle::CE_ItemViewItem, &opt, painter, opt.widget);
-        paintHover();
-
-        constexpr int HorizontalPadding = 6;
-        const QRect textRect = option.rect.adjusted(HorizontalPadding, 0,
-                                                    -HorizontalPadding, 0);
-        const QFontMetrics metrics(option.font);
-        const PreparedContext prepared = prepareContext(index, textRect.width(),
-                                                        metrics);
-        QTextLayout textLayout(prepared.text, option.font);
-        QVector<QTextLayout::FormatRange> formats;
-        for (const VisualMatchRange &range : prepared.matches) {
-            QTextCharFormat format;
-            format.setFontWeight(QFont::DemiBold);
-            format.setBackground(selected ? QColor(255, 255, 255, 72)
-                                          : QColor(255, 214, 64, 155));
-            format.setForeground(selected
-                ? option.palette.color(QPalette::HighlightedText)
-                : QColor(132, 72, 0));
-            formats.append({range.start, range.length, format});
-        }
-        textLayout.setFormats(formats);
-        textLayout.beginLayout();
-        QTextLine line = textLayout.createLine();
-        if (line.isValid())
-            line.setLineWidth(textRect.width());
-        textLayout.endLayout();
-        painter->setPen(selected
-            ? option.palette.color(QPalette::HighlightedText)
-            : option.palette.color(QPalette::Text));
-        if (line.isValid()) {
-            const qreal y = textRect.top()
-                + (textRect.height() - line.height()) / 2.0;
-            textLayout.draw(painter, QPointF(textRect.left(), y));
-        }
-
-        painter->restore();
-    }
-
-    QSize sizeHint(const QStyleOptionViewItem& option,
-                   const QModelIndex& index) const override
-    {
-        QSize hint = QStyledItemDelegate::sizeHint(option, index);
-        // paint() deliberately lays out exactly one visual line. Letting the
-        // platform delegate derive height from the full, potentially multi-KiB
-        // DisplayRole creates a second and contradictory wrapping policy.
-        hint.setHeight(option.fontMetrics.height() + 8);
-        return hint;
-    }
-};
-
-// ============================================================================
 //  SearchResultsDock 实现
 // ============================================================================
 SearchResultsDock::SearchResultsDock(QWidget *parent)
     : QDockWidget(QStringLiteral("搜索结果"), parent)
-    , m_controller(new SearchResultsController(this))
+    , m_controller(std::make_unique<SearchResultsController>())
 {
     // ⚠️ 关键修复：禁用浮动和移动，防止双击 / 拖动后嵌入错位
     //  - Fixed: 允许用户关闭/显示，不允许脱离位置
@@ -602,7 +351,7 @@ SearchResultsDock::SearchResultsDock(QWidget *parent)
     m_treeView->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     // One delegate owns the whole row so hover/selection geometry cannot
     // diverge between the location, context and count columns.
-    m_treeView->setItemDelegate(new SearchResultItemDelegate(m_treeView));
+    m_treeView->setItemDelegate(createSearchResultsDelegate(m_treeView));
     m_stack->addWidget(m_treeView);
 
     layout->addWidget(m_stack);
@@ -612,32 +361,9 @@ SearchResultsDock::SearchResultsDock(QWidget *parent)
     connect(m_treeView, &QTreeView::doubleClicked,
             this, &SearchResultsDock::onModelDoubleClicked);
     connect(m_rerunButton, &QPushButton::clicked, this, [this]() {
-        emit rerunRequested(m_controller->rerunTarget());
+        const SearchResultTarget &target = m_controller->rerunTarget();
+        emit rerunRequested(target.documentId, target.expectedRevision);
     });
-    connect(m_controller, &SearchResultsController::targetContentChanged,
-            this, &SearchResultsDock::invalidateResultsFor);
-    connect(m_controller, &SearchResultsController::targetDecorationReady,
-            this, &SearchResultsDock::decorateResultsFor);
-    connect(m_controller, &SearchResultsController::targetClosed, this,
-            [this](const QString &targetId, bool multiFile) {
-                if (multiFile) {
-                    if (m_multiModel && m_multiModel->invalidate(targetId))
-                        m_controller->markStale();
-                    m_summary->setText(
-                        QStringLiteral("在全部打开文件中搜索 “%1”：已找到至少 %2 处；%3 个文件不完整，%4 个已失效")
-                            .arg(m_controller->pattern()).arg(m_controller->matchCount())
-                            .arg(m_controller->incompleteCount()).arg(m_controller->staleCount()));
-                    setRerunAvailable(true);
-                    return;
-                }
-                SearchResultsModel *oldModel = m_model;
-                m_model = nullptr;
-                m_treeView->setModel(nullptr);
-                if (oldModel && oldModel->QObject::parent() == this)
-                    oldModel->deleteLater();
-                m_summary->setText(QStringLiteral("源文档已关闭，搜索结果已失效。"));
-                setRerunAvailable(false);
-            });
 
     // 关键：安装事件过滤器到 m_treeView viewport，以捕获 context 列内的点击位置
     //   —— 用于按"点击的匹配词"精准跳转（而非仅跳到第一个）
@@ -647,9 +373,10 @@ SearchResultsDock::SearchResultsDock(QWidget *parent)
 SearchResultsDock::~SearchResultsDock() = default;
 
 void SearchResultsDock::setRerunAvailable(bool available,
-                                          EditorTab *preferredTarget)
+                                          const SearchResultTarget &preferredTarget)
 {
-    m_controller->setRerunTarget(available ? preferredTarget : nullptr);
+    m_controller->setRerunTarget(available ? preferredTarget
+                                           : SearchResultTarget{});
     if (m_rerunButton)
         m_rerunButton->setVisible(available);
 }
@@ -664,7 +391,7 @@ void SearchResultsDock::updateSummary(const QString &pattern, const QString &fil
 void SearchResultsDock::setResults(const QVector<SearchMatch> &matches,
                                    const QString &pattern,
                                    const QString &fileName,
-                                   EditorTab *target,
+                                   const SearchResultTarget &target,
                                    bool incomplete)
 {
     auto *model = new SearchResultsModel(this);
@@ -679,10 +406,11 @@ void SearchResultsDock::clearResults()
 {
     setRerunAvailable(false);
     SearchResultsModel *oldSingleModel = m_model;
-    if (m_controller->singleTarget())
-        m_controller->singleTarget()->clearSearchHighlights();
-    for (EditorTab *target : m_controller->targets())
-        target->clearSearchHighlights();
+    if (m_controller->singleTarget().isValid())
+        emit clearSearchHighlightsRequested(
+            m_controller->singleTarget().documentId);
+    for (const SearchResultTarget &target : m_controller->targets())
+        emit clearSearchHighlightsRequested(target.documentId);
     m_lastHitRow = -1;
     m_lastHitMatchIdx = -1;
     m_controller->clear();
@@ -702,7 +430,7 @@ void SearchResultsDock::clearResults()
 void SearchResultsDock::setResultsModel(SearchResultsModel *model,
                                         const QString &pattern,
                                         const QString &fileName,
-                                        EditorTab *target)
+                                        const SearchResultTarget &target)
 {
     setRerunAvailable(false);
     m_controller->beginSingle(target);
@@ -740,9 +468,6 @@ void SearchResultsDock::setResultsModel(SearchResultsModel *model,
                     .arg(fileName, pattern).arg(total)
                     .arg(model->incompleteReason()));
         }
-        // The line index may have completed after this search captured its
-        // byte snapshot but before the model reached the Dock.
-        decorateResultsFor(target);
     } else {
         updateSummary(pattern, fileName, 0);
     }
@@ -750,7 +475,7 @@ void SearchResultsDock::setResultsModel(SearchResultsModel *model,
 
 void SearchResultsDock::beginSingleFileResults(const QString &pattern,
                                                 const QString &fileName,
-                                                EditorTab *target,
+                                                const SearchResultTarget &target,
                                                 TextEncoding encoding,
                                                 bool bytePositionMode)
 {
@@ -765,12 +490,15 @@ void SearchResultsDock::beginSingleFileResults(const QString &pattern,
 }
 
 void SearchResultsDock::appendSingleFilePreview(
-    EditorTab *target, const QVector<LargeFileSearchMatch> &batch,
+    const SearchResultTarget &target,
+    const QVector<LargeFileSearchMatch> &batch,
     TextEncoding encoding, bool bytePositionMode)
 {
-    if (m_controller->isMultiFile() || !target
-        || target != m_controller->singleTarget() || !m_model
-        || !m_controller->isCurrent(target) || batch.isEmpty()
+    const SearchResultTarget &expected = m_controller->singleTarget();
+    if (m_controller->isMultiFile() || !target.isValid()
+        || target.documentId != expected.documentId
+        || target.expectedRevision != expected.expectedRevision || !m_model
+        || batch.isEmpty()
         || m_model->textEncoding() != encoding
         || m_model->bytePositionMode() != bytePositionMode) {
         return;
@@ -781,38 +509,35 @@ void SearchResultsDock::appendSingleFilePreview(
     for (int i = 0; i < take; ++i) m_singlePreviewMatches.append(batch.at(i));
     m_model->setResults(m_singlePreviewMatches, {}, 0);
     m_summary->setText(QStringLiteral("%1 · 已发现至少 %2 处…")
-                           .arg(target->fileName()).arg(m_singlePreviewMatches.size()));
+                           .arg(target.displayName).arg(m_singlePreviewMatches.size()));
 }
 
-void SearchResultsDock::decorateResultsFor(EditorTab *tab)
+void SearchResultsDock::decorateResultsFor(const QUuid &documentId,
+                                            const LineIndex &lineIndex)
 {
-    if (!tab || !tab->isL2Mode() || !tab->l2View()
-        || tab->l2View()->lineIndex().isIncomplete()) {
+    if (documentId.isNull() || lineIndex.isIncomplete()) {
         return;
     }
-    const LineIndex &index = tab->l2View()->lineIndex();
     if (!m_controller->isMultiFile()) {
-        if (m_controller->singleTarget() == tab && m_model)
-            m_model->decorateLineNumbers(index);
+        if (m_controller->singleTarget().documentId == documentId && m_model)
+            m_model->decorateLineNumbers(lineIndex);
         return;
     }
     if (!m_multiModel)
         return;
-    const QString targetId = m_controller->targetId(tab);
+    const QString targetId = m_controller->targetId(documentId);
     if (!targetId.isEmpty())
-        m_multiModel->decorate(targetId, index);
+        m_multiModel->decorate(targetId, lineIndex);
 }
 
-void SearchResultsDock::invalidateResultsFor(EditorTab *tab)
+void SearchResultsDock::invalidateResultsFor(const QUuid &documentId)
 {
-    if (!tab)
+    if (!m_controller->contains(documentId))
         return;
-    tab->clearSearchHighlights();
+    emit clearSearchHighlightsRequested(documentId);
 
     if (m_controller->isMultiFile()) {
-        QString targetId = m_controller->targetId(tab);
-        if (targetId.isEmpty())
-            targetId = m_controller->ensureMultiTarget(tab);
+        const QString targetId = m_controller->targetId(documentId);
 
         if (m_multiModel && m_multiModel->invalidate(targetId)) {
             m_controller->markStale();
@@ -832,10 +557,29 @@ void SearchResultsDock::invalidateResultsFor(EditorTab *tab)
     m_treeView->setModel(nullptr);
     if (oldModel && oldModel->QObject::parent() == this)
         delete oldModel;
+    const SearchResultTarget invalidated = m_controller->singleTarget();
     m_controller->clear();
     m_summary->setText(QStringLiteral("文档内容已修改，搜索结果已失效；请重新搜索。"));
-    setRerunAvailable(true, tab);
+    setRerunAvailable(true, invalidated);
     show();
+}
+
+void SearchResultsDock::closeResultsFor(const QUuid &documentId)
+{
+    if (!m_controller->contains(documentId))
+        return;
+    if (m_controller->isMultiFile()) {
+        invalidateResultsFor(documentId);
+        return;
+    }
+    SearchResultsModel *oldModel = m_model;
+    m_model = nullptr;
+    m_treeView->setModel(nullptr);
+    if (oldModel && oldModel->QObject::parent() == this)
+        oldModel->deleteLater();
+    m_controller->clear();
+    m_summary->setText(QStringLiteral("源文档已关闭，搜索结果已失效。"));
+    setRerunAvailable(false);
 }
 
 void SearchResultsDock::beginMultiFileResults(const QString &pattern, int targetCount)
@@ -862,24 +606,26 @@ void SearchResultsDock::beginMultiFileResults(const QString &pattern, int target
     raise();
 }
 
-void SearchResultsDock::beginMultiFileTarget(EditorTab *tab,
+void SearchResultsDock::beginMultiFileTarget(const SearchResultTarget &target,
                                               TextEncoding encoding,
                                               bool bytePositionMode)
 {
-    if (!m_controller->isMultiFile() || !m_multiModel || !tab) return;
-    const QString targetId = m_controller->ensureMultiTarget(tab);
+    if (!m_controller->isMultiFile() || !m_multiModel || !target.isValid()) return;
+    m_controller->ensureMultiTarget(target);
     auto *preview = new SearchResultsModel(m_multiModel);
     preview->setBytePositionMode(bytePositionMode);
     preview->setTextEncoding(encoding);
-    m_multiModel->addPreview(tab, targetId, preview);
+    m_multiModel->addPreview(target, preview);
 }
 
 void SearchResultsDock::appendMultiFilePreview(
-    EditorTab *tab, const QVector<LargeFileSearchMatch> &batch,
+    const SearchResultTarget &target,
+    const QVector<LargeFileSearchMatch> &batch,
     TextEncoding encoding, bool bytePositionMode)
 {
-    if (!m_controller->isMultiFile() || !m_multiModel || !tab || batch.isEmpty()) return;
-    const QString targetId = m_controller->ensureMultiTarget(tab);
+    if (!m_controller->isMultiFile() || !m_multiModel
+        || !target.isValid() || batch.isEmpty()) return;
+    const QString targetId = m_controller->ensureMultiTarget(target);
     if (m_multiModel->appendPreview(targetId, batch, encoding,
                                     bytePositionMode)) {
         m_summary->setText(QStringLiteral("正在全部打开文件中搜索 “%1”…")
@@ -887,15 +633,15 @@ void SearchResultsDock::appendMultiFilePreview(
     }
 }
 
-void SearchResultsDock::appendMultiFileResults(EditorTab *tab,
+void SearchResultsDock::appendMultiFileResults(const SearchResultTarget &target,
                                                const QVector<SearchMatch> &matches,
                                                bool incomplete)
 {
-    if (!m_controller->isMultiFile() || !tab)
+    if (!m_controller->isMultiFile() || !target.isValid())
         return;
-    const QString targetId = m_controller->ensureMultiTarget(tab);
+    m_controller->ensureMultiTarget(target);
     if (m_multiModel) {
-        m_multiModel->addL1(tab, targetId, matches, incomplete);
+        m_multiModel->addL1(target, matches, incomplete);
         m_treeView->expand(m_multiModel->index(m_multiModel->rowCount() - 1, 0));
     }
     if (incomplete)
@@ -908,15 +654,15 @@ void SearchResultsDock::appendMultiFileResults(EditorTab *tab,
               .arg(m_controller->pattern()).arg(m_controller->matchCount()));
 }
 
-void SearchResultsDock::appendMultiFileResults(EditorTab *tab,
+void SearchResultsDock::appendMultiFileResults(const SearchResultTarget &target,
                                                SearchResultsModel *model)
 {
-    if (!m_controller->isMultiFile() || !tab || !model)
+    if (!m_controller->isMultiFile() || !target.isValid() || !model)
         return;
-    const QString targetId = m_controller->ensureMultiTarget(tab);
+    const QString targetId = m_controller->ensureMultiTarget(target);
     if (m_multiModel) {
         if (!m_multiModel->finish(targetId, model))
-            m_multiModel->addModel(tab, targetId, model);
+            m_multiModel->addModel(target, model);
         for (int row = 0; row < m_multiModel->rowCount(); ++row) {
             const QModelIndex group = m_multiModel->index(row, 0);
             if (group.data(TargetRole).toString() == targetId) {
@@ -928,7 +674,6 @@ void SearchResultsDock::appendMultiFileResults(EditorTab *tab,
     if (model->isIncomplete())
         m_controller->markIncomplete();
     m_controller->addMatches(model->totalMatches());
-    decorateResultsFor(tab);
     m_summary->setText(m_controller->incompleteCount() > 0
         ? QStringLiteral("在全部打开文件中搜索 “%1”：已找到至少 %2 处；%3 个文件结果不完整")
               .arg(m_controller->pattern()).arg(m_controller->matchCount()).arg(m_controller->incompleteCount())
@@ -991,8 +736,8 @@ bool SearchResultsDock::eventFilter(QObject *watched, QEvent *event)
                     QRect colRect = m_treeView->visualRect(idx);
                     int xInCol = me->pos().x() - colRect.left();
                     QFontMetrics fm(m_treeView->font());
-                    int matchIdx = hitTestModelMatch(idx, xInCol,
-                                                     colRect.width(), fm);
+                    int matchIdx = hitTestSearchResultMatch(
+                        idx, xInCol, colRect.width(), fm);
                     m_lastHitMatchIdx = matchIdx;
                     m_lastHitRow = idx.row();
                 } else {
@@ -1012,11 +757,6 @@ void SearchResultsDock::onModelDoubleClicked(const QModelIndex &index)
         MultiSearchResultsModel::Group *group = m_multiModel->groupFor(index);
         if (!group || !index.parent().isValid() || group->stale)
             return;
-        EditorTab *tab = group->tab;
-        if (!m_controller->isCurrent(tab, group->targetId)) {
-            invalidateResultsFor(tab);
-            return;
-        }
         const QVariantList ranges =
             index.data(SearchResultsModel::MatchByteRangesRole).toList();
         if (ranges.isEmpty()) return;
@@ -1024,25 +764,23 @@ void SearchResultsDock::onModelDoubleClicked(const QModelIndex &index)
             ? m_lastHitMatchIdx : 0;
         chosen = qBound(0, chosen, ranges.size() - 1);
         const QVariantMap range = ranges.at(chosen).toMap();
-        emit jumpToTabByteOffset(
-            tab, range.value(QStringLiteral("byteOffset")).toULongLong(),
+        emit jumpToDocumentByteOffset(
+            group->target.documentId, group->target.expectedRevision,
+            range.value(QStringLiteral("byteOffset")).toULongLong(),
             range.value(QStringLiteral("length")).toInt());
         return;
     }
     if (!m_model) return;
-    if (m_controller->singleTarget()
-        && !m_controller->isCurrent(m_controller->singleTarget())) {
-        invalidateResultsFor(m_controller->singleTarget());
-        return;
-    }
+    const SearchResultTarget target = m_controller->singleTarget();
     qint64 byteOff = -1;
     int    length  = 0;
     // 如果当前按下位置是同一个行并且有命中的匹配索引，则按该索引跳转
     if (m_lastHitRow == index.row() && m_lastHitMatchIdx >= 0) {
         if (m_model->matchByteOffsetAtIndex(index.row(), m_lastHitMatchIdx, &byteOff, &length)) {
             // 命中：跳转到用户点击的具体匹配词
-            if (m_controller->singleTarget())
-                emit jumpToTabByteOffset(m_controller->singleTarget(), byteOff, length);
+            if (target.isValid())
+                emit jumpToDocumentByteOffset(
+                    target.documentId, target.expectedRevision, byteOff, length);
             else
                 emit jumpToByteOffset(byteOff, length);
             return;
@@ -1052,11 +790,10 @@ void SearchResultsDock::onModelDoubleClicked(const QModelIndex &index)
     byteOff = m_model->matchByteOffset(index);
     length  = m_model->matchLength(index);
     if (byteOff >= 0) {
-        if (m_controller->singleTarget())
-            emit jumpToTabByteOffset(m_controller->singleTarget(), byteOff, length);
+        if (target.isValid())
+            emit jumpToDocumentByteOffset(
+                target.documentId, target.expectedRevision, byteOff, length);
         else
             emit jumpToByteOffset(byteOff, length);
     }
 }
-
-#include "SearchResultsDock.moc"

@@ -69,11 +69,10 @@ struct DocumentState {
     DocumentPersistence persistence = DocumentPersistence::None;
     DocumentContentKind contentKind = DocumentContentKind::Text;
     DocumentSecurityClass securityClass = DocumentSecurityClass::OrdinaryDocument;
-    DocumentCapabilities capabilities = DocumentCapability::Read
-        | DocumentCapability::Edit | DocumentCapability::Search
-        | DocumentCapability::Copy | DocumentCapability::Save
-        | DocumentCapability::AnalyzeLocally
-        | DocumentCapability::AnalyzeRemotelyWithConsent;
+    // Capabilities are an observed runtime fact, not a permissive default.
+    // The active document surface must populate them from its current state;
+    // a detached/default state is deliberately denied until proven available.
+    DocumentCapabilities capabilities = DocumentCapability::None;
     quint64 revision = 0;
     bool dirty = false;
 };
@@ -83,6 +82,7 @@ struct DocumentSnapshot {
     quint64 revision = 0;
     DocumentContentKind contentKind = DocumentContentKind::Text;
     DocumentSecurityClass securityClass = DocumentSecurityClass::OrdinaryDocument;
+    DocumentCapabilities capabilities = DocumentCapability::None;
     QString encodingName;
     QString text;
     QByteArray bytes;
@@ -90,7 +90,7 @@ struct DocumentSnapshot {
 
     bool mayEnterDocumentTools() const noexcept
     {
-        return securityClass != DocumentSecurityClass::AccountSecret;
+        return securityClass != DocumentSecurityClass::AccountSecret
+            && capabilities.testFlag(DocumentCapability::Read);
     }
 };
-

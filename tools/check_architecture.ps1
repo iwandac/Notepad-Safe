@@ -61,21 +61,22 @@ $mainSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'src/window/MainWi
 foreach ($backendLeak in @('NOTEPADSAFE_HAS_KDBX_BACKEND',
                             'SecurityIdentity::',
                             'SecureDocumentService::inspect',
-                            'KdbxFormatProbe')) {
+                            'KdbxFormatProbe',
+                            'secure.kdbx')) {
     if ($mainSource.Contains($backendLeak)) {
         Add-Failure "MainWindow contains backend selection/business token: $backendLeak"
     }
 }
 
 $searchDockHeader = Get-Content -LiteralPath (Join-Path $SourceRoot 'src/search/SearchResultsDock.h') -Raw
-foreach ($forbiddenState in @('QPointer<EditorTab>', 'TargetRevision',
+foreach ($forbiddenState in @('EditorTab', 'QPointer<EditorTab>', 'TargetRevision',
                                'targetConnections', 'multiTargets')) {
     if ($searchDockHeader.Contains($forbiddenState)) {
         Add-Failure "SearchResultsDock view declares result-session state: $forbiddenState"
     }
 }
 $searchDockSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'src/search/SearchResultsDock.cpp') -Raw
-foreach ($forbiddenControllerWork in @('contentRevision()',
+foreach ($forbiddenControllerWork in @('EditorTab', 'contentRevision()',
                                         '&EditorTab::contentChanged',
                                         'targetConnections')) {
     if ($searchDockSource.Contains($forbiddenControllerWork)) {
@@ -84,6 +85,15 @@ foreach ($forbiddenControllerWork in @('contentRevision()',
 }
 if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot 'src/search/SearchResultsController.cpp'))) {
     Add-Failure 'SearchResultsController implementation is missing'
+}
+$searchController = @(
+    (Get-Content -LiteralPath (Join-Path $SourceRoot 'src/search/SearchResultsController.h') -Raw),
+    (Get-Content -LiteralPath (Join-Path $SourceRoot 'src/search/SearchResultsController.cpp') -Raw)
+) -join "`n"
+foreach ($widgetLeak in @('EditorTab', 'QWidget', 'QPointer')) {
+    if ($searchController.Contains($widgetLeak)) {
+        Add-Failure "SearchResultsController depends on UI lifetime token: $widgetLeak"
+    }
 }
 if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot 'src/domain/PersistenceAdapterRegistry.cpp'))) {
     Add-Failure 'PersistenceAdapterRegistry implementation is missing'
@@ -110,6 +120,39 @@ foreach ($domainFile in $domainFiles) {
             Add-Failure "domain depends on UI/vendor token '$token': $($domainFile.Name)"
         }
     }
+}
+
+# Complexity budgets are ratchets, not targets. They make responsibility
+# extraction durable: a future feature must go into a focused component rather
+# than silently growing the four legacy coordinators again.
+$complexityBudgets = @(
+    @{ File = 'src/window/MainWindow.cpp'; Lines = 5634; Branches = 652 },
+    @{ File = 'src/editor/EditorTab.cpp'; Lines = 7288; Branches = 926 },
+    @{ File = 'src/search/FindReplaceDialog.cpp'; Lines = 1499; Branches = 197 },
+    @{ File = 'src/search/SearchResultsDock.cpp'; Lines = 799; Branches = 92 },
+    @{ File = 'src/app/DocumentOpenWorkflow.cpp'; Lines = 98; Branches = 14 },
+    @{ File = 'src/search/EditableTextSearch.cpp'; Lines = 110; Branches = 13 },
+    @{ File = 'src/search/SearchResultsController.cpp'; Lines = 73; Branches = 4 },
+    @{ File = 'src/search/SearchResultsDelegate.cpp'; Lines = 246; Branches = 17 },
+    @{ File = 'src/window/FileCredentialDialog.cpp'; Lines = 131; Branches = 4 },
+    @{ File = 'src/window/SensitiveText.cpp'; Lines = 41; Branches = 4 }
+)
+foreach ($budget in $complexityBudgets) {
+    $path = Join-Path $SourceRoot $budget.File
+    $lines = @(Get-Content -LiteralPath $path).Count
+    $content = Get-Content -LiteralPath $path -Raw
+    $branches = [regex]::Matches($content, '\bif\s*\(').Count
+    if ($lines -gt $budget.Lines) {
+        Add-Failure "$($budget.File) exceeds line budget: $lines > $($budget.Lines)"
+    }
+    if ($branches -gt $budget.Branches) {
+        Add-Failure "$($budget.File) exceeds branch budget: $branches > $($budget.Branches)"
+    }
+}
+
+$activeCmakeText = $activeCmake -join "`n"
+if ($activeCmakeText -match '(?i)TIMEOUT\s+3600') {
+    Add-Failure 'monolithic 3600-second test timeout is forbidden'
 }
 
 $concreteFactories = Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src') -Recurse -File |

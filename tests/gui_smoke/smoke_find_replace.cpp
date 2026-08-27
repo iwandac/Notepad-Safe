@@ -49,6 +49,11 @@
 #include "SearchResultsModel.h"
 #include "AsyncTaskManager.h"
 
+static SearchResultTarget dockTarget(EditorTab *tab) {
+    return tab ? searchResultTarget(tab->documentState(), tab->fileName())
+               : SearchResultTarget{};
+}
+
 class SmokeFindReplace : public SmokeTestBase {
     Q_OBJECT
 private slots:
@@ -482,13 +487,12 @@ void SmokeFindReplace::tc_fr_005_unicode_long_line_find_all_and_double_click() {
     dock.resize(1100, 320);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
-    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToTabByteOffset);
-    connect(&dock, &SearchResultsDock::jumpToTabByteOffset,
-            tab(), [](EditorTab *target, qint64 offset, int length) {
+    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToDocumentByteOffset);
+    connect(&dock, &SearchResultsDock::jumpToDocumentByteOffset,
+            tab(), [target = tab()](const QUuid &, quint64, qint64 offset, int length) {
                 if (target)
                     target->gotoByteOffset(offset, length);
             });
-
     FindReplaceDialog dialog(container_);
     dialog.setActiveTab(tab());
     dialog.setSearchResultsDock(&dock);
@@ -553,9 +557,9 @@ void SmokeFindReplace::tc_fr_005_unicode_long_line_find_all_and_double_click() {
     QTest::mouseClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, click);
     QTest::mouseDClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, click);
     QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 2000);
-    QCOMPARE(qvariant_cast<EditorTab *>(jumpSpy.first().at(0)), tab());
-    QCOMPARE(jumpSpy.first().at(1).toLongLong(), qint64(5000));
-    QCOMPARE(jumpSpy.first().at(2).toInt(), marker.toUtf8().size());
+    QCOMPARE(jumpSpy.first().at(0).toUuid(), tab()->documentState().id);
+    QCOMPARE(jumpSpy.first().at(2).toLongLong(), qint64(5000));
+    QCOMPARE(jumpSpy.first().at(3).toInt(), marker.toUtf8().size());
     QTRY_COMPARE_WITH_TIMEOUT(currentSelectionBytes(), marker.toUtf8(), 5000);
     QCOMPARE(tab()->contentRevision(), revisionBeforeNavigation);
     QCOMPARE(tab()->isModified(), modifiedBeforeNavigation);
@@ -584,6 +588,10 @@ void SmokeFindReplace::tc_fr_006_live_overlay_search_snapshot_highlight_and_inva
     dock.resize(1050, 320);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
+    connect(tab(), &EditorTab::contentChanged, &dock,
+            [&dock, target = tab()] {
+                dock.invalidateResultsFor(target->documentState().id);
+            });
     FindReplaceDialog dialog(container_);
     dialog.setActiveTab(tab());
     dialog.setSearchResultsDock(&dock);
@@ -614,9 +622,9 @@ void SmokeFindReplace::tc_fr_006_live_overlay_search_snapshot_highlight_and_inva
                                                 "gui-live-l2-search-highlight.png"));
     QVERIFY(container_->grab().save(highlightScreenshot));
 
-    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToTabByteOffset);
-    connect(&dock, &SearchResultsDock::jumpToTabByteOffset,
-            tab(), [](EditorTab *target, qint64 offset, int length) {
+    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToDocumentByteOffset);
+    connect(&dock, &SearchResultsDock::jumpToDocumentByteOffset,
+            tab(), [target = tab()](const QUuid &, quint64, qint64 offset, int length) {
                 if (target)
                     target->gotoByteOffset(offset, length);
             });
@@ -628,7 +636,7 @@ void SmokeFindReplace::tc_fr_006_live_overlay_search_snapshot_highlight_and_inva
     QTest::mouseDClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier,
                        tree->visualRect(contextIndex).center());
     QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 2000);
-    QCOMPARE(qvariant_cast<EditorTab *>(jumpSpy.first().at(0)), tab());
+    QCOMPARE(jumpSpy.first().at(0).toUuid(), tab()->documentState().id);
     QTRY_COMPARE_WITH_TIMEOUT(currentSelectionBytes(), marker.toUtf8(), 3000);
 
     tab()->editor()->SendScintilla(QsciScintillaBase::SCI_GOTOPOS,
@@ -683,6 +691,26 @@ void SmokeFindReplace::tc_fr_007_all_open_files_incremental_results_and_target_j
     dock.resize(1050, 350);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
+    connect(&dock, &SearchResultsDock::jumpToDocumentByteOffset,
+            &workspace, [&workspace](const QUuid &documentId,
+                                     quint64 expectedRevision,
+                                     qint64 offset, int length) {
+                for (int index = 0; index < workspace.count(); ++index) {
+                    auto *target = qobject_cast<EditorTab *>(workspace.widget(index));
+                    if (target && target->documentState().id == documentId
+                        && target->contentRevision() == expectedRevision) {
+                        workspace.setCurrentWidget(target);
+                        target->gotoByteOffset(offset, length);
+                        return;
+                    }
+                }
+            });
+    for (EditorTab *target : {first, second, third}) {
+        connect(target, &EditorTab::contentChanged, &dock,
+                [&dock, target] {
+                    dock.invalidateResultsFor(target->documentState().id);
+                });
+    }
     FindReplaceDialog dialog(&workspace);
     dialog.setTabWidget(&workspace);
     dialog.setActiveTab(first);
@@ -716,7 +744,7 @@ void SmokeFindReplace::tc_fr_007_all_open_files_incremental_results_and_target_j
         tree->model()->rowCount(tree->model()->index(2, 0)), 1, 10000);
     QVERIFY(first->editor()->isModified());
 
-    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToTabByteOffset);
+    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToDocumentByteOffset);
     QModelIndex secondGroup;
     for (int index = 0; index < tree->model()->rowCount(); ++index) {
         const QModelIndex candidate = tree->model()->index(index, 0);
@@ -736,7 +764,7 @@ void SmokeFindReplace::tc_fr_007_all_open_files_incremental_results_and_target_j
     QTest::mouseDClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier,
                        secondRect.center());
     QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 2000);
-    QCOMPARE(qvariant_cast<EditorTab *>(jumpSpy.first().at(0)), second);
+    QCOMPARE(jumpSpy.first().at(0).toUuid(), second->documentState().id);
 
     workspace.setCurrentWidget(first);
     workspace.activateWindow();
@@ -787,9 +815,9 @@ void SmokeFindReplace::tc_fr_008_multiline_regex_result_and_double_click()
     dock.resize(1000, 300);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
-    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToTabByteOffset);
-    connect(&dock, &SearchResultsDock::jumpToTabByteOffset,
-            tab(), [](EditorTab *target, qint64 offset, int length) {
+    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToDocumentByteOffset);
+    connect(&dock, &SearchResultsDock::jumpToDocumentByteOffset,
+            tab(), [target = tab()](const QUuid &, quint64, qint64 offset, int length) {
                 if (target)
                     target->gotoByteOffset(offset, length);
             });
@@ -827,8 +855,8 @@ void SmokeFindReplace::tc_fr_008_multiline_regex_result_and_double_click()
     QTest::mouseClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, click);
     QTest::mouseDClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, click);
     QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 2000);
-    QCOMPARE(jumpSpy.first().at(1).toLongLong(), qint64(8));
-    QCOMPARE(jumpSpy.first().at(2).toInt(), expected.size());
+    QCOMPARE(jumpSpy.first().at(2).toLongLong(), qint64(8));
+    QCOMPARE(jumpSpy.first().at(3).toInt(), expected.size());
     QTRY_COMPARE_WITH_TIMEOUT(currentSelectionBytes(), expected, 5000);
     const QString outputDir = QCoreApplication::applicationDirPath();
     QVERIFY(dock.grab().save(
@@ -863,9 +891,9 @@ void SmokeFindReplace::tc_fr_009_l1_pcre2_find_navigation_replace_and_error()
     dock.resize(1000, 300);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
-    connect(&dock, &SearchResultsDock::jumpToTabByteOffset,
-            &l1, [](EditorTab *target, qint64 offset, int length) {
-                if (target) target->gotoByteOffset(offset, length);
+    connect(&dock, &SearchResultsDock::jumpToDocumentByteOffset,
+            &l1, [&l1](const QUuid &, quint64, qint64 offset, int length) {
+                l1.gotoByteOffset(offset, length);
             });
 
     FindReplaceDialog dialog;
@@ -1033,9 +1061,9 @@ void SmokeFindReplace::tc_fr_011_hex_byte_find_all_highlight_and_double_click()
     dock.resize(1050, 330);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
-    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToTabByteOffset);
-    connect(&dock, &SearchResultsDock::jumpToTabByteOffset,
-            tab(), [](EditorTab *target, qint64 offset, int length) {
+    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToDocumentByteOffset);
+    connect(&dock, &SearchResultsDock::jumpToDocumentByteOffset,
+            tab(), [target = tab()](const QUuid &, quint64, qint64 offset, int length) {
                 if (target)
                     target->gotoByteOffset(offset, length);
             });
@@ -1090,8 +1118,8 @@ void SmokeFindReplace::tc_fr_011_hex_byte_find_all_highlight_and_double_click()
     QTest::mouseClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, rect.center());
     QTest::mouseDClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, rect.center());
     QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 2000);
-    QCOMPARE(jumpSpy.first().at(1).toLongLong(), qint64(35));
-    QCOMPARE(jumpSpy.first().at(2).toInt(), marker.size());
+    QCOMPARE(jumpSpy.first().at(2).toLongLong(), qint64(35));
+    QCOMPARE(jumpSpy.first().at(3).toInt(), marker.size());
     QTRY_COMPARE_WITH_TIMEOUT(currentSelectionBytes(), marker, 3000);
     auto *asciiPreview = tab()->findChild<QPlainTextEdit *>(
         QStringLiteral("HexAsciiPreview"));
@@ -1144,11 +1172,19 @@ void SmokeFindReplace::tc_fr_012_hex_byte_all_open_filters_text_targets()
     dock.resize(1050, 330);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
-    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToTabByteOffset);
-    connect(&dock, &SearchResultsDock::jumpToTabByteOffset,
-            &workspace, [](EditorTab *target, qint64 offset, int length) {
-                if (target)
-                    target->gotoByteOffset(offset, length);
+    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToDocumentByteOffset);
+    connect(&dock, &SearchResultsDock::jumpToDocumentByteOffset,
+            &workspace, [&workspace](const QUuid &documentId,
+                                     quint64 expectedRevision,
+                                     qint64 offset, int length) {
+                for (int index = 0; index < workspace.count(); ++index) {
+                    auto *target = qobject_cast<EditorTab *>(workspace.widget(index));
+                    if (target && target->documentState().id == documentId
+                        && target->contentRevision() == expectedRevision) {
+                        target->gotoByteOffset(offset, length);
+                        return;
+                    }
+                }
             });
 
     FindReplaceDialog dialog(&workspace);
@@ -1192,9 +1228,9 @@ void SmokeFindReplace::tc_fr_012_hex_byte_all_open_filters_text_targets()
     QTest::mouseClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, rect.center());
     QTest::mouseDClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, rect.center());
     QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 2000);
-    QCOMPARE(qvariant_cast<EditorTab *>(jumpSpy.first().at(0)), binaryTab);
-    QCOMPARE(jumpSpy.first().at(1).toLongLong(), qint64(20));
-    QCOMPARE(jumpSpy.first().at(2).toInt(), marker.size());
+    QCOMPARE(jumpSpy.first().at(0).toUuid(), binaryTab->documentState().id);
+    QCOMPARE(jumpSpy.first().at(2).toLongLong(), qint64(20));
+    QCOMPARE(jumpSpy.first().at(3).toInt(), marker.size());
     QCOMPARE(binaryTab->l2View()->selectionStart(), qint64(20));
     QCOMPARE(binaryTab->l2View()->selectionEnd(), qint64(24));
 
@@ -1313,6 +1349,10 @@ void SmokeFindReplace::tc_fr_014_invalidated_result_rerun_from_dock()
     dock.resize(1050, 320);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
+    connect(tab(), &EditorTab::contentChanged, &dock,
+            [&dock, target = tab()] {
+                dock.invalidateResultsFor(target->documentState().id);
+            });
 
     FindReplaceDialog dialog(container_);
     dialog.setActiveTab(tab());
@@ -1331,9 +1371,9 @@ void SmokeFindReplace::tc_fr_014_invalidated_result_rerun_from_dock()
     QTRY_VERIFY_WITH_TIMEOUT(tree->model() && tree->model()->rowCount() == 1, 3000);
     QVERIFY(!rerun->isVisible());
 
-    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToTabByteOffset);
-    connect(&dock, &SearchResultsDock::jumpToTabByteOffset,
-            tab(), [](EditorTab *target, qint64 offset, int length) {
+    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToDocumentByteOffset);
+    connect(&dock, &SearchResultsDock::jumpToDocumentByteOffset,
+            tab(), [target = tab()](const QUuid &, quint64, qint64 offset, int length) {
                 if (target)
                     target->gotoByteOffset(offset, length);
             });
@@ -1362,7 +1402,7 @@ void SmokeFindReplace::tc_fr_014_invalidated_result_rerun_from_dock()
     QTest::mouseClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, click);
     QTest::mouseDClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, click);
     QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 2000);
-    QCOMPARE(qvariant_cast<EditorTab *>(jumpSpy.first().at(0)), tab());
+    QCOMPARE(jumpSpy.first().at(0).toUuid(), tab()->documentState().id);
     const auto selectedBytes = [this]() {
         const qint64 start = tab()->editor()->SendScintilla(
             QsciScintillaBase::SCI_GETSELECTIONSTART);
@@ -1549,7 +1589,14 @@ void SmokeFindReplace::tc_fr_016_large_search_starts_before_line_index_completes
     // line index.  The row must turn into a line number in place without a
     // second search, while the byte range remains the navigation authority.
     SearchResultsDock dock(container_);
-    dock.setResultsModel(model, marker, tab()->fileName(), tab());
+    dock.setResultsModel(model, marker, tab()->fileName(), dockTarget(tab()));
+    connect(tab(), &EditorTab::l2LineBuildFinished, &dock,
+            [&dock, target = tab()](bool success) {
+                if (success) {
+                    dock.decorateResultsFor(target->documentState().id,
+                                            target->l2View()->lineIndex());
+                }
+            });
     dock.show();
     QCoreApplication::processEvents();
     auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
@@ -2550,9 +2597,9 @@ void SmokeFindReplace::tc_fr_027_real_s3_find_all_dock_double_click()
     dock.resize(1100, 360);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
-    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToTabByteOffset);
-    connect(&dock, &SearchResultsDock::jumpToTabByteOffset,
-            tab(), [](EditorTab *targetTab, qint64 offset, int length) {
+    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToDocumentByteOffset);
+    connect(&dock, &SearchResultsDock::jumpToDocumentByteOffset,
+            tab(), [targetTab = tab()](const QUuid &, quint64, qint64 offset, int length) {
                 if (targetTab)
                     targetTab->gotoByteOffset(offset, length);
             });
@@ -2613,8 +2660,8 @@ void SmokeFindReplace::tc_fr_027_real_s3_find_all_dock_double_click()
     QTest::mouseDClick(tree->viewport(), Qt::LeftButton,
                        Qt::NoModifier, rect.center());
     QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 3000);
-    QCOMPARE(jumpSpy.first().at(1).toLongLong(), target);
-    QCOMPARE(jumpSpy.first().at(2).toInt(), signature.size());
+    QCOMPARE(jumpSpy.first().at(2).toLongLong(), target);
+    QCOMPARE(jumpSpy.first().at(3).toInt(), signature.size());
     QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(), target, 5000);
     QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(),
                               target + signature.size(), 5000);
@@ -2757,9 +2804,9 @@ void SmokeFindReplace::tc_fr_029_result_spool_virtual_tail_navigation()
     dock.resize(1100, 420);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
-    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToTabByteOffset);
-    connect(&dock, &SearchResultsDock::jumpToTabByteOffset,
-            tab(), [](EditorTab *targetTab, qint64 offset, int length) {
+    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToDocumentByteOffset);
+    connect(&dock, &SearchResultsDock::jumpToDocumentByteOffset,
+            tab(), [targetTab = tab()](const QUuid &, quint64, qint64 offset, int length) {
                 if (targetTab)
                     targetTab->gotoByteOffset(offset, length);
             });
@@ -2808,8 +2855,8 @@ void SmokeFindReplace::tc_fr_029_result_spool_virtual_tail_navigation()
     QTest::mouseDClick(tree->viewport(), Qt::LeftButton,
                        Qt::NoModifier, tailRect.center());
     QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 3000);
-    QCOMPARE(jumpSpy.first().at(1).toLongLong(), expectedLastOffset);
-    QCOMPARE(jumpSpy.first().at(2).toInt(), marker.size());
+    QCOMPARE(jumpSpy.first().at(2).toLongLong(), expectedLastOffset);
+    QCOMPARE(jumpSpy.first().at(3).toInt(), marker.size());
     QTRY_COMPARE_WITH_TIMEOUT(view()->selectionStart(), expectedLastOffset, 3000);
     QTRY_COMPARE_WITH_TIMEOUT(view()->selectionEnd(),
                               expectedLastOffset + marker.size(), 3000);
@@ -2853,9 +2900,9 @@ void SmokeFindReplace::tc_fr_030_sparse_s3_text_regex_after_two_gib()
     dock.resize(1100, 360);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
-    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToTabByteOffset);
-    connect(&dock, &SearchResultsDock::jumpToTabByteOffset,
-            tab(), [](EditorTab *targetTab, qint64 offset, int length) {
+    QSignalSpy jumpSpy(&dock, &SearchResultsDock::jumpToDocumentByteOffset);
+    connect(&dock, &SearchResultsDock::jumpToDocumentByteOffset,
+            tab(), [targetTab = tab()](const QUuid &, quint64, qint64 offset, int length) {
                 if (targetTab)
                     targetTab->gotoByteOffset(offset, length);
             });
@@ -2909,8 +2956,8 @@ void SmokeFindReplace::tc_fr_030_sparse_s3_text_regex_after_two_gib()
     QTest::mouseDClick(tree->viewport(), Qt::LeftButton,
                        Qt::NoModifier, rect.center());
     QTRY_COMPARE_WITH_TIMEOUT(jumpSpy.count(), 1, 3000);
-    QCOMPARE(jumpSpy.first().at(1).toLongLong(), expectedOffset);
-    QCOMPARE(jumpSpy.first().at(2).toInt(), matchBytes.size());
+    QCOMPARE(jumpSpy.first().at(2).toLongLong(), expectedOffset);
+    QCOMPARE(jumpSpy.first().at(3).toInt(), matchBytes.size());
     QTRY_COMPARE_WITH_TIMEOUT(provider->selectionStartOffset(), expectedOffset, 5000);
     QTRY_COMPARE_WITH_TIMEOUT(provider->selectionEndOffset(),
                               expectedOffset + matchBytes.size(), 5000);
@@ -3590,9 +3637,9 @@ void SmokeFindReplace::tc_fr_039_multi_encoding_dock_models_are_independent()
         model->setTextEncoding(fixture.encoding);
         model->setResults({match}, {}, 0);
         QCOMPARE(model->textEncoding(), fixture.encoding);
-        dock.beginMultiFileTarget(targets.at(index), fixture.encoding,
+        dock.beginMultiFileTarget(dockTarget(targets.at(index)), fixture.encoding,
                                   fixture.byteMode);
-        dock.appendMultiFilePreview(targets.at(index), {match}, fixture.encoding,
+        dock.appendMultiFilePreview(dockTarget(targets.at(index)), {match}, fixture.encoding,
                                     fixture.byteMode);
         const QModelIndex previewGroup = tree->model()->index(index, 0);
         QCOMPARE(tree->model()->rowCount(previewGroup), 1);
@@ -3600,7 +3647,7 @@ void SmokeFindReplace::tc_fr_039_multi_encoding_dock_models_are_independent()
                      0, SearchResultsModel::COL_CONTEXT, previewGroup)
                      .data(SearchResultsModel::ContextRole).toString(),
                  fixture.expected);
-        dock.appendMultiFileResults(targets.at(index), model);
+        dock.appendMultiFileResults(dockTarget(targets.at(index)), model);
     }
 
     QCOMPARE(tree->model()->rowCount(), fixtures.size());
@@ -4041,9 +4088,18 @@ void SmokeFindReplace::tc_fr_041_search_dock_rows_remain_compact_across_modes()
     // broken result-row delegate to pass unnoticed.
     QTabWidget workspace;
     auto *target = new EditorTab(&workspace);
+    target->editor()->setText(QStringLiteral("tool snapshot"));
+    DocumentSnapshot snapshot;
+    QString snapshotError;
+    QVERIFY2(target->createDocumentSnapshot(1024, &snapshot, &snapshotError),
+             qPrintable(snapshotError));
+    QCOMPARE(snapshot.documentId, target->documentState().id);
+    QCOMPARE(snapshot.revision, target->contentRevision());
+    QCOMPARE(snapshot.text, QStringLiteral("tool snapshot"));
+    QVERIFY(!target->createDocumentSnapshot(4, &snapshot, &snapshotError));
     workspace.addTab(target, QStringLiteral("bytes.bin"));
     dock.beginMultiFileResults(marker, 1);
-    dock.beginMultiFileTarget(target, TextEncoding::Utf8, true);
+    dock.beginMultiFileTarget(dockTarget(target), TextEncoding::Utf8, true);
     LargeFileSearchMatch multiMatch;
     multiMatch.byteOffset = byteOffset;
     multiMatch.length = needle.size();
@@ -4051,7 +4107,7 @@ void SmokeFindReplace::tc_fr_041_search_dock_rows_remain_compact_across_modes()
     multiMatch.col = byteOffset;
     multiMatch.contextByteOffset = 0;
     multiMatch.lineContext = source;
-    dock.appendMultiFilePreview(target, {multiMatch}, TextEncoding::Utf8, true);
+    dock.appendMultiFilePreview(dockTarget(target), {multiMatch}, TextEncoding::Utf8, true);
     const QModelIndex group = tree->model()->index(0, 0);
     QVERIFY(group.isValid());
     tree->expand(group);

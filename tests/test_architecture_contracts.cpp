@@ -97,6 +97,9 @@ DocumentSnapshot snapshot(DocumentSecurityClass security)
     result.documentId = QUuid::createUuid();
     result.revision = 7;
     result.securityClass = security;
+    result.capabilities = DocumentCapability::Read
+        | DocumentCapability::AnalyzeLocally
+        | DocumentCapability::AnalyzeRemotelyWithConsent;
     result.text = QStringLiteral("const answer = 42;");
     result.sourceRange = {{0}, {result.text.toUtf8().size()}};
     return result;
@@ -135,33 +138,49 @@ int main(int argc, char **argv)
     }), "register StaticGraphTool");
     check(tools.instantiatedCount() == 0, "tool descriptors are lazy");
 
-    auto echo = tools.create(QStringLiteral("test.echo"));
-    auto graph = tools.create(QStringLiteral("test.static-graph"));
     const auto plain = snapshot(DocumentSecurityClass::OrdinaryDocument);
     auto secure = plain;
     secure.securityClass = DocumentSecurityClass::SecureDocument;
-    const auto plainResult = echo->run(plain, {});
-    const auto secureResult = echo->run(secure, {});
+    const auto plainResult = tools.run(QStringLiteral("test.echo"), plain);
+    const auto secureResult = tools.run(QStringLiteral("test.echo"), secure);
     check(plainResult.status == DocumentToolResult::Status::Completed
               && secureResult.status == DocumentToolResult::Status::Completed
               && plainResult.artifact.text == secureResult.artifact.text,
           "plain and unlocked secure documents use the same tool contract");
-    const auto accountResult = graph->run(
-        snapshot(DocumentSecurityClass::AccountSecret), {});
+    const auto accountResult = tools.run(
+        QStringLiteral("test.static-graph"),
+        snapshot(DocumentSecurityClass::AccountSecret));
     check(accountResult.status == DocumentToolResult::Status::Denied,
           "account secrets are denied before entering a document tool");
+    const int instancesBeforeCapabilityDenial = tools.instantiatedCount();
+    auto inaccessible = plain;
+    inaccessible.capabilities = DocumentCapability::None;
+    check(tools.run(QStringLiteral("test.echo"), inaccessible).status
+              == DocumentToolResult::Status::Denied
+              && tools.instantiatedCount() == instancesBeforeCapabilityDenial,
+          "missing document capability is denied before tool instantiation");
+    const DocumentToolDescriptor remoteDescriptor{
+        QStringLiteral("test.remote"), QStringLiteral("Remote"),
+        ToolExposurePolicy::RemoteRequiresPerInvocationConsent, false};
+    DocumentToolContext remoteContext;
+    check(!documentToolInvocationAllowed(plain, remoteDescriptor, remoteContext),
+          "remote document exposure requires per-invocation consent");
+    remoteContext.remoteExposureApproved = true;
+    check(documentToolInvocationAllowed(plain, remoteDescriptor, remoteContext),
+          "remote document exposure requires both capability and consent");
 
     ToolCancellation cancellation;
     cancellation.cancel();
     DocumentToolContext cancelledContext;
     cancelledContext.cancellation = &cancellation;
-    check(echo->run(plain, cancelledContext).status
+    check(tools.run(QStringLiteral("test.echo"), plain, cancelledContext).status
               == DocumentToolResult::Status::Cancelled,
           "tool cancellation is a stable port contract");
 
     DocumentState state;
     state.id = plain.documentId;
     state.revision = plain.revision;
+    state.capabilities = DocumentCapability::Edit;
     EditProposal proposal{state.id, state.revision, QStringLiteral("replacement")};
     check(proposal.appliesTo(state), "edit proposal applies to its baseline revision");
     ++state.revision;
@@ -192,7 +211,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < 20; ++i) {
         const PersistenceAdapterDescriptor descriptor{
             QStringLiteral("test.persistence.%1").arg(i), QStringLiteral("Test"),
-            i, false};
+            i, DocumentPersistence::PlainFile};
         check(persistenceAdapters.registerAdapter(descriptor, [descriptor] {
             return std::make_unique<CountingPersistenceAdapter>(descriptor);
         }), "register scale persistence adapter descriptor");
@@ -201,14 +220,17 @@ int main(int argc, char **argv)
           "twenty persistence adapters are discoverable without UI changes");
     check(persistenceAdapters.instantiatedCount() == 0,
           "unused persistence adapters add no startup construction");
-    check(persistenceAdapters.resolve(QStringLiteral("test.persistence.19"))
-              == QLatin1String("test.persistence.19"),
+    const auto resolvedPersistence = persistenceAdapters.resolve(
+        QStringLiteral("test.persistence.19"));
+    check(resolvedPersistence
+              && resolvedPersistence->id == QLatin1String("test.persistence.19"),
           "highest-priority matching persistence adapter wins");
     check(persistenceAdapters.instantiatedCount() == 1,
           "resolving a high-priority adapter does not instantiate lower adapters");
     check(!persistenceAdapters.registerAdapter(
               {QStringLiteral("test.persistence.19"), QStringLiteral("Duplicate"),
-               999, false}, [] { return std::unique_ptr<IPersistenceAdapter>{}; }),
+               999, DocumentPersistence::PlainFile},
+              [] { return std::unique_ptr<IPersistenceAdapter>{}; }),
           "duplicate persistence adapter ids fail closed");
 
     check(FeatureRegistry::featureIdForCommand(QStringLiteral("edit.copy"))
@@ -219,6 +241,12 @@ int main(int argc, char **argv)
           "accounts remain a distinct product feature boundary");
     check(FeatureRegistry::featureIdForCommand(QStringLiteral("unknown.command")).isEmpty(),
           "unknown commands fail closed instead of disappearing from the ledger");
+    check(FeatureRegistry::featureIdForCommand(QStringLiteral("file.svae")).isEmpty()
+              && FeatureRegistry::featureIdForCommand(
+                     QStringLiteral("edit.indentation.tabWidth.3")).isEmpty()
+              && FeatureRegistry::featureIdForCommand(
+                     QStringLiteral("language.unregistered")).isEmpty(),
+          "known command namespaces reject typo and unregistered suffixes");
 
     InferenceProviderRegistry inferenceProviders;
     check(inferenceProviders.manifests().isEmpty()

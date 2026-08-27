@@ -3733,7 +3733,7 @@ private slots:
             context.data(SearchResultsModel::MatchByteRangesRole).toList();
         QCOMPARE(ranges.size(), 1);
 
-        QSignalSpy jumpByteSpy(dock, &SearchResultsDock::jumpToTabByteOffset);
+        QSignalSpy jumpByteSpy(dock, &SearchResultsDock::jumpToDocumentByteOffset);
         switchToTab(mw_, 0);
         const QModelIndex jumpIndex = tree->model()->index(
             0, SearchResultsModel::COL_LINE, secondGroup);
@@ -4238,7 +4238,7 @@ private slots:
         QTest::mouseClick(close, Qt::LeftButton);
         QTRY_VERIFY_WITH_TIMEOUT(!dialog->isVisible(), 1000);
 
-        QSignalSpy jumpSpy(dock, &SearchResultsDock::jumpToTabByteOffset);
+        QSignalSpy jumpSpy(dock, &SearchResultsDock::jumpToDocumentByteOffset);
         const QModelIndex first = tree->model()->index(
             0, SearchResultsModel::COL_CONTEXT);
         tree->scrollTo(first);
@@ -4342,7 +4342,7 @@ private slots:
 
         QTest::mouseClick(close, Qt::LeftButton);
         QTRY_VERIFY_WITH_TIMEOUT(!dialog->isVisible(), 1000);
-        QSignalSpy jumpSpy(dock, &SearchResultsDock::jumpToTabByteOffset);
+        QSignalSpy jumpSpy(dock, &SearchResultsDock::jumpToDocumentByteOffset);
         tree->scrollTo(result, QAbstractItemView::PositionAtCenter);
         QApplication::processEvents(QEventLoop::AllEvents, 100);
         const QRect resultRect = tree->visualRect(result);

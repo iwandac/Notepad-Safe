@@ -3,6 +3,7 @@
 #include <QDialog>
 #include <QList>
 #include <QPointer>
+#include <QUuid>
 #include <QVector>
 
 class QCheckBox;
@@ -44,7 +45,8 @@ private slots:
     void onReplace();
     void onReplaceAll();
     void onFindAll();
-    void rerunInvalidatedSearch(EditorTab *preferredTarget);
+    void rerunInvalidatedSearch(const QUuid &preferredDocumentId,
+                                quint64 expectedRevision);
 
     // L2 异步搜索回调
     void onL2FindAllProgress(int percent, qint64 done, qint64 total);

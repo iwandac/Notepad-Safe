@@ -1,12 +1,14 @@
 #pragma once
 
+#include "DocumentState.h"
+
 #include <QString>
 
 struct PersistenceAdapterDescriptor {
     QString id;
     QString displayName;
     int priority = 0;
-    bool encryptedAtRest = false;
+    DocumentPersistence persistence = DocumentPersistence::PlainFile;
 };
 
 class IPersistenceAdapter {

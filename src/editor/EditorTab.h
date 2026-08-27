@@ -10,6 +10,7 @@
 #include <Qsci/qsciscintilla.h>
 #include "TextEncoding.h"
 #include "LargeFileSearch.h"   // 先入 LargeFileSearchMatch 定义
+#include "SearchMatch.h"
 #include "DiskFileVersion.h"
 #include "DocumentState.h"
 
@@ -65,23 +66,6 @@ enum class Syntax {
     Asm,
 };
 
-// ============================================================================
-//  L1（QsciScintilla 编辑器）的搜索匹配结果
-//  注意：LargeFileSearch.h 已在全局命名空间定义 struct LargeFileSearchMatch（并别名
-//  SearchMatch），此处故意用 ScintillaSearchMatch，避免 ODR 重定义；
-//  ScintillaEditorMatch 向后兼容旧代码。
-// ============================================================================
-struct ScintillaSearchMatch {
-    int line;       // 0-based 行号
-    int index;      // 0-based 列号
-    int length;     // 匹配长度
-    QString text;   // 匹配文本
-    QString context; // 所在行内容
-    qint64 byteOffset = -1; // 完整文档 UTF-8 byte range；跨行匹配以此导航
-    qint32 byteLength = -1;
-};
-using SearchMatch = ScintillaSearchMatch;
-
 class EditorTab : public QWidget {
     Q_OBJECT
 public:
@@ -124,7 +108,11 @@ public:
     QString tabTitle() const;
     QUuid sessionInstanceId() const { return m_sessionInstanceId; }
     quint64 contentRevision() const { return m_documentState.revision; }
-    const DocumentState &documentState() const noexcept { return m_documentState; }
+    DocumentState documentState() const noexcept;
+    // Produces the immutable, bounded input accepted by document tools. The
+    // snapshot never includes a path or account-workspace secret.
+    bool createDocumentSnapshot(qint64 maximumBytes, DocumentSnapshot *snapshot,
+                                QString *error = nullptr) const;
     // Secure notes use the same QScintilla editor but are persisted through
     // VaultService instead of a plaintext filesystem path.
     bool isSecureDocument() const {

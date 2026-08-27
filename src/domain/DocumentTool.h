@@ -86,6 +86,10 @@ inline bool documentToolInvocationAllowed(const DocumentSnapshot &snapshot,
 {
     if (!snapshot.mayEnterDocumentTools())
         return false;
-    return tool.exposure != ToolExposurePolicy::RemoteRequiresPerInvocationConsent
-        || context.remoteExposureApproved;
+    if (tool.exposure == ToolExposurePolicy::RemoteRequiresPerInvocationConsent) {
+        return snapshot.capabilities.testFlag(
+                   DocumentCapability::AnalyzeRemotelyWithConsent)
+            && context.remoteExposureApproved;
+    }
+    return snapshot.capabilities.testFlag(DocumentCapability::AnalyzeLocally);
 }

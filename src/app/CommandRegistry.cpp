@@ -70,6 +70,9 @@ bool CommandRegistry::allowedByDocument(const QString &commandId,
                                         const DocumentState *state,
                                         bool hasSelection)
 {
+    const QString featureId = FeatureRegistry::featureIdForCommand(commandId);
+    if (featureId.isEmpty())
+        return false;
     if (commandId.startsWith(QLatin1String("menu."))
         || commandId.startsWith(QLatin1String("view."))
         || commandId.startsWith(QLatin1String("help."))

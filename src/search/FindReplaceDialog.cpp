@@ -35,6 +35,12 @@ bool isSearchableDocument(EditorTab *tab)
         && !tab->isSecureDocumentTransitioning();
 }
 
+SearchResultTarget resultTarget(EditorTab *tab)
+{
+    return tab ? searchResultTarget(tab->documentState(), tab->fileName())
+               : SearchResultTarget{};
+}
+
 QString compactSearchMessage(QString message, qsizetype limit = 72)
 {
     message.replace(QLatin1Char('\n'), QLatin1Char(' '));
@@ -351,7 +357,7 @@ void FindReplaceDialog::setActiveTab(EditorTab *tab)
                         TextEncoding encoding, bool bytePositionMode) {
                 if (!allOpenScope() && m_resultsDock)
                     m_resultsDock->appendSingleFilePreview(
-                        tab, batch, encoding, bytePositionMode);
+                        resultTarget(tab), batch, encoding, bytePositionMode);
             });
         m_l2FinishedConn = QObject::connect(
             m_tab, &EditorTab::findAllL2Finished,
@@ -371,10 +377,22 @@ void FindReplaceDialog::setSearchResultsDock(SearchResultsDock *dock)
     }
 }
 
-void FindReplaceDialog::rerunInvalidatedSearch(EditorTab *preferredTarget)
+void FindReplaceDialog::rerunInvalidatedSearch(
+    const QUuid &preferredDocumentId, quint64 expectedRevision)
 {
+    Q_UNUSED(expectedRevision);
     if (m_l2SearchInProgress)
         return;
+    EditorTab *preferredTarget = nullptr;
+    if (!preferredDocumentId.isNull()) {
+        for (EditorTab *candidate : openTabs()) {
+            if (candidate
+                && candidate->documentState().id == preferredDocumentId) {
+                preferredTarget = candidate;
+                break;
+            }
+        }
+    }
     if (preferredTarget) {
         if (m_tabWidget) {
             const int index = m_tabWidget->indexOf(preferredTarget);
@@ -1018,7 +1036,8 @@ void FindReplaceDialog::onReplaceAll()
         if (m_resultsDock) {
             for (const auto &tab : std::as_const(changed)) {
                 if (tab)
-                    m_resultsDock->invalidateResultsFor(tab);
+                    m_resultsDock->invalidateResultsFor(
+                        tab->documentState().id);
             }
         }
         const QString completed = QStringLiteral(
@@ -1043,7 +1062,8 @@ void FindReplaceDialog::onReplaceAll()
                              QStringLiteral("已替换 %1 处匹配。").arg(count));
     if (count > 0 && m_tab->isL2Mode() && m_resultsDock) {
         // L2 替换后，旧的 SearchResultsModel 内 byteOffset 已失效，清空避免错误跳转
-        m_resultsDock->setResultsModel(nullptr, QString(), QString(), m_tab);
+        m_resultsDock->setResultsModel(
+            nullptr, QString(), QString(), resultTarget(m_tab));
     }
 }
 
@@ -1122,14 +1142,15 @@ void FindReplaceDialog::onFindAll()
             setL2SearchUiBusy(false);
             auto *empty = new SearchResultsModel(m_resultsDock);
             empty->setIncompleteReason(QStringLiteral("搜索任务未能启动。"));
-            m_resultsDock->setResultsModel(empty, pattern, m_tab->fileName(), m_tab);
+            m_resultsDock->setResultsModel(
+                empty, pattern, m_tab->fileName(), resultTarget(m_tab));
             m_resultsDock->show();
             m_resultsDock->raise();
         } else {
             // findAllL2Async has synchronously flushed the visible overlay and
             // captured the final revision. Bind the result group only now.
             m_resultsDock->beginSingleFileResults(
-                pattern, m_tab->fileName(), m_tab, encodingAtStart,
+                pattern, m_tab->fileName(), resultTarget(m_tab), encodingAtStart,
                 bytePositionModeAtStart);
         }
         return;
@@ -1158,7 +1179,7 @@ void FindReplaceDialog::onFindAll()
             target->setSearchHighlights(matches);
             if (m_resultsDock) {
                 m_resultsDock->setResults(matches, pattern, target->fileName(),
-                                          target, truncated);
+                                          resultTarget(target), truncated);
                 m_resultsDock->show();
                 m_resultsDock->raise();
             }
@@ -1244,7 +1265,8 @@ void FindReplaceDialog::dispatchNextMultiTarget(int generation)
                     target->setSearchHighlights(matches);
                     if (m_resultsDock)
                         m_resultsDock->appendMultiFileResults(
-                            target, matches, truncated || !error.isEmpty());
+                            resultTarget(target), matches,
+                            truncated || !error.isEmpty());
                 }
                 m_pendingMultiL2 = qMax(0, m_pendingMultiL2 - 1);
                 finishMultiSearchIfReady(generation);
@@ -1253,7 +1275,7 @@ void FindReplaceDialog::dispatchNextMultiTarget(int generation)
             m_pendingMultiL2 = qMax(0, m_pendingMultiL2 - 1);
             if (m_resultsDock)
                 m_resultsDock->appendMultiFileResults(
-                    tab, QVector<SearchMatch>{}, true);
+                    resultTarget(tab), QVector<SearchMatch>{}, true);
         }
     } else if (tab) {
         ++m_pendingMultiL2;
@@ -1270,7 +1292,8 @@ void FindReplaceDialog::dispatchNextMultiTarget(int generation)
                                        bool bytePositionMode) {
                 if (generation == m_multiSearchGeneration && target && m_resultsDock)
                     m_resultsDock->appendMultiFilePreview(
-                        target, batch, encoding, bytePositionMode);
+                        resultTarget(target), batch, encoding,
+                        bytePositionMode);
             });
         m_multiConnections.push_back(partialConnection);
         const auto finishedConnection = connect(
@@ -1283,10 +1306,12 @@ void FindReplaceDialog::dispatchNextMultiTarget(int generation)
                 }
                 *settled = true;
                 if (target && model && m_resultsDock) {
-                    m_resultsDock->appendMultiFileResults(target, model);
+                    m_resultsDock->appendMultiFileResults(
+                        resultTarget(target), model);
                     model = nullptr;
                 } else if (target && m_resultsDock) {
-                    m_resultsDock->invalidateResultsFor(target);
+                    m_resultsDock->invalidateResultsFor(
+                        target->documentState().id);
                 }
                 if (model)
                     model->deleteLater();
@@ -1310,14 +1335,16 @@ void FindReplaceDialog::dispatchNextMultiTarget(int generation)
                                 m_resultsDock, m_multiHexBytes)) {
             if (m_resultsDock)
                 m_resultsDock->beginMultiFileTarget(
-                    tab, encodingAtStart, bytePositionModeAtStart);
+                    resultTarget(tab), encodingAtStart,
+                    bytePositionModeAtStart);
         } else {
             *settled = true;
             m_pendingMultiL2 = qMax(0, m_pendingMultiL2 - 1);
             if (m_resultsDock) {
                 auto *incomplete = new SearchResultsModel(m_resultsDock);
                 incomplete->setIncompleteReason(QStringLiteral("搜索任务未能启动。"));
-                m_resultsDock->appendMultiFileResults(tab, incomplete);
+                m_resultsDock->appendMultiFileResults(
+                    resultTarget(tab), incomplete);
             }
         }
     }
@@ -1461,9 +1488,11 @@ void FindReplaceDialog::onL2FindAllFinished(SearchResultsModel* model,
         return;
     }
     if (model) {
-        m_resultsDock->setResultsModel(model, pattern, fileName, target);
+        m_resultsDock->setResultsModel(
+            model, pattern, fileName, resultTarget(target));
     } else {
-        m_resultsDock->invalidateResultsFor(target);
+        if (target)
+            m_resultsDock->invalidateResultsFor(target->documentState().id);
     }
     m_resultsDock->show();
     m_resultsDock->raise();

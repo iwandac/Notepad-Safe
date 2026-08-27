@@ -5,6 +5,7 @@
 #include <QList>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 class PersistenceAdapterRegistry final {
@@ -14,7 +15,7 @@ public:
     bool registerAdapter(PersistenceAdapterDescriptor descriptor,
                          Factory factory);
     QList<PersistenceAdapterDescriptor> descriptors() const;
-    QString resolve(const QString &path);
+    std::optional<PersistenceAdapterDescriptor> resolve(const QString &path);
     int instantiatedCount() const noexcept { return instantiatedCount_; }
 
 private:

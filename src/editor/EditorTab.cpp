@@ -7,6 +7,7 @@
 #include "FileTierPolicy.h"
 #include "SearchResultsModel.h"
 #include "Pcre2Regex.h"
+#include "EditableTextSearch.h"
 #include "AsyncTaskManager.h"
 #include "DraftStore.h"
 
@@ -97,116 +98,6 @@ namespace {
 // much smaller than the 32 MiB S1 product boundary: tier and work scheduling
 // answer different questions.
 constexpr qint64 L1InlineNavigationBudgetBytes = 256LL * 1024;
-
-struct LiteralUtf8Hit {
-    qint64 byteOffset = -1;
-    qint32 byteLength = 0;
-    int utf16Offset = -1;
-    int utf16Length = 0;
-};
-
-bool l1WordCharacter(const QString &text, int index)
-{
-    if (index < 0 || index >= text.size()) return false;
-    uint scalar = text.at(index).unicode();
-    if (text.at(index).isLowSurrogate() && index > 0
-        && text.at(index - 1).isHighSurrogate()) {
-        scalar = QChar::surrogateToUcs4(text.at(index - 1), text.at(index));
-    } else if (text.at(index).isHighSurrogate() && index + 1 < text.size()
-               && text.at(index + 1).isLowSurrogate()) {
-        scalar = QChar::surrogateToUcs4(text.at(index), text.at(index + 1));
-    }
-    return scalar == uint('_') || QChar::isLetterOrNumber(scalar);
-}
-
-bool l1WholeWordAccepted(const QString &text, int start, int length)
-{
-    return (start == 0 || !l1WordCharacter(text, start - 1))
-        && (start + length >= text.size()
-            || !l1WordCharacter(text, start + length));
-}
-
-QVector<qint32> utf16ToUtf8Boundaries(const QString &text)
-{
-    QVector<qint32> mapping(text.size() + 1, 0);
-    qint32 bytes = 0;
-    for (int index = 0; index < text.size();) {
-        mapping[index] = bytes;
-        const int units = text.at(index).isHighSurrogate()
-                && index + 1 < text.size()
-                && text.at(index + 1).isLowSurrogate()
-            ? 2 : 1;
-        if (units == 2)
-            mapping[index + 1] = bytes;
-        bytes += QStringView(text).mid(index, units).toString().toUtf8().size();
-        index += units;
-        mapping[index] = bytes;
-    }
-    return mapping;
-}
-
-QVector<LiteralUtf8Hit> findUtf8LiteralHits(
-    const QByteArray &subject, const QString &pattern, bool caseSensitive,
-    bool wholeWord, const std::function<bool()> &cancelled = {},
-    const std::function<void(qint64)> &progress = {}, bool firstOnly = false,
-    bool reverse = false, qint64 byteBoundary = -1,
-    qsizetype maximumHits = std::numeric_limits<qsizetype>::max())
-{
-    QVector<LiteralUtf8Hit> hits;
-    if (pattern.isEmpty()) return hits;
-    const QString text = QString::fromUtf8(subject);
-    const QVector<qint32> bytesAt = utf16ToUtf8Boundaries(text);
-    const Qt::CaseSensitivity sensitivity = caseSensitive
-        ? Qt::CaseSensitive : Qt::CaseInsensitive;
-    int from = reverse ? text.size() : 0;
-    if (byteBoundary >= 0) {
-        const auto boundary = std::lower_bound(
-            bytesAt.cbegin(), bytesAt.cend(), qint32(qMin<qint64>(
-                byteBoundary, std::numeric_limits<qint32>::max())));
-        from = int(std::distance(bytesAt.cbegin(), boundary));
-    }
-    int hit = -1;
-    if (reverse) {
-        // QString::lastIndexOf(..., -1) means "start at the end", not
-        // "the range before byte 0 is empty".  Handle BOF explicitly so a
-        // non-wrapping Find Previous cannot silently wrap to the last hit.
-        if (from > 0)
-            hit = text.lastIndexOf(pattern, qMin(from - 1, text.size()),
-                                   sensitivity);
-    } else {
-        hit = text.indexOf(pattern, qBound(0, from, text.size()), sensitivity);
-    }
-    qint64 lastReported = 0;
-    while (hit >= 0) {
-        if (cancelled && cancelled()) {
-            hits.clear();
-            return hits;
-        }
-        const int end = qMin(text.size(), hit + pattern.size());
-        if (!wholeWord || l1WholeWordAccepted(text, hit, end - hit)) {
-            LiteralUtf8Hit value;
-            value.byteOffset = bytesAt.at(hit);
-            value.byteLength = bytesAt.at(end) - bytesAt.at(hit);
-            value.utf16Offset = hit;
-            value.utf16Length = end - hit;
-            hits.append(value);
-            if (firstOnly || hits.size() >= maximumHits)
-                break;
-        }
-        const qint64 examined = reverse
-            ? qint64(subject.size()) - bytesAt.at(hit) : bytesAt.at(hit);
-        if (progress && examined >= lastReported + 256 * 1024) {
-            lastReported = examined;
-            progress(qMin<qint64>(examined, subject.size()));
-        }
-        hit = reverse
-            ? text.lastIndexOf(pattern, hit - 1, sensitivity)
-            : text.indexOf(pattern, hit + 1, sensitivity);
-    }
-    if (progress)
-        progress(subject.size());
-    return hits;
-}
 
 QsciScintilla::EolMode detectLineEndingMode(const QString &text)
 {
@@ -368,54 +259,6 @@ ScintillaSigned directScintilla(QsciScintilla *editor, unsigned int message,
         editor->SendScintillaPtrResult(QsciScintillaBase::SCI_GETDIRECTPOINTER));
     return function && context ? function(context, message, wParam, lParam) : 0;
 }
-
-class Utf8StreamValidator final {
-public:
-    bool feed(const char *data, qsizetype size)
-    {
-        const auto *bytes = reinterpret_cast<const unsigned char *>(data);
-        for (qsizetype i = 0; i < size; ++i) {
-            const unsigned char byte = bytes[i];
-            if (remaining_ == 0) {
-                if (byte <= 0x7f)
-                    continue;
-                if (byte >= 0xc2 && byte <= 0xdf) {
-                    begin(byte & 0x1f, 1, 0x80);
-                } else if (byte >= 0xe0 && byte <= 0xef) {
-                    begin(byte & 0x0f, 2, 0x800);
-                } else if (byte >= 0xf0 && byte <= 0xf4) {
-                    begin(byte & 0x07, 3, 0x10000);
-                } else {
-                    return false;
-                }
-                continue;
-            }
-            if ((byte & 0xc0) != 0x80)
-                return false;
-            codePoint_ = (codePoint_ << 6) | (byte & 0x3f);
-            if (--remaining_ == 0
-                && (codePoint_ < minimum_ || codePoint_ > 0x10ffff
-                    || (codePoint_ >= 0xd800 && codePoint_ <= 0xdfff))) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    bool complete() const { return remaining_ == 0; }
-
-private:
-    void begin(quint32 prefix, int remaining, quint32 minimum)
-    {
-        codePoint_ = prefix;
-        remaining_ = remaining;
-        minimum_ = minimum;
-    }
-
-    quint32 codePoint_ = 0;
-    quint32 minimum_ = 0;
-    int remaining_ = 0;
-};
 
 } // namespace
 
@@ -900,6 +743,96 @@ void EditorTab::setModified(bool m)
 bool EditorTab::isUntitled() const
 {
     return m_documentState.location.isEmpty();
+}
+
+DocumentState EditorTab::documentState() const noexcept
+{
+    DocumentState state = m_documentState;
+    state.capabilities = DocumentCapability::None;
+
+    const bool accessible = !isSecureDocumentMasked()
+        && !isSecureDocumentTransitioning();
+    if (!accessible)
+        return state;
+
+    state.capabilities |= DocumentCapability::Read;
+    state.capabilities |= DocumentCapability::Search;
+    state.capabilities |= DocumentCapability::Copy;
+    state.capabilities |= DocumentCapability::AnalyzeLocally;
+    state.capabilities |= DocumentCapability::AnalyzeRemotelyWithConsent;
+    if (canModifyCommand())
+        state.capabilities |= DocumentCapability::Edit;
+    if (!isReadOnlyByPolicy())
+        state.capabilities |= DocumentCapability::Save;
+    return state;
+}
+
+bool EditorTab::createDocumentSnapshot(qint64 maximumBytes,
+                                       DocumentSnapshot *snapshot,
+                                       QString *error) const
+{
+    if (!snapshot) {
+        if (error)
+            *error = tr("文档快照输出为空。");
+        return false;
+    }
+    *snapshot = {};
+    const DocumentState state = documentState();
+    if (m_secureDocumentMasked || m_secureDocumentTransitioning
+        || !state.capabilities.testFlag(DocumentCapability::Read)) {
+        if (error)
+            *error = tr("文档当前未解锁或不可读取。");
+        return false;
+    }
+    const qint64 size = contentSizeBytes();
+    if (maximumBytes <= 0 || size < 0 || size > maximumBytes
+        || size > std::numeric_limits<qsizetype>::max()) {
+        if (error) {
+            *error = tr("文档大小 %1 字节超过本次工具快照上限 %2 字节；请缩小处理范围。")
+                         .arg(size).arg(maximumBytes);
+        }
+        return false;
+    }
+
+    DocumentSnapshot result;
+    result.documentId = state.id;
+    result.revision = state.revision;
+    result.contentKind = state.contentKind;
+    result.securityClass = state.securityClass;
+    result.capabilities = state.capabilities;
+    result.encodingName = encodingName(encoding());
+    if (!isL2Mode() && state.contentKind == DocumentContentKind::Text) {
+        result.text = m_editor->text();
+        const qint64 utf8Size = result.text.toUtf8().size();
+        if (utf8Size > maximumBytes) {
+            if (error)
+                *error = tr("编辑后的文本超过本次工具快照上限；请缩小处理范围。");
+            return false;
+        }
+        result.sourceRange = {{0}, {utf8Size}};
+        result.encodingName = QStringLiteral("UTF-8 working text");
+    } else {
+        QByteArray source;
+        if (m_windowedReadOnlyProvider) {
+            source = m_windowedReadOnlyProvider->sourceBytes(
+                0, static_cast<qsizetype>(size));
+        } else if (m_l2View) {
+            source = m_l2View->readByteRange(0, size);
+        }
+        if (source.size() != size) {
+            if (error)
+                *error = tr("无法建立完整且一致的文档快照。");
+            return false;
+        }
+        result.sourceRange = {{0}, {size}};
+        if (state.contentKind == DocumentContentKind::Binary) {
+            result.bytes = std::move(source);
+        } else {
+            result.text = decodeBytesWithEncoding(source, encoding()).text;
+        }
+    }
+    *snapshot = std::move(result);
+    return true;
 }
 
 QString EditorTab::filePath() const
@@ -1691,10 +1624,10 @@ QVector<SearchMatch> EditorTab::findAll(const QString &pattern, bool regex,
             return matches;
         }
     } else {
-        const QVector<LiteralUtf8Hit> literalHits = findUtf8LiteralHits(
+        const QVector<EditableTextHit> literalHits = findEditableTextLiteralHits(
             subject, pattern, caseSensitive, wholeWord, {}, {}, false, false,
             -1, 200000);
-        for (const LiteralUtf8Hit &hit : literalHits) {
+        for (const EditableTextHit &hit : literalHits) {
             if (!recordMatch(hit.byteOffset, hit.byteLength))
                 break;
         }
@@ -1834,7 +1767,7 @@ bool EditorTab::findAllL1Async(
                     && !cancelled() && error.isEmpty();
                 }
             } else {
-                const QVector<LiteralUtf8Hit> literalHits = findUtf8LiteralHits(
+                const QVector<EditableTextHit> literalHits = findEditableTextLiteralHits(
                     subject, pattern, caseSensitive, wholeWord, cancelled,
                     [reportProgress, total = qint64(subject.size())](qint64 done) {
                         reportProgress(done, total);
@@ -1842,7 +1775,7 @@ bool EditorTab::findAllL1Async(
                 if (cancelled()) {
                     ok = false;
                 } else {
-                    for (const LiteralUtf8Hit &hit : literalHits) {
+                    for (const EditableTextHit &hit : literalHits) {
                         if (!recordMatch(hit.byteOffset, hit.byteLength)) {
                             ok = false;
                             break;
@@ -6317,11 +6250,11 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
             };
             bool ok = true;
             if (!regex) {
-                auto literal = findUtf8LiteralHits(
+                auto literal = findEditableTextLiteralHits(
                     subject, pattern, caseSensitive, wholeWord, {}, {}, true,
                     !forward, boundary);
                 if (literal.isEmpty() && wrap) {
-                    literal = findUtf8LiteralHits(
+                    literal = findEditableTextLiteralHits(
                         subject, pattern, caseSensitive, wholeWord, {}, {}, true,
                         !forward, forward ? 0 : subject.size() + 1);
                 }
@@ -6628,13 +6561,13 @@ bool EditorTab::findNextL2Async(
                     1, 1, 0, subject.size());
                 bool ok = true;
                 if (!regex) {
-                    auto literal = findUtf8LiteralHits(
+                    auto literal = findEditableTextLiteralHits(
                         subject, pattern, caseSensitive, wholeWord, cancelled,
                         [reportProgress, total = qint64(subject.size())](qint64 done) {
                             reportProgress(done, total);
                         }, true, !forward, boundary);
                     if (literal.isEmpty() && !cancelled() && wrap) {
-                        literal = findUtf8LiteralHits(
+                        literal = findEditableTextLiteralHits(
                             subject, pattern, caseSensitive, wholeWord, cancelled,
                             [reportProgress, total = qint64(subject.size())](qint64 done) {
                                 reportProgress(done, total);

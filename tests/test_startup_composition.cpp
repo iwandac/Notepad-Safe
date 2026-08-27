@@ -92,7 +92,8 @@ int main(int argc, char **argv)
             return 10;
         const PersistenceAdapterDescriptor persistenceDescriptor{
             QStringLiteral("startup.persistence.%1").arg(i),
-            QStringLiteral("Persistence"), -100 - i, false};
+            QStringLiteral("Persistence"), -100 - i,
+            DocumentPersistence::PlainFile};
         if (!composition.persistenceAdapters().registerAdapter(
                 persistenceDescriptor, [persistenceDescriptor] {
                     return std::make_unique<NoopPersistenceAdapter>(
@@ -136,7 +137,20 @@ int main(int argc, char **argv)
     if (firstPaintMs >= 1500)
         return 8;
 
-    qInfo("Startup composition: first paint %lld ms, heavy factories 0, tools 100, document providers 24, persistence adapters 22, inference providers 20",
+    DocumentSnapshot snapshot;
+    snapshot.documentId = QUuid::createUuid();
+    snapshot.revision = 1;
+    snapshot.capabilities = DocumentCapability::Read
+        | DocumentCapability::AnalyzeLocally;
+    snapshot.text = QStringLiteral("post-paint lazy tool input");
+    snapshot.sourceRange = {{0}, {snapshot.text.toUtf8().size()}};
+    if (composition.runDocumentTool(QStringLiteral("startup.tool.0"), snapshot).status
+            != DocumentToolResult::Status::Completed
+        || composition.documentTools().instantiatedCount() != 1) {
+        return 12;
+    }
+
+    qInfo("Startup composition: first paint %lld ms, heavy factories 0 before paint; lazy tool instantiated after paint",
           static_cast<long long>(firstPaintMs));
     return 0;
 }

@@ -1,5 +1,35 @@
 #include "FeatureRegistry.h"
 
+#include <initializer_list>
+
+namespace {
+
+bool containsCommand(const QString &commandId,
+                     std::initializer_list<const char *> commands)
+{
+    for (const char *command : commands) {
+        if (commandId == QLatin1String(command))
+            return true;
+    }
+    return false;
+}
+
+bool hasWhitelistedSuffix(const QString &commandId, const char *prefix,
+                          std::initializer_list<const char *> suffixes)
+{
+    const QLatin1String prefixText(prefix);
+    if (!commandId.startsWith(prefixText))
+        return false;
+    const QStringView suffix = QStringView(commandId).sliced(prefixText.size());
+    for (const char *allowed : suffixes) {
+        if (suffix == QLatin1String(allowed))
+            return true;
+    }
+    return false;
+}
+
+} // namespace
+
 QList<FeatureDescriptor> FeatureRegistry::features()
 {
     return {
@@ -28,18 +58,59 @@ QList<FeatureDescriptor> FeatureRegistry::features()
 
 QString FeatureRegistry::featureIdForCommand(const QString &commandId)
 {
-    if (commandId.startsWith(QLatin1String("file.")))
+    if (containsCommand(commandId, {
+            "file.new", "file.open", "file.recent", "file.reload",
+            "file.save", "file.saveAs", "file.close", "file.closeAll",
+            "file.exit"}))
         return QStringLiteral("NSP-FILE");
-    if (commandId.startsWith(QLatin1String("edit.")))
+    if (containsCommand(commandId, {
+            "edit.undo", "edit.redo", "edit.cut", "edit.copy", "edit.paste",
+            "edit.selectAll", "edit.hexInsertMode", "edit.line.duplicate",
+            "edit.line.delete", "edit.line.moveUp", "edit.line.moveDown",
+            "edit.line.transpose", "edit.multiSelect.next", "edit.multiSelect.all",
+            "edit.selection.upper", "edit.selection.lower", "edit.lines.join",
+            "edit.lines.split", "edit.lines.sortAscending",
+            "edit.lines.sortDescending", "edit.indentation",
+            "edit.indentation.useTabs", "edit.indentation.tabWidth",
+            "edit.indentation.backspaceUnindents", "edit.completion.words"})
+        || hasWhitelistedSuffix(commandId, "edit.indentation.tabWidth.",
+                                {"2", "4", "8"}))
         return QStringLiteral("NSP-EDIT");
-    if (commandId.startsWith(QLatin1String("search."))
-        || commandId.startsWith(QLatin1String("bookmark.")))
+    if (containsCommand(commandId, {
+            "search.find", "search.replace", "search.next", "search.previous",
+            "search.brace.match", "search.brace.select", "search.bookmarks",
+            "bookmark.toggle", "bookmark.next", "bookmark.previous",
+            "bookmark.clear"}))
         return QStringLiteral("NSP-SEARCH");
-    if (commandId.startsWith(QLatin1String("language.")))
+    if (hasWhitelistedSuffix(commandId, "language.", {
+            "plain", "cpp", "python", "json", "html", "xml", "sql",
+            "yaml", "markdown", "javascript", "java", "csharp", "css",
+            "bash", "batch", "cmake", "makefile", "lua", "ruby", "perl",
+            "diff", "properties", "asm"}))
         return QStringLiteral("NSP-LANGUAGE");
-    if (commandId.startsWith(QLatin1String("view.")))
+    if (containsCommand(commandId, {
+            "view.appearance", "view.appearance.system", "view.appearance.light",
+            "view.appearance.dark", "view.wordWrap", "view.split",
+            "view.split.horizontal", "view.split.vertical", "view.symbols",
+            "view.symbols.whitespace", "view.symbols.eol", "view.folding",
+            "view.folding.toggleCurrent", "view.folding.collapseAll",
+            "view.folding.expandAll", "view.presentation",
+            "view.presentation.text", "view.presentation.hex",
+            "view.presentation.toggle", "view.edge", "view.edge.visible",
+            "view.zoom", "view.zoom.in", "view.zoom.out", "view.zoom.reset",
+            "view.panels", "view.panel.searchResults", "view.toolbar",
+            "view.statusBar"})
+        || hasWhitelistedSuffix(commandId, "view.edge.column.",
+                                {"72", "80", "100", "120", "150", "200"}))
         return QStringLiteral("NSP-VIEW");
-    if (commandId.startsWith(QLatin1String("encoding.")))
+    if (containsCommand(commandId, {"encoding.eol", "encoding.convert"})
+        || hasWhitelistedSuffix(commandId, "encoding.eol.", {"crlf", "lf", "cr"})
+        || hasWhitelistedSuffix(commandId, "encoding.display.", {
+            "gbk", "gb18030", "big5", "shiftjis", "windows1252", "utf8",
+            "utf8bom", "utf16le", "utf16be"})
+        || hasWhitelistedSuffix(commandId, "encoding.convert.", {
+            "gbk", "gb18030", "big5", "shiftjis", "windows1252", "utf8",
+            "utf8bom", "utf16le", "utf16be"}))
         return QStringLiteral("NSP-ENCODING");
     if (commandId == QLatin1String("tools.accounts")
         || commandId == QLatin1String("tools.securityCenter")
@@ -47,10 +118,15 @@ QString FeatureRegistry::featureIdForCommand(const QString &commandId)
         return QStringLiteral("NSP-ACCOUNTS");
     if (commandId == QLatin1String("tools.tasks"))
         return QStringLiteral("NSP-TASKS");
-    if (commandId.startsWith(QLatin1String("help.")))
+    if (commandId == QLatin1String("help.about"))
         return QStringLiteral("NSP-HELP");
-    if (commandId.startsWith(QLatin1String("menu."))
-        || commandId.startsWith(QLatin1String("tabContext.")))
+    if (containsCommand(commandId, {
+            "menu.file", "menu.edit", "menu.search", "menu.language",
+            "menu.view", "menu.encoding", "menu.tools", "menu.help",
+            "tabContext.save", "tabContext.saveAs", "tabContext.close",
+            "tabContext.closeOthers", "tabContext.closeAll",
+            "tabContext.copyPath", "tabContext.reveal",
+            "tabContext.presentText", "tabContext.presentHex"}))
         return QStringLiteral("NSP-SHELL");
     return {};
 }
@@ -63,4 +139,3 @@ bool FeatureRegistry::isKnownFeature(const QString &featureId)
     }
     return false;
 }
-

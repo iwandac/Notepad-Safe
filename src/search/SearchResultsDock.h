@@ -1,10 +1,9 @@
 #pragma once
 
 #include <QDockWidget>
-#include <QPointer>
-#include <QHash>
 #include <memory>
-#include "EditorTab.h"
+#include "SearchResultTarget.h"
+#include "SearchMatch.h"
 #include "SearchResultsModel.h"
 
 class QTreeView;
@@ -13,6 +12,7 @@ class QPushButton;
 class QStackedWidget;
 class MultiSearchResultsModel;
 class SearchResultsController;
+class LineIndex;
 
 // 搜索结果 Dock 窗口
 class SearchResultsDock : public QDockWidget {
@@ -23,39 +23,50 @@ public:
 
     // ---- Editable Text results are adapted to the canonical result model.
     void setResults(const QVector<SearchMatch> &matches, const QString &pattern,
-                    const QString &fileName, EditorTab *target = nullptr,
+                    const QString &fileName,
+                    const SearchResultTarget &target = {},
                     bool incomplete = false);
 
     // ---- Canonical result path: SearchResultsModel -> QTreeView.
     // model 通常以 Dock 为 QObject parent；多文件路径会显式接管所有权。
     void setResultsModel(SearchResultsModel *model, const QString &pattern,
-                         const QString &fileName, EditorTab *target = nullptr);
+                         const QString &fileName,
+                         const SearchResultTarget &target = {});
     void beginSingleFileResults(const QString &pattern, const QString &fileName,
-                                EditorTab *target, TextEncoding encoding,
+                                const SearchResultTarget &target,
+                                TextEncoding encoding,
                                 bool bytePositionMode);
-    void appendSingleFilePreview(EditorTab *target,
+    void appendSingleFilePreview(const SearchResultTarget &target,
                                  const QVector<LargeFileSearchMatch> &batch,
                                  TextEncoding encoding, bool bytePositionMode);
     void beginMultiFileResults(const QString &pattern, int targetCount);
-    void beginMultiFileTarget(EditorTab *tab, TextEncoding encoding,
+    void beginMultiFileTarget(const SearchResultTarget &target,
+                              TextEncoding encoding,
                               bool bytePositionMode);
-    void appendMultiFilePreview(EditorTab *tab,
+    void appendMultiFilePreview(const SearchResultTarget &target,
                                 const QVector<LargeFileSearchMatch> &batch,
                                 TextEncoding encoding, bool bytePositionMode);
-    void appendMultiFileResults(EditorTab *tab, const QVector<SearchMatch> &matches,
+    void appendMultiFileResults(const SearchResultTarget &target,
+                                const QVector<SearchMatch> &matches,
                                 bool incomplete = false);
     // Transfers model ownership to the dock's virtual multi-file model.
-    void appendMultiFileResults(EditorTab *tab, SearchResultsModel *model);
+    void appendMultiFileResults(const SearchResultTarget &target,
+                                SearchResultsModel *model);
     void finishMultiFileResults(bool cancelled = false);
     void clearResults();
-    void invalidateResultsFor(EditorTab *tab);
-    void decorateResultsFor(EditorTab *tab);
+    void invalidateResultsFor(const QUuid &documentId);
+    void closeResultsFor(const QUuid &documentId);
+    void decorateResultsFor(const QUuid &documentId, const LineIndex &lineIndex);
 
 signals:
-    void rerunRequested(EditorTab *preferredTarget);
+    void rerunRequested(const QUuid &preferredDocumentId,
+                        quint64 expectedRevision);
+    void clearSearchHighlightsRequested(const QUuid &documentId);
     // All result rows use source byte offsets as the navigation authority.
     void jumpToByteOffset(qint64 byteOffset, int length);
-    void jumpToTabByteOffset(EditorTab *tab, qint64 byteOffset, int length);
+    void jumpToDocumentByteOffset(const QUuid &documentId,
+                                  quint64 expectedRevision,
+                                  qint64 byteOffset, int length);
 
 protected:
     // 事件过滤器：监听 m_treeView viewport 的鼠标事件，用于"点击哪一个匹配词"
@@ -75,10 +86,11 @@ private:
     // 上次按下位置对应的"行 / 匹配索引"（用于双击时跳转到指定匹配）
     int m_lastHitMatchIdx = -1;
     int m_lastHitRow = -1;
-    SearchResultsController *m_controller = nullptr;
+    std::unique_ptr<SearchResultsController> m_controller;
     QVector<LargeFileSearchMatch> m_singlePreviewMatches;
 
     void updateSummary(const QString &pattern, const QString &fileName,
                        qint64 totalMatches);
-    void setRerunAvailable(bool available, EditorTab *preferredTarget = nullptr);
+    void setRerunAvailable(bool available,
+                           const SearchResultTarget &preferredTarget = {});
 };

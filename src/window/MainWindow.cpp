@@ -15,7 +15,10 @@
 #include "SecurityServiceFactory.h"
 #include "SecuritySessionService.h"
 #include "AppComposition.h"
+#include "FileCredentialDialog.h"
+#include "SensitiveText.h"
 #include "CommandRegistry.h"
+#include "DocumentOpenWorkflow.h"
 
 #include <QTabWidget>
 #include <QTabBar>
@@ -124,168 +127,6 @@ std::unique_ptr<QSettings> createAppSettings()
                                        QStringLiteral("NotepadSafe"));
 }
 
-void scrubByteArray(QByteArray &bytes)
-{
-    if (bytes.isEmpty())
-        return;
-#ifdef Q_OS_WIN
-    ::SecureZeroMemory(bytes.data(), static_cast<size_t>(bytes.size()));
-#else
-    volatile char *cursor = bytes.data();
-    for (qsizetype i = 0; i < bytes.size(); ++i)
-        cursor[i] = 0;
-#endif
-    bytes.clear();
-}
-
-QString takeSensitiveLineEdit(QLineEdit *edit)
-{
-    if (!edit)
-        return {};
-    QString sensitive = edit->text();
-    if (!sensitive.isEmpty()) {
-        // Replace the widget's reference first. The returned QString then owns
-        // the old buffer and its caller can overwrite it after use.
-        edit->setText(QString(sensitive.size(), QChar(0)));
-        edit->clear();
-    }
-    return sensitive;
-}
-
-void clearSensitiveLineEdit(QLineEdit *edit)
-{
-    QString sensitive = takeSensitiveLineEdit(edit);
-    if (!sensitive.isEmpty())
-        sensitive.fill(QChar(0));
-    sensitive.clear();
-}
-
-class FileCredentialDialog final : public QDialog {
-public:
-    enum class Kind { Passphrase, RecoveryKey };
-
-    FileCredentialDialog(const QString &title, const QString &message,
-                         bool allowRecovery, QWidget *parent)
-        : QDialog(parent)
-    {
-        setObjectName(QStringLiteral("fileCredentialDialog"));
-        setWindowTitle(title);
-        setMinimumWidth(500);
-        auto *layout = new QVBoxLayout(this);
-        auto *description = new QLabel(message, this);
-        description->setWordWrap(true);
-        layout->addWidget(description);
-
-        auto *form = new QFormLayout();
-        kind_ = new QComboBox(this);
-        kind_->setObjectName(QStringLiteral("fileCredentialKind"));
-        kind_->addItem(QStringLiteral("文件密码"), static_cast<int>(Kind::Passphrase));
-        if (allowRecovery)
-            kind_->addItem(QStringLiteral("恢复密钥"), static_cast<int>(Kind::RecoveryKey));
-        form->addRow(QStringLiteral("解锁方式"), kind_);
-
-        fields_ = new QStackedWidget(this);
-        passphrase_ = new QLineEdit(fields_);
-        passphrase_->setObjectName(QStringLiteral("fileCredentialPassphrase"));
-        passphrase_->setEchoMode(QLineEdit::Password);
-        passphrase_->setClearButtonEnabled(true);
-        fields_->addWidget(passphrase_);
-        recoveryKey_ = new QLineEdit(fields_);
-        recoveryKey_->setObjectName(QStringLiteral("fileCredentialRecoveryKey"));
-        recoveryKey_->setEchoMode(QLineEdit::Password);
-        recoveryKey_->setClearButtonEnabled(true);
-        recoveryKey_->setPlaceholderText(QStringLiteral("NSR1-…"));
-        fields_->addWidget(recoveryKey_);
-        form->addRow(QStringLiteral("凭据"), fields_);
-        layout->addLayout(form);
-
-        auto *showInput = new QCheckBox(QStringLiteral("显示输入"), this);
-        showInput->setObjectName(QStringLiteral("fileCredentialShowInput"));
-        layout->addWidget(showInput);
-        error_ = new QLabel(this);
-        error_->setObjectName(QStringLiteral("fileCredentialError"));
-        error_->setStyleSheet(QStringLiteral("color:#b00020"));
-        error_->setWordWrap(true);
-        layout->addWidget(error_);
-        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Open | QDialogButtonBox::Cancel,
-                                             Qt::Horizontal, this);
-        buttons->setObjectName(QStringLiteral("fileCredentialButtons"));
-        buttons->button(QDialogButtonBox::Open)->setText(QStringLiteral("打开"));
-        buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("取消"));
-        layout->addWidget(buttons);
-        connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
-        connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
-        connect(kind_, &QComboBox::currentIndexChanged, this, [this](int) {
-            clearSecrets();
-            error_->clear();
-            fields_->setCurrentIndex(kind() == Kind::RecoveryKey ? 1 : 0);
-            focusCredential();
-        });
-        connect(showInput, &QCheckBox::toggled, this, [this](bool shown) {
-            const auto mode = shown ? QLineEdit::Normal : QLineEdit::Password;
-            passphrase_->setEchoMode(mode);
-            recoveryKey_->setEchoMode(mode);
-        });
-        passphrase_->setFocus();
-    }
-
-    ~FileCredentialDialog() override { clearSecrets(); }
-
-    Kind kind() const
-    {
-        return static_cast<Kind>(kind_->currentData().toInt());
-    }
-
-    SecureBuffer takePassphrase()
-    {
-        QString text = takeSensitiveLineEdit(passphrase_);
-        QByteArray utf8 = text.toUtf8();
-        if (!text.isEmpty())
-            text.fill(QChar(0));
-        text.clear();
-        SecureBuffer result(utf8.constData(), utf8.size());
-        scrubByteArray(utf8);
-        return result;
-    }
-
-    QString takeRecoveryKey()
-    {
-        QString raw = takeSensitiveLineEdit(recoveryKey_);
-        QString result = raw.trimmed();
-        if (!raw.isEmpty())
-            raw.fill(QChar(0));
-        raw.clear();
-        return result;
-    }
-
-    void showError(const QString &message)
-    {
-        error_->setText(message);
-        focusCredential();
-    }
-
-    void clearSecrets()
-    {
-        clearSensitiveLineEdit(passphrase_);
-        clearSensitiveLineEdit(recoveryKey_);
-    }
-
-private:
-    void focusCredential()
-    {
-        if (kind() == Kind::RecoveryKey)
-            recoveryKey_->setFocus();
-        else
-            passphrase_->setFocus();
-    }
-
-    QComboBox *kind_ = nullptr;
-    QStackedWidget *fields_ = nullptr;
-    QLineEdit *passphrase_ = nullptr;
-    QLineEdit *recoveryKey_ = nullptr;
-    QLabel *error_ = nullptr;
-};
-
 } // namespace
 
 // 前向：同步编码菜单勾选状态
@@ -302,106 +143,6 @@ static void syncEncodingMenuTo(QMenu *menu, TextEncoding enc)
             a->setChecked(false);
         }
     }
-}
-
-// S1/S2/S3 自动分流打开文件（DESIGN §5.2 固定产品边界）：
-//   S1 → EditorTab::loadFile (QsciScintilla 完整编辑)
-//   S2/S3 → 只允许 mmap 路径。失败时绝不回退到主线程 readAll；否则一个
-//           2 GiB+ 文件会把“只读分析”退化成界面卡死或进程内存耗尽。
-// 返回是否成功（与 loadFile 返回一致）
-static bool openTabAutoMode(EditorTab *tab, const QString &path,
-                            std::optional<TextEncoding> forcedEncoding = std::nullopt)
-{
-    if (!tab) return false;
-    const FileContentProbeResult probe = probeFileContent(path);
-    // Binary routing belongs to the shared document opener so normal Open,
-    // recent files, drag/drop and session restore cannot disagree.
-    if (!forcedEncoding && probe.contentKind == DocumentContentKind::Binary) {
-        QString error;
-        if (!tab->openLargeFileL2(path, &error,
-                                  L2Presentation::Hex,
-                                  L2ContentKind::Binary)) {
-            qWarning("[openTabAutoMode] binary mmap open failed: path='%s', error='%s'",
-                     qUtf8Printable(path), qUtf8Printable(error));
-            return false;
-        }
-        tab->setViewModeL2(ViewMode::Hex);
-        return true;
-    }
-    const FileTierDecision decision = probe.tier;
-    if (decision.usesMappedPreview()) {
-        QString err;
-        if (tab->openLargeFileL2(path, &err, L2Presentation::Text,
-                                 L2ContentKind::Text, forcedEncoding))
-            return true;
-        qWarning("[openTabAutoMode] mmap 打开失败，拒绝回退到同步全量加载: path='%s', error='%s'",
-                 qUtf8Printable(path), qUtf8Printable(err));
-        return false;
-    }
-    return tab->loadFile(path, forcedEncoding);
-}
-
-static bool openSessionFile(EditorTab *tab, const SessionTab &state)
-{
-    if (!tab || state.filePath.isEmpty())
-        return false;
-    if (state.presentation == QLatin1String("hex")) {
-        QString error;
-        if (!tab->openLargeFileL2(state.filePath, &error,
-                                  L2Presentation::Hex,
-                                  L2ContentKind::Binary)) {
-            qWarning("[session] explicit Hex restore failed: path='%s', error='%s'",
-                     qUtf8Printable(state.filePath), qUtf8Printable(error));
-            return false;
-        }
-        return true;
-    }
-    if (state.presentation == QLatin1String("text")
-        && probeFileContent(state.filePath).contentKind
-               == DocumentContentKind::Binary) {
-        QString error;
-        // The user explicitly overrode Binary/Unknown classification with a
-        // text presentation. Preserve that choice across restart while keeping
-        // a potentially huge/arbitrary byte stream on the read-only provider.
-        if (!tab->openLargeFileL2(state.filePath, &error,
-                                  L2Presentation::Text,
-                                  L2ContentKind::Binary)) {
-            qWarning("[session] explicit Text restore failed: path='%s', error='%s'",
-                     qUtf8Printable(state.filePath), qUtf8Printable(error));
-            return false;
-        }
-        return true;
-    }
-    return openTabAutoMode(tab, state.filePath);
-}
-
-static void restoreSessionPosition(EditorTab *tab, const SessionTab &state)
-{
-    if (!tab)
-        return;
-    if (state.cursorByteOffset >= 0) {
-        const qint64 selectionStart = qMin(state.selectionStartByte,
-                                           state.selectionEndByte);
-        const qint64 selectionEnd = qMax(state.selectionStartByte,
-                                         state.selectionEndByte);
-        if (selectionStart >= 0 && selectionEnd > selectionStart) {
-            tab->gotoByteOffset(selectionStart, int(qMin<qint64>(
-                selectionEnd - selectionStart, INT_MAX)));
-        } else {
-            tab->gotoByteOffset(state.cursorByteOffset);
-        }
-        return;
-    }
-    tab->setCursorPosition(state.cursorLine, state.cursorIndex);
-}
-
-static void restoreSessionSplit(EditorTab *tab, const SessionTab &state)
-{
-    if (!tab || !state.splitView || !tab->canSplitView())
-        return;
-    tab->setSplitView(
-        true, state.splitOrientation == QLatin1String("vertical")
-                  ? Qt::Vertical : Qt::Horizontal);
 }
 
 MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
@@ -439,8 +180,18 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
     m_searchDock->hide();
     connect(m_searchDock, &SearchResultsDock::jumpToByteOffset,
             this, &MainWindow::onJumpToByteOffset);
-    connect(m_searchDock, &SearchResultsDock::jumpToTabByteOffset,
-            this, &MainWindow::onJumpToTabByteOffset);
+    connect(m_searchDock, &SearchResultsDock::jumpToDocumentByteOffset,
+            this, &MainWindow::onJumpToDocumentByteOffset);
+    connect(m_searchDock, &SearchResultsDock::clearSearchHighlightsRequested,
+            this, [this](const QUuid &documentId) {
+        for (int index = 0; m_tabs && index < m_tabs->count(); ++index) {
+            auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(index));
+            if (tab && tab->documentState().id == documentId) {
+                tab->clearSearchHighlights();
+                return;
+            }
+        }
+    });
 
     // Accounts and Security Center are created on first use. Their widgets and
     // backend discovery must not participate in the empty-Shell first paint.
@@ -2442,6 +2193,8 @@ EditorTab *MainWindow::addNewTab()
     connect(tab, &EditorTab::contentChanged, this, [this, tab](quint64) {
         if (currentTab() == tab)
             m_characterStatusTimer.start();
+        if (m_searchDock)
+            m_searchDock->invalidateResultsFor(tab->documentState().id);
     });
     connect(tab, &EditorTab::characterCountChanged, this, [this, tab]() {
         if (currentTab() == tab)
@@ -2510,6 +2263,9 @@ EditorTab *MainWindow::addNewTab()
         statusBar()->showMessage(msg, 0);
     });
     connect(tab, &EditorTab::l2LineBuildFinished, this, [this, tab](bool ok) {
+        if (ok && m_searchDock && tab->isL2Mode() && tab->l2View())
+            m_searchDock->decorateResultsFor(
+                tab->documentState().id, tab->l2View()->lineIndex());
         if (currentTab() != tab) return;
         if (tab->isL2Active() && tab->viewModeL2() == ViewMode::Hex) {
             statusBar()->clearMessage();
@@ -3137,9 +2893,10 @@ bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
     const QFileInfo info(path);
     if (!info.isFile())
         return false;
-    const QString persistenceAdapter =
+    const auto persistenceAdapter =
         m_composition->persistenceAdapters().resolve(path);
-    if (persistenceAdapter == QLatin1String("secure.kdbx")) {
+    if (persistenceAdapter
+        && persistenceAdapter->persistence == DocumentPersistence::SecureFile) {
         ensureSecurityServicesCreated();
         if (!m_secureDocuments || !m_secureDocuments->available()) {
             QMessageBox::critical(this, QStringLiteral("安全文件不可用"),
@@ -3316,7 +3073,7 @@ bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
         // reused tab must stop being a secure document before ordinary routing.
         reuseTab->convertToPlainDocument(QString());
     }
-    const bool opened = openTabAutoMode(tab, path, forcedEncoding);
+    const bool opened = openDocumentByPolicy(tab, path, forcedEncoding);
     if (!opened) {
         if (!reuseTab) {
             const int index = m_tabs->indexOf(tab);
@@ -4588,8 +4345,10 @@ void MainWindow::syncCommandStates(EditorTab *tab)
         && m_workspaceStack->currentWidget() == m_accountsPage;
     const QMimeData *clipboardData = QGuiApplication::clipboard()->mimeData();
     if (m_commandRegistry) {
+        const DocumentState documentState = hasDocument
+            ? tab->documentState() : DocumentState{};
         CommandContext context;
-        context.document = hasDocument ? &tab->documentState() : nullptr;
+        context.document = hasDocument ? &documentState : nullptr;
         context.hasDocument = hasDocument;
         context.canModify = canModify;
         context.hasSelection = hasSelection;
@@ -4842,6 +4601,8 @@ void MainWindow::closeTabUnchecked(int index)
     QWidget *widget = m_tabs->widget(index);
     auto *tab = qobject_cast<EditorTab *>(widget);
     if (tab) {
+        if (m_searchDock)
+            m_searchDock->closeResultsFor(tab->documentState().id);
         if (tab->isSecureDocument() && m_secureDocuments)
             closeSecureDocumentOnSecurityLane(tab->secureDocumentId());
         else
@@ -5002,10 +4763,25 @@ void MainWindow::onJumpToByteOffset(qint64 byteOffset, int length)
     tab->setFocusEditor();
 }
 
-void MainWindow::onJumpToTabByteOffset(EditorTab *tab, qint64 byteOffset, int length)
+void MainWindow::onJumpToDocumentByteOffset(const QUuid &documentId,
+                                             quint64 expectedRevision,
+                                             qint64 byteOffset, int length)
 {
+    EditorTab *tab = nullptr;
+    for (int index = 0; m_tabs && index < m_tabs->count(); ++index) {
+        auto *candidate = qobject_cast<EditorTab *>(m_tabs->widget(index));
+        if (candidate && candidate->documentState().id == documentId) {
+            tab = candidate;
+            break;
+        }
+    }
     if (!tab)
         return;
+    if (tab->contentRevision() != expectedRevision) {
+        if (m_searchDock)
+            m_searchDock->invalidateResultsFor(documentId);
+        return;
+    }
     const int tabIndex = m_tabs->indexOf(tab);
     if (tabIndex < 0)
         return;
@@ -5361,14 +5137,13 @@ void MainWindow::restoreSession()
             // 恢复语法（autosave 本身不猜语法）
             tab->setSyntax(static_cast<Syntax>(st.syntax));
         } else if (!st.filePath.isEmpty() && QFileInfo::exists(st.filePath)) {
-            loaded = openSessionFile(tab, st);
+            loaded = openSessionDocument(tab, st);
         }
 
         if (!loaded) {
             tab->setSyntax(static_cast<Syntax>(st.syntax));
         } else {
-            restoreSessionPosition(tab, st);
-            restoreSessionSplit(tab, st);
+            restoreDocumentSessionView(tab, st);
         }
         m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
     }
@@ -5482,7 +5257,7 @@ struct MainWindow::PendingSessionRestore {
 //  设计目的：
 //   · 构造函数返回前不读任何大文件（避免 main.cpp 的 w.show() 被延后）
 //   · 每个 tab 恢复之间 QApplication::processEvents 让窗口重绘
-//   · 走 openTabAutoMode ≥32MB 强制 L2 窗口化秒开，不再 L1 主线程阻塞读
+//   · 走 openDocumentByPolicy ≥32MB 强制 L2 窗口化秒开，不再 L1 主线程阻塞读
 // ============================================================================
 void MainWindow::deferredRestoreSession()
 {
@@ -5599,7 +5374,7 @@ void MainWindow::restoreNextSessionTab()
     } else if (!st.filePath.isEmpty() && QFileInfo::exists(st.filePath)) {
         // ===== 关键修复：不再直接 tab->loadFile(st.filePath) =====
         //   原 bug：即便 100MB 也走 L1 全量 readAll + 主线程分块；
-        //   新逻辑：openTabAutoMode → ≥ 32MB 自动 openLargeFileL2（窗口化只读，无后台编辑加载）
+        //   新逻辑：openDocumentByPolicy → ≥ 32MB 自动 openLargeFileL2（窗口化只读，无后台编辑加载）
         const qint64 realSize = QFileInfo(st.filePath).size();
         const qint64 limit = FileTierPolicy::StandardEditLimitBytes;
         const FileTierDecision tier = FileTierPolicy::classify(realSize);
@@ -5613,8 +5388,8 @@ void MainWindow::restoreNextSessionTab()
             qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 L1 同步 loadFile (< 限制)。",
                    m_pendingRestore->currentIndex + 1, total);
         }
-        loaded = openSessionFile(tab, st);
-        qDebug("[STARTUP][RESTORE tab %d/%d]   openTabAutoMode 返回 ok=%d, 耗时=%lld ms（关键：如果 > 500ms 就是阻塞启动的根因！）",
+        loaded = openSessionDocument(tab, st);
+        qDebug("[STARTUP][RESTORE tab %d/%d]   openDocumentByPolicy 返回 ok=%d, 耗时=%lld ms（关键：如果 > 500ms 就是阻塞启动的根因！）",
                m_pendingRestore->currentIndex + 1, total, loaded ? 1 : 0, tabTimer.elapsed());
     } else {
         qDebug("[STARTUP][RESTORE tab %d/%d] → 文件不存在或路径为空，保持空标签页",
@@ -5632,8 +5407,7 @@ void MainWindow::restoreNextSessionTab()
         delete tab;
         tab = nullptr;
     } else {
-        restoreSessionPosition(tab, st);
-        restoreSessionSplit(tab, st);
+        restoreDocumentSessionView(tab, st);
         m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
     }
 

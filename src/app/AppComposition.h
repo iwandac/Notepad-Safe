@@ -28,6 +28,12 @@ public:
 
     DocumentToolRegistry &documentTools() noexcept { return documentTools_; }
     const DocumentToolRegistry &documentTools() const noexcept { return documentTools_; }
+    DocumentToolResult runDocumentTool(
+        const QString &id, const DocumentSnapshot &snapshot,
+        const DocumentToolContext &context = {}) const
+    {
+        return documentTools_.run(id, snapshot, context);
+    }
     DocumentProviderRegistry &documentProviders() noexcept { return documentProviders_; }
     const DocumentProviderRegistry &documentProviders() const noexcept
     {

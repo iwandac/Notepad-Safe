@@ -131,6 +131,7 @@ target_link_libraries(notepadsafe_file_runtime PUBLIC
 )
 
 add_library(notepadsafe_search_runtime STATIC
+    src/search/EditableTextSearch.cpp
     src/search/EncodedRegexCompiler.cpp
     src/search/Pcre2Regex.cpp
     src/search/LargeFileSearch.cpp
@@ -302,11 +303,15 @@ target_link_libraries(notepadsafe_session_runtime PUBLIC
 add_library(notepadsafe_app STATIC
     src/app/AppComposition.cpp
     src/app/StartupCoordinator.cpp
-    src/app/CommandRegistry.cpp
-    src/window/MainWindow.cpp
+     src/app/CommandRegistry.cpp
+     src/app/DocumentOpenWorkflow.cpp
+     src/window/SensitiveText.cpp
+     src/window/FileCredentialDialog.cpp
+     src/window/MainWindow.cpp
     src/search/FindReplaceDialog.cpp
-    src/search/SearchResultsController.cpp
-    src/search/SearchResultsDock.cpp
+     src/search/SearchResultsController.cpp
+     src/search/SearchResultsDelegate.cpp
+     src/search/SearchResultsDock.cpp
     src/async/StatusBarTaskWidget.cpp
     src/async/AsyncTaskPanelDialog.cpp
     src/vault/VaultDock.cpp
