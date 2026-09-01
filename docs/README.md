@@ -4,11 +4,13 @@
 > 本仓库为**独立产品仓库**，clone 后可直接构建运行。
 > （原 Credential Vault 项目中的 `apps/qt-notepad` 已独立为该仓库，并统一重命名为 **Notepad Safe**）
 
+> **当前状态：开发预览，产品成熟度仍在验收。** 下列勾选项表示存在实现与局部回归，不等于完整 GUI、性能和故障恢复通过。本次排除 Windows 安装、签名、打包分发；性能轮关闭后直接 AI-D0 设计收敛 → 第 5 轮基座 → 优先第 7 轮文本助手 / 独立第 6 轮代码可视化 → 第 9 轮组合验收，第 8 轮默认拒绝远程。权威进度见[产品成熟度路线图](ITERATION_ROADMAP.md)。已有 `tools/run_release_gate.ps1` 保留严格发布含义，不作为本次 AI 前置或宣称已通过。
+
 ---
 
 ## 1. 特性速览
 
-- ✅ **单 exe**：静态构建，无 DLL 依赖，分发即用
+- ✅ **单 exe**：静态构建；本次验证实际运行，不承诺安装分发已验收
 - ✅ **多标签页** + 会话自动恢复（崩溃/退出不丢未保存内容）
 - ✅ **编码检测**（UTF-8 / UTF-16 LE/BE / GBK，BOM + 启发式）
 - ✅ **原子保存**（.tmp → rename，防止崩溃损坏原文件）
@@ -68,7 +70,7 @@ run_tests.bat
 ```
 
 该脚本显式开启测试构建并运行非 GUI 回归。GUI smoke 使用 `run_all_gui_smoke.bat`；真实进程
-E2E 由发布门禁按需运行。默认 `build.bat` 不生成任何测试或诊断目标。构建边界与归档清单见
+E2E 按各轮运行质量合同显式执行。默认 `build.bat` 不生成任何测试或诊断目标。构建边界与归档清单见
 `docs/STATIC_CODE_AUDIT.md`。
 
 ## 3. 使用
@@ -123,13 +125,25 @@ notepadsafe/
     ├── REGEX_ENGINE_EXPLORATION.md # 已接受的统一正则架构、方言与准入合同
     ├── TARGET_EXPERIENCE.md    # 目标体验、功能总账与动态 GUI 验收
     ├── REFERENCE_BASELINE.md   # 成熟产品/上游行为参考与探索停止规则
-    ├── ITERATION_ROADMAP.md    # 最终目标、十轮收敛路线与发布门槛
+    ├── ITERATION_ROADMAP.md    # 当前成熟度顺序、质量门与停止条件
+    ├── AI_PRODUCT_DESIGN.md    # AI 文档助手、代码可视化、数据权限与验收设计
+    ├── ROUND1_HEX_PRODUCT_ACCEPTANCE.md # 第 1 轮 Hex 用户结果、切片与退出证据
+    ├── ROUND2_CORE_JOURNEYS_PRODUCT_ACCEPTANCE.md # 第 2 轮单实例、搜索真值、Tail 与产品语言
+    ├── ROUND3_PERFORMANCE_RECOVERY_ACCEPTANCE.md # 第 3 轮性能、资源预算与故障恢复
+    ├── ROUND4_WINDOWS_DISTRIBUTION_ACCEPTANCE.md # 历史分发设计；本次明确排除
+    ├── ROUND5_DOCUMENT_TOOL_FOUNDATION_ACCEPTANCE.md # 第 5 轮范围授权、Artifact、Diff 与 Undo
+    ├── ROUND6_CODE_VISUALIZATION_ACCEPTANCE.md # 第 6 轮静态解析、产品说明与原生数据流图
+    ├── ROUND7_LOCAL_AI_TEXT_ASSISTANT_ACCEPTANCE.md # 第 7 轮本地模型、流式生成与差异应用
+    ├── ROUND8_REMOTE_AI_DECISION_ACCEPTANCE.md # 第 8 轮远程 AI 拒绝门或逐次授权
+    ├── ROUND9_AI_RELEASE_ACCEPTANCE.md # 第 9 轮 AI 组合产品验收；不含安装发布
     └── SUPPLY_CHAIN.md         # 固定依赖的更新与验证规程
 ```
 
 ## 5. 目标架构
 
-架构与安全边界见 [docs/DESIGN.md](DESIGN.md)；用户可见目标、功能总账和正式 GUI 动态验收方法见 [目标体验与动态验收参考](TARGET_EXPERIENCE.md)；成熟产品/上游能力的采用与拒绝边界见 [参考基线](REFERENCE_BASELINE.md)；自主开发轮次和最终停止条件见 [目标模式收敛路线](ITERATION_ROADMAP.md)。后续开发必须同时满足这些基线，主要决策包括：
+架构与安全边界见 [架构设计](DESIGN.md)；用户可见目标和动态 GUI 验收方法见 [目标体验](TARGET_EXPERIENCE.md)；成熟产品能力的采用与拒绝边界见 [参考基线](REFERENCE_BASELINE.md)。当前顺序、进度与停止条件以[成熟度路线图](ITERATION_ROADMAP.md)为准。
+
+既有质量记录为[第 1 轮 Hex](ROUND1_HEX_PRODUCT_ACCEPTANCE.md)、[第 2 轮核心旅程](ROUND2_CORE_JOURNEYS_PRODUCT_ACCEPTANCE.md)；当前完成[第 3 轮性能/恢复](ROUND3_PERFORMANCE_RECOVERY_ACCEPTANCE.md)后，直接按 [AI 产品设计 §9](AI_PRODUCT_DESIGN.md#9-ai-d0性能轮之后的设计收敛与开发交接)做 AI-D0，不经过[历史第 4 轮分发](ROUND4_WINDOWS_DISTRIBUTION_ACCEPTANCE.md)。后续沿用[第 5 轮基座](ROUND5_DOCUMENT_TOOL_FOUNDATION_ACCEPTANCE.md)、[第 7 轮文本助手](ROUND7_LOCAL_AI_TEXT_ASSISTANT_ACCEPTANCE.md)、[第 6 轮代码可视化](ROUND6_CODE_VISUALIZATION_ACCEPTANCE.md)、[第 8 轮远程策略](ROUND8_REMOTE_AI_DECISION_ACCEPTANCE.md)和[第 9 轮组合产品验收](ROUND9_AI_RELEASE_ACCEPTANCE.md)。数字保留历史编号，不表示必须依数字串行；真实文本助手优先，所有语言完成不是其前置。主要边界包括：
 
 - 供应链版本锁定、更新验证、SBOM 和退出策略（机器锁见 `../third_party/dependencies.lock.json`，操作规程见 `SUPPLY_CHAIN.md`）。
 - 小于 32 MiB：Scintilla 完整编辑。

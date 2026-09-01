@@ -396,11 +396,11 @@ QVector<EncodingSampleChunk> memoryEncodingSamples(const QByteArray &data)
     };
 }
 
-QVector<EncodingSampleChunk> fileEncodingSamples(QFile *file)
+QVector<EncodingSampleChunk> fileEncodingSamples(qint64 size,
+    const std::function<QByteArray(qint64, qsizetype)> &readAt)
 {
-    const qint64 size = file->size();
     if (size <= EncodingDetectionBudgetBytes) {
-        return {{file->readAll(), 0, true, true}};
+        return {{readAt(0, qsizetype(size)), 0, true, true}};
     }
     const qint64 side = EncodingDetectionBudgetBytes / 3;
     const qint64 head = EncodingDetectionBudgetBytes - side * 2;
@@ -414,9 +414,7 @@ QVector<EncodingSampleChunk> fileEncodingSamples(QFile *file)
         {tailOffset, side, false, true},
     };
     for (const auto &range : ranges) {
-        if (!file->seek(range.offset))
-            return {};
-        const QByteArray bytes = file->read(range.length);
+        const QByteArray bytes = readAt(range.offset, qsizetype(range.length));
         if (bytes.size() != range.length)
             return {};
         chunks.push_back({bytes, range.offset, range.start, range.end});
@@ -544,7 +542,15 @@ EncodingDetection detectFileEncoding(const QString &path)
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly))
         return {};
-    return detectEncodingSamples(fileEncodingSamples(&file));
+    return detectFileEncoding(file.size(), [&file](qint64 offset, qsizetype length) {
+        return file.seek(offset) ? file.read(length) : QByteArray{};
+    });
+}
+
+EncodingDetection detectFileEncoding(qint64 size,
+    const std::function<QByteArray(qint64, qsizetype)> &readAt)
+{
+    return detectEncodingSamples(fileEncodingSamples(size, readAt));
 }
 
 DecodeResult decodeBytes(const QByteArray &data)
@@ -914,6 +920,26 @@ QString encodingName(TextEncoding encoding)
     case TextEncoding::Windows1252: return QStringLiteral("Windows-1252");
     }
     return QStringLiteral("Unknown");
+}
+
+std::optional<TextEncoding> encodingFromName(const QString &name)
+{
+    static constexpr TextEncoding supported[] = {
+        TextEncoding::Utf8,
+        TextEncoding::Utf8Bom,
+        TextEncoding::Utf16LE,
+        TextEncoding::Utf16BE,
+        TextEncoding::GBK,
+        TextEncoding::GB18030,
+        TextEncoding::Big5,
+        TextEncoding::ShiftJis,
+        TextEncoding::Windows1252,
+    };
+    for (const TextEncoding encoding : supported) {
+        if (name == encodingName(encoding))
+            return encoding;
+    }
+    return std::nullopt;
 }
 
 bool windowsCodePageForEncoding(TextEncoding encoding, quint32 *codePage)

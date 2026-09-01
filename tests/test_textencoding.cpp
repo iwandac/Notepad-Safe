@@ -4,6 +4,8 @@
 #include <QCoreApplication>
 #include <QByteArray>
 #include <QString>
+#include <QFile>
+#include <QTemporaryDir>
 
 #include <algorithm>
 #include <cstdio>
@@ -190,6 +192,60 @@ void test_encoding_name()
     CHECK(encodingName(TextEncoding::Utf16LE) == QStringLiteral("UTF-16LE"), "UTF-16LE 名称");
     CHECK(encodingName(TextEncoding::Utf16BE) == QStringLiteral("UTF-16BE"), "UTF-16BE 名称");
     CHECK(encodingName(TextEncoding::GBK) == QStringLiteral("GBK"), "GBK 名称");
+    CHECK(encodingName(TextEncoding::GB18030) == QStringLiteral("GB18030"), "GB18030 名称");
+    CHECK(encodingName(TextEncoding::Big5) == QStringLiteral("Big5"), "Big5 名称");
+    CHECK(encodingName(TextEncoding::ShiftJis) == QStringLiteral("Shift-JIS"), "Shift-JIS 名称");
+    CHECK(encodingName(TextEncoding::Windows1252) == QStringLiteral("Windows-1252"), "Windows-1252 名称");
+}
+
+void test_encoding_name_roundtrip()
+{
+    TEST("九种受支持编码名称精确往返");
+    const TextEncoding supported[] = {
+        TextEncoding::Utf8,
+        TextEncoding::Utf8Bom,
+        TextEncoding::Utf16LE,
+        TextEncoding::Utf16BE,
+        TextEncoding::GBK,
+        TextEncoding::GB18030,
+        TextEncoding::Big5,
+        TextEncoding::ShiftJis,
+        TextEncoding::Windows1252,
+    };
+    for (const TextEncoding encoding : supported) {
+        const QString name = encodingName(encoding);
+        CHECK(encodingFromName(name) == encoding, "保存的精确名称恢复原编码");
+        CHECK(!encodingFromName(QStringLiteral(" ") + name), "拒绝前导空白别名");
+        CHECK(!encodingFromName(name + QStringLiteral(" ")), "拒绝尾随空白别名");
+        if (name.toLower() != name)
+            CHECK(!encodingFromName(name.toLower()), "拒绝小写别名");
+        if (name.toUpper() != name)
+            CHECK(!encodingFromName(name.toUpper()), "拒绝大写别名");
+    }
+}
+
+void test_encoding_name_rejects_unsupported_values()
+{
+    TEST("空值及未知编码名称不猜测代码页");
+    const QString unsupported[] = {
+        QString(),
+        QStringLiteral("Unknown"),
+        QStringLiteral("UTF8"),
+        QStringLiteral("UTF-8-BOM"),
+        QStringLiteral("UTF-16"),
+        QStringLiteral("Shift_JIS"),
+        QStringLiteral("CP1252"),
+        QStringLiteral("1252"),
+        QStringLiteral("CP936"),
+        QStringLiteral("ANSI"),
+        QStringLiteral("GB 18030"),
+        QStringLiteral("UTF-8\t"),
+        QStringLiteral("UTF-8\n"),
+        QStringLiteral("UTF-8\u00a0"),
+        QString(4096, QLatin1Char('x')),
+    };
+    for (const QString &name : unsupported)
+        CHECK(!encodingFromName(name), "未知持久化名称返回 nullopt");
 }
 
 void test_multibyte_byte_grid_projection()
@@ -296,6 +352,54 @@ void test_projection_position_mapper_half_open_contract()
     }
 }
 
+void test_admitted_reader_encoding_sampling()
+{
+    TEST("已准入读取器保留首中尾编码采样预算");
+    constexpr qint64 budget = 1024 * 1024;
+    CHECK(EncodingDetectionBudgetBytes == budget, "编码总采样预算保持 1 MiB");
+    QTemporaryDir directory;
+    CHECK(directory.isValid(), "临时编码夹具目录可用");
+    if (!directory.isValid()) return;
+    for (const qint64 size : {0LL, 127LL, budget, budget * 4}) {
+        QByteArray bytes(size, 'a');
+        if (size > 3) bytes.replace(size - 3, 3, QByteArray::fromHex("e4b8ad"));
+        const QString path = directory.filePath(QString::number(size) + ".txt");
+        QFile file(path);
+        const bool written = file.open(QIODevice::WriteOnly) && file.write(bytes) == size;
+        CHECK(written, "写入真实编码采样夹具");
+        file.close();
+        if (!written) continue;
+        QVector<QPair<qint64, qsizetype>> reads;
+        qint64 total = 0;
+        const auto actual = detectFileEncoding(size, [&](qint64 offset, qsizetype length) {
+            reads.append({offset, length});
+            total += length;
+            return bytes.mid(offset, length);
+        });
+        CHECK(total == qMin(size, budget), "读取字节总量不超过原固定预算");
+        if (size <= budget) {
+            CHECK(reads.size() == 1 && reads[0].first == 0 && reads[0].second == size,
+                  "预算内只读取完整的一段（包括空文件）");
+        } else {
+            const qint64 side = budget / 3;
+            qint64 middle = (size - side) / 2;
+            middle -= middle % 4;
+            CHECK(reads.size() == 3
+                      && reads[0] == qMakePair(qint64(0), qsizetype(budget - 2 * side))
+                      && reads[1] == qMakePair(middle, qsizetype(side))
+                      && reads[2] == qMakePair(size - side, qsizetype(side)),
+                  "大文件首中尾三段范围准确，不能退化为只读首段");
+        }
+        for (const auto expected : {detectFileEncoding(path), detectEncoding(bytes)}) {
+            CHECK(actual.encoding == expected.encoding && actual.origin == expected.origin
+                      && actual.confidence == expected.confidence
+                      && actual.hasBom == expected.hasBom
+                      && actual.decodeErrors == expected.decodeErrors,
+                  "已打开读取器与原路径/内存入口的完整编码判定一致");
+        }
+    }
+}
+
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
@@ -317,9 +421,12 @@ int main(int argc, char *argv[])
     test_encode_decode_roundtrip_utf16le();
     test_encode_decode_roundtrip_utf16be();
     test_encoding_name();
+    test_encoding_name_roundtrip();
+    test_encoding_name_rejects_unsupported_values();
     test_multibyte_byte_grid_projection();
     test_replacement_character_projection_truth();
     test_projection_position_mapper_half_open_contract();
+    test_admitted_reader_encoding_sampling();
 
     fprintf(stderr, "\n=== Result: %d/%d passed ===\n\n", test_passed, test_count);
     return (test_passed == test_count) ? 0 : 1;

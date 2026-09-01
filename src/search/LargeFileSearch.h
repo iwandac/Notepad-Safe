@@ -9,6 +9,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <limits>
+#include <memory>
 #include <mutex>
 
 #include "DynamicThresholds.h"
@@ -88,6 +89,11 @@ public:
     void setSource(const uchar* mmapBase, qint64 mmapSize,
                    const LineIndex* lineIndex,
                    const PatchList* patchList);
+    // UI-thread source ownership boundary. Unlike setSource, idle rebinding
+    // preserves the completed memory/spool index and models that borrow it.
+    bool sourceInUse();
+    bool rebindIdleSource(const uchar *base, qint64 size,
+                          const LineIndex *lines, const PatchList *patches);
 
     // findAll：异步启动，通过信号 finished/failed/progress/partialBatch 与调用者交互
     void findAll(const QString& pattern, const Options& opts);
@@ -110,6 +116,10 @@ public:
 
     // 当前 taskId（findAllViaTaskManager 启动后有效；findAll 直接启动则为 0）
     qint64 lastTaskId() const { return lastTaskId_; }
+
+    // Engine-thread presentation metadata, available only during the matching
+    // failed(raw) signal. Copy in that callback; never use as search state.
+    QString failureUserMessage(const QString &raw) const;
 
     // 结果总数（内存 + 溢出文件）——带 acquire 屏障，确保 worker 写入主线程可见
     qint64 totalMatches() const {
@@ -155,12 +165,20 @@ public:
                     qint64* outReplacedCount = nullptr);
 
 signals:
+    void sourceBecameIdle();
     void progress(qint64 bytesProcessed, qint64 totalBytes);
     void partialBatch(const QVector<LargeFileSearchMatch>& batch);
     void finished(qint64 totalMatches);
     void failed(const QString& message);
 
 private:
+    struct FailurePresentation {
+        QString raw;
+        QString userMessage;
+    };
+    FailurePresentation failurePresentation_;
+    void publishFailure(const QString &raw, const QString &userMessage);
+
     const uchar*   mmapBase_ = nullptr;
     qint64         mmapSize_ = 0;
     const LineIndex*  lineIndex_ = nullptr;
@@ -192,13 +210,31 @@ private:
     std::condition_variable workerIdle_;
     int                     workerReservations_ = 0;
     bool                    shuttingDown_ = false;
+    bool                    stoppingWorkers_ = false;
+    struct WorkerReservation;
+    using WorkerReservationPtr = std::shared_ptr<WorkerReservation>;
+    WorkerReservationPtr currentWorker_;
 
     // ---------- 内部 helper ----------
     bool prepareOverrunFile(QString* errMsg);
     void appendMatches(const QVector<LargeFileSearchMatch>& batch);  // 内存 + 溢出文件分流
     void closeOverrunFile();
-    bool reserveWorker();
-    void releaseWorker();
+    WorkerReservationPtr reserveWorker(
+        std::function<void(const QString &, const QString &)> failure);
+    static bool claimWorker(const WorkerReservationPtr &worker);
+    static void setWorkerFailure(const WorkerReservationPtr &worker,
+                                 const QString &raw, const QString &userMessage);
+    static void setWorkerCompletion(const WorkerReservationPtr &worker,
+                                    std::function<void()> completion);
+    static void recordWorkerException(const WorkerReservationPtr &worker);
+    void releaseWorker(const WorkerReservationPtr &worker);
+    void finishWorker(const WorkerReservationPtr &worker);
+    void deliverWorker(const WorkerReservationPtr &worker);
+    void bindWorkerTask(const WorkerReservationPtr &worker, qint64 taskId);
+    void observeWorkerTerminal(const WorkerReservationPtr &worker, qint64 taskId,
+                               AsyncTaskState state, const AsyncErrorInfo &error);
+    void abandonWorker(const WorkerReservationPtr &worker);
+    bool isCurrentWorker(const WorkerReservationPtr &worker) const;
     void stopWorkers(bool permanent);
     static bool preparePattern(const QString &pattern, const Options &opts,
                                QByteArray *literal, bool *usePcre2,

@@ -98,6 +98,7 @@ QStringList FeatureRegistry::requiredStartupCommandIds()
         QStringLiteral("view.appearance.system"),
         QStringLiteral("view.appearance.light"),
         QStringLiteral("view.appearance.dark"), QStringLiteral("view.wordWrap"),
+        QStringLiteral("view.tail.toggle"), QStringLiteral("view.tail.resume"),
         QStringLiteral("view.split"), QStringLiteral("view.split.horizontal"),
         QStringLiteral("view.split.vertical"), QStringLiteral("view.symbols"),
         QStringLiteral("view.symbols.whitespace"),
@@ -148,6 +149,8 @@ QStringList FeatureRegistry::requiredStartupCommandIds()
 
 QString FeatureRegistry::featureIdForCommand(const QString &commandId)
 {
+    if (containsCommand(commandId, {"view.tail.toggle", "view.tail.resume"}))
+        return QStringLiteral("NSP-LARGEFILE");
     if (containsCommand(commandId, {
             "file.new", "file.open", "file.recent", "file.reload",
             "file.save", "file.saveAs", "file.close", "file.closeAll",

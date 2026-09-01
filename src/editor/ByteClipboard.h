@@ -10,6 +10,7 @@
 
 namespace ByteClipboard {
 
+inline constexpr qint64 MaxPayloadBytes = 64LL * 1024 * 1024;
 inline constexpr const char *RawBytesMime =
     "application/x-notepadsafe-raw-bytes";
 inline constexpr const char *SearchModeMime =
@@ -28,6 +29,21 @@ inline bool isPrintableAscii(const QByteArray &bytes)
 inline QString hexText(const QByteArray &bytes)
 {
     return QString::fromLatin1(bytes.toHex(' ').toUpper());
+}
+
+inline QString payloadTooLargeMessage()
+{
+    return QStringLiteral(
+        "剪贴板内容超过 64 MiB。请缩小选区或分批操作；本次操作未应用。");
+}
+
+inline bool payloadWithinLimit(qint64 bytes, QString *error = nullptr)
+{
+    if (bytes >= 0 && bytes <= MaxPayloadBytes)
+        return true;
+    if (error)
+        *error = payloadTooLargeMessage();
+    return false;
 }
 
 // The character pane is an encoding projection of authoritative bytes. Keep

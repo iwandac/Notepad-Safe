@@ -11,6 +11,7 @@
 //              无 old 残留、有且仅有 3 处 new、其他区域原封不动
 // ============================================================================
 #include <QtCore/QObject>
+#include "RegisteredReadFixture.h"
 #include <QtTest/QTest>
 #include <QtTest/QSignalSpy>
 #include <QtWidgets/QApplication>
@@ -29,17 +30,21 @@
 #include <QtGui/QClipboard>
 #include <QtGui/QFontMetrics>
 #include <QtGui/QMouseEvent>
+#include <QtGui/QAction>
 #include <QtCore/QDebug>
+#include <QtCore/QCryptographicHash>
 #include <QtCore/QDir>
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QFile>
 #include <QtCore/QCoreApplication>
 #include <QtCore/QTimer>
 #include <QtCore/QUuid>
+#include <QtCore/QScopeGuard>
 #include <algorithm>
 
 #include "SmokeTestBase.h"
 #include "EditorTab.h"
+#include "MainWindow.h"
 #include "FindReplaceDialog.h"
 #include "VirtualFileView.h"
 #include "WindowedReadOnlyProvider.h"
@@ -204,6 +209,10 @@ private slots:
     // Delegate 只绘制单行时，行高契约也必须是单行；长字节上下文不得因
     // QTreeView 的隐式自动换行在不同搜索模式下撑满整个 Dock。
     void tc_fr_041_search_dock_rows_remain_compact_across_modes();
+
+    // Real MainWindow queues the result jump. An edit after the request but
+    // before that queued turn must invalidate it without applying old offsets.
+    void tc_fr_042_queued_result_jump_revalidates_target_revision();
 
 private:
     QString s3FixturePath();
@@ -1063,7 +1072,7 @@ void SmokeFindReplace::tc_fr_011_hex_byte_find_all_highlight_and_double_click()
     content[40] = 'Z';
     const QString path = createSmallTestFile(content, "fr-011-binary.bin");
     QString error;
-    QVERIFY2(tab()->openLargeFileL2(path, &error,
+    QVERIFY2(openWindowedFixture(tab(), path, &error,
                                     L2Presentation::Hex,
                                     L2ContentKind::Binary), qPrintable(error));
     QApplication::processEvents(QEventLoop::AllEvents, 200);
@@ -1169,7 +1178,7 @@ void SmokeFindReplace::tc_fr_012_hex_byte_all_open_filters_text_targets()
     auto *lockedTab = new EditorTab(&workspace);
     QString error;
     QVERIFY(textTab->loadFile(textPath));
-    QVERIFY2(binaryTab->openLargeFileL2(binaryPath, &error,
+    QVERIFY2(openWindowedFixture(binaryTab, binaryPath, &error,
                                         L2Presentation::Hex,
                                         L2ContentKind::Binary), qPrintable(error));
     workspace.addTab(textTab, QStringLiteral("Text"));
@@ -1436,6 +1445,159 @@ void SmokeFindReplace::tc_fr_014_invalidated_result_rerun_from_dock()
     dock.close();
 }
 
+void SmokeFindReplace::tc_fr_042_queued_result_jump_revalidates_target_revision()
+{
+    QTemporaryDir profile;
+    QVERIFY(profile.isValid());
+    const bool hadDataDir = qEnvironmentVariableIsSet("NOTEPADSAFE_DATADIR");
+    const QByteArray previousDataDir = qgetenv("NOTEPADSAFE_DATADIR");
+    qputenv("NOTEPADSAFE_DATADIR", profile.path().toUtf8());
+    const auto restoreDataDir = qScopeGuard([&]() {
+        if (hadDataDir)
+            qputenv("NOTEPADSAFE_DATADIR", previousDataDir);
+        else
+            qunsetenv("NOTEPADSAFE_DATADIR");
+    });
+
+    const QByteArray marker("QUEUED_RESULT_TOKEN");
+    const QByteArray original = QByteArray("header before the result\n")
+        + marker + QByteArray(" belongs to the original revision\n")
+        + QByteArray(240, 'z') + QByteArray("\nend of original document\n");
+    const QString path = createSmallTestFile(original, "fr-042-queued-jump.txt");
+    QVERIFY(!path.isEmpty());
+    const auto sourceHash = [&]() {
+        QFile source(path);
+        if (!source.open(QIODevice::ReadOnly))
+            return QByteArray{};
+        return QCryptographicHash::hash(source.readAll(), QCryptographicHash::Sha256);
+    };
+    const QByteArray hashBefore = sourceHash();
+    QVERIFY(!hashBefore.isEmpty());
+    const qint64 oldOffset = original.indexOf(marker);
+    QVERIFY(oldOffset > 0);
+
+    MainWindow window;
+    const auto cleanupWindow = qScopeGuard([&]() {
+        // Do not invoke a Save/Discard transaction to tear down the fixture.
+        if (auto *tabs = window.findChild<QTabWidget *>()) {
+            while (tabs->count() > 0) {
+                QWidget *page = tabs->widget(0);
+                if (auto *target = qobject_cast<EditorTab *>(page))
+                    target->shutdownL2BeforeClose();
+                tabs->removeTab(0);
+                delete page;
+            }
+        }
+    });
+    window.showNormal();
+    window.resize(1200, 800);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    window.openFilesFromExternal({path});
+    auto *tabs = window.findChild<QTabWidget *>();
+    QVERIFY(tabs);
+    QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 1, 3000);
+    auto *target = qobject_cast<EditorTab *>(tabs->currentWidget());
+    QVERIFY(target && !target->isL2Mode());
+    QCOMPARE(target->editor()->text().toUtf8(), original);
+    QVERIFY(!target->isModified());
+    const QUuid documentId = target->documentState().id;
+    const quint64 searchRevision = target->contentRevision();
+
+    auto *findAction = window.findChild<QAction *>(QStringLiteral("search.find"));
+    auto *dock = window.findChild<SearchResultsDock *>(QStringLiteral("SearchResultsDock"));
+    QVERIFY(findAction && dock);
+    findAction->trigger();
+    auto *dialog = window.findChild<FindReplaceDialog *>();
+    QVERIFY(dialog);
+    QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
+    auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+    auto *scope = dialog->findChild<QComboBox *>(QStringLiteral("searchScopeCombo"));
+    auto *findAll = dialog->findChild<QPushButton *>(QStringLiteral("findAllButton"));
+    auto *tree = dock->findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+    auto *summary = dock->findChild<QLabel *>(QStringLiteral("searchResultsSummary"));
+    auto *rerun = dock->findChild<QPushButton *>(QStringLiteral("searchResultsRerunButton"));
+    QVERIFY(pattern && scope && findAll && tree && summary && rerun);
+    pattern->setText(QString::fromLatin1(marker));
+    scope->setCurrentIndex(scope->findData(0));
+    QTest::mouseClick(findAll, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(tree->model() && tree->model()->rowCount() == 1, 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(findAll->isEnabled(), 3000);
+    auto *model = qobject_cast<SearchResultsModel *>(tree->model());
+    QVERIFY(model);
+    const QModelIndex result = model->index(0, SearchResultsModel::COL_LINE);
+    QCOMPARE(model->matchByteOffset(result), oldOffset);
+    QCOMPARE(model->matchLength(result), int(marker.size()));
+    QCOMPARE(target->contentRevision(), searchRevision);
+    dialog->hide();
+    dock->show();
+    window.activateWindow();
+    tree->scrollTo(result);
+    QApplication::processEvents(QEventLoop::AllEvents, 60);
+    const QRect clickRect = tree->visualRect(result);
+    QVERIFY(clickRect.isValid());
+    QVERIFY(tree->viewport()->rect().contains(clickRect.center()));
+
+    QSignalSpy jumpSpy(dock, &SearchResultsDock::jumpToDocumentByteOffset);
+    bool requestIdentityMatched = false;
+    bool requestRevisionMatched = false;
+    bool editApplied = false;
+    qint64 caretAfterEdit = -1;
+    const QString inserted = QStringLiteral("Inserted before the recorded match.\n");
+    // MainWindow connected its real navigation slot in its constructor. This
+    // later direct observer therefore edits after that slot queues the jump,
+    // without pumping events or calling a navigation slot from the test.
+    const auto editConnection = connect(
+        dock, &SearchResultsDock::jumpToDocumentByteOffset, &window,
+        [&](const QUuid &id, quint64 revision, qint64 offset, int length) {
+            if (editApplied)
+                return;
+            requestIdentityMatched = id == documentId
+                && target->documentState().id == documentId;
+            requestRevisionMatched = revision == searchRevision
+                && target->contentRevision() == searchRevision;
+            if (!requestIdentityMatched || !requestRevisionMatched
+                || offset != oldOffset || length != marker.size())
+                return;
+            target->editor()->insertAt(inserted, 0, 0);
+            caretAfterEdit = target->editor()->length();
+            target->editor()->SendScintilla(QsciScintillaBase::SCI_SETSEL,
+                static_cast<unsigned long>(caretAfterEdit),
+                static_cast<long>(caretAfterEdit));
+            editApplied = true;
+        }, Qt::DirectConnection);
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier,
+                      clickRect.center());
+    QTest::mouseDClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier,
+                       clickRect.center());
+    QObject::disconnect(editConnection);
+    QCOMPARE(jumpSpy.count(), 1);
+    QVERIFY(requestIdentityMatched && requestRevisionMatched && editApplied);
+    QVERIFY(caretAfterEdit > oldOffset + marker.size());
+
+    bool queuedTurnDrained = false;
+    QTimer::singleShot(0, &window, [&]() { queuedTurnDrained = true; });
+    QTRY_VERIFY_WITH_TIMEOUT(queuedTurnDrained, 2000);
+    QCOMPARE(tabs->currentWidget(), static_cast<QWidget *>(target));
+    QCOMPARE(target->documentState().id, documentId);
+    QVERIFY(target->contentRevision() > searchRevision);
+    QVERIFY(target->isModified());
+    QCOMPARE(target->editor()->text().toUtf8(), inserted.toUtf8() + original);
+    QCOMPARE(sourceHash(), hashBefore);
+    QVERIFY(tree->model() == nullptr);
+    QVERIFY(summary->text().contains(QStringLiteral("失效")));
+    QVERIFY(rerun->isVisible() && rerun->isEnabled());
+
+    const qint64 selectedStart = target->editor()->SendScintilla(
+        QsciScintillaBase::SCI_GETSELECTIONSTART);
+    const qint64 selectedEnd = target->editor()->SendScintilla(
+        QsciScintillaBase::SCI_GETSELECTIONEND);
+    QVERIFY2(selectedStart != oldOffset || selectedEnd != oldOffset + marker.size(),
+             "queued result jump applied an obsolete byte range after the document revision changed");
+    QCOMPARE(selectedStart, caretAfterEdit);
+    QCOMPARE(selectedEnd, caretAfterEdit);
+}
+
 void SmokeFindReplace::tc_fr_015_all_open_replace_transaction_and_skip_summary()
 {
     const QString marker = QStringLiteral("MULTI_REPLACE_TOKEN");
@@ -1463,7 +1625,7 @@ void SmokeFindReplace::tc_fr_015_all_open_replace_transaction_and_skip_summary()
         QStringLiteral("secure %1\r\n").arg(marker));
     QVERIFY(secure->isSecureDocument());
     QString error;
-    QVERIFY2(l2->openLargeFileL2(l2Path, &error), qPrintable(error));
+    QVERIFY2(openWindowedFixture(l2, l2Path, &error), qPrintable(error));
     QVERIFY(l2->isL2Mode());
     QVERIFY(!l2->isReadOnlyByPolicy());
     workspace.addTab(first, QStringLiteral("first"));
@@ -1844,7 +2006,7 @@ void SmokeFindReplace::tc_fr_019_query_option_state_machine_exhaustive()
     auto *lockedTab = new EditorTab(&workspace);
     QVERIFY(textTab->loadFile(textPath));
     QString openError;
-    QVERIFY2(binaryTab->openLargeFileL2(
+    QVERIFY2(openWindowedFixture(binaryTab,
                  binaryPath, &openError,
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(openError));
@@ -2229,7 +2391,7 @@ void SmokeFindReplace::tc_fr_022_hex_query_formats_errors_and_navigation()
     const QString path = createSmallTestFile(
         content, QStringLiteral("fr-022-hex-formats.bin"));
     QString openError;
-    QVERIFY2(tab()->openLargeFileL2(
+    QVERIFY2(openWindowedFixture(tab(),
                  path, &openError,
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(openError));
@@ -2614,7 +2776,7 @@ void SmokeFindReplace::tc_fr_027_real_s3_find_all_dock_double_click()
     source.close();
 
     QString error;
-    QVERIFY2(tab()->openLargeFileL2(
+    QVERIFY2(openWindowedFixture(tab(),
                  path, &error,
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(error));
@@ -2724,7 +2886,7 @@ void SmokeFindReplace::tc_fr_028_real_s3_find_next_preparation_and_repeat_bounda
     source.close();
 
     QString error;
-    QVERIFY2(tab()->openLargeFileL2(
+    QVERIFY2(openWindowedFixture(tab(),
                  path, &error,
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(error));
@@ -2920,7 +3082,7 @@ void SmokeFindReplace::tc_fr_030_sparse_s3_text_regex_after_two_gib()
     QCOMPARE(QFileInfo(path).size(), FileSize);
 
     QString error;
-    QVERIFY2(tab()->openLargeFileL2(
+    QVERIFY2(openWindowedFixture(tab(),
                  path, &error,
                  L2Presentation::Text, L2ContentKind::Text),
              qPrintable(error));
@@ -3050,7 +3212,7 @@ void SmokeFindReplace::tc_fr_031_real_s3_default_literal_is_not_regex()
     source.close();
 
     QString error;
-    QVERIFY2(tab()->openLargeFileL2(
+    QVERIFY2(openWindowedFixture(tab(),
                  path, &error,
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(error));
@@ -3118,7 +3280,7 @@ void SmokeFindReplace::tc_fr_032_invalid_utf8_binary_default_literal_portable()
         payload, QStringLiteral("fr-032-invalid-utf8.bin"));
 
     QString error;
-    QVERIFY2(tab()->openLargeFileL2(
+    QVERIFY2(openWindowedFixture(tab(),
                  path, &error,
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(error));
@@ -3331,7 +3493,7 @@ void SmokeFindReplace::tc_fr_037_replacement_character_projection_literal_revers
         payload, QStringLiteral("fr-037-replacement-projection.bin"));
 
     QString error;
-    QVERIFY2(tab()->openLargeFileL2(
+    QVERIFY2(openWindowedFixture(tab(),
                  path, &error, L2Presentation::Text, L2ContentKind::Binary),
              qPrintable(error));
     auto *provider = tab()->windowedReadOnlyProvider();
@@ -3392,7 +3554,7 @@ void SmokeFindReplace::tc_fr_038_real_tinytestfile_replacement_literal_user_flow
     editor.show();
     QVERIFY(QTest::qWaitForWindowExposed(&editor));
     QString error;
-    QVERIFY2(editor.openLargeFileL2(
+    QVERIFY2(openWindowedFixture(&editor,
                  path, &error,
                  L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(error));
@@ -3765,7 +3927,7 @@ void SmokeFindReplace::tc_fr_034_real_smalltestfile_text_directional_search_prog
     fixture.close();
 
     QString error;
-    QVERIFY2(tab()->openLargeFileL2(
+    QVERIFY2(openWindowedFixture(tab(),
                  path, &error, L2Presentation::Hex, L2ContentKind::Binary),
              qPrintable(error));
     QTRY_VERIFY_WITH_TIMEOUT(tab()->windowedReadOnlyProvider(), 5000);
@@ -4021,7 +4183,7 @@ void SmokeFindReplace::tc_fr_040_l2_search_identity_includes_projection_snapshot
     editor.show();
     QVERIFY(QTest::qWaitForWindowExposed(&editor));
     QString error;
-    QVERIFY2(editor.openLargeFileL2(
+    QVERIFY2(openWindowedFixture(&editor,
                  path, &error, L2Presentation::Text, L2ContentKind::Binary),
              qPrintable(error));
     QTRY_VERIFY_WITH_TIMEOUT(editor.l2View() && editor.l2View()->isOpen(), 5000);

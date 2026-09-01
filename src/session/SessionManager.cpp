@@ -1,4 +1,5 @@
 #include "SessionManager.h"
+#include "AppDataLocation.h"
 #include "DraftStore.h"
 
 #include <QDir>
@@ -7,11 +8,9 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QStandardPaths>
 #include <QDateTime>
 #include <QSaveFile>
 #include <QUuid>
-#include <QProcessEnvironment>
 #include <QSet>
 #include <QBuffer>
 #include <limits>
@@ -52,30 +51,22 @@ bool isSameOrChildPath(const QString &rootPath, const QString &candidatePath)
            || candidate.startsWith(root + QLatin1Char('/'), sensitivity);
 }
 
-} // namespace
-
-static QString resolveDataDir()
+QString recoveryPathKey(const QString &path)
 {
-    // 允许通过环境变量 NOTEPADSAFE_DATADIR 覆盖用户数据目录（e2e/自动化测试用）
-    //   - 不设置：默认 %LOCALAPPDATA%\NotepadSafe（用户真实数据，原行为）
-    //   - 设置：直接用该路径（沙箱/CI 指向 %TEMP%\NotepadSafe_E2E\data，不污染真实用户数据）
-    QString env = QProcessEnvironment::systemEnvironment().value("NOTEPADSAFE_DATADIR").trimmed();
-    if (!env.isEmpty()) {
-        // 必须是绝对路径；否则回退默认（避免相对路径歧义）
-        QFileInfo fi(env);
-        if (fi.isAbsolute()) return QDir::cleanPath(fi.absoluteFilePath());
-        qWarning("[SessionManager] NOTEPADSAFE_DATADIR='%s' 不是绝对路径，忽略回退默认",
-                 qUtf8Printable(env));
-    }
-    QString localApp = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
-    return localApp + "/NotepadSafe";
+    QString key = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+#ifdef Q_OS_WIN
+    key = key.toCaseFolded();
+#endif
+    return key;
 }
+
+} // namespace
 
 SessionManager::SessionManager(QObject *parent)
     : QObject(parent)
 {
     // 支持 NOTEPADSAFE_DATADIR 覆盖：便于 e2e 沙箱/CI 在 %TEMP% 下独立运行
-    m_dataDir     = resolveDataDir();
+    m_dataDir     = resolveNotepadSafeDataRoot();
     m_autosaveDir = m_dataDir + "/autosave";
     ensureDirs();
 }
@@ -138,39 +129,67 @@ bool SessionManager::isManagedAutosavePath(const QString &path) const
     return true;
 }
 
-void SessionManager::removeAutosaveFile(const QString &path) const
+bool SessionManager::removeAutosaveFile(const QString &path) const
 {
-    if (isManagedAutosavePath(path) && QFile::exists(path))
-        QFile::remove(path);
+    if (!isManagedAutosavePath(path))
+        return false;
+    return !QFile::exists(path) || QFile::remove(path);
 }
 
-void SessionManager::discardRecovery(ISessionDocumentPort *document) const
+bool SessionManager::discardRecovery(ISessionDocumentPort *document) const
 {
     if (!document)
-        return;
-    removeAutosaveFile(document->recoveryPath());
+        return false;
+    const QString path = document->recoveryPath();
+    if (!path.isEmpty() && !removeAutosaveFile(path))
+        return false;
     document->acceptRecoveryPath({});
+    return true;
 }
 
 bool SessionManager::restoreAutosave(
     ISessionDocumentPort *tab, const QString &autosavePath,
-    const QString &realFilePath) const
+    const QString &realFilePath, QString *error,
+    QString *diagnosticCode) const
 {
-    if (!tab || !isManagedAutosavePath(autosavePath)
-        || !QFileInfo::exists(autosavePath)) {
+    if (error)
+        error->clear();
+    if (diagnosticCode)
+        diagnosticCode->clear();
+    const auto reject = [error, diagnosticCode](const QString &code,
+                                                 const QString &message) {
+        if (error)
+            *error = message;
+        if (diagnosticCode)
+            *diagnosticCode = code;
         return false;
+    };
+    if (!tab || !isManagedAutosavePath(autosavePath)) {
+        return reject(QStringLiteral("[recovery.draft.invalid]"),
+                      tr("恢复稿路径不在应用的受管恢复目录中。"));
+    }
+    if (!QFileInfo::exists(autosavePath)) {
+        return reject(QStringLiteral("[recovery.draft.missing]"),
+                      tr("加密恢复稿已不存在。原文件未被修改。"));
+    }
+    const QFileInfo draftInfo(autosavePath);
+    const bool encryptedDraft = DraftStore::isEncryptedDraft(autosavePath);
+    const bool legacyPlaintext = draftInfo.fileName().endsWith(
+        QStringLiteral(".tmp"), Qt::CaseInsensitive);
+    if (!encryptedDraft && !legacyPlaintext) {
+        return reject(QStringLiteral("[recovery.draft.invalid]"),
+                      tr("加密恢复稿格式无效或已损坏。原文件未被修改。"));
     }
 
     SessionRestoreRequest request;
     request.encryptedPath = autosavePath;
     request.realFilePath = realFilePath;
-    QString error;
-    if (DraftStore::isEncryptedDraft(autosavePath)) {
+    QString localError;
+    if (encryptedDraft) {
         DraftStore::SnapshotInfo info;
-        if (!DraftStore::inspect(autosavePath, &info, &error)) {
-            qWarning("[SessionManager] encrypted draft restore failed: %s",
-                     qUtf8Printable(error));
-            return false;
+        if (!DraftStore::inspect(autosavePath, &info, &localError)) {
+            qWarning("[SessionManager] encrypted draft metadata rejected");
+            return reject(QStringLiteral("[recovery.draft.invalid]"), localError);
         }
         request.encoding = info.encoding;
         request.plaintextBytes = info.plaintextBytes;
@@ -180,25 +199,34 @@ bool SessionManager::restoreAutosave(
             request.kind = SessionRecoveryKind::FullCheckpoint;
         } else {
             request.kind = SessionRecoveryKind::SmallOrJournal;
-            if (!DraftStore::readSnapshot(autosavePath, &request.plaintext, &error)) {
-                qWarning("[SessionManager] encrypted draft restore failed: %s",
-                         qUtf8Printable(error));
-                return false;
+            if (!DraftStore::readSnapshot(autosavePath, &request.plaintext,
+                                          &localError)) {
+                qWarning("[SessionManager] encrypted draft could not be unlocked");
+                return reject(QStringLiteral("[recovery.draft.unlock]"), localError);
             }
         }
     } else {
         request.legacyPlaintextFile = true;
     }
 
-    const bool loaded = tab->restoreSessionRecovery(request, &error);
+    const bool loaded = tab->restoreSessionRecovery(request, &localError);
     scrubSnapshot(request.plaintext);
-    if (!loaded && !error.isEmpty()) {
+    if (!loaded) {
+        QString code = QStringLiteral("[recovery.restore.failed]");
+        if (localError.contains(QStringLiteral("原始二进制文件已移动或变化")))
+            code = QStringLiteral("[recovery.source.changed]");
+        else if (localError.contains(QStringLiteral("当前 Windows 用户下解锁")))
+            code = QStringLiteral("[recovery.draft.unlock]");
+        else if (encryptedDraft
+                 && (localError.contains(QStringLiteral("恢复检查点"))
+                     || localError.contains(QStringLiteral("恢复日志元数据已损坏"))))
+            code = QStringLiteral("[recovery.draft.invalid]");
         qWarning("[SessionManager] recovery payload rejected: %s",
-                 qUtf8Printable(error));
+                 qUtf8Printable(code));
+        return reject(code, localError);
     }
-    if (loaded)
-        tab->acceptRecoveryPath(autosavePath);
-    return loaded;
+    tab->acceptRecoveryPath(autosavePath);
+    return true;
 }
 
 bool SessionManager::saveSession(
@@ -214,6 +242,7 @@ bool SessionManager::saveSession(
 struct SessionManager::AsyncSavePlan {
     struct Item {
         SessionTab state;
+        bool retained = false;
         QUuid instanceId;
         quint64 revision = 0;
         QString previousPath;
@@ -234,6 +263,7 @@ struct SessionManager::AsyncSavePlan {
     QDateTime capturedAtUtc;
     QString autosaveDir;
     QString sessionPath;
+    bool valid = true;
 };
 
 struct SessionManager::AsyncSaveResult {
@@ -254,6 +284,17 @@ std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSave(
     const QVector<ISessionDocumentPort *> &tabs, int activeIndex,
     bool forceSnapshots)
 {
+    QVector<SessionCaptureEntry> entries;
+    entries.reserve(tabs.size());
+    for (auto *tab : tabs)
+        entries.append(SessionCaptureEntry{tab});
+    return captureAsyncSaveEntries(entries, activeIndex, forceSnapshots);
+}
+
+std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSaveEntries(
+    const QVector<SessionCaptureEntry> &entries, int activeIndex,
+    bool forceSnapshots)
+{
     ensureDirs();
     auto plan = std::make_shared<AsyncSavePlan>();
     plan->activeIndex = activeIndex;
@@ -262,7 +303,25 @@ std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSave(
     plan->sessionPath = sessionFilePath();
     constexpr qint64 largeSnapshotIntervalMs = 5LL * 60 * 1000;
 
-    for (ISessionDocumentPort *tab : tabs) {
+    // Validate before exporting any live payload. Missing/corrupt managed drafts
+    // remain discoverable failure records; an external ordinary path is not ours.
+    for (const auto &entry : entries) {
+        if (const auto *retained = std::get_if<SessionTab>(&entry);
+            retained && !retained->secureDocument && !retained->autosavePath.isEmpty()
+            && !isManagedAutosavePath(retained->autosavePath)) {
+            plan->valid = false;
+            return plan;
+        }
+    }
+    for (const auto &entry : entries) {
+        if (const auto *retained = std::get_if<SessionTab>(&entry)) {
+            AsyncSavePlan::Item item;
+            item.state = *retained;
+            item.retained = true;
+            plan->items.append(std::move(item));
+            continue;
+        }
+        ISessionDocumentPort *tab = std::get<ISessionDocumentPort *>(entry);
         if (!tab)
             continue;
         AsyncSavePlan::Item item;
@@ -331,11 +390,11 @@ std::shared_ptr<SessionManager::AsyncSaveResult> SessionManager::writeAsyncSave(
     const std::shared_ptr<AsyncSavePlan> &plan) const
 {
     auto result = std::make_shared<AsyncSaveResult>();
-    if (!plan)
+    if (!plan || !plan->valid)
         return result;
     result->activeInstances = plan->activeInstances;
     result->capturedAtUtc = plan->capturedAtUtc;
-    QStringList toKeep;
+    QSet<QString> toKeep;
     QJsonArray tabsArray;
 
     for (auto &item : plan->items) {
@@ -371,8 +430,8 @@ std::shared_ptr<SessionManager::AsyncSaveResult> SessionManager::writeAsyncSave(
             if (written) {
                 finalPath = item.targetPath;
                 itemResult.snapshotWritten = true;
-                if (item.previousExists && item.previousPath != item.targetPath)
-                    QFile::remove(item.previousPath);
+                // A different previous path may still be referenced by the old
+                // manifest or an undelivered item. Only post-publication GC owns it.
             } else if (item.existingSnapshot) {
                 finalPath = item.targetPath;
             } else if (item.previousExists) {
@@ -387,8 +446,9 @@ std::shared_ptr<SessionManager::AsyncSaveResult> SessionManager::writeAsyncSave(
         item.state.autosavePath = finalPath;
         itemResult.autosavePath = finalPath;
         if (!finalPath.isEmpty())
-            toKeep.append(finalPath);
-        result->items.append(itemResult);
+            toKeep.insert(recoveryPathKey(finalPath));
+        if (!item.retained)
+            result->items.append(itemResult);
 
         QJsonObject obj;
         obj["filePath"] = item.state.filePath;
@@ -404,6 +464,7 @@ std::shared_ptr<SessionManager::AsyncSaveResult> SessionManager::writeAsyncSave(
         obj["secureDocument"] = item.state.secureDocument;
         obj["documentId"] = item.state.documentId;
         obj["presentation"] = item.state.presentation;
+        obj["hexInsertMode"] = item.state.hexInsertMode;
         obj["splitView"] = item.state.splitView;
         obj["splitOrientation"] = item.state.splitOrientation;
         tabsArray.append(obj);
@@ -426,7 +487,7 @@ std::shared_ptr<SessionManager::AsyncSaveResult> SessionManager::writeAsyncSave(
         const auto oldFiles = dir.entryInfoList(
             {"autosave_*.ndraft", "autosave_*.tmp", "tab_*.tmp"}, QDir::Files);
         for (const QFileInfo &oldFile : oldFiles) {
-            if (!toKeep.contains(oldFile.absoluteFilePath()))
+            if (!toKeep.contains(recoveryPathKey(oldFile.absoluteFilePath())))
                 QFile::remove(oldFile.absoluteFilePath());
         }
     }
@@ -443,7 +504,7 @@ void SessionManager::applyAsyncSave(
     const std::shared_ptr<AsyncSaveResult> &result,
     const QVector<ISessionDocumentPort *> &tabs)
 {
-    if (!result)
+    if (!result || !result->sessionWritten)
         return;
     QHash<QUuid, ISessionDocumentPort *> tabsByInstance;
     for (ISessionDocumentPort *tab : tabs) {
@@ -525,6 +586,7 @@ SessionData SessionManager::loadSession() const
         st.splitOrientation = obj["splitOrientation"].toString();
         st.documentId = obj["documentId"].toString();
         st.presentation = obj["presentation"].toString();
+        st.hexInsertMode = obj["hexInsertMode"].toBool(false);
         data.tabs.append(st);
     }
     data.activeTab = data.tabs.isEmpty()

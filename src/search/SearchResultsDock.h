@@ -6,8 +6,7 @@
 #include "SearchResultsModel.h"
 
 class QTreeView;
-class QLabel;
-class QPushButton;
+class SearchResultsFeedback;
 class QStackedWidget;
 class MultiSearchResultsModel;
 class SearchResultsController;
@@ -80,8 +79,7 @@ private:
     QTreeView      *m_treeView = nullptr; // 全部结果共用的虚拟化控件
     SearchResultsModel *m_model = nullptr; // 当前绑定的统一结果模型（非 owning）
     MultiSearchResultsModel *m_multiModel = nullptr;
-    QLabel         *m_summary = nullptr;
-    QPushButton    *m_rerunButton = nullptr;
+    SearchResultsFeedback *m_feedback = nullptr;
 
     // 上次按下位置对应的"行 / 匹配索引"（用于双击时跳转到指定匹配）
     int m_lastHitMatchIdx = -1;
@@ -91,6 +89,7 @@ private:
 
     void updateSummary(const QString &pattern, const QString &fileName,
                        qint64 totalMatches);
+    void updateTechnicalDetails();
     void setRerunAvailable(bool available,
                            const SearchResultTarget &preferredTarget = {});
 };

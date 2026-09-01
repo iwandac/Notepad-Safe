@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QtGlobal>
+#include <QByteArrayView>
 #include <QString>
 
 struct KdbxHeaderInfo {
@@ -12,5 +13,6 @@ struct KdbxHeaderInfo {
 
 class KdbxFormatProbe final {
 public:
+    static KdbxHeaderInfo inspectHeader(QByteArrayView header);
     static KdbxHeaderInfo inspectFile(const QString &filePath);
 };

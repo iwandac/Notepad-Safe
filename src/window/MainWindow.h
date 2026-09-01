@@ -5,6 +5,7 @@
 #include <QVector>
 #include <QStringList>
 #include <QTimer>
+#include <QSet>
 #include "TextEncoding.h"
 
 #include <memory>
@@ -26,10 +27,12 @@ class SearchResultsController;
 class SessionManager;
 class VaultDock;
 class StatusBarTaskWidget;
+class WorkspaceRecoveryCoordinator;
 class ISecuritySessionService;
 class ISecureDocumentPersistence;
 class AppComposition;
 class CommandRegistry;
+class DocumentTailActions;
 class QPaintEvent;
 struct SecureDocumentSnapshot;
 
@@ -125,13 +128,21 @@ private slots:
 
 signals:
     void firstPaintCompleted();
+    void sessionRestoreCompleted();
+    // Emitted only after every user-cancellable close check and the forced
+    // recovery-point commit have succeeded, immediately before teardown.
+    void shutdownCommitted();
 
 private:
+    friend class WorkspaceRecoveryCoordinator;
     std::unique_ptr<AppComposition> m_ownedComposition;
     AppComposition *m_composition = nullptr;
     std::unique_ptr<CommandRegistry> m_commandRegistry;
+    DocumentTailActions *m_tailActions = nullptr;
     bool m_firstPaintCompleted = false;
     QTabWidget *m_tabs = nullptr;
+    QSet<QWidget *> m_closingTabs;
+    bool m_windowCloseInProgress = false;
     QStackedWidget *m_workspaceStack = nullptr;
     QWidget *m_accountsPage = nullptr;
     QWidget *m_securityCenterPage = nullptr;
@@ -151,6 +162,8 @@ private:
     QLabel *m_statusSyntax = nullptr;
     QLabel *m_statusModified = nullptr;
     QToolButton *m_hexEditModeButton = nullptr;
+    QToolButton *m_externalOpenFailuresButton = nullptr;
+    QStringList m_externalOpenFailures;
     StatusBarTaskWidget *m_taskWidget = nullptr;
 
     // 最近文件菜单
@@ -236,8 +249,19 @@ private:
     void createToolBar();
     void createStatusBar();
 
+    enum class OpenPresentationPolicy {
+        FocusDocumentWorkspace,
+        PreserveCurrentWorkspace
+    };
+    enum class OpenAuthorizationPolicy {
+        AllowInteractive,
+        DenyInteractiveUnlock
+    };
     EditorTab *currentTab() const;
-    EditorTab *addNewTab();
+    EditorTab *addNewTab(
+        OpenPresentationPolicy presentation =
+            OpenPresentationPolicy::FocusDocumentWorkspace,
+        int recoveryItemIndex = -1);
     void showDocumentWorkspace();
     bool showAccountsWorkspace();
     bool showSecurityCenterWorkspace();
@@ -245,12 +269,22 @@ private:
     void changeMasterPassword();
     void exportRecoveryKey();
     void verifyRecoveryKey();
-    bool ensureSecuritySessionInteractive();
+    bool ensureSecuritySessionInteractive(
+        OpenPresentationPolicy presentation = OpenPresentationPolicy::FocusDocumentWorkspace);
     bool openPathUnified(const QString &path, EditorTab *reuseTab = nullptr,
-                         std::optional<TextEncoding> forcedEncoding = std::nullopt);
-    bool openSecurePath(const QString &path, EditorTab *reuseTab = nullptr);
+                         std::optional<TextEncoding> forcedEncoding = std::nullopt,
+                         OpenPresentationPolicy presentation =
+                             OpenPresentationPolicy::FocusDocumentWorkspace,
+                         OpenAuthorizationPolicy authorization =
+                             OpenAuthorizationPolicy::AllowInteractive,
+                         QString *failureReason = nullptr,
+                         bool *securityRefused = nullptr);
+    EditorTab *findOpenPlainDocument(const QString &path) const;
+    bool openSecurePath(const QString &path, EditorTab *reuseTab = nullptr,
+                        OpenPresentationPolicy presentation = OpenPresentationPolicy::FocusDocumentWorkspace);
     EditorTab *adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
-                                   EditorTab *reuseTab = nullptr);
+                                   EditorTab *reuseTab = nullptr,
+                                   OpenPresentationPolicy presentation = OpenPresentationPolicy::FocusDocumentWorkspace);
     enum class ExternalSaveDisposition { Proceed, HandledSuccess, Cancelled };
     ExternalSaveDisposition resolveExternalSaveConflict(EditorTab *tab);
     ExternalSaveDisposition resolveSecureExternalSaveConflict(EditorTab *tab);
@@ -263,7 +297,7 @@ private:
     // closingApp=true: 关闭整个应用，未命名文件走 autosave 不提示
     // closingApp=false (默认): 关闭单个标签，未命名文件且有内容也要提示是否保存
     bool maybeSaveTab(int index, bool closingApp = false);
-    void closeTabUnchecked(int index);
+    void closeTabUnchecked(int index, bool checkSave = false);
     void closeOtherTabs(int keepIndex);
     void updateStatusBar();
     void showWorkspaceStatus(const QString &workspaceName);
@@ -278,8 +312,7 @@ private:
     bool isDocumentWorkspaceActive() const;
     void loadSettings();
     void saveSettings();
-    void restoreSession();
-    void saveSessionNow(bool forceSnapshots = false);
+    bool saveSessionNow(bool forceSnapshots = false);
     bool saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool showErrors = true);
     bool checkpointSecureTab(EditorTab *tab, QString *errorMessage = nullptr);
     static QString secureTitleFrom(EditorTab *tab);
@@ -303,9 +336,7 @@ private slots:
     // 恢复队列：每 singleShot(0) 处理 1 个 tab，处理间允许 UI 重绘
     void restoreNextSessionTab();
 private:
-    // 完整结构体定义在 MainWindow.cpp（避免在此处 #include SessionManager.h 拖慢编译）
-    struct PendingSessionRestore;
-    PendingSessionRestore *m_pendingRestore = nullptr;  // 仅在恢复期间非空
+    std::unique_ptr<WorkspaceRecoveryCoordinator> m_workspaceRecovery;
 
     // 给一个 widget 及（如果是 EditorTab）内部 editor/viewport 关闭 acceptDrops
     // 并安装事件过滤器，转发 drag/drop 到 MainWindow，防止子控件（QsciScintilla）吞事件

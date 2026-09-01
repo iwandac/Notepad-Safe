@@ -151,6 +151,7 @@ void SearchResultsModel::clear() {
     groupedLines_.clear();
     totalMatchCount_ = 0;
     incompleteReason_.clear();
+    incompleteUserReason_.clear();
     overrunFile_.clear();
     overrunCount_ = 0;
     overrunCheckpoints_.clear();
@@ -293,6 +294,7 @@ void SearchResultsModel::setResults(const QVector<LargeFileSearchMatch>& memoryM
     beginResetModel();
     memoryMatches_ = memoryMatches;
     incompleteReason_.clear();
+    incompleteUserReason_.clear();
     overrunFile_ = overrunFilePath;
     overrunCount_ = overrunCount;
     totalMatchCount_ = qint64(memoryMatches.size()) + overrunCount;

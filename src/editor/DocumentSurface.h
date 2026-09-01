@@ -2,6 +2,7 @@
 
 #include "DocumentState.h"
 #include "TextEncoding.h"
+#include "PersistenceReadPolicy.h"
 
 #include <QString>
 #include <optional>
@@ -14,6 +15,8 @@ struct DocumentSurfaceOpenRequest {
     bool windowed = false;
     DocumentPresentationKind presentation = DocumentPresentationKind::Text;
     std::optional<TextEncoding> forcedEncoding;
+    PersistenceReadPolicy readPolicy;
+    bool requireReadOnly = false;
 };
 
 // The application layer opens a document through this narrow port.  It must

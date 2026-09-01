@@ -6,6 +6,7 @@
 #include "EditorTab.h"
 #include "VirtualFileView.h"
 #include "WindowedReadOnlyProvider.h"
+#include "AppComposition.h"
 #include "AsyncThreadPool.h"
 
 #include <QApplication>
@@ -269,6 +270,7 @@ void test_session_tab_default_values()
     CHECK(st.cursorIndex == 0, "默认 cursorIndex 应为 0");
     CHECK(st.modified == false, "默认 modified 应为 false");
     CHECK(st.autosavePath.isEmpty(), "默认 autosavePath 应为空");
+    CHECK(st.hexInsertMode == false, "默认 Hex 编辑模式应为安全的 OVR");
 }
 
 void test_session_data_default_values()
@@ -434,6 +436,8 @@ void test_binary_hex_patch_recovery_is_encrypted_and_restorable()
     CHECK(source->l2View()->replaceBytes(20, replacement.size(), replacement, &error),
           "修改 4 个原始字节");
     source->gotoByteOffset(20, replacement.size());
+    source->toggleHexOverwriteMode();
+    CHECK(!source->hexOverwriteMode(), "恢复点前已显式切换为 INS");
     QVector<ISessionDocumentPort *> tabs{source.get()};
     CHECK(sm.saveSession(tabs, 0, true), "保存 Binary/Hex 加密恢复会话");
 
@@ -442,6 +446,7 @@ void test_binary_hex_patch_recovery_is_encrypted_and_restorable()
     if (state.tabs.size() == 1) {
         const SessionTab &tabState = state.tabs.first();
         CHECK(tabState.presentation == "hex", "会话保留 Hex 呈现方式");
+        CHECK(tabState.hexInsertMode, "会话显式保留 Hex INS/OVR 状态");
         CHECK(tabState.cursorByteOffset == 24
                   && tabState.selectionStartByte == 20
                   && tabState.selectionEndByte == 24,
@@ -509,6 +514,7 @@ void test_worker_limit_and_unicode_character_count()
     WindowedReadOnlyProvider provider;
     QString countError;
     CHECK(provider.openFile(countPath, WindowedReadOnlyProvider::Presentation::Text,
+                            AppComposition().persistenceAdapters().readPolicySnapshot(),
                             &countError),
           "窗口化文本启动后台字符统计");
     QElapsedTimer countTimer;

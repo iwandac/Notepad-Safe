@@ -2,7 +2,6 @@
 #include "LineIndex.h"
 #include "PatchList.h"
 #include "DynamicThresholds.h"
-#include "AsyncTaskManager.h"
 #include "EncodedRegexCompiler.h"
 #include "Pcre2Regex.h"
 
@@ -15,6 +14,7 @@
 #include <QDateTime>
 #include <QUuid>
 #include <QPointer>
+#include <QThread>
 #include <cstring>
 #include <algorithm>
 #include <utility>
@@ -195,19 +195,26 @@ std::function<qint64(qint64)> makeByteCandidateFinder(
             const qint64 chunkEnd = qMin(anchorSearchLimit,
                                          state->searchOffset + Chunk);
             const size_t available = size_t(chunkEnd - state->searchOffset);
-            const void *first = std::memchr(subject + state->searchOffset,
-                                            anchor, available);
-            const void *alternate = nullptr;
+            const uchar *hit = nullptr;
             if (!caseSensitive && alternateAnchor != foldedAnchor) {
-                alternate = std::memchr(subject + state->searchOffset,
-                                        alternateAnchor, available);
-                first = std::memchr(subject + state->searchOffset,
-                                    foldedAnchor, available);
+                // A pair of independent memchr calls is only linear when both
+                // cases are sparse.  With dense single-case input, the absent
+                // alternate used to rescan the complete remaining chunk before
+                // every nearby hit.  Visit this bounded chunk once and accept
+                // either ASCII spelling so the candidate cursor stays monotonic.
+                const uchar *cursor = subject + state->searchOffset;
+                const uchar *end = subject + chunkEnd;
+                while (cursor < end) {
+                    if (*cursor == foldedAnchor || *cursor == alternateAnchor) {
+                        hit = cursor;
+                        break;
+                    }
+                    ++cursor;
+                }
+            } else {
+                hit = static_cast<const uchar *>(std::memchr(
+                    subject + state->searchOffset, anchor, available));
             }
-            const auto *hit = static_cast<const uchar *>(first);
-            const auto *alternateHit = static_cast<const uchar *>(alternate);
-            if (!hit || (alternateHit && alternateHit < hit))
-                hit = alternateHit;
             if (!hit) {
                 state->searchOffset = chunkEnd;
                 const qint64 examined = qMin(
@@ -808,7 +815,10 @@ void LargeFileSearch::setSource(const uchar* mmapBase, qint64 mmapSize,
 {
     // All four source objects are borrowed. Never replace them while a queued
     // or running search can still dereference the previous snapshot.
+    const QPointer<LargeFileSearch> owner(this);
     stopWorkers(false);
+    if (!owner)
+        return;
     mmapBase_ = mmapBase;
     mmapSize_ = mmapSize;
     lineIndex_ = lineIndex;
@@ -831,44 +841,6 @@ void LargeFileSearch::requestCancel() {
     cancel_.store(true, std::memory_order_relaxed);
 }
 
-bool LargeFileSearch::reserveWorker()
-{
-    std::lock_guard<std::mutex> lock(workerMutex_);
-    if (shuttingDown_ || workerReservations_ != 0)
-        return false;
-    ++workerReservations_;
-    return true;
-}
-
-void LargeFileSearch::releaseWorker()
-{
-    std::lock_guard<std::mutex> lock(workerMutex_);
-    if (workerReservations_ > 0)
-        --workerReservations_;
-    if (workerReservations_ == 0)
-        workerIdle_.notify_all();
-}
-
-void LargeFileSearch::stopWorkers(bool permanent)
-{
-    cancel_.store(true, std::memory_order_release);
-    const qint64 taskId = lastTaskId_;
-    if (taskId > 0)
-        AsyncTaskManager::instance().cancel(taskId);
-
-    std::unique_lock<std::mutex> lock(workerMutex_);
-    if (permanent)
-        shuttingDown_ = true;
-    workerIdle_.wait(lock, [this] { return workerReservations_ == 0; });
-    lastTaskId_ = 0;
-    if (!permanent)
-        cancel_.store(false, std::memory_order_release);
-}
-
-void LargeFileSearch::cancelAndWait()
-{
-    stopWorkers(false);
-}
 
 // ============================================================================
 //  溢出文件操作
@@ -1111,6 +1083,25 @@ void LargeFileSearch::fillLineContext(LargeFileSearchMatch& m,
     assignContext(lineStart, lineEnd,
                   qMax(lineStart, m.byteOffset - SideBytes),
                   qMin(lineEnd, visibleMatchEnd + SideBytes));
+}
+
+bool LargeFileSearch::sourceInUse()
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    std::lock_guard<std::mutex> lock(workerMutex_);
+    return workerReservations_ != 0 || bool(currentWorker_) || stoppingWorkers_ || shuttingDown_;
+}
+
+bool LargeFileSearch::rebindIdleSource(const uchar *base, qint64 size,
+                                      const LineIndex *lines, const PatchList *patches)
+{
+    if (sourceInUse()) return false;
+    mmapBase_ = base;
+    mmapSize_ = size;
+    lineIndex_ = lines;
+    lineIndexCompleteAtSnapshot_ = lines && !lines->isIncomplete();
+    patchList_ = patches;
+    return true;
 }
 
 void LargeFileSearch::fillByteContext(LargeFileSearchMatch& m) const

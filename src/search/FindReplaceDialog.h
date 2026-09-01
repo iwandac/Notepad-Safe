@@ -16,6 +16,8 @@ class QTabWidget;
 class QWidget;
 class DocumentSearchSurface;
 class SearchResultsDock;
+class SingleFindAllRequest;
+class SearchNavigationRequest;
 
 // 非模态查找/替换对话框
 class FindReplaceDialog : public QDialog {
@@ -51,9 +53,6 @@ private slots:
 
     // L2 异步搜索回调
     void onL2FindAllProgress(int percent, qint64 done, qint64 total);
-    void onL2FindAllFinished(class SearchResultsModel* model,
-                             const QString& pattern,
-                             const QString& fileName);
 
 private:
     QLineEdit *m_findEdit = nullptr;
@@ -82,13 +81,10 @@ private:
     SearchResultsDock *m_resultsDock = nullptr;
     QTabWidget *m_tabWidget = nullptr;
 
-    // 上一个文档搜索表面的异步信号连接（切换 tab 时断开）
-    QMetaObject::Connection m_l2ProgressConn;
-    QMetaObject::Connection m_l2PartialConn;
-    QMetaObject::Connection m_l2FinishedConn;
+    QPointer<SingleFindAllRequest> m_singleRequest;
+    QPointer<SearchNavigationRequest> m_navigationRequest;
     QMetaObject::Connection m_rerunConnection;
     bool m_l2SearchInProgress = false;
-    bool m_navigationInProgress = false;
     bool m_allowNavigationDuringBusy = false;
     bool m_replaceMode = false;
     SearchSession m_searchSession;
@@ -97,13 +93,19 @@ private:
     int m_multiNextIndex = 0;
 
     void buildUi();
+    void disconnectSingleSearch();
+    void finishSingleSearch();
+    void onL2FindAllFinished(QPointer<SingleFindAllRequest> request,
+                            QPointer<DocumentSearchSurface> target,
+                            class SearchResultsModel *model,
+                            const QString &pattern, const QString &fileName);
     QString currentFindText() const;
     QString currentReplaceText() const;
     void emitFindParameters();
     // L2 异步搜索期间：按钮启用/禁用 + 状态提示
     void setL2SearchUiBusy(bool busy, const QString& msg = QString(),
                            bool allowNavigation = false);
-    void setNavigationUiBusy(bool busy, const QString& msg = QString());
+    void updateNavigationUi(const QString& msg = QString());
     bool allOpenScope() const;
     bool hexBytesMode() const;
     void updateQueryUi();

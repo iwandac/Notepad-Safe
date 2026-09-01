@@ -5,6 +5,7 @@
 #include "SearchResultsDock.h"
 #include "SearchResultsController.h"
 #include "SessionManager.h"
+#include "WorkspaceRecoveryCoordinator.h"
 #include "TextEncoding.h"
 #include "FileTierPolicy.h"
 #include "VirtualFileView.h"
@@ -125,7 +126,7 @@ void MainWindow::ensureFindDialogCreated()
     });
 }
 
-bool MainWindow::ensureSecuritySessionInteractive()
+bool MainWindow::ensureSecuritySessionInteractive(OpenPresentationPolicy presentation)
 {
     ensureSecurityServicesCreated();
     if (!m_securitySession || !m_securitySession->available()
@@ -134,7 +135,7 @@ bool MainWindow::ensureSecuritySessionInteractive()
                               QStringLiteral("当前构建未包含 KDBX 安全后端。"));
         return false;
     }
-    const auto restoreMaskedTabs = [this]() {
+    const auto restoreMaskedTabs = [this, presentation]() {
         if (m_securePersistence) {
             const int activeIndex = m_tabs ? m_tabs->currentIndex() : -1;
             for (int i = 0; m_tabs && i < m_tabs->count(); ++i) {
@@ -155,11 +156,12 @@ bool MainWindow::ensureSecuritySessionInteractive()
                         return m_securePersistence->open(backing, &restored);
                     });
                 if (!restoreError.isError()) {
-                    adoptSecureSnapshot(restored, masked);
+                    adoptSecureSnapshot(restored, masked, presentation);
                     restored.text.fill(QChar(0));
                 }
             }
-            if (activeIndex >= 0 && activeIndex < m_tabs->count())
+            if (presentation == OpenPresentationPolicy::FocusDocumentWorkspace
+                && activeIndex >= 0 && activeIndex < m_tabs->count())
                 m_tabs->setCurrentIndex(activeIndex);
         }
     };
@@ -328,10 +330,17 @@ void MainWindow::newFile()
     statusBar()->showMessage(QStringLiteral("已新建文档"), 1800);
 }
 
-EditorTab *MainWindow::addNewTab()
+EditorTab *MainWindow::addNewTab(OpenPresentationPolicy presentation, int recoveryItemIndex)
 {
-    showDocumentWorkspace();
+    const bool activateDocumentWorkspace =
+        presentation == OpenPresentationPolicy::FocusDocumentWorkspace;
+    QWidget *const previousCurrent = m_tabs->currentWidget();
+    if (activateDocumentWorkspace)
+        showDocumentWorkspace();
+    if (!WorkspaceRecoveryCoordinator::forWindow(this).mayCreateTarget(recoveryItemIndex))
+        return nullptr;
     auto *tab = new EditorTab(this);
+    WorkspaceRecoveryCoordinator::forWindow(this).attachInFlightTarget(recoveryItemIndex, tab);
     int index = m_tabs->addTab(tab, QStringLiteral("未命名"));
 
     // 注册拖放代理：保证拖到这个 EditorTab/editor/viewport 任意位置都能触发 MainWindow 打开
@@ -477,13 +486,18 @@ EditorTab *MainWindow::addNewTab()
             syncGlobalMenuCheckStates();
     });
 
-    m_tabs->setCurrentIndex(index);
+    if (activateDocumentWorkspace) {
+        m_tabs->setCurrentIndex(index);
+    } else if (previousCurrent && m_tabs->currentWidget() != previousCurrent) {
+        m_tabs->setCurrentWidget(previousCurrent);
+    }
     if (m_findDialog) {
-        m_findDialog->setActiveTab(tab);
+        if (activateDocumentWorkspace)
+            m_findDialog->setActiveTab(tab);
         m_findDialog->notifyTabOpened(tab);
     }
     // 新建后立刻同步一次 L2 敏感动作（覆盖新 tab 还没收到任何信号的早期空状态）
-    syncCommandStates(tab);
+    syncCommandStates(currentTab());
     return tab;
 }
 
@@ -893,12 +907,15 @@ void MainWindow::maskSecureDocuments()
 }
 
 EditorTab *MainWindow::adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
-                                          EditorTab *reuseTab)
+                                          EditorTab *reuseTab,
+                                          OpenPresentationPolicy presentation)
 {
     if (!m_securePersistence || !m_securePersistence->available())
         return nullptr;
-    showDocumentWorkspace();
-    EditorTab *tab = reuseTab ? reuseTab : addNewTab();
+    const bool activate = presentation == OpenPresentationPolicy::FocusDocumentWorkspace;
+    if (activate)
+        showDocumentWorkspace();
+    EditorTab *tab = reuseTab ? reuseTab : addNewTab(presentation);
     if (reuseTab && reuseTab->isSecureDocument()
         && reuseTab->secureDocumentId() != snapshot.documentId
         && m_securePersistence) {
@@ -930,10 +947,12 @@ EditorTab *MainWindow::adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
     tab->setModified(snapshot.recoveredUnsaved);
     const int index = m_tabs->indexOf(tab);
     if (index >= 0) {
-        m_tabs->setCurrentIndex(index);
         m_tabs->setTabText(index, tab->tabTitle());
+        if (activate) {
+            m_tabs->setCurrentIndex(index);
+            tab->setFocusEditor();
+        }
     }
-    tab->setFocusEditor();
     if (snapshot.recoveredUnsaved) {
         statusBar()->showMessage(
             QStringLiteral("已恢复上次未写入 KDBX 的本机加密内容，请确认后保存。"),
@@ -944,7 +963,8 @@ EditorTab *MainWindow::adoptSecureSnapshot(SecureDocumentSnapshot &snapshot,
 }
 
 
-bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
+bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab,
+                                OpenPresentationPolicy presentation)
 {
     ensureSecurityServicesCreated();
     if (!m_securePersistence || !m_securePersistence->available())
@@ -959,13 +979,15 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
                                     ? openTab->secureBackingPath() : openTab->filePath();
         if (QFileInfo(backing).absoluteFilePath().compare(absolutePath,
                                                           Qt::CaseInsensitive) == 0) {
-            showDocumentWorkspace();
-            m_tabs->setCurrentIndex(i);
-            openTab->setFocusEditor();
+            if (presentation == OpenPresentationPolicy::FocusDocumentWorkspace) {
+                showDocumentWorkspace();
+                m_tabs->setCurrentIndex(i);
+                openTab->setFocusEditor();
+            }
             return true;
         }
     }
-    if (!m_securitySession->hasActiveSession() && !ensureSecuritySessionInteractive())
+    if (!m_securitySession->hasActiveSession() && !ensureSecuritySessionInteractive(presentation))
         return false;
 
     SecureDocumentSnapshot snapshot;
@@ -974,7 +996,7 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
         QStringLiteral("正在打开安全文档"),
         [this, path, &snapshot] { return m_securePersistence->open(path, &snapshot); });
     if (!error.isError()) {
-        if (!adoptSecureSnapshot(snapshot, reuseTab))
+        if (!adoptSecureSnapshot(snapshot, reuseTab, presentation))
             return false;
         if (!snapshot.draft)
             updateRecentFiles(path);
@@ -1023,7 +1045,7 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
             buffer.clear();
         }
         if (!error.isError()) {
-            if (!adoptSecureSnapshot(snapshot, reuseTab))
+            if (!adoptSecureSnapshot(snapshot, reuseTab, presentation))
                 return false;
             if (!snapshot.draft)
                 updateRecentFiles(path);
@@ -1032,212 +1054,6 @@ bool MainWindow::openSecurePath(const QString &path, EditorTab *reuseTab)
         dialog.showError(error.userMessage);
     }
     return false;
-}
-
-bool MainWindow::openPathUnified(const QString &path, EditorTab *reuseTab,
-                                 std::optional<TextEncoding> forcedEncoding)
-{
-    const QFileInfo info(path);
-    if (!info.isFile())
-        return false;
-    const auto persistenceAdapter =
-        m_composition->persistenceAdapters().resolve(path);
-    if (persistenceAdapter
-        && persistenceAdapter->persistence == DocumentPersistence::SecureFile) {
-        ensureSecurityServicesCreated();
-        if (!m_securePersistence || !m_securePersistence->available()) {
-            QMessageBox::critical(this, QStringLiteral("安全文件不可用"),
-                                  QStringLiteral("当前构建未包含 KDBX 安全后端。"));
-            return false;
-        }
-        QString documentType;
-        QUuid documentId;
-        SecurityIdentityParameters fileParameters;
-        const VaultError probe = m_securePersistence->inspectFile(
-            path, &documentType, &documentId, &fileParameters);
-        if (!probe.isError() && documentType == QStringLiteral("SecureDocument")) {
-            // A copied or hard-linked .nsafe still carries the same document id.
-            // Focus its live editor instead of asking the service to open a
-            // second competing handle to the same logical document.
-            if (!reuseTab && !documentId.isNull()) {
-                for (int i = 0; i < m_tabs->count(); ++i) {
-                    auto *openTab = qobject_cast<EditorTab *>(m_tabs->widget(i));
-                    if (!openTab || openTab->secureDocumentId() != documentId)
-                        continue;
-                    showDocumentWorkspace();
-                    m_tabs->setCurrentIndex(i);
-                    openTab->setFocusEditor();
-                    updateRecentFiles(path);
-                    statusBar()->showMessage(QStringLiteral("文件已在当前窗口中打开"), 2000);
-                    return true;
-                }
-            }
-            return openSecurePath(path, reuseTab);
-        }
-        if (probe.isError()
-            && probe.diagnosticCode != QStringLiteral("identity.envelope.missing")) {
-            QMessageBox box(QMessageBox::Critical, QStringLiteral("安全文件已损坏"),
-                            probe.userMessage, QMessageBox::Ok, this);
-            box.setDetailedText(probe.diagnosticCode);
-            box.exec();
-            return false;
-        }
-
-        const bool managedAccounts = !probe.isError()
-                                     && documentType == QStringLiteral("Accounts");
-        // Account KDBX routing needs its adapter before credentials are
-        // applied. The workspace remains lazy for ordinary startup/documents,
-        // but file-open is a legitimate first-use trigger.
-        ensureAccountsWorkspaceCreated();
-        if (!ensureSecuritySessionInteractive())
-            return false;
-        if (managedAccounts) {
-            SecureBuffer rememberedMaster;
-            VaultError sessionOpen = m_securitySession->acquireRememberedMasterKey(
-                fileParameters, &rememberedMaster);
-            if (!sessionOpen.isError()) {
-                sessionOpen = m_vaultDock->unlockManagedStoreWithMasterKey(
-                    path, rememberedMaster);
-            }
-            rememberedMaster.clear();
-            if (sessionOpen.isError()) {
-                SecureBuffer rememberedRecovery;
-                VaultError recoveryOpen =
-                    m_securitySession->acquireRememberedRecoverySecret(
-                        fileParameters, &rememberedRecovery);
-                if (!recoveryOpen.isError()) {
-                    recoveryOpen = m_vaultDock->unlockManagedStoreWithRecoverySecret(
-                        path, rememberedRecovery);
-                }
-                rememberedRecovery.clear();
-                sessionOpen = recoveryOpen;
-            }
-            if (!sessionOpen.isError()) {
-                updateRecentFiles(path);
-                return showAccountsWorkspace();
-            }
-            if (sessionOpen.code != VaultErrorCode::InvalidCredentials) {
-                QMessageBox box(QMessageBox::Critical,
-                                QStringLiteral("无法打开账户集合"),
-                                sessionOpen.userMessage, QMessageBox::Ok, this);
-                box.setDetailedText(sessionOpen.diagnosticCode);
-                box.exec();
-                return false;
-            }
-        }
-
-        FileCredentialDialog dialog(
-            managedAccounts ? QStringLiteral("打开受其他密码保护的账户集合")
-                            : QStringLiteral("打开兼容 KDBX"),
-            managedAccounts
-                ? QStringLiteral("当前会话不能解锁此账户文件。选择该文件的主密码或恢复密钥。")
-                : QStringLiteral("输入此 KDBX 文件的主密码。"),
-            managedAccounts, this);
-        while (dialog.exec() == QDialog::Accepted) {
-            VaultError error;
-            if (dialog.kind() == FileCredentialDialog::Kind::RecoveryKey) {
-                QString recoveryKey = dialog.takeRecoveryKey();
-                if (recoveryKey.isEmpty()) {
-                    dialog.showError(QStringLiteral("请输入恢复密钥。"));
-                    continue;
-                }
-                SecureBuffer recoverySecret;
-                error = m_securitySession->decodeRecoveryKey(
-                    recoveryKey, &recoverySecret);
-                if (!error.isError()) {
-                    error = m_vaultDock->unlockManagedStoreWithRecoverySecret(
-                        path, recoverySecret);
-                }
-                if (!error.isError()) {
-                    error = m_securitySession->rememberRecoverySecret(
-                        fileParameters, recoverySecret);
-                }
-                recoverySecret.clear();
-                recoveryKey.fill(QChar(0));
-                recoveryKey.clear();
-            } else {
-                SecureBuffer buffer = dialog.takePassphrase();
-                if (buffer.empty()) {
-                    dialog.showError(QStringLiteral("请输入文件密码。"));
-                    continue;
-                }
-                if (managedAccounts) {
-                    SecureBuffer masterUnlockKey;
-                    error = m_securitySession->deriveMasterUnlockKey(
-                        buffer, fileParameters, &masterUnlockKey);
-                    if (!error.isError()) {
-                        error = m_vaultDock->unlockManagedStoreWithMasterKey(
-                            path, masterUnlockKey);
-                    }
-                    if (!error.isError()) {
-                        error = m_securitySession->rememberMasterKey(
-                            fileParameters, masterUnlockKey);
-                    }
-                    masterUnlockKey.clear();
-                } else {
-                    error = m_vaultDock->unlockVault(path, buffer);
-                }
-                buffer.clear();
-            }
-            if (!error.isError()) {
-                updateRecentFiles(path);
-                return showAccountsWorkspace();
-            }
-            dialog.showError(error.userMessage);
-        }
-        return false;
-    }
-    // Normal Open is idempotent.  Probe at most 192 KiB regardless of file
-    // size, then compare against the baselines already captured by each tab.
-    // Reload deliberately supplies reuseTab and must re-read that tab instead.
-    if (!reuseTab) {
-        DiskFileVersion candidate;
-        const DiskFileState candidateState = captureDiskFileVersion(path, &candidate);
-        for (int i = 0; i < m_tabs->count(); ++i) {
-            auto *openTab = qobject_cast<EditorTab *>(m_tabs->widget(i));
-            if (!openTab || openTab->isSecureDocument())
-                continue;
-            const bool samePath = sameDiskFilePath(openTab->filePath(), path);
-            const bool sameIdentity = candidateState == DiskFileState::Unchanged
-                                      && openTab->representsDiskFile(candidate);
-            if (!samePath && !sameIdentity)
-                continue;
-            showDocumentWorkspace();
-            m_tabs->setCurrentIndex(i);
-            openTab->setFocusEditor();
-            updateRecentFiles(path);
-            statusBar()->showMessage(QStringLiteral("文件已在当前窗口中打开"), 2000);
-            return true;
-        }
-    }
-
-    showDocumentWorkspace();
-    EditorTab *tab = reuseTab ? reuseTab : addNewTab();
-    if (reuseTab && reuseTab->isSecureDocument()) {
-        if (m_securePersistence)
-            closeSecureDocumentOnSecurityLane(reuseTab->secureDocumentId());
-        // External Open may reuse the single empty default secure draft. The
-        // reused tab must stop being a secure document before ordinary routing.
-        reuseTab->convertToPlainDocument(QString());
-    }
-    const bool opened = openDocumentByPolicy(
-        m_composition->documentProviders(), tab, path, forcedEncoding);
-    if (!opened) {
-        if (!reuseTab) {
-            const int index = m_tabs->indexOf(tab);
-            if (index >= 0)
-                m_tabs->removeTab(index);
-            delete tab;
-        }
-        return false;
-    }
-    updateRecentFiles(path);
-    m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
-    if (tab == currentTab()) {
-        syncGlobalMenuCheckStates();
-        updateStatusBar();
-    }
-    return true;
 }
 
 void MainWindow::openFile()

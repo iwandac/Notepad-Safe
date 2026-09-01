@@ -1,12 +1,11 @@
 #include "MainWindow.h"
 #include "AppComposition.h"
 #include "AsyncSerialQueue.h"
-#include "DocumentOpenWorkflow.h"
-#include "DocumentSessionView.h"
 #include "EditorTab.h"
 #include "FileTierPolicy.h"
 #include "SessionManager.h"
 #include "VaultDock.h"
+#include "WorkspaceRecoveryCoordinator.h"
 
 #include <QApplication>
 #include <QCloseEvent>
@@ -16,6 +15,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QPointer>
+#include <QScopeGuard>
 #include <QProgressDialog>
 #include <QSettings>
 #include <QStatusBar>
@@ -43,62 +43,14 @@ std::unique_ptr<QSettings> createAppSettings()
 }
 } // namespace
 
-void MainWindow::restoreSession()
-{
-    SessionData data = m_session->loadSession();
-    if (data.tabs.isEmpty())
-        return;
-
-    bool hasUnsaved = false;
-    for (const SessionTab &st : data.tabs) {
-        auto *tab = addNewTab();
-
-        bool loaded = false;
-        // 优先从 autosave 恢复未保存内容
-        if (!st.autosavePath.isEmpty() && QFileInfo::exists(st.autosavePath)) {
-            loaded = m_session->restoreAutosave(tab, st.autosavePath, st.filePath);
-            if (loaded)
-                hasUnsaved = true;
-            // 恢复语法（autosave 本身不猜语法）
-            tab->setSyntax(static_cast<Syntax>(st.syntax));
-        } else if (!st.filePath.isEmpty() && QFileInfo::exists(st.filePath)) {
-            loaded = openSessionDocument(m_composition->documentProviders(), tab, st);
-        }
-
-        if (!loaded) {
-            tab->setSyntax(static_cast<Syntax>(st.syntax));
-        } else {
-            restoreDocumentSessionView(tab, st);
-        }
-        m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
-    }
-
-    if (data.activeTab >= 0 && data.activeTab < m_tabs->count())
-        m_tabs->setCurrentIndex(data.activeTab);
-
-    if (hasUnsaved) {
-        statusBar()->showMessage(QStringLiteral("已恢复上次未保存的会话"), 5000);
-    }
-
-    // 恢复完成后清理 session.json（不清 autosave，因为会话内存中已关联，
-    // 下次 saveSession 会用 keep-list 正确保留/清理）
-    QFile::remove(m_session->sessionFilePath());
-}
-void MainWindow::saveSessionNow(bool forceSnapshots)
+bool MainWindow::saveSessionNow(bool forceSnapshots)
 {
     if (!forceSnapshots && AsyncSerialQueue::session().busy())
-        return; // Coalesce periodic autosaves; the next timer captures the latest revision.
+        return true; // Coalesce periodic autosaves; the next timer captures the latest revision.
 
-    QVector<ISessionDocumentPort *> tabs;
-    for (int i = 0; i < m_tabs->count(); ++i) {
-        auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
-        // SessionManager only records secure document ids and encrypted backing
-        // paths; it never serializes decrypted secure text.
-        if (tab)
-            tabs.append(tab);
-    }
-    auto plan = m_session->captureAsyncSave(
-        tabs, m_tabs->currentIndex(), forceSnapshots);
+    int activeIndex = 0;
+    const auto entries = WorkspaceRecoveryCoordinator::forWindow(this).captureEntries(&activeIndex);
+    auto plan = m_session->captureAsyncSaveEntries(entries, activeIndex, forceSnapshots);
     auto result = std::make_shared<std::shared_ptr<SessionManager::AsyncSaveResult>>();
 
     AsyncSerialQueue::Request request;
@@ -123,7 +75,8 @@ void MainWindow::saveSessionNow(bool forceSnapshots)
                 return;
             QVector<ISessionDocumentPort *> currentTabs;
             for (int i = 0; i < guarded->m_tabs->count(); ++i) {
-                if (auto *tab = qobject_cast<EditorTab *>(guarded->m_tabs->widget(i)))
+                if (auto *tab = dynamic_cast<ISessionDocumentPort *>(
+                        guarded->m_tabs->widget(i)))
                     currentTabs.append(tab);
             }
             guarded->m_session->applyAsyncSave(*result, currentTabs);
@@ -132,7 +85,7 @@ void MainWindow::saveSessionNow(bool forceSnapshots)
                     QStringLiteral("自动恢复快照未能提交；将稍后重试。"), 5000);
         };
         AsyncSerialQueue::session().enqueue(std::move(request));
-        return;
+        return true;
     }
 
     QProgressDialog progress(QStringLiteral("正在建立最新恢复点…"), QString(),
@@ -142,14 +95,19 @@ void MainWindow::saveSessionNow(bool forceSnapshots)
     progress.setMinimumDuration(150);
     progress.setCancelButton(nullptr);
     QEventLoop loop;
-    request.completed = [guarded, result, &loop, &progress](AsyncTaskState state) {
+    bool committed = false;
+    request.completed = [guarded, result, &loop, &progress,
+                         &committed](AsyncTaskState state) {
         if (guarded && guarded->m_session) {
             QVector<ISessionDocumentPort *> currentTabs;
             for (int i = 0; i < guarded->m_tabs->count(); ++i) {
-                if (auto *tab = qobject_cast<EditorTab *>(guarded->m_tabs->widget(i)))
+                if (auto *tab = dynamic_cast<ISessionDocumentPort *>(
+                    guarded->m_tabs->widget(i)))
                     currentTabs.append(tab);
             }
             guarded->m_session->applyAsyncSave(*result, currentTabs);
+            committed = state == AsyncTaskState::Finished
+                        && guarded->m_session->asyncSaveSucceeded(*result);
             if (state == AsyncTaskState::Failed) {
                 guarded->statusBar()->showMessage(
                     QStringLiteral("恢复点提交失败；已有恢复文件仍被保留。"), 7000);
@@ -161,195 +119,17 @@ void MainWindow::saveSessionNow(bool forceSnapshots)
     AsyncSerialQueue::session().enqueue(std::move(request));
     progress.show();
     loop.exec(QEventLoop::ExcludeUserInputEvents);
+    return committed;
 }
 
-// ============================================================================
-//  PendingSessionRestore：MainWindow 私有结构体（会话恢复队列状态）
-//  头文件用前置声明避免拖慢编译；完整定义只在此 cpp 中。
-// ============================================================================
-struct MainWindow::PendingSessionRestore {
-    QVector<SessionTab> tabs;
-    int activeTab = 0;
-    int currentIndex = 0;   // 已处理到第几个 tab
-    bool hasUnsaved = false;
-    QString sessionJsonPathToRemove;
-    QPointer<EditorTab> preferredActiveTab;
-};
-
-// ============================================================================
-//  异步会话恢复：deferredRestoreSession + restoreNextSessionTab
-//  设计目的：
-//   · 构造函数返回前不读任何大文件（避免 main.cpp 的 w.show() 被延后）
-//   · 每个 tab 恢复之间 QApplication::processEvents 让窗口重绘
-//   · 走 openDocumentByPolicy ≥32MB 强制 L2 窗口化秒开，不再 L1 主线程阻塞读
-// ============================================================================
 void MainWindow::deferredRestoreSession()
 {
-    QPointer<EditorTab> preferredActiveTab = currentTab();
-    SessionData data = m_session->loadSession();
-    if (data.tabs.isEmpty()) {
-        // 没有会话记录：补一个空 tab（对应原构造函数中的空 tab 兜底）
-        if (m_tabs->count() == 0)
-            newFile();
-        return;
-    }
-
-    // 构造排队上下文（使用 new，因为恢复过程跨多个事件循环 tick）
-    m_pendingRestore = new PendingSessionRestore;
-    m_pendingRestore->tabs                 = data.tabs;   // 拷贝 session 列表
-    m_pendingRestore->activeTab            = data.activeTab;
-    m_pendingRestore->currentIndex         = 0;
-    m_pendingRestore->hasUnsaved           = false;
-    m_pendingRestore->sessionJsonPathToRemove = m_session->sessionFilePath();
-    m_pendingRestore->preferredActiveTab      = preferredActiveTab;
-
-    // 立刻给用户看到 "正在恢复会话… 0/M"（StatusBar 永久可见，同时窗口已绘制）
-    statusBar()->showMessage(
-        QStringLiteral("正在恢复会话… 0/%1 个标签页").arg(m_pendingRestore->tabs.size()),
-        0);
-
-    // 第 1 个 tab：singleShot(0) 入队，确保 deferredRestoreSession 返回后事件循环再跑它
-    QTimer::singleShot(0, this, &MainWindow::restoreNextSessionTab);
+    WorkspaceRecoveryCoordinator::forWindow(this).start();
 }
 
 void MainWindow::restoreNextSessionTab()
 {
-    if (!m_pendingRestore) return;
-
-    const int total = m_pendingRestore->tabs.size();
-
-    // --- 收尾：全部 tab 已处理完 ---
-    if (m_pendingRestore->currentIndex >= total) {
-        if (m_pendingRestore->preferredActiveTab
-            && m_tabs->indexOf(m_pendingRestore->preferredActiveTab) >= 0) {
-            m_tabs->setCurrentWidget(m_pendingRestore->preferredActiveTab);
-        } else if (m_pendingRestore->activeTab >= 0
-                   && m_pendingRestore->activeTab < m_tabs->count()) {
-            m_tabs->setCurrentIndex(m_pendingRestore->activeTab);
-        }
-
-        if (!m_pendingRestore->sessionJsonPathToRemove.isEmpty())
-            QFile::remove(m_pendingRestore->sessionJsonPathToRemove);
-
-        if (m_pendingRestore->hasUnsaved) {
-            statusBar()->showMessage(
-                QStringLiteral("已恢复 %1 个标签页（含未保存修改）").arg(total), 5000);
-        } else {
-            statusBar()->showMessage(
-                QStringLiteral("已恢复 %1 个标签页").arg(total), 3000);
-        }
-
-        delete m_pendingRestore;
-        m_pendingRestore = nullptr;
-        // 安全兜底：一个 tab 都没恢复成功（比如文件全部被删除）→ 补一个空 tab
-        if (m_tabs->count() == 0)
-            newFile();
-        return;
-    }
-
-    QElapsedTimer tabTimer; tabTimer.start();
-    const SessionTab &st = m_pendingRestore->tabs[m_pendingRestore->currentIndex];
-    EditorTab *tab = addNewTab();
-    qDebug("[STARTUP][RESTORE tab %d/%d] addNewTab 完成, 耗时=%lld ms | filePath='%s' autosave='%s'",
-           m_pendingRestore->currentIndex + 1, total, tabTimer.elapsed(),
-           qUtf8Printable(st.filePath), qUtf8Printable(st.autosavePath));
-    tabTimer.restart();
-
-    bool loaded = false;
-
-    if (st.secureDocument) {
-        const QString securePath = !st.filePath.isEmpty() ? st.filePath : st.autosavePath;
-        loaded = !securePath.isEmpty() && QFileInfo::exists(securePath)
-                 && openSecurePath(securePath, tab);
-    } else if (!st.autosavePath.isEmpty() && QFileInfo::exists(st.autosavePath)) {
-        // ====== 关键修复（BUG C：大文件 autosave 阻塞启动）======
-        //   旧做法：直接 tab->loadAutosave(st.autosavePath)
-        //     · 100MB autosave：file.readAll() 主线程同步读 1~3s，窗口不显示、无提示
-        //   新做法：tab->openAutosaveAutoMode(autosave, real)
-        //     · S1：走原 loadAutosave（毫秒级）
-        //     · 尺寸 ≥ 限制：L2 mmap autosave 文件 → incomplete LineIndex → 秒开返回
-        //       后台 AsyncTaskManager 增量构建行索引，用户可见窗口 + 状态栏进度
-        //   参数：autosavePath = 实际数据源，filePath = 对用户显示的原名/未来保存路径
-        const qint64 asSize = QFileInfo(st.autosavePath).size();
-        const qint64 limit = FileTierPolicy::StandardEditLimitBytes;
-        const FileTierDecision tier = FileTierPolicy::classify(asSize);
-        qDebug("[STARTUP][RESTORE tab %d/%d] → 走 autosave 分支: size=%lld KB, S1-limit=%lld KB",
-               m_pendingRestore->currentIndex + 1, total,
-               asSize / 1024, limit / 1024);
-        if (tier.usesMappedPreview()) {
-            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选窗口化秒开 (S2/S3)，"
-                   "应 < 50ms 返回；若之后 >= 500ms 才返回，说明 openAutosaveAutoMode 内部阻塞了！",
-                   m_pendingRestore->currentIndex + 1, total);
-        } else {
-            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 L1 同步 loadAutosave (asSize < 限制)，"
-                   "一般毫秒级。", m_pendingRestore->currentIndex + 1, total);
-        }
-
-        loaded = m_session->restoreAutosave(tab, st.autosavePath, st.filePath);
-        if (loaded)
-            m_pendingRestore->hasUnsaved = true;
-        qDebug("[STARTUP][RESTORE tab %d/%d]   restoreAutosave 返回 ok=%d, 耗时=%lld ms",
-               m_pendingRestore->currentIndex + 1, total, loaded ? 1 : 0, tabTimer.elapsed());
-        tab->setSyntax(static_cast<Syntax>(st.syntax));
-    } else if (!st.filePath.isEmpty() && QFileInfo::exists(st.filePath)) {
-        // ===== 关键修复：不再直接 tab->loadFile(st.filePath) =====
-        //   原 bug：即便 100MB 也走 L1 全量 readAll + 主线程分块；
-        //   新逻辑：openDocumentByPolicy → ≥ 32MB 自动 openLargeFileL2（窗口化只读，无后台编辑加载）
-        const qint64 realSize = QFileInfo(st.filePath).size();
-        const qint64 limit = FileTierPolicy::StandardEditLimitBytes;
-        const FileTierDecision tier = FileTierPolicy::classify(realSize);
-        qDebug("[STARTUP][RESTORE tab %d/%d] → 走真实文件路径分支: size=%lld KB, S1-limit=%lld KB",
-               m_pendingRestore->currentIndex + 1, total,
-               realSize / 1024, limit / 1024);
-        if (tier.usesMappedPreview()) {
-            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选窗口化秒开 (S2/S3)，应 < 50ms 返回。",
-                   m_pendingRestore->currentIndex + 1, total);
-        } else {
-            qDebug("[STARTUP][RESTORE tab %d/%d]   自动选 L1 同步 loadFile (< 限制)。",
-                   m_pendingRestore->currentIndex + 1, total);
-        }
-        loaded = openSessionDocument(m_composition->documentProviders(), tab, st);
-        qDebug("[STARTUP][RESTORE tab %d/%d]   openDocumentByPolicy 返回 ok=%d, 耗时=%lld ms（关键：如果 > 500ms 就是阻塞启动的根因！）",
-               m_pendingRestore->currentIndex + 1, total, loaded ? 1 : 0, tabTimer.elapsed());
-    } else {
-        qDebug("[STARTUP][RESTORE tab %d/%d] → 文件不存在或路径为空，保持空标签页",
-               m_pendingRestore->currentIndex + 1, total);
-    }
-    tabTimer.restart();
-
-    if (!loaded) {
-        // A failed/missing session item must not survive as a legacy plaintext
-        // blank tab. After the restore queue finishes, the normal default-new
-        // path creates an encrypted draft if no document could be recovered.
-        const int failedIndex = m_tabs->indexOf(tab);
-        if (failedIndex >= 0)
-            m_tabs->removeTab(failedIndex);
-        delete tab;
-        tab = nullptr;
-    } else {
-        restoreDocumentSessionView(tab, st);
-        m_tabs->setTabText(m_tabs->indexOf(tab), tab->tabTitle());
-    }
-
-    // Session items are background restoration when the process was launched
-    // for an explicit file. Do not let each restored tab steal the visible
-    // document while the user is already reading or editing it.
-    if (m_pendingRestore->preferredActiveTab
-        && m_tabs->indexOf(m_pendingRestore->preferredActiveTab) >= 0) {
-        m_tabs->setCurrentWidget(m_pendingRestore->preferredActiveTab);
-    }
-
-    m_pendingRestore->currentIndex++;
-    const int done = m_pendingRestore->currentIndex;
-    statusBar()->showMessage(
-        QStringLiteral("正在恢复会话… %1/%2 个标签页").arg(done).arg(total), 0);
-
-    qDebug("[STARTUP][RESTORE tab %d/%d] 收尾(cursor/syntax/title/statusBar)耗时=%lld ms。",
-           done, total, tabTimer.elapsed());
-
-    // 下一个 tab 在新的事件循环 turn 入队；中间不嵌套 processEvents，用户输入、
-    // 重绘和 DWM 合成都可以按 Qt 正常顺序执行，避免恢复流程发生可重入状态修改。
-    QTimer::singleShot(0, this, &MainWindow::restoreNextSessionTab);
+    WorkspaceRecoveryCoordinator::forWindow(this).restoreNext();
 }
 
 // ============ 设置 ============
@@ -473,6 +253,21 @@ void MainWindow::saveSettings()
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    // A nested window/tab close must not delete a target paused in teardown.
+    if (m_windowCloseInProgress || !m_closingTabs.isEmpty()) {
+        event->ignore();
+        return;
+    }
+    if (!WorkspaceRecoveryCoordinator::forWindow(this).beginWindowClose()) {
+        event->ignore(); // The synchronous restore stack must unwind before teardown.
+        return;
+    }
+    m_windowCloseInProgress = true;
+    const QPointer<MainWindow> owner(this);
+    const auto releaseClose = qScopeGuard([owner] {
+        if (owner)
+            owner->m_windowCloseInProgress = false;
+    });
     // shutdownL2BeforeClose() intentionally pumps the event loop while workers
     // settle. Prevent autosave/session timers from re-entering document I/O in
     // the middle of that close transaction. If closing is cancelled, restore
@@ -485,6 +280,7 @@ void MainWindow::closeEvent(QCloseEvent *event)
     m_securityExpiryTimer.stop();
     const auto resumeTimers = [this, autosaveWasActive,
                                secureAutosaveWasActive, expiryWasActive]() {
+        WorkspaceRecoveryCoordinator::forWindow(this).cancelWindowClose();
         if (autosaveWasActive)
             m_autosaveTimer.start();
         if (secureAutosaveWasActive)
@@ -505,18 +301,25 @@ void MainWindow::closeEvent(QCloseEvent *event)
         }
     }
 
-    // 所有中央加密标签已经在 maybeSaveTab 中写回KDBX后，才允许锁定
-    // 安全身份；否则会先销毁密钥，再导致加密标签无法保存。
+    // Step 2: establish the latest durable recovery responsibility before any
+    // irreversible close preparation. A failed commit must leave Accounts and
+    // the document workspace usable for a real retry.
+    if (!saveSessionNow(true)) {
+        resumeTimers();
+        event->ignore();
+        return;
+    }
+
+    // 所有中央加密标签已经在 maybeSaveTab 中写回 KDBX 后，才允许锁定
+    // Accounts；否则会先销毁密钥，再导致加密标签无法保存。这里刻意放在
+    // 恢复点提交之后，避免提交失败时仍可见的窗口被 prepareToClose 静默锁库。
     if (m_vaultDock && !m_vaultDock->prepareToClose()) {
         resumeTimers();
         event->ignore();
         return;
     }
+    emit shutdownCommitted();
     saveSettings();
-
-
-    // Step 2: 保存会话
-    saveSessionNow(true);
 
     // Step 2.5（崩溃修复关键）：
     //    saveSessionNow() 后，所有需要 L2 mmap 的路径（exportToFile → applyAndSave）已完成。

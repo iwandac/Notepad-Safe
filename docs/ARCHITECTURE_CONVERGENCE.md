@@ -167,7 +167,22 @@ uniform row height、禁换行和 elide 规则由 `SearchResultsViewPolicy` 唯�
 该策略。非视觉 `SearchResultsController` 是纯值状态，持有 target/revision/stale/incomplete，MainWindow
 负责按 DocumentId 解析标签并处理正文变化、关闭、索引完成和导航。`FindReplaceDialog` 只依赖
 `DocumentSearchSurface`，不再识别 EditorTab；查询、scope、generation、cancel、pending 与 skip 计数
-由唯一 `SearchSession` 持有。新一轮查询原子失效上一 generation，晚到 completion 不能让计数下溢。
+由唯一 `SearchSession` 持有。已收敛的 All Open 路径在新一轮查询时失效上一 generation，
+晚到 completion 不能让计数下溢。2026-08-29 成熟度 2C 复审发现单文件路径尚未完整服从
+该查询代次；2026-08-30 候选以 `SingleFindAllRequest` 持有冻结目标与连接寿命，复用同一
+SearchSession 作为代次权威，小/大文件切换和晚到结果已有定向首绿，整片 ON/OFF 尚未关闭。
+
+成熟度 2C 候选将 L1 不可变快照的扫描/一次终态派发放入无 Widgets 的
+`EditableTextFindAllTask`（既有 `notepadsafe_search_runtime`），EditorTab 保留 revision、
+缓存和正文提交权。L2 的真实工作入口/停止保留量由 `LargeFileSearchTasks.cpp` 内的
+一次原子 claim 和原 mutex/CV 结算；通用调度仍唯一归 AsyncTaskManager。
+这些候选不新增查询管理器；关闭重入及外部请求通知的验收状态以
+`ROUND2_CORE_JOURNEYS_PRODUCT_ACCEPTANCE.md` 为准，尚不代表 2C 通过。
+
+2026-08-30 新发现的边界仍待收敛：普通 S2 打开只有 location，persistence 元数据仍为 None；
+工具基座前必须使文档身份元数据与实际持久化路由一致，不能让工具自行猜测。
+只读 Provider 的搜索仍借用旧 VirtualFileView mmap，真实 Find All 完成后阻止外部截断/替换；
+释放必须同时尊重全部真实 reader 和可见结果/spool 的寿命，不能直接 closeFile 清掉结果。
 
 ### R4 安全与未来扩展边界
 

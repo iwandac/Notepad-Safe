@@ -38,8 +38,15 @@ bool EditorTab::createPersistenceSnapshot(qint64 maximumBytes,
 bool EditorTab::suspendPersistenceBacking(QString *error)
 {
     Q_UNUSED(error)
-    if (isL2Mode() && m_l2View && m_l2View->isOpen())
-        m_l2View->closeFile();
+    m_persistenceBackingSuspendedWithEdits = false;
+    if (isL2Mode() && m_l2View && m_l2View->isOpen()) {
+        if (m_l2View->isMemoryBacked()) {
+            m_l2View->closeFile();
+        } else {
+            m_l2View->closeFile(true, true);
+            m_persistenceBackingSuspendedWithEdits = true;
+        }
+    }
     return true;
 }
 
@@ -48,8 +55,13 @@ bool EditorTab::resumePersistenceBacking(const QString &absolutePath,
 {
     if (!isL2Mode() || !m_l2View || m_l2View->isOpen())
         return true;
-    if (!m_l2View->openFile(absolutePath, error))
+    const bool preserveEdits = m_persistenceBackingSuspendedWithEdits;
+    const bool opened = preserveEdits
+        ? m_l2View->openFilePreservingEdits(absolutePath, error)
+        : m_l2View->openFile(absolutePath, error);
+    if (!opened)
         return false;
+    m_persistenceBackingSuspendedWithEdits = false;
     emit cursorPositionChanged(m_lastL2Line, m_lastL2Col);
     return true;
 }
@@ -57,6 +69,9 @@ bool EditorTab::resumePersistenceBacking(const QString &absolutePath,
 void EditorTab::acceptPersistenceCommit(const QString &absolutePath,
                                         DiskFileVersion version)
 {
+    // The committed source already contains the snapshot; reopening it must
+    // reset the old PatchList rather than applying those edits a second time.
+    m_persistenceBackingSuspendedWithEdits = false;
     const bool wasSecure = isSecureDocument();
     m_documentSession.bindPlainFile(absolutePath, wasSecure);
     if (wasSecure) {

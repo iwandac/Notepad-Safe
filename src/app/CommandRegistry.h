@@ -35,6 +35,9 @@ struct CommandContext {
     bool displayEncodingAvailable = false;
     bool conversionAvailable = false;
     bool dualPresentation = false;
+    bool tailAvailable = false;
+    bool tailEnabled = false;
+    bool tailCanResume = false;
 };
 
 // One command identity is shared by menu, toolbar, shortcut and context entry.

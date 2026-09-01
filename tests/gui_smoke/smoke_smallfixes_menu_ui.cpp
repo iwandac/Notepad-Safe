@@ -42,6 +42,7 @@
 #include <QtGui/QWheelEvent>
 #include <QtGui/QDragEnterEvent>
 #include <QtGui/QDropEvent>
+#include <QtGui/QScreen>
 #include <QtCore/QMimeData>
 #include <QtCore/QUrl>
 #include <QtCore/QTemporaryDir>
@@ -55,6 +56,8 @@
 #include <QtCore/QDeadlineTimer>
 #include <QtCore/QMetaType>
 #include <QtCore/QThread>
+#include <QtCore/QCryptographicHash>
+#include <QtCore/QScopeGuard>
 #include <QtWidgets/QStackedWidget>
 #include <QtWidgets/QStatusBar>
 #include <QtWidgets/QLabel>
@@ -69,6 +72,7 @@
 #include <QtWidgets/QFrame>
 #include <QtWidgets/QListView>
 #include <QtWidgets/QPlainTextEdit>
+#include <QtWidgets/QTextEdit>
 #include <QtWidgets/QScrollBar>
 #include <QtWidgets/QSplitter>
 #include <QtWidgets/QStyle>
@@ -85,6 +89,7 @@
 #endif
 
 #include "MainWindow.h"
+#include "AppComposition.h"
 #include "EditorTab.h"
 #include "ByteClipboard.h"
 #include "VirtualFileView.h"
@@ -227,6 +232,13 @@ static EditorTab* currentEditorTab(const MainWindow* mw) {
 static int tabCount(const MainWindow* mw) {
     auto* tabs = mw->findChild<QTabWidget*>();
     return tabs ? tabs->count() : 0;
+}
+
+static QByteArray dropFixtureHash(const QString &path) {
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return {};
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    return hash.addData(&file) ? hash.result() : QByteArray{};
 }
 static EditorTab* tabAt(const MainWindow* mw, int idx) {
     auto* tabs = mw->findChild<QTabWidget*>();
@@ -643,10 +655,10 @@ private slots:
         QVERIFY2(sizeStatus->text().contains(QStringLiteral("40.00 MB")),
                  qPrintable(QStringLiteral("窗口化 mmap 打开后状态栏必须显示真实文件大小，实际：%1")
                                 .arg(sizeStatus->text())));
-        QVERIFY2(sizeStatus->text().contains(QStringLiteral("Binary · Hex")),
+        QVERIFY2(sizeStatus->text().contains(QStringLiteral("二进制 · 十六进制")),
                  qPrintable(QStringLiteral("状态栏必须显示文档类型与呈现方式，实际：%1")
                                 .arg(sizeStatus->text())));
-        QVERIFY2(sizeStatus->text().contains(QStringLiteral("只读分析")),
+        QVERIFY2(sizeStatus->text().contains(QStringLiteral("只读")),
                  qPrintable(QStringLiteral("Binary Hex 必须明确显示只读能力，实际：%1")
                                 .arg(sizeStatus->text())));
         auto* sortAsc = findMenuActionByExactDisplay(mw_, QStringLiteral("行升序排序"));
@@ -1051,7 +1063,7 @@ private slots:
         bool restoredSizeStatus = false;
         for (QLabel *label : mw_->findChildren<QLabel *>())
             restoredSizeStatus |= label->text()
-                == QStringLiteral("512 B · Binary · Hex · 可编辑");
+                == QStringLiteral("512 B · 二进制 · 十六进制 · 可编辑");
         QVERIFY(restoredSizeStatus);
         auto *hexModeStatus = mw_->findChild<QToolButton *>(
             QStringLiteral("status.hexEditMode"));
@@ -1489,6 +1501,232 @@ private slots:
         closeAllEditorTabs(mw_);
     }
 
+    void tc_hex_mouse_drag_autoscroll_crosses_active_window_contract() {
+        closeAllEditorTabs(mw_);
+        QByteArray bytes(9 * 1024 * 1024, '\0');
+        for (qsizetype i = 0; i < bytes.size(); ++i)
+            bytes[i] = char((i * 37 + 11) & 0xff);
+        const QByteArray sourceHash = QCryptographicHash::hash(
+            bytes, QCryptographicHash::Sha256);
+        const QString path = tmpDir_.filePath(
+            QStringLiteral("hex-mouse-edge-autoscroll.bin"));
+        {
+            QFile source(path);
+            QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(source.write(bytes), qint64(bytes.size()));
+        }
+
+        mw_->openFilesFromExternal(QStringList{path});
+        QVERIFY(waitForTabCountAndL2(mw_, 1, true, 10000));
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && tab->l2View() && tab->viewModeL2() == ViewMode::Hex);
+        auto *hex = tab->editor();
+        auto *ascii = tab->findChild<QPlainTextEdit *>(
+            QStringLiteral("HexAsciiPreview"));
+        QScrollBar *global = tab->l2View()->verticalScrollBar();
+        QVERIFY(hex && ascii && ascii->isVisibleTo(tab) && global);
+        const int bytesPerRow = tab->l2View()->hexBytesPerRow();
+        const int rowsOnScreen = qMax(4, int(hex->SendScintilla(
+            QsciScintillaBase::SCI_LINESONSCREEN)));
+        const qint64 firstWindowStart = tab->l2View()->activeWindowByteStart();
+        const qint64 firstWindowEnd = tab->l2View()->activeWindowByteEnd();
+        QVERIFY(firstWindowEnd > firstWindowStart);
+        QVERIFY(firstWindowEnd < tab->l2View()->virtualFileSize());
+
+        // Put the final rows of the current projection on screen without
+        // replacing the projection. The selection itself must then be created
+        // solely by a real Hex-surface pointer drag.
+        const qint64 bottomTopRow = qMax<qint64>(
+            firstWindowStart / bytesPerRow,
+            firstWindowEnd / bytesPerRow - rowsOnScreen - 2);
+        global->setValue(int(qMin<qint64>(global->maximum(), bottomTopRow)));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            hex->SendScintilla(QsciScintillaBase::SCI_GETFIRSTVISIBLELINE)
+                >= hex->lines() - rowsOnScreen - 3,
+            2000);
+
+        const int firstVisible = int(hex->SendScintilla(
+            QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
+        const int anchorLine = qBound(0, firstVisible + rowsOnScreen / 2,
+                                      qMax(0, hex->lines() - 2));
+        const int anchorColumn = qMin(2, bytesPerRow - 1) * 3;
+        const long anchorPosition = hex->positionFromLineIndex(
+            anchorLine, anchorColumn);
+        const int anchorX = int(hex->SendScintilla(
+            QsciScintillaBase::SCI_POINTXFROMPOSITION, 0UL, anchorPosition)) + 1;
+        const int anchorY = int(hex->SendScintilla(
+            QsciScintillaBase::SCI_POINTYFROMPOSITION, 0UL, anchorPosition))
+            + hex->fontMetrics().height() / 2;
+        const qint64 forwardAnchor = firstWindowStart
+            + qint64(anchorLine) * bytesPerRow + anchorColumn / 3;
+        const QPoint bottomEdge(qBound(2, anchorX, hex->viewport()->width() - 3),
+                                hex->viewport()->height() - 2);
+        QTest::mousePress(hex->viewport(), Qt::LeftButton, Qt::NoModifier,
+                          QPoint(anchorX, anchorY));
+        for (int step = 0; step < 36; ++step) {
+            QTest::mouseMove(hex->viewport(), bottomEdge, 25);
+            QCoreApplication::processEvents();
+        }
+        QTRY_VERIFY_WITH_TIMEOUT(
+            tab->l2View()->activeWindowByteStart() > firstWindowStart, 5000);
+        const int returnedFirst = int(hex->SendScintilla(
+            QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
+        const int returnedLine = qBound(
+            0, returnedFirst + rowsOnScreen / 2, qMax(0, hex->lines() - 1));
+        const long returnedPosition = hex->positionFromLineIndex(
+            returnedLine, anchorColumn);
+        const QPoint returnedInside(
+            int(hex->SendScintilla(QsciScintillaBase::SCI_POINTXFROMPOSITION,
+                                   0UL, returnedPosition)) + 1,
+            int(hex->SendScintilla(QsciScintillaBase::SCI_POINTYFROMPOSITION,
+                                   0UL, returnedPosition))
+                + hex->fontMetrics().height() / 2);
+        const long returnedAddressLength = hex->SendScintilla(
+            QsciScintillaBase::SCI_MARGINGETTEXT,
+            static_cast<unsigned long>(returnedLine),
+            static_cast<void *>(nullptr));
+        QByteArray returnedAddressText(qMax<long>(0, returnedAddressLength) + 1,
+                                       '\0');
+        hex->SendScintilla(QsciScintillaBase::SCI_MARGINGETTEXT,
+                           static_cast<unsigned long>(returnedLine),
+                           static_cast<void *>(returnedAddressText.data()));
+        bool returnedAddressOk = false;
+        const qint64 returnedCaret = QString::fromLatin1(
+            returnedAddressText.constData(), qMax<long>(0, returnedAddressLength))
+            .toLongLong(&returnedAddressOk, 16) + anchorColumn / 3;
+        QVERIFY(returnedAddressOk);
+        QVERIFY(returnedCaret > firstWindowEnd);
+        QTest::mouseMove(hex->viewport(), returnedInside, 50);
+        QCoreApplication::processEvents();
+        QTest::mouseRelease(hex->viewport(), Qt::LeftButton,
+                            Qt::NoModifier, returnedInside);
+
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionStart(),
+                                  forwardAnchor, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionEnd(), returnedCaret,
+                                  3000);
+        QCOMPARE(tab->l2View()->selectionAnchorByte(), forwardAnchor);
+        QCOMPARE(tab->l2View()->selectionCaretByte(), returnedCaret);
+        QVERIFY(global->value() > int(bottomTopRow));
+
+        // The visible ASCII mirror represents the intersection of the global
+        // source selection and the current bounded projection. Switching focus
+        // and reflowing must not change the authoritative source endpoints.
+        const qint64 forwardStart = tab->l2View()->selectionStart();
+        const qint64 forwardEnd = tab->l2View()->selectionEnd();
+        const qint64 forwardCaret = tab->l2View()->selectionCaretByte();
+        ascii->setFocus(Qt::OtherFocusReason);
+        mw_->resize(mw_->width() - 140, mw_->height());
+        QTRY_VERIFY_WITH_TIMEOUT(tab->l2View()->hexBytesPerRow() > 0, 1000);
+        QCOMPARE(tab->l2View()->selectionStart(), forwardStart);
+        QCOMPARE(tab->l2View()->selectionEnd(), forwardEnd);
+        QCOMPARE(tab->l2View()->selectionAnchorByte(), forwardAnchor);
+        QCOMPARE(tab->l2View()->selectionCaretByte(), forwardCaret);
+        hex->setFocus(Qt::OtherFocusReason);
+        tab->copy();
+        QCOMPARE(QGuiApplication::clipboard()->text().split(
+                     QLatin1Char(' '), Qt::SkipEmptyParts).size(),
+                 int(forwardEnd - forwardStart));
+        QCOMPARE(tab->l2View()->selectionAnchorByte(), forwardAnchor);
+        QCOMPARE(tab->l2View()->selectionCaretByte(), forwardCaret);
+        QTest::keyClick(hex, Qt::Key_Right);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionStart(),
+                                  forwardEnd, 1000);
+        QCOMPARE(tab->l2View()->selectionEnd(), forwardEnd);
+        QCOMPARE(tab->l2View()->selectionAnchorByte(), forwardEnd);
+        QCOMPARE(tab->l2View()->selectionCaretByte(), forwardEnd);
+
+        // Now start in the ASCII surface and drag upward. This is a genuinely
+        // reverse selection and must cross the preceding projection window
+        // without sorting away anchor/caret direction.
+        const qint64 reverseWindowStart = tab->l2View()->activeWindowByteStart();
+        const int reverseBytesPerRow = tab->l2View()->hexBytesPerRow();
+        QVERIFY(reverseWindowStart > 0);
+        const qint64 nearWindowTopRow = reverseWindowStart / reverseBytesPerRow + 2;
+        global->setValue(int(qMin<qint64>(global->maximum(), nearWindowTopRow)));
+        QTRY_VERIFY_WITH_TIMEOUT(
+            ascii->cursorForPosition(QPoint(1, 1)).block().blockNumber() <= 4,
+            2000);
+        QTextBlock reverseBlock = ascii->document()->findBlockByNumber(
+            qMin(3, ascii->document()->blockCount() - 1));
+        QVERIFY(reverseBlock.isValid() && reverseBlock.text().size() > 4);
+        QTextCursor reverseCursor(ascii->document());
+        reverseCursor.setPosition(reverseBlock.position() + 4);
+        const QPoint reverseAnchorPoint = ascii->cursorRect(reverseCursor).center();
+        const QTextCursor reverseHit = ascii->cursorForPosition(reverseAnchorPoint);
+        const int reverseHitLine = reverseHit.block().blockNumber();
+        const long addressLength = hex->SendScintilla(
+            QsciScintillaBase::SCI_MARGINGETTEXT,
+            static_cast<unsigned long>(reverseHitLine),
+            static_cast<void *>(nullptr));
+        QByteArray addressText(qMax<long>(0, addressLength) + 1, '\0');
+        hex->SendScintilla(QsciScintillaBase::SCI_MARGINGETTEXT,
+                           static_cast<unsigned long>(reverseHitLine),
+                           static_cast<void *>(addressText.data()));
+        bool addressOk = false;
+        const qint64 reverseRowStart = QString::fromLatin1(
+            addressText.constData(), qMax<long>(0, addressLength))
+            .toLongLong(&addressOk, 16);
+        QVERIFY(addressOk);
+        const qint64 reverseAnchor = reverseRowStart
+            + qint64(reverseHit.position() - reverseHit.block().position());
+        const QPoint topEdge(qBound(2, reverseAnchorPoint.x(),
+                                    ascii->viewport()->width() - 3), 1);
+        QTest::mousePress(ascii->viewport(), Qt::LeftButton, Qt::NoModifier,
+                          reverseAnchorPoint);
+        for (int step = 0; step < 36; ++step) {
+            QTest::mouseMove(ascii->viewport(), topEdge, 25);
+            QCoreApplication::processEvents();
+        }
+        QTest::mouseRelease(ascii->viewport(), Qt::LeftButton,
+                            Qt::NoModifier, topEdge);
+
+        QTRY_VERIFY_WITH_TIMEOUT(
+            tab->l2View()->activeWindowByteStart() < reverseWindowStart, 5000);
+        QCOMPARE(tab->l2View()->selectionAnchorByte(), reverseAnchor);
+        QVERIFY(tab->l2View()->selectionCaretByte() < reverseWindowStart);
+        QCOMPARE(tab->l2View()->selectionStart(),
+                 tab->l2View()->selectionCaretByte());
+        QCOMPARE(tab->l2View()->selectionEnd(), reverseAnchor);
+        QVERIFY(tab->currentByteOffset() < reverseWindowStart);
+        auto *positionStatus = mw_->findChild<QLabel *>(
+            QStringLiteral("status.position"));
+        QVERIFY(positionStatus);
+        QTRY_VERIFY_WITH_TIMEOUT(positionStatus->text().contains(
+            QString::number(tab->currentByteOffset(), 16)
+                .rightJustified(8, QLatin1Char('0')).toUpper()), 1000);
+
+        // Copy reads the complete authoritative source range. A subsequent
+        // Shift+arrow extends from the global caret, while plain Right hands
+        // authority back by collapsing to the high selection boundary.
+        const qint64 reverseCaret = tab->l2View()->selectionCaretByte();
+        hex->setFocus(Qt::OtherFocusReason);
+        tab->copy();
+        QCOMPARE(tab->l2View()->selectionAnchorByte(), reverseAnchor);
+        QCOMPARE(tab->l2View()->selectionCaretByte(), reverseCaret);
+        QTest::keyClick(hex, Qt::Key_Left, Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionAnchorByte(),
+                                  reverseAnchor, 1000);
+        QCOMPARE(tab->l2View()->selectionCaretByte(), reverseCaret - 1);
+        QTest::keyClick(hex, Qt::Key_Right);
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->selectionStart(),
+                                  reverseAnchor, 1000);
+        QCOMPARE(tab->l2View()->selectionEnd(), reverseAnchor);
+
+        QCOMPARE(tab->l2View()->readByteRange(0, bytes.size()), bytes);
+        QFile unchanged(path);
+        QVERIFY(unchanged.open(QIODevice::ReadOnly));
+        QCryptographicHash diskHash(QCryptographicHash::Sha256);
+        while (!unchanged.atEnd()) {
+            const QByteArray chunk = unchanged.read(1024 * 1024);
+            QVERIFY(!chunk.isEmpty() || unchanged.atEnd());
+            diskHash.addData(chunk);
+        }
+        QCOMPARE(diskHash.result(), sourceHash);
+        QVERIFY(!tab->isModified());
+        closeAllEditorTabs(mw_);
+    }
+
     void tc_hex_insert_mode_discoverable_and_eof_append() {
         closeAllEditorTabs(mw_);
         const QByteArray original = QByteArray::fromHex("00112233");
@@ -1558,7 +1796,7 @@ private slots:
         auto *sizeStatus = mw_->findChild<QLabel *>(QStringLiteral("status.size"));
         QVERIFY(sizeStatus);
         QTRY_VERIFY_WITH_TIMEOUT(sizeStatus->text().startsWith(
-                                     QStringLiteral("5 B · Binary · Hex · 可编辑")), 1000);
+                                     QStringLiteral("5 B · 二进制 · 十六进制 · 可编辑")), 1000);
         QVERIFY(mw_->grab().save(QCoreApplication::applicationDirPath()
                                  + QStringLiteral("/gui-hex-insert-mode.png")));
         closeAllEditorTabs(mw_);
@@ -3786,6 +4024,103 @@ private slots:
         closeAllEditorTabs(mw_);
     }
 
+    void tc_external_open_preserves_dirty_and_active_search() {
+        closeAllEditorTabs(mw_);
+        const QString firstPath = tmpDir_.filePath(
+            QStringLiteral("external-boundary-a.txt"));
+        const QString secondPath = tmpDir_.filePath(
+            QStringLiteral("external-boundary-b.txt"));
+        const QString externalPath = tmpDir_.filePath(
+            QStringLiteral("external-boundary-new.txt"));
+        const auto writeText = [](const QString &path, const QByteArray &bytes) {
+            QFile file(path);
+            return file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+                && file.write(bytes) == bytes.size();
+        };
+        QVERIFY(writeText(firstPath, QByteArray("TOKEN first on disk\n")));
+        QVERIFY(writeText(secondPath, QByteArray("TOKEN second on disk\n")));
+        QVERIFY(writeText(externalPath,
+                          QByteArray("TOKEN external joins active search\n")));
+
+        mw_->openFilesFromExternal({firstPath, secondPath});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 2, 3000);
+        auto *tabs = mw_->findChild<QTabWidget *>();
+        QVERIFY(tabs);
+        switchToTab(mw_, 0);
+        auto *dirty = currentEditorTab(mw_);
+        QVERIFY(dirty);
+        dirty->editor()->append(QStringLiteral("unsaved dirty marker"));
+        dirty->setModified(true);
+        const QString dirtyText = dirty->editor()->text();
+        QFile disk(firstPath);
+        QVERIFY(disk.open(QIODevice::ReadOnly));
+        const QByteArray diskBefore = disk.readAll();
+        disk.close();
+
+        auto *findAction = mw_->findChild<QAction *>(QStringLiteral("search.find"));
+        auto *dock = mw_->findChild<SearchResultsDock *>(
+            QStringLiteral("SearchResultsDock"));
+        QVERIFY(findAction && dock);
+        findAction->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            mw_->findChild<FindReplaceDialog *>() != nullptr, 1000);
+        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+        QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
+        auto *pattern = dialog->findChild<QLineEdit *>(
+            QStringLiteral("findPatternEdit"));
+        auto *scope = dialog->findChild<QComboBox *>(
+            QStringLiteral("searchScopeCombo"));
+        auto *findAll = dialog->findChild<QPushButton *>(
+            QStringLiteral("findAllButton"));
+        auto *cancel = dialog->findChild<QPushButton *>(
+            QStringLiteral("cancelSearchButton"));
+        auto *tree = dock->findChild<QTreeView *>(
+            QStringLiteral("searchResultsTree"));
+        auto *summary = dock->findChild<QLabel *>(
+            QStringLiteral("searchResultsSummary"));
+        QVERIFY(pattern && scope && findAll && cancel && tree && summary);
+        QSignalSpy clearSpy(dock,
+                            &SearchResultsDock::clearSearchHighlightsRequested);
+        pattern->setText(QStringLiteral("TOKEN"));
+        scope->setCurrentIndex(scope->findData(1));
+        QTest::mouseClick(findAll, Qt::LeftButton);
+        QVERIFY(cancel->isVisible() && cancel->isEnabled());
+        QAbstractItemModel *const frozenModel = tree->model();
+        QVERIFY(frozenModel);
+
+        mw_->openFilesFromExternal({externalPath});
+        QCOMPARE(tabCount(mw_), 3);
+        QCOMPARE(clearSpy.count(), 0);
+        QVERIFY2(cancel->isVisible(),
+                 "external open cancelled the active all-open search");
+        QCOMPARE(tabs->indexOf(dirty) >= 0, true);
+        QVERIFY(dirty->isModified());
+        QCOMPARE(dirty->editor()->text(), dirtyText);
+        QVERIFY(disk.open(QIODevice::ReadOnly));
+        QCOMPARE(disk.readAll(), diskBefore);
+        disk.close();
+
+        QTRY_VERIFY_WITH_TIMEOUT(!cancel->isVisible(), 5000);
+        QVERIFY(!summary->text().contains(QStringLiteral("已取消")));
+        QCOMPARE(tree->model(), frozenModel);
+        QCOMPARE(frozenModel->rowCount(), 3);
+        const auto verifyResultGroup = [frozenModel](const QString &fileName) {
+            for (int row = 0; row < frozenModel->rowCount(); ++row) {
+                const QModelIndex group = frozenModel->index(row, 0);
+                if (group.data().toString().contains(fileName)) {
+                    return frozenModel->rowCount(group) > 0;
+                }
+            }
+            return false;
+        };
+        QVERIFY(verifyResultGroup(QStringLiteral("external-boundary-a.txt")));
+        QVERIFY(verifyResultGroup(QStringLiteral("external-boundary-b.txt")));
+        QVERIFY(verifyResultGroup(QStringLiteral("external-boundary-new.txt")));
+        QCOMPARE(clearSpy.count(), 0);
+        dialog->close();
+        closeAllEditorTabs(mw_);
+    }
+
     void tc_background_task_phased_progress_contract() {
         auto &manager = AsyncTaskManager::instance();
         manager.cancelAllByType();
@@ -3937,6 +4272,13 @@ private slots:
         auto *threadSummary = panel->findChild<QLabel *>(
             QStringLiteral("taskSummaryThreads"));
         QVERIFY(cancelAll && clearHistory && failedSummary && threadSummary);
+        auto *technicalDetails = panel->findChild<QAbstractButton *>(
+            QStringLiteral("backgroundTaskDetailsToggle"));
+        QVERIFY(technicalDetails && technicalDetails->isVisible());
+        QVERIFY(!threadSummary->isVisible());
+        technicalDetails->setFocus();
+        QTest::keyClick(technicalDetails, Qt::Key_Space);
+        QTRY_VERIFY_WITH_TIMEOUT(threadSummary->isVisible(), 1000);
         QVERIFY(cancelAll->isEnabled());
         QVERIFY(clearHistory->isEnabled());
         QCOMPARE(failedSummary->text(), QStringLiteral("失败: 2"));
@@ -3948,8 +4290,12 @@ private slots:
                 QStringLiteral("/%1").arg(expectedThreads)), 2000);
         QVERIFY(manager.activeThreadCount() >= 1);
         QVERIFY(manager.activeThreadCount() <= expectedThreads);
-        QVERIFY(chip->toolTip().contains(
+        // Thread occupancy remains exact in the opt-in technical view, not
+        // the default product tooltip. Do not relabel threads as tasks.
+        QVERIFY(!chip->toolTip().contains(QStringLiteral("工作线程")));
+        QVERIFY(!chip->toolTip().contains(
             QStringLiteral("/%1").arg(expectedThreads)));
+        QVERIFY(chip->toolTip().contains(QStringLiteral("活跃任务 1")));
         QVERIFY(chip->toolTip().contains(QStringLiteral("预计")));
 
         const QString runningShot = QCoreApplication::applicationDirPath()
@@ -4616,6 +4962,584 @@ private slots:
         QVERIFY(unchanged.open(QIODevice::ReadOnly));
         QCOMPARE(unchanged.readAll(), originalBytes);
         closeAllEditorTabs(mw_);
+    }
+
+    void tc_2b2_invalid_only_local_drop_is_an_open_intent_data() {
+        QTest::addColumn<bool>("editorSurface");
+        QTest::addColumn<bool>("directory");
+        QTest::newRow("mainwindow-missing") << false << false;
+        QTest::newRow("mainwindow-directory") << false << true;
+        QTest::newRow("editor-missing") << true << false;
+        QTest::newRow("editor-directory") << true << true;
+    }
+
+    void tc_2b2_invalid_only_local_drop_is_an_open_intent() {
+        QFETCH(bool, editorSurface);
+        QFETCH(bool, directory);
+        closeAllEditorTabs(mw_);
+        const QString source = tmpDir_.filePath(QStringLiteral("invalid-drop-source.txt"));
+        {
+            QFile file(source);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(file.write("original source\n"), qint64(16));
+        }
+        mw_->openFilesFromExternal({source});
+        auto *tab = currentEditorTab(mw_);
+        QVERIFY(tab);
+        const auto id = tab->documentState().id;
+        const auto hash = dropFixtureHash(source);
+        const QString path = tmpDir_.filePath(directory ? QStringLiteral("invalid-only-directory")
+                                                      : QStringLiteral("invalid-only-missing.txt"));
+        if (directory) QVERIFY(QDir().mkpath(path));
+        QWidget *surface = editorSurface ? tab->editor()->viewport()
+                                         : static_cast<QWidget *>(mw_);
+        QString feedback;
+        QTimer guard;
+        guard.setInterval(10);
+        connect(&guard, &QTimer::timeout, this, [&]() {
+            for (QMessageBox *box : mw_->findChildren<QMessageBox *>()) {
+                if (!box->isVisible()) continue;
+                feedback += box->text() + box->informativeText();
+                box->accept();
+            }
+        });
+        guard.start();
+        QMimeData mime;
+        mime.setUrls({QUrl::fromLocalFile(path)});
+        QDragEnterEvent enter(QPoint(8, 8), Qt::CopyAction, &mime,
+                              Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(surface, &enter);
+        QDropEvent drop(QPointF(8, 8), Qt::CopyAction, &mime,
+                        Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(surface, &drop);
+        guard.stop();
+        QCOMPARE(tabCount(mw_), 1);
+        QCOMPARE(currentEditorTab(mw_)->documentState().id, id);
+        QCOMPARE(dropFixtureHash(source), hash);
+        QVERIFY2(enter.isAccepted() && drop.isAccepted(),
+                 "invalid-only local URL was rejected before its open intent reached feedback");
+        QVERIFY(feedback.contains(QFileInfo(path).fileName()));
+        QVERIFY(feedback.contains(directory ? QStringLiteral("文件夹") : QStringLiteral("不存在")));
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_2b2_mixed_local_drop_preserves_documents_and_feedback_data() {
+        QTest::addColumn<bool>("editorSurface");
+        QTest::newRow("mainwindow") << false;
+        QTest::newRow("editor-viewport") << true;
+    }
+
+    void tc_2b2_mixed_local_drop_preserves_documents_and_feedback() {
+        QFETCH(bool, editorSurface);
+        closeAllEditorTabs(mw_);
+        const QString base = tmpDir_.filePath(QStringLiteral("drop-dirty.txt"));
+        const QString plain = tmpDir_.filePath(QStringLiteral("drop-valid.txt"));
+        const QString binary = tmpDir_.filePath(QStringLiteral("drop-readonly.bin"));
+        const QString missing = tmpDir_.filePath(QStringLiteral("drop-missing.txt"));
+        const QString directory = tmpDir_.filePath(QStringLiteral("drop-directory"));
+        const QString secure = tmpDir_.filePath(QStringLiteral("drop-protected.nsafe"));
+        for (const QString &path : {base, plain, secure}) {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(file.write("original source\n"), qint64(16));
+        }
+        QVERIFY(QDir().mkpath(directory));
+        {
+            QFile file(binary);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QVERIFY(file.resize(33LL * 1024 * 1024));
+        }
+        const QByteArray baseHash = dropFixtureHash(base);
+        const QByteArray plainHash = dropFixtureHash(plain);
+        const QByteArray binaryHash = dropFixtureHash(binary);
+        const QByteArray secureHash = dropFixtureHash(secure);
+        QVERIFY(!baseHash.isEmpty() && !binaryHash.isEmpty());
+        mw_->openFilesFromExternal({base});
+        auto *dirty = currentEditorTab(mw_);
+        QVERIFY(dirty);
+        dirty->editor()->append(QStringLiteral("unsaved user text"));
+        QVERIFY(dirty->isModified());
+        const QString dirtyText = dirty->editor()->text();
+        const DocumentState dirtyState = dirty->documentState();
+        auto *stack = mw_->findChild<QStackedWidget *>(QStringLiteral("WorkspaceStack"));
+        QVERIFY(stack);
+        QWidget *const workspace = stack->currentWidget();
+        QWidget *surface = editorSurface ? dirty->editor()->viewport()
+                                         : static_cast<QWidget *>(mw_);
+        QStringList visibleErrors;
+        int credentialDialogs = 0;
+        QTimer modalGuard;
+        modalGuard.setInterval(10);
+        connect(&modalGuard, &QTimer::timeout, this, [&]() {
+            for (QWidget *widget : QApplication::topLevelWidgets()) {
+                auto *dialog = qobject_cast<QDialog *>(widget);
+                if (!dialog || !dialog->isVisible() || !dialog->isModal()) continue;
+                if (auto *box = qobject_cast<QMessageBox *>(dialog)) {
+                    visibleErrors << box->text() + QLatin1Char(' ') + box->informativeText();
+                    box->accept();
+                } else {
+                    ++credentialDialogs;
+                    dialog->reject();
+                }
+            }
+        });
+        modalGuard.start();
+        QMimeData mime;
+        // Secure/missing/directory precede later successes. A final duplicate
+        // must preserve identity without erasing the batch's failure feedback.
+        mime.setUrls({QUrl::fromLocalFile(secure), QUrl::fromLocalFile(missing),
+                      QUrl::fromLocalFile(directory), QUrl::fromLocalFile(plain),
+                      QUrl::fromLocalFile(binary), QUrl::fromLocalFile(base)});
+        QDragEnterEvent enter(QPoint(8, 8), Qt::CopyAction, &mime,
+                              Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(surface, &enter);
+        QDropEvent drop(QPointF(8, 8), Qt::CopyAction, &mime,
+                        Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(surface, &drop);
+        modalGuard.stop();
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 3, 5000);
+        EditorTab *binaryTab = nullptr;
+        for (int i = 0; i < tabCount(mw_); ++i) {
+            if (tabAt(mw_, i)->filePath() == binary) binaryTab = tabAt(mw_, i);
+        }
+        QVERIFY(binaryTab);
+        QTRY_COMPARE_WITH_TIMEOUT(binaryTab->contentSizeBytes(), QFileInfo(binary).size(), 5000);
+        QVERIFY(enter.isAccepted() && drop.isAccepted());
+        QCOMPARE(currentEditorTab(mw_), dirty);
+        QCOMPARE(dirty->documentState().id, dirtyState.id);
+        QCOMPARE(dirty->documentState().capabilities, dirtyState.capabilities);
+        QCOMPARE(dirty->editor()->text(), dirtyText);
+        QVERIFY(dirty->isModified());
+        QVERIFY(binaryTab->isBinaryDocument() && binaryTab->isReadOnlyByPolicy());
+        QVERIFY(!binaryTab->documentState().capabilities.testFlag(DocumentCapability::Edit));
+        QVERIFY(!binaryTab->documentState().capabilities.testFlag(DocumentCapability::Save));
+        QCOMPARE(stack->currentWidget(), workspace);
+        QCOMPARE(dropFixtureHash(base), baseHash);
+        QCOMPARE(dropFixtureHash(plain), plainHash);
+        QCOMPARE(dropFixtureHash(binary), binaryHash);
+        QCOMPARE(dropFixtureHash(secure), secureHash);
+        QCOMPARE(credentialDialogs, 0);
+        const QString feedback = visibleErrors.join(QLatin1Char('\n'))
+            + QLatin1Char('\n') + mw_->statusBar()->currentMessage();
+        qInfo().noquote() << "2B2 preserved dirty/id/hash/readonly/workspace; batch feedback:" << feedback;
+        QVERIFY2(feedback.contains(QFileInfo(missing).fileName()),
+                 "missing local URL disappeared without a visible failure");
+        QVERIFY2(feedback.contains(QStringLiteral("不存在")), "missing reason must be factual");
+        QVERIFY2(feedback.contains(QFileInfo(directory).fileName())
+                     && feedback.contains(QStringLiteral("文件夹")),
+                 "directory intent disappeared without its applicable reason");
+        QVERIFY2(feedback.contains(QFileInfo(secure).fileName())
+                     && feedback.contains(QStringLiteral("文件→打开")),
+                 "secure refusal and next step were erased by a later successful open");
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_2b2_remote_only_drop_does_not_insert_urls_data() {
+        QTest::addColumn<bool>("editorSurface");
+        QTest::newRow("mainwindow") << false;
+        QTest::newRow("editor-viewport") << true;
+    }
+
+    void tc_2b2_remote_only_drop_does_not_insert_urls() {
+        QFETCH(bool, editorSurface);
+        closeAllEditorTabs(mw_);
+        const QString path = tmpDir_.filePath(QStringLiteral("drop-remote-guard.txt"));
+        {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(file.write("original source\n"), qint64(16));
+        }
+        mw_->openFilesFromExternal({path});
+        auto *tab = currentEditorTab(mw_);
+        QVERIFY(tab);
+        tab->editor()->append(QStringLiteral("unsaved text"));
+        const QString body = tab->editor()->text();
+        const auto state = tab->documentState();
+        const QByteArray hash = dropFixtureHash(path);
+        QWidget *surface = editorSurface ? tab->editor()->viewport()
+                                         : static_cast<QWidget *>(mw_);
+        QMimeData mime;
+        const QString url = QStringLiteral("https://drop.invalid/must-not-load-or-insert");
+        mime.setUrls({QUrl(url)});
+        mime.setText(url); // Native editor text fallback must not insert this.
+        QDragEnterEvent enter(QPoint(8, 8), Qt::CopyAction, &mime,
+                              Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(surface, &enter);
+        QDropEvent drop(QPointF(8, 8), Qt::CopyAction, &mime,
+                        Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(surface, &drop);
+        QCOMPARE(tabCount(mw_), 1);
+        QCOMPARE(tab->documentState().id, state.id);
+        QCOMPARE(tab->documentState().capabilities, state.capabilities);
+        QCOMPARE(tab->editor()->text(), body);
+        QVERIFY(tab->isModified());
+        QCOMPARE(dropFixtureHash(path), hash);
+        QVERIFY2(!enter.isAccepted() && !drop.isAccepted(), "remote-only URL drop was accepted");
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_2b2_external_batch_keeps_secure_refusal_after_success() {
+        closeAllEditorTabs(mw_);
+        const QString plain = tmpDir_.filePath(QStringLiteral("drop-feedback-valid.txt"));
+        const QString secure = tmpDir_.filePath(QStringLiteral("drop-feedback-protected.nsafe"));
+        for (const QString &path : {plain, secure}) {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(file.write("original source\n"), qint64(16));
+        }
+        mw_->openFilesFromExternal({plain});
+        const auto id = currentEditorTab(mw_)->documentState().id;
+        const auto hash = dropFixtureHash(secure);
+        mw_->openFilesFromExternal({secure, plain});
+        QCOMPARE(tabCount(mw_), 1);
+        QCOMPARE(currentEditorTab(mw_)->documentState().id, id);
+        QCOMPARE(dropFixtureHash(secure), hash);
+        const QString feedback = mw_->statusBar()->currentMessage();
+        qInfo().noquote() << "2B2 final batch feedback:" << feedback;
+        QVERIFY2(feedback.contains(QFileInfo(secure).fileName())
+                     && feedback.contains(QStringLiteral("文件→打开")),
+                 "later success erased the protected-file refusal and next step");
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_2b2_external_authorization_survives_second_probe_type_change() {
+        QTemporaryDir data;
+        QVERIFY(data.isValid());
+        const QString fixture = QFINDTESTDATA("../fixtures/kdbx/Format400.kdbx");
+        QFile fixtureFile(fixture);
+        QVERIFY(fixtureFile.open(QIODevice::ReadOnly));
+        const QByteArray secureBytes = fixtureFile.readAll();
+        QVERIFY(!secureBytes.isEmpty());
+        const QByteArray expectedHash = QCryptographicHash::hash(secureBytes, QCryptographicHash::Sha256);
+        const QString changedPath = data.filePath(QStringLiteral("reclassified.dat"));
+        {
+            QFile file(changedPath);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            QCOMPARE(file.write("ordinary initial bytes\n"), qint64(23));
+        }
+        mw_->hide();
+        qputenv("NOTEPADSAFE_DATADIR", data.path().toUtf8());
+        AppComposition composition;
+        auto window = std::make_unique<MainWindow>(nullptr, &composition);
+        const auto cleanup = qScopeGuard([&]() {
+            closeAllEditorTabs(window.get());
+            window.reset();
+            qputenv("NOTEPADSAFE_DATADIR", primaryTestDataDir_.toUtf8());
+            mw_->show();
+        });
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window.get()));
+        auto *stack = window->findChild<QStackedWidget *>(QStringLiteral("WorkspaceStack"));
+        auto *tabs = window->findChild<QTabWidget *>();
+        QVERIFY(stack && tabs && stack->currentWidget() == tabs);
+        int probes = 0;
+        int writes = 0;
+        bool replacementSucceeded = false;
+        QVERIFY(composition.persistenceAdapters().registerRoute(
+            {QStringLiteral("test.2b2.reclassification"), QStringLiteral("test"),
+             10000, DocumentPersistence::PlainFile},
+            [&](const QString &path) {
+                if (path != changedPath) return false;
+                if (++probes == 2) {
+                    QFile file(path);
+                    replacementSucceeded = file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+                        && file.write(secureBytes) == secureBytes.size();
+                    ++writes;
+                }
+                return false; // Both classifications are performed by real routes.
+            }));
+        int credentialDialogs = 0;
+        QTimer guard;
+        guard.setInterval(10);
+        connect(&guard, &QTimer::timeout, this, [&]() {
+            for (QWidget *widget : QApplication::topLevelWidgets()) {
+                auto *dialog = qobject_cast<QDialog *>(widget);
+                if (!dialog || !dialog->isVisible() || !dialog->isModal()) continue;
+                if (!qobject_cast<QMessageBox *>(dialog)) ++credentialDialogs;
+                dialog->reject();
+            }
+        });
+        const int factoriesBefore = composition.heavyFactoryCalls();
+        guard.start();
+        window->openFilesFromExternal({changedPath});
+        guard.stop();
+        QVERIFY(replacementSucceeded);
+        QCOMPARE(writes, 1);
+        QCOMPARE(dropFixtureHash(changedPath), expectedHash);
+        QCOMPARE(tabs->count(), 0);
+        qInfo() << "2B2 second-probe mutation count=" << writes
+                << "security factories=" << composition.heavyFactoryCalls() - factoriesBefore
+                << "credential dialogs=" << credentialDialogs;
+        QCOMPARE(credentialDialogs, 0);
+        QCOMPARE(composition.heavyFactoryCalls(), factoriesBefore);
+        QCOMPARE(stack->currentWidget(), tabs);
+        QVERIFY(!QFileInfo::exists(data.filePath(QStringLiteral("security-session-v1.bin"))));
+        QVERIFY(window->statusBar()->currentMessage().contains(QFileInfo(changedPath).fileName()));
+        QVERIFY(window->statusBar()->currentMessage().contains(QStringLiteral("文件→打开")));
+        auto *review = window->findChild<QToolButton *>(QStringLiteral("externalOpenFailuresButton"));
+        QVERIFY(review && review->isVisible());
+    }
+
+    void tc_2b2_failure_details_keyboard_and_batch_lifetime() {
+        closeAllEditorTabs(mw_);
+        const QString plain = tmpDir_.filePath(QStringLiteral("batch-success.txt"));
+        const QString directory = tmpDir_.filePath(QStringLiteral("多字节&路径-只读复查-多字节&路径"));
+        QVERIFY(QDir().mkpath(directory));
+        const QString first = QDir(directory).filePath(QStringLiteral("第一份&不解锁.nsafe"));
+        const QString second = QDir(directory).filePath(QStringLiteral("第二份&不解锁.nsafe"));
+        const QString replacement = QDir(directory).filePath(QStringLiteral("新批次&不解锁.nsafe"));
+        for (const QString &path : {plain, first, second, replacement}) {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(file.write("original source\n"), qint64(16));
+        }
+        const auto firstHash = dropFixtureHash(first);
+        const auto secondHash = dropFixtureHash(second);
+        const auto replacementHash = dropFixtureHash(replacement);
+        mw_->openFilesFromExternal({plain});
+        const auto id = currentEditorTab(mw_)->documentState().id;
+        int dialogs = 0;
+        int credentials = 0;
+        bool plainText = false;
+        QString details;
+        QTimer guard;
+        guard.setInterval(10);
+        connect(&guard, &QTimer::timeout, this, [&]() {
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (!dialog) return;
+            if (auto *box = qobject_cast<QMessageBox *>(dialog)) {
+                ++dialogs;
+                plainText = box->textFormat() == Qt::PlainText;
+                details = box->text() + QLatin1Char('\n') + box->informativeText();
+                box->accept();
+            } else {
+                ++credentials;
+                dialog->reject();
+            }
+        });
+        guard.start();
+        mw_->openFilesFromExternal({first, second, plain});
+        QCOMPARE(dialogs, 0); // Secure-only rejection remains non-interrupting.
+        auto *button = mw_->findChild<QToolButton *>(QStringLiteral("externalOpenFailuresButton"));
+        QVERIFY(button && button->isVisible());
+        QCOMPARE(button->text(), QStringLiteral("未打开文件（2）"));
+        QVERIFY(button->focusPolicy() == Qt::StrongFocus);
+        QVERIFY(button->accessibleDescription().contains(QStringLiteral("不会重新打开")));
+        mw_->activateWindow();
+        button->setFocus();
+        QTRY_VERIFY_WITH_TIMEOUT(button->hasFocus(), 2000);
+        QTest::keyClick(button, Qt::Key_Space);
+        QCOMPARE(dialogs, 1);
+        QVERIFY(plainText);
+        QVERIFY(details.contains(first) && details.contains(second));
+        QVERIFY(details.contains(QStringLiteral("文件→打开")));
+        QCOMPARE(currentEditorTab(mw_)->documentState().id, id);
+        mw_->openFilesFromExternal({});
+        QCOMPARE(button->text(), QStringLiteral("未打开文件（2）"));
+        QVERIFY(button->isVisible());
+        mw_->openFilesFromExternal({replacement, plain});
+        QCOMPARE(dialogs, 1);
+        QCOMPARE(button->text(), QStringLiteral("未打开文件（1）"));
+        button->setFocus();
+        QTest::keyClick(button, Qt::Key_Space);
+        QCOMPARE(dialogs, 2);
+        QVERIFY(details.contains(replacement));
+        QVERIFY(!details.contains(first) && !details.contains(second));
+        mw_->openFilesFromExternal({plain});
+        QVERIFY(!button->isVisible());
+        button->click(); // Even a stale activation cannot replay the old batch.
+        QCOMPARE(dialogs, 2);
+        QCOMPARE(credentials, 0);
+        QCOMPARE(tabCount(mw_), 1);
+        QCOMPARE(currentEditorTab(mw_)->documentState().id, id);
+        QCOMPARE(dropFixtureHash(first), firstHash);
+        QCOMPARE(dropFixtureHash(second), secondHash);
+        QCOMPARE(dropFixtureHash(replacement), replacementHash);
+        guard.stop();
+        closeAllEditorTabs(mw_);
+    }
+
+    void tc_2b2_large_failure_details_expand_with_keyboard() {
+        closeAllEditorTabs(mw_);
+        const QString directory = tmpDir_.filePath(QStringLiteral("较长的多字节&路径用于复查失败明细-较长的多字节&路径用于复查失败明细"));
+        QVERIFY(QDir().mkpath(directory));
+        QStringList paths;
+        QList<QByteArray> hashes;
+        for (int index = 0; index < 6; ++index) {
+            const QString path = QDir(directory).filePath(
+                QStringLiteral("%1-用户文件&不会自动解锁-用户文件&不会自动解锁.nsafe").arg(index));
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(file.write("original source\n"), qint64(16));
+            file.close();
+            paths << path;
+            hashes << dropFixtureHash(path);
+        }
+        mw_->openFilesFromExternal(paths);
+        QVERIFY(QApplication::activeModalWidget() == nullptr);
+        auto *review = mw_->findChild<QToolButton *>(QStringLiteral("externalOpenFailuresButton"));
+        QVERIFY(review && review->isVisible());
+        QCOMPARE(review->text(), QStringLiteral("未打开文件（6）"));
+        int stage = 0;
+        bool plainText = false;
+        bool boundedPreview = false;
+        bool initiallyCollapsed = false;
+        bool expandedVisible = false;
+        bool insideScreen = false;
+        bool screenshotSaved = false;
+        QString visibleDetails;
+        const QString screenshot = QDir(QCoreApplication::applicationDirPath()).filePath(
+            QStringLiteral("gui-2b2-large-failure-details.png"));
+        QTimer guard;
+        guard.setInterval(20);
+        connect(&guard, &QTimer::timeout, this, [&]() {
+            auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+            if (!box) return;
+            if (stage == 0) {
+                plainText = box->textFormat() == Qt::PlainText;
+                boundedPreview = box->informativeText().size() < 1200
+                    && box->informativeText().contains(QStringLiteral("6"))
+                    && box->informativeText().contains(QStringLiteral("展开"));
+                initiallyCollapsed = true;
+                for (QTextEdit *editor : box->findChildren<QTextEdit *>())
+                    initiallyCollapsed = initiallyCollapsed && !editor->isVisible();
+                QAbstractButton *expand = nullptr;
+                for (QAbstractButton *button : box->buttons()) {
+                    if (box->buttonRole(button) == QMessageBox::ActionRole) expand = button;
+                }
+                stage = 1;
+                if (!expand) { box->reject(); return; }
+                expand->setFocus();
+                QTest::keyClick(expand, Qt::Key_Space);
+                return;
+            }
+            for (QTextEdit *editor : box->findChildren<QTextEdit *>()) {
+                if (!editor->isVisible()) continue;
+                expandedVisible = editor->isReadOnly();
+                visibleDetails = editor->toPlainText();
+            }
+            insideScreen = box->screen()->availableGeometry().contains(box->frameGeometry());
+            screenshotSaved = box->grab().save(screenshot);
+            stage = 2;
+            box->accept();
+        });
+        guard.start();
+        review->setFocus();
+        QTest::keyClick(review, Qt::Key_Space);
+        guard.stop();
+        QCOMPARE(stage, 2);
+        QVERIFY(plainText && boundedPreview && initiallyCollapsed);
+        QVERIFY2(expandedVisible, "keyboard expansion must reveal the real read-only text widget");
+        for (int index = 0; index < paths.size(); ++index) {
+            QVERIFY(visibleDetails.contains(paths[index]));
+            QCOMPARE(dropFixtureHash(paths[index]), hashes[index]);
+        }
+        QVERIFY(visibleDetails.contains(QStringLiteral("文件→打开")));
+        QVERIFY(insideScreen);
+        QVERIFY(screenshotSaved);
+        QCOMPARE(tabCount(mw_), 0);
+        qInfo().noquote() << "2B2 keyboard-expanded read-only details screenshot:" << screenshot;
+        mw_->openFilesFromExternal({});
+    }
+
+    void tc_2b2_open_dirty_document_reuses_identity_while_disk_is_exclusive() {
+#ifndef Q_OS_WIN
+        QSKIP("Windows exclusive-handle file sharing fixture");
+#else
+        closeAllEditorTabs(mw_);
+        const QString path = tmpDir_.filePath(QStringLiteral("drop-existing-exclusive.txt"));
+        {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(file.write("original source\n"), qint64(16));
+        }
+        mw_->openFilesFromExternal({path});
+        auto *tab = currentEditorTab(mw_);
+        QVERIFY(tab);
+        tab->editor()->append(QStringLiteral("unsaved edits stay authoritative"));
+        const auto state = tab->documentState();
+        const QString body = tab->editor()->text();
+        const auto hash = dropFixtureHash(path);
+        HANDLE handle = CreateFileW(reinterpret_cast<LPCWSTR>(path.utf16()),
+            GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        QVERIFY(handle != INVALID_HANDLE_VALUE);
+        std::unique_ptr<void, decltype(&CloseHandle)> exclusive(handle, CloseHandle);
+        int dialogs = 0;
+        QTimer guard;
+        guard.setInterval(10);
+        connect(&guard, &QTimer::timeout, this, [&]() {
+            for (QMessageBox *box : mw_->findChildren<QMessageBox *>()) {
+                if (!box->isVisible()) continue;
+                ++dialogs;
+                box->accept();
+            }
+        });
+        guard.start();
+        mw_->openFilesFromExternal({path});
+        guard.stop();
+        exclusive.reset();
+        QCOMPARE(dropFixtureHash(path), hash);
+        QCOMPARE(dialogs, 0);
+        QCOMPARE(tabCount(mw_), 1);
+        QCOMPARE(currentEditorTab(mw_), tab);
+        QCOMPARE(tab->documentState().id, state.id);
+        QCOMPARE(tab->documentState().capabilities, state.capabilities);
+        QCOMPARE(tab->editor()->text(), body);
+        QVERIFY(tab->isModified());
+        closeAllEditorTabs(mw_);
+#endif
+    }
+
+    void tc_2b2_exclusive_unreadable_batch_keeps_valid_file() {
+#ifndef Q_OS_WIN
+        QSKIP("Windows exclusive-handle file sharing fixture");
+#else
+        closeAllEditorTabs(mw_);
+        const QString locked = tmpDir_.filePath(QStringLiteral("drop-unreadable.txt"));
+        const QString valid = tmpDir_.filePath(QStringLiteral("drop-after-unreadable.txt"));
+        for (const QString &path : {locked, valid}) {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(file.write("original source\n"), qint64(16));
+        }
+        const auto lockedHash = dropFixtureHash(locked);
+        const auto validHash = dropFixtureHash(valid);
+        HANDLE handle = CreateFileW(reinterpret_cast<LPCWSTR>(locked.utf16()),
+            GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        QVERIFY(handle != INVALID_HANDLE_VALUE);
+        std::unique_ptr<void, decltype(&CloseHandle)> exclusive(handle, CloseHandle);
+        int dialogs = 0;
+        QString feedback;
+        QTimer guard;
+        guard.setInterval(10);
+        connect(&guard, &QTimer::timeout, this, [&]() {
+            for (QMessageBox *box : mw_->findChildren<QMessageBox *>()) {
+                if (!box->isVisible()) continue;
+                ++dialogs;
+                feedback = box->text() + QLatin1Char('\n') + box->informativeText();
+                box->accept();
+            }
+        });
+        guard.start();
+        mw_->openFilesFromExternal({locked, valid});
+        guard.stop();
+        QCOMPARE(dialogs, 1);
+        QCOMPARE(tabCount(mw_), 1);
+        QCOMPARE(currentEditorTab(mw_)->filePath(), valid);
+        QVERIFY(!currentEditorTab(mw_)->isModified());
+        exclusive.reset();
+        QCOMPARE(dropFixtureHash(locked), lockedHash);
+        QCOMPARE(dropFixtureHash(valid), validHash);
+        QVERIFY(feedback.contains(QFileInfo(locked).fileName()));
+        QVERIFY(feedback.contains(QStringLiteral("无法读取")));
+        QVERIFY(feedback.contains(QStringLiteral("重试")));
+        QVERIFY(!feedback.contains(QStringLiteral("不存在")));
+        mw_->openFilesFromExternal({locked});
+        QCOMPARE(tabCount(mw_), 2);
+        QCOMPARE(currentEditorTab(mw_)->filePath(), locked);
+        QCOMPARE(dropFixtureHash(locked), lockedHash);
+        closeAllEditorTabs(mw_);
+#endif
     }
 
     void tc_gui_hex_surfaces_route_external_file_drop_to_main_window() {

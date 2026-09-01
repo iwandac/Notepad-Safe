@@ -3,18 +3,24 @@
 // Bounded mmap-backed read-only provider shared by S2 and S3.
 
 #include <QDateTime>
+#include <QMetaObject>
 #include <QVector>
 #include <QWidget>
+
+#include <memory>
 
 #include "SharedReadOnlyFile.h"
 #include "TextEncoding.h"
 #include "ReadOnlySelectionModel.h"
+#include "OrdinaryReadSource.h"
 
 class QFileSystemWatcher;
 class QPlainTextEdit;
 class QScrollBar;
 class QTimer;
 class QsciScintilla;
+class WindowedHexMouseSelectionController;
+class ReadOnlyTailController;
 
 class WindowedReadOnlyProvider final : public QWidget
 {
@@ -26,7 +32,10 @@ public:
     explicit WindowedReadOnlyProvider(QWidget *parent = nullptr);
     ~WindowedReadOnlyProvider() override;
 
-    bool openFile(const QString &path, Presentation presentation, QString *error = nullptr);
+    bool openFile(const QString &path, Presentation presentation,
+                  const PersistenceReadPolicy &policy, QString *error = nullptr,
+                  std::optional<TextEncoding> forcedEncoding = {},
+                  EncodingDetection *detection = nullptr);
     void closeFile();
     void setPresentation(Presentation presentation);
     void setBinaryContent(bool binary);
@@ -38,17 +47,26 @@ public:
     Presentation presentation() const { return m_presentation; }
 
     qint64 fileSize() const { return m_fileSize; }
+    bool hasSource() const { return !m_path.isEmpty(); }
+    const PersistenceReadPolicy &readPolicy() const { return m_readPolicy; }
+    const DiskFileVersion &sourceVersion() const { return m_sourceVersion; }
+    DiskFileStamp sourceStamp() const;
+    bool validateCurrent(QString *error = nullptr);
     qint64 characterCount() const { return m_characterCount; }
     bool characterCountPending() const { return m_characterCountPending; }
+    bool statisticsDeferred() const { return m_statisticsDeferred; }
+    ReadOnlyTailController *tailController() const { return m_tailController; }
     qint64 globalOffset() const { return m_globalOffset; }
     qint64 windowStart() const { return m_windowStart; }
     qint64 windowEnd() const { return m_windowEnd; }
     qint64 visibleTopOffset() const;
     qint64 visibleBottomOffset() const;
     int hexBytesPerRow() const { return m_hexBytesPerRow; }
-    QByteArray sourceBytes(qint64 offset, qsizetype length) const;
+    QByteArray sourceBytes(qint64 offset, qsizetype length, QString *error = nullptr) const;
     qint64 selectionStartOffset() const;
     qint64 selectionEndOffset() const;
+    qint64 selectionAnchorOffset() const;
+    qint64 selectionCaretOffset() const;
     bool copySelection(QString *error = nullptr) const;
     bool refreshFileMapping(QString *error = nullptr);
 
@@ -68,6 +86,7 @@ signals:
     void searchProgress(qint64 scannedBytes, qint64 totalBytes);
     void searchFinished(qint64 matchOffset);
     void sourceFileChanged(qint64 previousSize, qint64 currentSize);
+    void sourceVersionAccepted(QString path, DiskFileVersion version);
     void sourceReloadFailed(const QString &message);
     void characterCountChanged(qint64 count, bool pending);
 
@@ -75,10 +94,13 @@ protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
+    friend class WindowedHexMouseSelectionController;
+    friend class ReadOnlyTailController;
     enum class SelectionAuthority { NativeProjection, SourceBytes };
 
-    void reloadWindow(qint64 anchorOffset, qint64 selectionBytes,
-                      qint64 requestedTopOffset = -1, bool preserveHorizontal = false);
+    bool reloadWindow(qint64 anchorOffset, qint64 selectionBytes,
+                      qint64 requestedTopOffset = -1, bool preserveHorizontal = false,
+                      QString *error = nullptr);
     void scrollByLines(int lineDelta);
     void beginVirtualSelection();
     void updateVirtualSelection(qint64 caretOffset);
@@ -108,9 +130,15 @@ private:
     void selectProjectedBytes(qint64 absoluteOffset, qint64 selectionBytes);
     void startLineNumberIndex();
     void cancelLineNumberIndex();
+    void settleLineNumberTask(qint64 taskId, quint64 generation);
+    void setStatisticsDeferred(bool deferred);
     bool lineNumberBaseForOffset(qint64 offset, qint64 *baseLine) const;
+    void observeFileChange();
+    void observeSourceStamp(const DiskFileStamp &stamp, DiskFileState state = DiskFileState::Unchanged);
+    void reportSourceFailure(const OrdinaryReadResult &result);
 
-    SharedReadOnlyFile m_file;
+    PersistenceReadPolicy m_readPolicy;
+    DiskFileVersion m_sourceVersion;
     QString m_path;
     qint64 m_fileSize = 0;
     qint64 m_globalOffset = 0;
@@ -126,6 +154,7 @@ private:
     QsciScintilla *m_editor = nullptr;
     QPlainTextEdit *m_asciiPreview = nullptr;
     QScrollBar *m_globalScrollBar = nullptr;
+    ReadOnlyTailController *m_tailController = nullptr;
     bool m_updatingScrollBar = false;
     bool m_wordWrap = false;
     bool m_scrollToEndAfterPaint = false;
@@ -137,13 +166,13 @@ private:
     bool m_syncingAsciiSelection = false;
     bool m_applyingSourceSelection = false;
     bool m_asciiMouseSelecting = false;
+    std::unique_ptr<WindowedHexMouseSelectionController> m_hexMouseSelection;
     SelectionAuthority m_selectionAuthority = SelectionAuthority::NativeProjection;
     ReadOnlySelectionModel m_sourceSelection;
     QFileSystemWatcher *m_fileWatcher = nullptr;
     QTimer *m_remapDebounce = nullptr;
     QTimer *m_filePoll = nullptr;
-    QDateTime m_observedModified;
-    qint64 m_observedSize = -1;
+    DiskFileStamp m_observedStamp;
 
     qint64 m_searchTaskId = -1;
     quint64 m_searchGeneration = 0;
@@ -152,8 +181,10 @@ private:
     QByteArray m_searchNeedle;
     qint64 m_characterCount = -1;
     bool m_characterCountPending = false;
+    bool m_statisticsDeferred = false;
     qint64 m_lineNumberTaskId = -1;
     quint64 m_lineNumberGeneration = 0;
+    QMetaObject::Connection m_lineNumberFinishedConnection;
     bool m_lineNumberPending = false;
     QVector<qint64> m_lineBreakPrefix;
     QVector<quint8> m_lineBreakPrefixEndsWithCr;

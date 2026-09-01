@@ -60,6 +60,11 @@ public:
     // filePath：本地文件路径（绝对）。
     // 返回 false 时 errMsg 有可读原因。
     bool openFile(const QString& filePath, QString* errMsg = nullptr);
+    // Plain-file persistence must release the Windows mapping before
+    // QSaveFile replaces the source. If commit then fails, reopen the original
+    // mapping without discarding the still-dirty PatchList/caret/selection.
+    bool openFilePreservingEdits(const QString& filePath,
+                                 QString* errMsg = nullptr);
     // Decrypted secure binary payloads must never be written to a temporary
     // file. They use the same byte/patch/Hex provider directly from a bounded
     // in-memory backing store.
@@ -74,7 +79,8 @@ public:
     //    processEvents 可能派发指向本对象的 QueuedConnection（如 onAsyncLineBuildSwapped）
     //    导致 use-after-free / 虚表访问崩溃 0xC0000005。改用固定时间保守等待（最坏 500ms
     //    对 LineIndex 100MB 级任务绰绰有余——每 16MB 就检查 cancel，最坏仅 16MB 扫描时间 10~30ms）。
-    void closeFile(bool allowProcessEvents = true);
+    void closeFile(bool allowProcessEvents = true,
+                   bool preserveDocumentState = false);
 
     bool isOpen() const { return m_memoryBacked || mmapBase_ != nullptr; }
     // Windowed S2/S3 presentation owns its own bounded projection. Its hidden
@@ -177,11 +183,10 @@ public:
     bool hasSelection() const { return selStartByte_ != selEndByte_; }
     qint64 selectionStart() const { return std::min(selStartByte_, selEndByte_); }
     qint64 selectionEnd()   const { return std::max(selStartByte_, selEndByte_); }
+    qint64 selectionAnchorByte() const { return selAnchorByte_; }
+    qint64 selectionCaretByte() const { return cursorByte_; }
     // 设置字节选区 [start,end)（start 可以大于 end）
-    void selectBytes(qint64 start, qint64 end) {
-        selStartByte_ = start; selEndByte_ = end; selAnchorByte_ = start; cursorByte_ = end;
-        viewport()->update();
-    }
+    void selectBytes(qint64 anchor, qint64 caret);
     QByteArray selectedBytes() const;
     void selectAll();
     void clearSelection() { selStartByte_ = selEndByte_ = cursorByte_; selAnchorByte_ = cursorByte_; viewport()->update(); }
@@ -379,7 +384,8 @@ private:
     qint64 m_mmapTaskId = -1;  // AsyncTaskManager 的 mmap 任务 ID
     bool   m_loading = false;  // 正在异步 mmap 加载中
     Q_INVOKABLE void onMmapReady(quintptr ptr, qint64 size,
-                                 LineIndex quickIndex, bool quickIndexBuilt);
+                                 LineIndex quickIndex, bool quickIndexBuilt,
+                                 bool preserveDocumentState);
 
     // ---- 成员 ----
     SharedReadOnlyFile file_;
@@ -388,6 +394,9 @@ private:
     uchar*     mmapBase_ = nullptr;
     qint64     mmapSize_ = 0;
     bool       m_fullLineIndexBuildEnabled = true;
+
+    bool openFileImpl(const QString& filePath, QString* errMsg,
+                      bool preserveDocumentState);
 
     LineIndex  lineIndex_;
     PatchList  patches_;

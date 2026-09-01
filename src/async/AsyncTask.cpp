@@ -63,6 +63,45 @@ QString AsyncTask::stateText() const
     return QObject::tr("未知");
 }
 
+AsyncTaskUserText AsyncTask::userText() const
+{
+    const auto duration = [](qint64 milliseconds) {
+        const qint64 seconds = qMax<qint64>(1, (milliseconds + 999) / 1000);
+        if (seconds < 60) return QObject::tr("%1 秒").arg(seconds);
+        const qint64 minutes = (seconds + 59) / 60;
+        if (minutes < 60) return QObject::tr("%1 分钟").arg(minutes);
+        return QObject::tr("%1 小时 %2 分钟").arg(minutes / 60).arg(minutes % 60);
+    };
+    AsyncTaskUserText out;
+    out.title = title;
+    out.status = stateText();
+    const qint64 remaining = estimatedRemainingMs();
+    if (remaining >= 0)
+        out.status += QObject::tr(" · 约剩 %1").arg(duration(remaining));
+    QString phase;
+    if (!progressPhase.isEmpty()) {
+        phase = progressPhaseCount > 0
+            ? QObject::tr("%1/%2 %3").arg(progressPhaseIndex).arg(progressPhaseCount).arg(progressPhase)
+            : progressPhase;
+    }
+    const int precise = percentHundredths();
+    if (precise >= 0)
+        out.progress = QString::number(precise / 100.0, 'f', 2) + QLatin1Char('%');
+    else
+        out.progress = state == AsyncTaskState::Queued || state == AsyncTaskState::Running
+            ? QObject::tr("处理中") : stateText();
+    if (!phase.isEmpty()) out.progress.prepend(phase + QStringLiteral(" · "));
+    if (state == AsyncTaskState::Failed) {
+        out.failure = error.userMessage.trimmed();
+        if (out.failure.isEmpty())
+            out.failure = QObject::tr("此任务未完成，请查看技术详情后重试。");
+    }
+    out.summary = out.title + QLatin1Char('\n') + out.status
+        + QStringLiteral(" · ") + out.progress;
+    if (!out.failure.isEmpty()) out.summary += QLatin1Char('\n') + out.failure;
+    return out;
+}
+
 QString AsyncTask::priorityText() const
 {
     switch (priority) {

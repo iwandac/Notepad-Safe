@@ -3,6 +3,8 @@
 #include "LargeFileSearch.h"
 #include "DynamicThresholds.h"
 #include "AsyncTaskManager.h"
+#include "ByteClipboard.h"
+#include "EditorSurfaceAccessibility.h"
 
 #include <QResizeEvent>
 #include <QMouseEvent>
@@ -91,6 +93,7 @@ VirtualFileView::VirtualFileView(QWidget* parent)
     : QAbstractScrollArea(parent)
     , fm_(font_)
 {
+    configureByteProviderAccessibility(this);
     font_ = pickMonospaceFont();
     setFont(font_);
     fm_ = QFontMetrics(font_);
@@ -146,7 +149,22 @@ VirtualFileView::~VirtualFileView() {
 // ============================================================================
 bool VirtualFileView::openFile(const QString& filePath, QString* errMsg)
 {
-    closeFile();
+    return openFileImpl(filePath, errMsg, false);
+}
+
+bool VirtualFileView::openFilePreservingEdits(const QString& filePath,
+                                              QString* errMsg)
+{
+    return openFileImpl(filePath, errMsg, true);
+}
+
+bool VirtualFileView::openFileImpl(const QString& filePath, QString* errMsg,
+                                   bool preserveDocumentState)
+{
+    const QPointer<VirtualFileView> owner(this);
+    closeFile(true, preserveDocumentState);
+    if (!owner)
+        return false;
     QString openError;
     if (!openSharedReadOnlyFile(file_, QFileInfo(filePath).absoluteFilePath(), &openError)) {
         if (errMsg) *errMsg = QObject::tr("无法打开文件：%1").arg(openError);
@@ -157,19 +175,25 @@ bool VirtualFileView::openFile(const QString& filePath, QString* errMsg)
     if (size == 0) {
         mmapSize_ = 0;
         lineIndex_.clear();
-        bookmarks_.clear();
-        cursorByte_ = 0;
-        selStartByte_ = selEndByte_ = 0;
-        patches_.resetAfterSave();
-        lastL2Count_ = 0;
+        if (!preserveDocumentState) {
+            bookmarks_.clear();
+            cursorByte_ = 0;
+            selStartByte_ = selEndByte_ = 0;
+            patches_.resetAfterSave();
+            lastL2Count_ = 0;
+        }
         if (search_) search_->setSource(nullptr, 0, &lineIndex_, &patches_);
+        if (!owner)
+            return false;
         if (navigationSearch_)
             navigationSearch_->setSource(nullptr, 0, &lineIndex_, &patches_);
+        if (!owner)
+            return false;
         updateMetrics();
         updateScrollBarsFromContent();
         viewport()->update();
         emit fileOpenedChanged(true);
-        emit saveNeededChanged(false);
+        emit saveNeededChanged(patches_.isModified());
         emit lineBuildProgress(0, 0);
         emit lineBuildFinished(true);
         return true;
@@ -198,7 +222,8 @@ bool VirtualFileView::openFile(const QString& filePath, QString* errMsg)
         AsyncTaskPriority::High,
         QObject::tr("映射文件: %1").arg(QFileInfo(filePath).fileName()),
         QObject::tr("正在将文件映射到内存..."),
-        [that, size, pathCopy, buildQuickIndex](qint64, AsyncCancelPtr cancel,
+        [that, size, pathCopy, buildQuickIndex, preserveDocumentState](
+                               qint64, AsyncCancelPtr cancel,
                                std::function<void(qint64,qint64)> reportProgress,
                                std::function<void(const AsyncErrorInfo&)> reportError)
         {
@@ -209,6 +234,7 @@ bool VirtualFileView::openFile(const QString& filePath, QString* errMsg)
             if (!p) {
                 AsyncErrorInfo e;
                 e.message = QObject::tr("无法映射文件到内存（QFile::map 失败）。");
+                e.userMessage = QObject::tr("无法准备文件浏览。请检查文件是否仍可读取后重试，或查看技术详情。");
                 reportError(e);
                 return;
             }
@@ -235,7 +261,8 @@ bool VirtualFileView::openFile(const QString& filePath, QString* errMsg)
                                       Q_ARG(quintptr, reinterpret_cast<quintptr>(p)),
                                       Q_ARG(qint64, size),
                                       Q_ARG(LineIndex, quickIndex),
-                                      Q_ARG(bool, buildQuickIndex));
+                                      Q_ARG(bool, buildQuickIndex),
+                                      Q_ARG(bool, preserveDocumentState));
         },
         0, QLatin1String("Mmap"), size
     );
@@ -245,7 +272,12 @@ bool VirtualFileView::openFile(const QString& filePath, QString* errMsg)
 
 bool VirtualFileView::openMemory(QByteArray bytes, ViewMode mode, QString* errMsg)
 {
+    const QPointer<VirtualFileView> owner(this);
     closeFile();
+    if (!owner) {
+        bytes.fill(0);
+        return false;
+    }
     if (mode != ViewMode::Hex) {
         if (errMsg)
             *errMsg = QObject::tr("内存安全载荷当前只支持十六进制视图。");
@@ -271,8 +303,12 @@ bool VirtualFileView::openMemory(QByteArray bytes, ViewMode mode, QString* errMs
     lastL2Count_ = 0;
     if (search_)
         search_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
+    if (!owner)
+        return false;
     if (navigationSearch_)
         navigationSearch_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
+    if (!owner)
+        return false;
 
     m_activeWindowStart = 0;
     m_activeWindowLen = 0;
@@ -295,7 +331,9 @@ bool VirtualFileView::openMemory(QByteArray bytes, ViewMode mode, QString* errMs
 }
 
 void VirtualFileView::onMmapReady(quintptr ptr, qint64 size,
-                                  LineIndex quickIndex, bool quickIndexBuilt) {
+                                  LineIndex quickIndex, bool quickIndexBuilt,
+                                  bool preserveDocumentState) {
+    const QPointer<VirtualFileView> owner(this);
     m_loading = false;
     m_mmapTaskId = -1;
 
@@ -309,16 +347,22 @@ void VirtualFileView::onMmapReady(quintptr ptr, qint64 size,
     mmapSize_ = size;
     lineIndex_ = quickIndex;
 
-    bookmarks_.clear();
     m_buildProgressBytes = quickIndexBuilt
         ? qMin<qint64>(size, 1024 * 1024) : 0;
-    cursorByte_ = 0;
-    selStartByte_ = selEndByte_ = 0;
-    patches_.resetAfterSave();
-    lastL2Count_ = 0;
+    if (!preserveDocumentState) {
+        bookmarks_.clear();
+        cursorByte_ = 0;
+        selStartByte_ = selEndByte_ = 0;
+        patches_.resetAfterSave();
+        lastL2Count_ = 0;
+    }
     if (search_) search_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
+    if (!owner)
+        return;
     if (navigationSearch_)
         navigationSearch_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
+    if (!owner)
+        return;
 
     // ---- 小 chunk overlay：复位 activeWindow ----
     m_activeWindowStart = 0;
@@ -394,7 +438,7 @@ void VirtualFileView::onMmapReady(quintptr ptr, qint64 size,
 
     viewport()->update();
     emit fileOpenedChanged(true);
-    emit saveNeededChanged(false);
+    emit saveNeededChanged(patches_.isModified());
     emit lineBuildProgress(qMin<qint64>(Q_INT64_C(1024) * 1024, mmapSize_), mmapSize_);
 
     // ---- L3（落点）对齐一次：若 activeWindow 变了，发信号让 EditorTab 灌 overlay Scintilla ----
@@ -425,11 +469,16 @@ bool VirtualFileView::remapFile(QString* errMsg) {
         return false;
     }
     QString path = file_.fileName();
+    const QPointer<VirtualFileView> owner(this);
     closeFile();
+    if (!owner)
+        return false;
     return openFile(path, errMsg);
 }
 
-void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
+void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/,
+                                bool preserveDocumentState /*= false*/) {
+    const QPointer<VirtualFileView> owner(this);
     const bool closingMemoryBacked = m_memoryBacked;
     // processEvents below may deliver a queued result from the line-index task
     // being canceled. That result belongs to the old mapping and must not
@@ -442,13 +491,19 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
     // completion barrier before any of those objects are reset or unmapped.
     if (search_)
         search_->cancelAndWait();
+    if (!owner)
+        return;
     if (navigationSearch_)
         navigationSearch_->cancelAndWait();
+    if (!owner)
+        return;
     // ========================================================================
     //  取消异步 mmap 任务（如果正在加载中）
     // ========================================================================
     if (m_mmapTaskId > 0) {
         AsyncTaskManager::instance().cancel(m_mmapTaskId);
+        if (!owner)
+            return;
         m_mmapTaskId = -1;
     }
     m_loading = false;
@@ -464,6 +519,8 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
     if (m_lineBuildTaskId > 0) {
         // 先通过 Manager 设置取消（线程安全的内部状态切换 + cancel 原子置 true）
         AsyncTaskManager::instance().cancel(m_lineBuildTaskId);
+        if (!owner)
+            return;
 
         // cancel 原子也要再置一次（双重保险：worker 可能刚读完 task.cancel 但还没开始工作）
         if (lineBuildCancel_) lineBuildCancel_->store(true, std::memory_order_release);
@@ -525,8 +582,12 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
     if (m_scrollDebounceTimer) m_scrollDebounceTimer->stop();
     if (m_prefetchWatcher && m_prefetchWatcher->isRunning())
         m_prefetchWatcher->cancel();
+    if (!owner)
+        return;
     if (m_prefetchTaskId >= 0) {
         AsyncTaskManager::instance().cancel(m_prefetchTaskId);
+        if (!owner)
+            return;
         m_prefetchTaskId = -1;
     }
     if (m_prefetchCancel)
@@ -563,15 +624,21 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
     m_buildProgressBytes = 0;
     if (file_.isOpen()) file_.close();
     lineIndex_.clear();
-    bookmarks_.clear();
-    cursorByte_ = 0;
-    selStartByte_ = selEndByte_ = 0;
-    patches_.resetAfterSave();
-    patches_.setSensitive(false);
-    lastL2Count_ = 0;
+    if (!preserveDocumentState) {
+        bookmarks_.clear();
+        cursorByte_ = 0;
+        selStartByte_ = selEndByte_ = 0;
+        patches_.resetAfterSave();
+        patches_.setSensitive(false);
+        lastL2Count_ = 0;
+    }
     if (search_) search_->setSource(nullptr, 0, nullptr, nullptr);
+    if (!owner)
+        return;
     if (navigationSearch_)
         navigationSearch_->setSource(nullptr, 0, nullptr, nullptr);
+    if (!owner)
+        return;
 
     // ---- 关闭文件时一并清理小 chunk 状态 ----
     if (closingMemoryBacked) {
@@ -603,7 +670,11 @@ void VirtualFileView::closeFile(bool allowProcessEvents /*= true*/) {
         updateScrollBarsFromContent();
         viewport()->update();
         emit fileOpenedChanged(false);
-        emit saveNeededChanged(false);
+        if (!owner)
+            return;
+        emit saveNeededChanged(preserveDocumentState && patches_.isModified());
+        if (!owner)
+            return;
     }
     m_closingFile = false;
 }
@@ -1055,6 +1126,27 @@ void VirtualFileView::gotoByteOffset(qint64 byteOffset, bool /*selectTo*/) {
     viewport()->update();
 }
 
+void VirtualFileView::selectBytes(qint64 anchor, qint64 caret)
+{
+    const qint64 size = virtualFileSize();
+    anchor = qBound<qint64>(0, anchor, size);
+    caret = qBound<qint64>(0, caret, size);
+    selStartByte_ = anchor;
+    selEndByte_ = caret;
+    selAnchorByte_ = anchor;
+    cursorByte_ = caret;
+    int line = 0;
+    qint64 column = 0;
+    if (m_viewMode == ViewMode::Hex) {
+        line = hexByteToLine(caret);
+        column = caret - hexLineToByteOffset(line);
+    } else {
+        computeCursorLineCol(&line, &column);
+    }
+    emit cursorPositionChanged(line, int(qMin<qint64>(INT_MAX, column)));
+    viewport()->update();
+}
+
 void VirtualFileView::toggleBookmarkAtCursor() {
     int cLine; qint64 cCol64;
     computeCursorLineCol(&cLine, &cCol64);
@@ -1178,6 +1270,8 @@ bool VirtualFileView::deleteBytesAhead(int nBytes, QString* errMsg) {
 bool VirtualFileView::pasteBytes(const QByteArray& bytes, QString* errMsg) {
     if (!isOpen()) { if (errMsg) *errMsg = QObject::tr("文件未打开。"); return false; }
     if (bytes.isEmpty()) return true;
+    if (!ByteClipboard::payloadWithinLimit(bytes.size(), errMsg))
+        return false;
     if (bytes.size() > DynamicThresholds::instance().PASTE_LIMIT) {
         emit patchPressureWarn();
     }
@@ -1932,6 +2026,7 @@ LineIndex VirtualFileView::buildLineIndexOnWorker(const uchar* data, qint64 size
 
 void VirtualFileView::onAsyncLineBuildSwapped(LineIndex result, bool buildOk)
 {
+    const QPointer<VirtualFileView> owner(this);
     if (m_closingFile || !mmapBase_)
         return;
     // Preserve the byte represented by the old incomplete progress thumb.
@@ -1961,8 +2056,12 @@ void VirtualFileView::onAsyncLineBuildSwapped(LineIndex result, bool buildOk)
                 m_buildProgressBytes = mmapSize_;  // 构建完成
                 viewport()->update();
                 if (search_) search_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
+                if (!owner)
+                    return;
                 if (navigationSearch_)
                     navigationSearch_->setSource(mmapBase_, mmapSize_, &lineIndex_, &patches_);
+                if (!owner)
+                    return;
                 emit lineBuildProgress(mmapSize_, mmapSize_);
                 // 同步更新任务进度到 100%（防止 QueuedConnection 进度包在任务入 history 后丢失）
                 if (m_lineBuildTaskId > 0) {

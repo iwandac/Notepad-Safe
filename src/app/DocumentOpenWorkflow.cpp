@@ -4,11 +4,8 @@
 #include "FileContentProbe.h"
 #include "FileTierPolicy.h"
 #include "SessionManager.h"
-#include "VirtualFileView.h"
 
 #include <QDebug>
-
-#include <climits>
 
 bool openDocumentByPolicy(const DocumentProviderRegistry &providers,
                           IDocumentSurface *surface, const QString &path,
@@ -21,7 +18,8 @@ bool openDocumentByPolicy(const DocumentProviderRegistry &providers,
         QString error;
         const DocumentSurfaceOpenRequest request{
             path, DocumentContentKind::Binary, true,
-            DocumentPresentationKind::Hex, forcedEncoding};
+            DocumentPresentationKind::Hex, forcedEncoding, {},
+            probe.tier.isReadOnlyByPolicy()};
         if (!providers.openBest(surface, request, &error)) {
             qWarning("[openDocumentByPolicy] binary mmap open failed: path='%s', error='%s'",
                      qUtf8Printable(path), qUtf8Printable(error));
@@ -33,7 +31,8 @@ bool openDocumentByPolicy(const DocumentProviderRegistry &providers,
         QString error;
         const DocumentSurfaceOpenRequest request{
             path, DocumentContentKind::Text, true,
-            DocumentPresentationKind::Text, forcedEncoding};
+            DocumentPresentationKind::Text, forcedEncoding, {},
+            probe.tier.isReadOnlyByPolicy()};
         if (providers.openBest(surface, request, &error)) {
             return true;
         }
@@ -53,33 +52,31 @@ bool openSessionDocument(const DocumentProviderRegistry &providers,
 {
     if (!surface || state.filePath.isEmpty())
         return false;
-    if (state.presentation == QLatin1String("hex")) {
+    const std::optional<TextEncoding> restoredEncoding =
+        encodingFromName(state.encoding);
+    const bool restoreHex = state.presentation == QLatin1String("hex");
+    // Freeze current classification even for a restored Hex presentation;
+    // a later path replacement may add restrictions, never remove them.
+    const FileContentProbeResult probe = probeFileContent(state.filePath);
+    if (restoreHex || probe.contentKind == DocumentContentKind::Binary) {
         QString error;
+        // A stored display encoding must not bypass Binary classification in
+        // openDocumentByPolicy. Keep its byte-backed provider for either view;
+        // the surface still derives read-only capability from current size.
+        const DocumentPresentationKind presentation =
+            state.presentation == QLatin1String("text")
+                ? DocumentPresentationKind::Text
+                : DocumentPresentationKind::Hex;
         const DocumentSurfaceOpenRequest request{
             state.filePath, DocumentContentKind::Binary, true,
-            DocumentPresentationKind::Hex, std::nullopt};
+            presentation, restoredEncoding, {}, probe.tier.isReadOnlyByPolicy()};
         if (!providers.openBest(surface, request, &error)) {
-            qWarning("[session] explicit Hex restore failed: path='%s', error='%s'",
+            qWarning("[session] Binary restore failed: path='%s', error='%s'",
                      qUtf8Printable(state.filePath), qUtf8Printable(error));
             return false;
         }
         return true;
     }
-    if (state.presentation == QLatin1String("text")
-        && probeFileContent(state.filePath).contentKind
-               == DocumentContentKind::Binary) {
-        QString error;
-        // Explicit text view for a binary file is a distinct current-product
-        // route; it intentionally uses the text window provider.
-        const DocumentSurfaceOpenRequest request{
-            state.filePath, DocumentContentKind::Binary, true,
-            DocumentPresentationKind::Text, std::nullopt};
-        if (!providers.openBest(surface, request, &error)) {
-            qWarning("[session] explicit Text restore failed: path='%s', error='%s'",
-                     qUtf8Printable(state.filePath), qUtf8Printable(error));
-            return false;
-        }
-        return true;
-    }
-    return openDocumentByPolicy(providers, surface, state.filePath);
+    return openDocumentByPolicy(providers, surface, state.filePath,
+                                restoredEncoding);
 }

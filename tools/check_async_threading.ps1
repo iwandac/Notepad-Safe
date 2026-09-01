@@ -24,7 +24,14 @@ Get-ChildItem -LiteralPath $sourceRoot -Recurse -File |
             $line = $_
             foreach ($pattern in $patterns) {
                 if ($line -match $pattern) {
-                    $relative = [IO.Path]::GetRelativePath($repoRoot, $path)
+                    $rootWithSeparator = $repoRoot.TrimEnd('\', '/') + `
+                        [IO.Path]::DirectorySeparatorChar
+                    if ($path.StartsWith($rootWithSeparator,
+                                         [StringComparison]::OrdinalIgnoreCase)) {
+                        $relative = $path.Substring($rootWithSeparator.Length)
+                    } else {
+                        $relative = $path
+                    }
                     $violations += "${relative}:${lineNumber}: $line"
                     break
                 }

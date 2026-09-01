@@ -41,6 +41,9 @@ public:
     std::shared_ptr<AsyncSavePlan> captureAsyncSave(
         const QVector<ISessionDocumentPort *> &tabs, int activeIndex,
         bool forceSnapshots = false);
+    std::shared_ptr<AsyncSavePlan> captureAsyncSaveEntries(
+        const QVector<SessionCaptureEntry> &entries, int activeIndex,
+        bool forceSnapshots = false);
     std::shared_ptr<AsyncSaveResult> writeAsyncSave(
         const std::shared_ptr<AsyncSavePlan> &plan) const;
     bool asyncSaveSucceeded(
@@ -51,7 +54,9 @@ public:
     // 恢复内部快照。新版 .ndraft 在内存中解密后直接交给编辑器；旧版 .tmp
     // 仅作为迁移读取路径保留，不再产生新的 S1 明文快照。
     bool restoreAutosave(ISessionDocumentPort *tab, const QString &autosavePath,
-                         const QString &realFilePath = QString()) const;
+                         const QString &realFilePath = QString(),
+                         QString *error = nullptr,
+                         QString *diagnosticCode = nullptr) const;
 
     // 加载上次会话
     SessionData loadSession() const;
@@ -67,8 +72,8 @@ public:
 
     // 清理单个 autosave 文件（用户正式保存后调用）。仅允许删除本实例
     // autosave 目录内、由 SessionManager 命名的恢复文件。
-    void removeAutosaveFile(const QString &path) const;
-    void discardRecovery(ISessionDocumentPort *document) const;
+    bool removeAutosaveFile(const QString &path) const;
+    bool discardRecovery(ISessionDocumentPort *document) const;
 
 private:
     QString m_dataDir;

@@ -14,6 +14,8 @@
 #include <QStyle>
 #include <QMouseEvent>
 #include <QDateTime>
+#include <QScrollBar>
+#include <QTextCursor>
 
 namespace {
 QString taskDuration(qint64 milliseconds)
@@ -28,9 +30,64 @@ QString taskDuration(qint64 milliseconds)
 }
 
 namespace {
-// ====== 每一行：标题 + 状态标签 + 进度条 + 取消按钮（Queued/Running 时显示）+ 错误红色小字
+// Public row text comes only from the shared task projection; diagnostics stay
+// in the opt-in technical section below.
 class AsyncTaskItemDelegate : public QStyledItemDelegate
 {
+    // Use identical text widths/fonts/flags for measuring and painting. Native
+    // progress controls are visual indicators, never the source of row text.
+    static constexpr int TextFlags = Qt::AlignLeft | Qt::AlignTop | Qt::TextWrapAnywhere;
+    struct RowLayout {
+        QFont titleFont, textFont;
+        QString title, body, error;
+        QRect titleRect, bodyRect, progressRect, cancelRect, errorRect;
+        int height = 0;
+    };
+
+    static RowLayout rowLayout(const QStyleOptionViewItem &option, const QModelIndex &index)
+    {
+        RowLayout row;
+        row.titleFont = option.font;
+        row.titleFont.setBold(true);
+        row.textFont = option.font;
+        row.textFont.setBold(false);
+        row.textFont.setPointSize(qMax(8, row.textFont.pointSize() - 1));
+        row.title = index.data(AsyncTaskManager::TaskTitleRole).toString();
+        row.body = index.data(AsyncTaskManager::TaskUserStatusRole).toString()
+            + QStringLiteral(" · ") + index.data(AsyncTaskManager::TaskUserProgressRole).toString();
+        row.error = index.data(AsyncTaskManager::TaskUserErrorRole).toString();
+        const int left = option.rect.left() + 8;
+        const int width = qMax(1, option.rect.width() - 16);
+        int top = option.rect.top() + 6;
+        const auto textRect = [left, width](const QFont &font, const QString &text, int y) {
+            const QFontMetrics metrics(font);
+            const int height = qMax(metrics.height(), metrics.boundingRect(
+                QRect(0, 0, width, 100000), TextFlags, text).height());
+            return QRect(left, y, width, height);
+        };
+        row.titleRect = textRect(row.titleFont, row.title, top);
+        top = row.titleRect.bottom() + 5;
+        row.bodyRect = textRect(row.textFont, row.body, top);
+        top = row.bodyRect.bottom() + 7;
+        const QFontMetrics metrics(row.textFont);
+        const int controlHeight = qMax(24, metrics.height() + 8);
+        const int barHeight = qMax(12, metrics.height());
+        const auto state = static_cast<AsyncTaskState>(index.data(AsyncTaskManager::TaskStateRole).toInt());
+        const bool cancellable = (state == AsyncTaskState::Queued || state == AsyncTaskState::Running)
+            && index.data(AsyncTaskManager::TaskCancellableRole).toBool();
+        if (cancellable)
+            row.cancelRect = QRect(left + qMax(0, width - 70), top, qMin(70, width), controlHeight);
+        row.progressRect = QRect(left, top + (controlHeight - barHeight) / 2,
+            qMax(1, width - (cancellable ? 78 : 0)), barHeight);
+        top += controlHeight;
+        if (!row.error.isEmpty()) {
+            row.errorRect = textRect(row.textFont, row.error, top + 6);
+            top = row.errorRect.bottom() + 1;
+        }
+        row.height = top - option.rect.top() + 6;
+        return row;
+    }
+
 public:
     using QStyledItemDelegate::QStyledItemDelegate;
 
@@ -40,140 +97,62 @@ public:
         painter->setClipRect(option.rect);
         QStyle *style = qApp->style();
         style->drawPrimitive(QStyle::PE_PanelItemViewItem, &option, painter, nullptr);
+        const bool selected = option.state & QStyle::State_Selected;
+        const QColor foreground = option.palette.color(selected ? QPalette::HighlightedText : QPalette::Text);
+        // Some native styles do not paint selection for this primitive. Always
+        // pair the actual row background with the same palette's foreground.
+        if (selected) painter->fillRect(option.rect, option.palette.brush(QPalette::Highlight));
 
-        const QRect r = option.rect.adjusted(8, 6, -8, -6);
-        const QString title     = index.data(AsyncTaskManager::TaskTitleRole).toString();
-        const QString typeT     = index.data(AsyncTaskManager::TaskTypeTextRole).toString();
-        const QString stateT    = index.data(AsyncTaskManager::TaskStateTextRole).toString();
-        const QString prioT     = index.data(AsyncTaskManager::TaskPriorityTextRole).toString();
-        const int precisePercent =
-            index.data(AsyncTaskManager::TaskPercentHundredthsRole).toInt();
-        const QString phase =
-            index.data(AsyncTaskManager::TaskProgressPhaseRole).toString();
-        const int phaseIndex =
-            index.data(AsyncTaskManager::TaskProgressPhaseIndexRole).toInt();
-        const int phaseCount =
-            index.data(AsyncTaskManager::TaskProgressPhaseCountRole).toInt();
-        const qint64 done       = index.data(AsyncTaskManager::TaskProgressDoneRole).toLongLong();
-        const qint64 total      = index.data(AsyncTaskManager::TaskProgressTotalRole).toLongLong();
-        const int state         = index.data(AsyncTaskManager::TaskStateRole).toInt();
-        const auto taskState    = static_cast<AsyncTaskState>(state);
-        const QString err       = index.data(AsyncTaskManager::TaskErrorRole).toString();
-        const qint64 elapsedMs = index.data(AsyncTaskManager::TaskElapsedMsRole).toLongLong();
-        const qint64 remainingMs =
-            index.data(AsyncTaskManager::TaskEstimatedRemainingMsRole).toLongLong();
+        const RowLayout row = rowLayout(option, index);
+        const auto state = static_cast<AsyncTaskState>(index.data(AsyncTaskManager::TaskStateRole).toInt());
+        const bool active = state == AsyncTaskState::Queued || state == AsyncTaskState::Running;
+        const int precise = index.data(AsyncTaskManager::TaskPercentHundredthsRole).toInt();
 
-        QFont f = painter->font();
-        f.setBold(true);
-        painter->setFont(f);
-        painter->setPen(option.palette.color((option.state & QStyle::State_Selected) ? QPalette::HighlightedText : QPalette::Text));
-        painter->drawText(r.topLeft() + QPoint(0, painter->fontMetrics().ascent()), title);
+        painter->setFont(row.titleFont);
+        painter->setPen(foreground);
+        painter->drawText(row.titleRect, TextFlags, row.title);
+        painter->setFont(row.textFont);
+        painter->drawText(row.bodyRect, TextFlags, row.body);
 
-        f.setBold(false);
-        f.setPointSize(qMax(8, f.pointSize() - 1));
-        painter->setFont(f);
-        painter->setPen(option.palette.color(QPalette::Mid));
-        int tw = painter->fontMetrics().horizontalAdvance(typeT + "  |  " + prioT);
-        painter->drawText(r.topRight() + QPoint(-tw, painter->fontMetrics().ascent() - 2),
-                          QStringLiteral("%1  |  %2").arg(typeT, prioT));
-
-        // 第二行：状态 pill + 耗时
-        QRect line2 = r.adjusted(0, painter->fontMetrics().lineSpacing() + 4, 0, -painter->fontMetrics().lineSpacing() - 22);
-        line2.setHeight(painter->fontMetrics().lineSpacing());
-        QString pillText = QStringLiteral(" %1  ·  %2 ")
-                               .arg(stateT, taskDuration(elapsedMs));
-        if (remainingMs >= 0)
-            pillText += tr("· 约剩 %1 ").arg(taskDuration(remainingMs));
-        QColor pillBg;
-        QColor pillFg;
-        switch (taskState) {
-        case AsyncTaskState::Running:  pillBg = QColor(122, 90, 248, 28); pillFg = QColor(122, 90, 248); break;
-        case AsyncTaskState::Finished: pillBg = QColor(46, 158, 106, 22);  pillFg = QColor(46, 158, 106); break;
-        case AsyncTaskState::Failed:   pillBg = QColor(228, 83, 74, 22);   pillFg = QColor(228, 83, 74);  break;
-        case AsyncTaskState::Canceled: pillBg = QColor(242, 176, 75, 22);  pillFg = QColor(196, 140, 50); break;
-        case AsyncTaskState::Queued:
-        default:                       pillBg = QColor(107, 115, 134, 22); pillFg = option.palette.color(QPalette::Mid).darker(120); break;
-        }
-        QRect pillR = QRect(line2.topLeft(), QSize(painter->fontMetrics().horizontalAdvance(pillText) + 16, painter->fontMetrics().height() + 4));
-        painter->setPen(Qt::NoPen);
-        painter->setBrush(pillBg);
-        painter->drawRoundedRect(pillR, 6, 6);
-        painter->setPen(pillFg);
-        painter->drawText(pillR, Qt::AlignCenter, pillText);
-
-        // 进度条：右侧 82 像素留作取消按钮
-        QRect progR = pillR;
-        progR.setLeft(pillR.right() + 10);
-        progR.setRight(r.right() - 82);
-        progR.setHeight(painter->fontMetrics().height() + 4);
-        progR.translate(0, -1);
-        QStyleOptionProgressBar pbar;
-        pbar.rect = progR;
-        pbar.minimum = 0;
-        const bool active = taskState == AsyncTaskState::Queued
-                            || taskState == AsyncTaskState::Running;
-        const bool knownProgress = total > 0 && precisePercent >= 0;
-        if (knownProgress) {
-            pbar.maximum = 10000;
-            pbar.progress = qBound(0, precisePercent, 10000);
-            const QString phasePrefix = phase.isEmpty() ? QString()
-                : phaseCount > 0
-                    ? tr("%1/%2 %3 · ").arg(phaseIndex).arg(phaseCount).arg(phase)
-                    : phase + QStringLiteral(" · ");
-            pbar.text = tr("%1%2%  %3 / %4")
-                .arg(phasePrefix)
-                .arg(QString::number(precisePercent / 100.0, 'f', 2))
-                .arg(done).arg(total);
+        QStyleOptionProgressBar progress;
+        progress.rect = row.progressRect;
+        progress.state = option.state | QStyle::State_Horizontal;
+        progress.minimum = 0;
+        if (precise >= 0) {
+            progress.maximum = 10000;
+            progress.progress = qBound(0, precise, 10000);
         } else if (active) {
-            pbar.maximum = 0;
-            pbar.progress = 0;
-            pbar.text = tr("处理中");
+            progress.maximum = 0;
+            progress.progress = 0;
         } else {
-            // A terminal task with unknown total is not busy. Keep a stable,
-            // non-animated row instead of leaving an indeterminate stripe.
-            pbar.maximum = 100;
-            pbar.progress = taskState == AsyncTaskState::Finished ? 100 : 0;
-            pbar.text = stateT;
+            // A terminal unknown-total task is never a busy animation.
+            progress.maximum = 100;
+            progress.progress = state == AsyncTaskState::Finished ? 100 : 0;
         }
-        pbar.textVisible = true;
-        pbar.palette = option.palette;
-        style->drawControl(QStyle::CE_ProgressBar, &pbar, painter);
-
-        // 同一几何同时用于绘制和 editorEvent 命中；已结束任务不显示伪按钮。
-        const bool cancellable = index.data(AsyncTaskManager::TaskCancellableRole).toBool()
-                              && (taskState == AsyncTaskState::Queued
-                                  || taskState == AsyncTaskState::Running);
-        if (cancellable) {
-            QRect cancelRect(r.right() - 74, pillR.top(), 70, pillR.height());
-            QStyleOptionButton btn;
-            btn.rect = cancelRect;
-            btn.text = tr("取消");
-            btn.state = QStyle::State_Enabled | QStyle::State_Raised;
-            btn.palette = option.palette;
-            style->drawControl(QStyle::CE_PushButton, &btn, painter);
+        progress.textVisible = false;
+        progress.palette = option.palette;
+        style->drawControl(QStyle::CE_ProgressBar, &progress, painter);
+        if (!row.cancelRect.isEmpty()) {
+            QStyleOptionButton button;
+            button.rect = row.cancelRect;
+            button.text = tr("取消");
+            button.state = QStyle::State_Enabled | QStyle::State_Raised;
+            button.palette = option.palette;
+            style->drawControl(QStyle::CE_PushButton, &button, painter);
         }
-
-        // 第三行：若有错误，红色 1 行概要
-        if (!err.isEmpty()) {
-            const int thirdLineY = r.top() + painter->fontMetrics().lineSpacing() * 2 + 10;
-            QRect errR(r.left(), thirdLineY, r.width() - 90, painter->fontMetrics().lineSpacing() * 2);
-            painter->setPen(QColor(228, 83, 74));
-            QString oneLine = err.section(QLatin1Char('\n'), 0, 0).left(140);
-            if (err.section(QLatin1Char('\n'), 0, 0).size() > 140)
-                oneLine += QChar(0x2026);
-            painter->drawText(errR, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, oneLine);
+        if (!row.error.isEmpty()) {
+            painter->setPen(foreground);
+            painter->drawText(row.errorRect, TextFlags, row.error);
         }
-
         painter->restore();
     }
 
     QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override
     {
-        QSize s = QStyledItemDelegate::sizeHint(option, index);
-        const QString err = index.data(AsyncTaskManager::TaskErrorRole).toString();
-        int base = option.fontMetrics.lineSpacing() * 3 + 26;
-        if (!err.isEmpty()) base += option.fontMetrics.lineSpacing() * 2;
-        return QSize(s.width(), base);
+        QStyleOptionViewItem measured = option;
+        const auto *view = qobject_cast<QListView *>(parent());
+        measured.rect = QRect(0, 0, view ? view->viewport()->width() : qMax(1, option.rect.width()), 0);
+        return QSize(0, rowLayout(measured, index).height);
     }
 
     bool editorEvent(QEvent *event, QAbstractItemModel *model, const QStyleOptionViewItem &option, const QModelIndex &index) override
@@ -181,13 +160,7 @@ public:
         Q_UNUSED(model);
         if (event->type() == QEvent::MouseButtonRelease) {
             auto *me = static_cast<QMouseEvent*>(event);
-            const QRect r = option.rect.adjusted(8, 6, -8, -6);
-            QFont compactFont = option.font;
-            compactFont.setPointSize(qMax(8, compactFont.pointSize() - 1));
-            const QFontMetrics metrics(compactFont);
-            const int pillTop = r.top() + metrics.lineSpacing() + 4;
-            QRect cancelRect(r.right() - 74, pillTop, 70, metrics.height() + 4);
-            if (cancelRect.contains(me->pos())) {
+            if (rowLayout(option, index).cancelRect.contains(me->pos())) {
                 const int st = index.data(AsyncTaskManager::TaskStateRole).toInt();
                 if (index.data(AsyncTaskManager::TaskCancellableRole).toBool()
                     && (st == static_cast<int>(AsyncTaskState::Queued)
@@ -220,6 +193,7 @@ AsyncTaskPanelDialog::AsyncTaskPanelDialog(QWidget *parent)
     topRow->setSpacing(8);
     auto makePill = [](QLabel *&out, const QString &label) {
         out = new QLabel(label);
+        out->setTextFormat(Qt::PlainText);
         out->setStyleSheet(QStringLiteral(
             "QLabel{padding:4px 12px;border-radius:999px;"
             "background:palette(alternate-base);border:1px solid palette(midlight);"
@@ -239,7 +213,6 @@ AsyncTaskPanelDialog::AsyncTaskPanelDialog(QWidget *parent)
     topRow->addWidget(m_summaryRunning);
     topRow->addWidget(m_summaryDone);
     topRow->addWidget(m_summaryFailed);
-    topRow->addWidget(m_summaryThreads);
     topRow->addStretch(1);
     rootLay->addLayout(topRow);
 
@@ -268,14 +241,46 @@ AsyncTaskPanelDialog::AsyncTaskPanelDialog(QWidget *parent)
     m_listView->setSelectionMode(QAbstractItemView::SingleSelection);
     m_listView->setAlternatingRowColors(true);
     m_listView->setUniformItemSizes(false);
+    m_listView->setResizeMode(QListView::Adjust);
     rootLay->addWidget(m_listView, 3);
 
-    m_detailsEdit = new QPlainTextEdit(this);
+    m_selectedSummary = new QLabel(tr("选择任务以查看状态。"), this);
+    m_selectedSummary->setObjectName(QStringLiteral("backgroundTaskSummary"));
+    m_selectedSummary->setAccessibleName(tr("所选任务"));
+    m_selectedSummary->setTextFormat(Qt::PlainText);
+    m_selectedSummary->setWordWrap(true);
+    m_selectedSummary->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+    rootLay->addWidget(m_selectedSummary);
+
+    m_detailsToggle = new QPushButton(tr("技术详情"), this);
+    m_detailsToggle->setObjectName(QStringLiteral("backgroundTaskDetailsToggle"));
+    m_detailsToggle->setAccessibleName(tr("技术详情"));
+    m_detailsToggle->setCheckable(true);
+    m_detailsToggle->setAutoDefault(false);
+    m_detailsToggle->setAccessibleDescription(tr("已折叠，按空格展开技术详情。"));
+    rootLay->addWidget(m_detailsToggle, 0, Qt::AlignLeft);
+    m_technicalDetails = new QWidget(this);
+    m_technicalDetails->setObjectName(QStringLiteral("backgroundTaskTechnicalDetails"));
+    m_technicalDetails->setAccessibleName(tr("技术详情"));
+    auto *technicalLayout = new QVBoxLayout(m_technicalDetails);
+    technicalLayout->setContentsMargins(0, 0, 0, 0);
+    technicalLayout->addWidget(m_summaryThreads, 0, Qt::AlignLeft);
+    m_detailsEdit = new QPlainTextEdit(m_technicalDetails);
     m_detailsEdit->setObjectName(QStringLiteral("backgroundTaskDetails"));
+    m_detailsEdit->setAccessibleName(tr("任务技术详情"));
     m_detailsEdit->setReadOnly(true);
     m_detailsEdit->setPlaceholderText(tr("点击上面任意任务，查看详细描述与异常堆栈"));
     m_detailsEdit->setMaximumHeight(180);
-    rootLay->addWidget(m_detailsEdit, 2);
+    technicalLayout->addWidget(m_detailsEdit);
+    rootLay->addWidget(m_technicalDetails, 2);
+    m_technicalDetails->hide();
+    connect(m_detailsToggle, &QPushButton::toggled, this, [this](bool expanded) {
+        if (!expanded && m_technicalDetails->isAncestorOf(QApplication::focusWidget()))
+            m_detailsToggle->setFocus();
+        m_technicalDetails->setVisible(expanded);
+        m_detailsToggle->setAccessibleDescription(expanded
+            ? tr("已展开，按空格折叠技术详情。") : tr("已折叠，按空格展开技术详情。"));
+    });
 
     connect(m_closeBtn, &QPushButton::clicked, this, &QDialog::hide);
     connect(m_cancelSelectedBtn, &QPushButton::clicked,
@@ -289,8 +294,34 @@ AsyncTaskPanelDialog::AsyncTaskPanelDialog(QWidget *parent)
     auto &mgr = AsyncTaskManager::instance();
     connect(&mgr, &AsyncTaskManager::summaryChanged,   this, &AsyncTaskPanelDialog::refreshHeaderSummary);
     connect(&mgr, &AsyncTaskManager::threadCountChanged,this, &AsyncTaskPanelDialog::refreshThreadOccupancy);
-    connect(&mgr, &QAbstractItemModel::modelReset,
-            this, &AsyncTaskPanelDialog::updateActionStates);
+    connect(&mgr, &QAbstractItemModel::modelAboutToBeReset, this, [this]() {
+        const QModelIndex current = m_listView->currentIndex();
+        if (current.isValid()) m_selectedTaskId = current.data(AsyncTaskManager::TaskIdRole).toLongLong();
+        m_modelResetting = true;
+    });
+    connect(&mgr, &QAbstractItemModel::modelReset, this, [this]() {
+        QModelIndex restored;
+        auto *model = m_listView->model();
+        for (int row = 0; m_selectedTaskId != 0 && row < model->rowCount(); ++row) {
+            const QModelIndex candidate = model->index(row, 0);
+            if (candidate.data(AsyncTaskManager::TaskIdRole).toLongLong() == m_selectedTaskId) {
+                restored = candidate;
+                break;
+            }
+        }
+        m_listView->setCurrentIndex(restored);
+        if (!restored.isValid()) m_selectedTaskId = 0;
+        m_modelResetting = false;
+        refreshSelectedTask();
+    });
+    connect(&mgr, &QAbstractItemModel::dataChanged, this,
+        [this](const QModelIndex &top, const QModelIndex &bottom, const QList<int> &) {
+            const QModelIndex current = m_listView->currentIndex();
+            if (current.isValid() && current.row() >= top.row() && current.row() <= bottom.row())
+                refreshSelectedTask();
+            else
+                updateActionStates();
+        });
     connect(&mgr, &QAbstractItemModel::rowsInserted,
             this, &AsyncTaskPanelDialog::updateActionStates);
     connect(&mgr, &QAbstractItemModel::rowsRemoved,
@@ -323,14 +354,27 @@ void AsyncTaskPanelDialog::refreshThreadOccupancy(int runningThreads, int maxThr
 void AsyncTaskPanelDialog::onCurrentRowChanged(const QModelIndex &current, const QModelIndex &previous)
 {
     Q_UNUSED(previous);
-    if (!current.isValid()) {
+    if (m_modelResetting) return;
+    const qint64 taskId = current.isValid() ? current.data(AsyncTaskManager::TaskIdRole).toLongLong() : 0;
+    if (taskId != m_selectedTaskId) m_detailsEdit->clear();
+    m_selectedTaskId = taskId;
+    refreshSelectedTask();
+}
+
+void AsyncTaskPanelDialog::refreshSelectedTask()
+{
+    if (m_modelResetting) return;
+    const AsyncTask t = AsyncTaskManager::instance().taskById(m_selectedTaskId);
+    if (m_selectedTaskId == 0 || t.id != m_selectedTaskId) {
+        m_selectedSummary->setText(tr("选择任务以查看状态。"));
+        m_selectedSummary->setAccessibleDescription(m_selectedSummary->text());
         m_detailsEdit->clear();
         updateActionStates();
         return;
     }
-    auto &mgr = AsyncTaskManager::instance();
-    qint64 id = current.data(AsyncTaskManager::TaskIdRole).toLongLong();
-    AsyncTask t = mgr.taskById(id);
+    const QString summary = t.userText().summary;
+    m_selectedSummary->setText(summary);
+    m_selectedSummary->setAccessibleDescription(summary);
 
     QString out;
     out += tr("任务ID: %1    批次ID: %2\n").arg(t.id).arg(t.batchId);
@@ -354,20 +398,66 @@ void AsyncTaskPanelDialog::onCurrentRowChanged(const QModelIndex &current, const
     const qint64 remainingMs = t.estimatedRemainingMs();
     if (remainingMs >= 0)
         out += tr("预计剩余: %1\n").arg(taskDuration(remainingMs));
-    out += QLatin1String("\n描述:\n");
+    out += QStringLiteral("\n描述:\n");
     out += t.description.isEmpty() ? QStringLiteral("(无)") : t.description;
     if (!t.error.isNull()) {
         out += QStringLiteral("\n\n======== 异常 ========\n");
         out += t.error.toString();
     }
-    m_detailsEdit->setPlainText(out);
+    const QString previousText = m_detailsEdit->toPlainText();
+    if (previousText != out) {
+        const QTextCursor previous = m_detailsEdit->textCursor();
+        // Copy positions before setPlainText: even a copied QTextCursor still
+        // tracks its document and moves when that document is replaced.
+        const int anchor = previous.anchor();
+        const int position = previous.position();
+        const int start = qMin(anchor, position);
+        const int end = qMax(anchor, position);
+        int restoredAnchor = qBound(0, anchor, int(out.size()));
+        int restoredPosition = qBound(0, position, int(out.size()));
+        if (start != end) {
+            const QString selectedText = previousText.mid(start, end - start);
+            int relocatedStart = out.indexOf(selectedText);
+            if (relocatedStart >= 0 && out.indexOf(selectedText, relocatedStart + 1) >= 0) {
+                // Repeated text is safe only inside an unchanged prefix/suffix;
+                // do not silently select some other occurrence of a diagnostic.
+                int prefix = 0;
+                const int commonLength = qMin(previousText.size(), out.size());
+                while (prefix < commonLength && previousText.at(prefix) == out.at(prefix)) ++prefix;
+                int suffix = 0;
+                while (suffix < commonLength - prefix
+                    && previousText.at(previousText.size() - suffix - 1) == out.at(out.size() - suffix - 1)) ++suffix;
+                relocatedStart = end <= prefix ? start
+                    : (start >= previousText.size() - suffix ? start + out.size() - previousText.size() : -1);
+            }
+            if (relocatedStart >= 0) {
+                restoredAnchor = anchor < position ? relocatedStart : relocatedStart + end - start;
+                restoredPosition = anchor < position ? relocatedStart + end - start : relocatedStart;
+            } else {
+                // The selected text changed or became ambiguous. Keep a caret,
+                // rather than making Copy return unrelated replacement text.
+                restoredAnchor = restoredPosition;
+            }
+        }
+        const int vertical = m_detailsEdit->verticalScrollBar()->value();
+        const int horizontal = m_detailsEdit->horizontalScrollBar()->value();
+        m_detailsEdit->setPlainText(out);
+        // The public summary must stay live, but inspecting/copying technical
+        // details must not jump to the top on each existing one-second tick.
+        QTextCursor restored = m_detailsEdit->textCursor();
+        restored.setPosition(restoredAnchor);
+        restored.setPosition(restoredPosition, QTextCursor::KeepAnchor);
+        m_detailsEdit->setTextCursor(restored);
+        m_detailsEdit->verticalScrollBar()->setValue(vertical);
+        m_detailsEdit->horizontalScrollBar()->setValue(horizontal);
+    }
     updateActionStates();
 }
 
 void AsyncTaskPanelDialog::onCancelSelected()
 {
     const QModelIndex current = m_listView->currentIndex();
-    if (!current.isValid())
+    if (!current.isValid() || !current.data(AsyncTaskManager::TaskCancellableRole).toBool())
         return;
     const int state = current.data(AsyncTaskManager::TaskStateRole).toInt();
     if (state != static_cast<int>(AsyncTaskState::Queued)
@@ -386,20 +476,21 @@ void AsyncTaskPanelDialog::onCancelAll()
 void AsyncTaskPanelDialog::onClearHistory()
 {
     AsyncTaskManager::instance().clearHistory();
-    m_detailsEdit->clear();
 }
 
 void AsyncTaskPanelDialog::updateActionStates()
 {
-    const int active = AsyncTaskManager::instance().cancellableCount();
-    m_cancelAllBtn->setEnabled(active > 0);
-    m_clearBtn->setEnabled(AsyncTaskManager::instance().rowCount() > active);
+    auto &manager = AsyncTaskManager::instance();
+    const int active = manager.queuedCount() + manager.runningCount();
+    m_cancelAllBtn->setEnabled(manager.cancellableCount() > 0);
+    m_clearBtn->setEnabled(manager.rowCount() > active);
 
     const QModelIndex current = m_listView->currentIndex();
     const int state = current.isValid()
                           ? current.data(AsyncTaskManager::TaskStateRole).toInt()
                           : -1;
     m_cancelSelectedBtn->setEnabled(
-        state == static_cast<int>(AsyncTaskState::Queued)
-        || state == static_cast<int>(AsyncTaskState::Running));
+        current.data(AsyncTaskManager::TaskCancellableRole).toBool()
+        && (state == static_cast<int>(AsyncTaskState::Queued)
+            || state == static_cast<int>(AsyncTaskState::Running)));
 }

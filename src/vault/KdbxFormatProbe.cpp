@@ -22,21 +22,26 @@ KdbxHeaderInfo KdbxFormatProbe::inspectFile(const QString &filePath)
         return result;
     }
 
-    const QByteArray header = file.read(12);
-    if (header.size() != 12) {
+    return inspectHeader(file.read(12));
+}
+
+KdbxHeaderInfo KdbxFormatProbe::inspectHeader(QByteArrayView header)
+{
+    KdbxHeaderInfo result;
+    if (header.size() < 12) {
         result.error = QStringLiteral("KDBX 文件头被截断。 ");
         return result;
     }
 
     constexpr quint32 KeePassSignature1 = 0x9AA2D903U;
     constexpr quint32 KeePassSignature2 = 0xB54BFB67U;
-    if (littleEndian32(header.constData()) != KeePassSignature1 ||
-        littleEndian32(header.constData() + 4) != KeePassSignature2) {
+    if (littleEndian32(header.data()) != KeePassSignature1 ||
+        littleEndian32(header.data() + 4) != KeePassSignature2) {
         result.error = QStringLiteral("文件不是 KDBX 数据库。 ");
         return result;
     }
 
-    const quint32 version = littleEndian32(header.constData() + 8);
+    const quint32 version = littleEndian32(header.data() + 8);
     result.minorVersion = quint16(version & 0xFFFFU);
     result.majorVersion = quint16(version >> 16);
     result.recognized = result.majorVersion == 3 || result.majorVersion == 4;

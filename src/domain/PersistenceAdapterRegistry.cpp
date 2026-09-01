@@ -12,12 +12,12 @@ bool PersistenceAdapterRegistry::registerAdapter(
     if (descriptor.id.trimmed().isEmpty() || !factory || duplicate) {
         return false;
     }
-    entries_.push_back(Entry{std::move(descriptor), {}, std::move(factory), {}});
+    entries_.push_back(Entry{std::move(descriptor), {}, std::move(factory), {}, {}});
     return true;
 }
 
 bool PersistenceAdapterRegistry::registerRoute(
-    PersistenceAdapterDescriptor descriptor, Route route)
+    PersistenceAdapterDescriptor descriptor, Route route, PersistenceReadProbe readProbe)
 {
     const bool duplicate = std::any_of(
         entries_.cbegin(), entries_.cend(), [&descriptor](const Entry &entry) {
@@ -25,7 +25,7 @@ bool PersistenceAdapterRegistry::registerRoute(
         });
     if (descriptor.id.trimmed().isEmpty() || !route || duplicate)
         return false;
-    entries_.push_back(Entry{std::move(descriptor), std::move(route), {}, {}});
+    entries_.push_back(Entry{std::move(descriptor), std::move(route), {}, {}, readProbe});
     return true;
 }
 
@@ -48,7 +48,7 @@ bool PersistenceAdapterRegistry::registerAdapter(
         ++instantiatedCount_;
         return true;
     }
-    entries_.push_back(Entry{descriptor, {}, {}, std::move(adapter)});
+    entries_.push_back(Entry{descriptor, {}, {}, std::move(adapter), {}});
     ++instantiatedCount_;
     return true;
 }
@@ -65,6 +65,25 @@ QList<PersistenceAdapterDescriptor> PersistenceAdapterRegistry::descriptors() co
         return left.id < right.id;
     });
     return result;
+}
+
+PersistenceReadPolicy PersistenceAdapterRegistry::readPolicySnapshot() const
+{
+    PersistenceReadPolicy policy;
+    for (const Entry &entry : entries_) {
+        if (entry.descriptor.persistence != DocumentPersistence::SecureFile)
+            continue;
+        const PersistenceReadProbe probe = entry.readProbe;
+        // Missing or unbounded recognition must not silently become permission
+        // to read a format through an ordinary provider. Never load a factory.
+        if (!probe.recognizes || probe.prefixBytes <= 0
+            || probe.prefixBytes > PersistenceReadPolicy::MaximumPrefixBytes)
+            return {};
+        policy.rules_.append({entry.descriptor.id, probe});
+        policy.prefixBytes_ = qMax(policy.prefixBytes_, probe.prefixBytes);
+    }
+    policy.available_ = !policy.rules_.isEmpty();
+    return policy;
 }
 
 std::optional<PersistenceAdapterDescriptor>

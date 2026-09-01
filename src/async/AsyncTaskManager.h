@@ -40,7 +40,10 @@ public:
         TaskCancellableRole,
         TaskStateTextRole,
         TaskPriorityTextRole,
-        TaskTypeTextRole
+        TaskTypeTextRole,
+        TaskUserStatusRole,
+        TaskUserProgressRole,
+        TaskUserErrorRole
     };
 
     // ========= 基本查询 =========

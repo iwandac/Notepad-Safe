@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SearchResultTarget.h"
+#include "SearchMatch.h"
 #include "SearchResultsModel.h"
 #include "LineIndex.h"
 
@@ -47,6 +48,7 @@ public:
         QVector<LargeFileSearchMatch> preview;
         qint64 totalMatches = 0;
         QString incompleteReason;
+        QString incompleteUserReason;
         bool stale = false;
     };
 
@@ -122,7 +124,7 @@ public:
             if (role == TargetRole) return group->target.key();
             if (role == StaleRole) return group->stale;
             if (role == Qt::ToolTipRole && !group->incompleteReason.isEmpty())
-                return group->incompleteReason;
+                return group->incompleteUserReason;
             if (role == Qt::FontRole) {
                 QFont font;
                 font.setBold(true);
@@ -136,7 +138,7 @@ public:
                 return group->stale
                     ? QStringLiteral("结果已失效，请重新搜索此文件")
                     : (group->incompleteReason.isEmpty()
-                        ? QString() : QStringLiteral("结果不完整"));
+                        ? QString() : group->incompleteUserReason);
             if (index.column() == SearchResultsModel::COL_MATCHCOUNT)
                 return group->totalMatches;
             return {};
@@ -153,19 +155,12 @@ public:
     void addL1(const SearchResultTarget &target,
                const QVector<SearchMatch> &matches, bool incomplete = false)
     {
-        auto *group = new Group;
-        group->target = target;
         auto *model = new SearchResultsModel(this);
         model->setTextEncoding(TextEncoding::Utf8);
         model->setResults(canonicalResults(matches), {}, 0);
-        group->results = model;
-        group->totalMatches = matches.size();
         if (incomplete)
-            group->incompleteReason = QStringLiteral("结果未完整生成");
-        const int row = groups_.size();
-        beginInsertRows({}, row, row);
-        groups_.append(group);
-        endInsertRows();
+            model->setIncompleteReason(QStringLiteral("结果未完整生成"));
+        addModel(target, model);
     }
 
     void addModel(const SearchResultTarget &target,
@@ -176,6 +171,7 @@ public:
         group->results = model;
         group->totalMatches = model ? model->totalMatches() : 0;
         group->incompleteReason = model ? model->incompleteReason() : QString();
+        group->incompleteUserReason = model ? model->incompleteUserReason() : QString();
         if (model) model->setParent(this);
         const int row = groups_.size();
         beginInsertRows({}, row, row);
@@ -220,6 +216,7 @@ public:
         group->preview.clear();
         group->totalMatches = model->totalMatches();
         group->incompleteReason = model->incompleteReason();
+        group->incompleteUserReason = model->incompleteUserReason();
         model->setParent(this);
         endResetModel();
         if (oldModel && oldModel != model) delete oldModel;

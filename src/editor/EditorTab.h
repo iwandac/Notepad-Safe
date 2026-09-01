@@ -10,6 +10,7 @@
 #include "TextEncoding.h"
 #include "LargeFileSearch.h"   // 先入 LargeFileSearchMatch 定义
 #include "SearchMatch.h"
+#include "EditableTextFindAllTask.h"
 #include "DiskFileVersion.h"
 #include "DocumentState.h"
 #include "DocumentSession.h"
@@ -17,6 +18,7 @@
 #include "DocumentContentPort.h"
 #include "SessionDocumentPort.h"
 #include "DocumentSearchSurface.h"
+#include "HexMouseSelectionController.h"
 
 enum class ViewMode : int;  // 前置声明（定义在 VirtualFileView.h）
 
@@ -36,6 +38,9 @@ enum class L2ContentKind {
 class QsciLexer;
 class VirtualFileView;
 class WindowedReadOnlyProvider;
+class EditorSearchSource;
+bool ownsWindowedReadOnlyInputObject(const WindowedReadOnlyProvider *provider,
+                                     const QObject *object);
 class QStackedWidget;
 class QIODevice;
 class QKeyEvent;
@@ -334,10 +339,12 @@ public:
     bool backspaceUnindents() const { return m_backspaceUnindents; }
     void setWordCompletionEnabled(bool enabled);
     bool wordCompletionEnabled() const { return m_wordCompletionEnabled; }
+    enum class SplitViewFocusPolicy { FocusNewView, PreserveCurrentFocus };
     bool canSplitView() const;
     bool splitViewEnabled() const { return m_splitEditor != nullptr; }
     Qt::Orientation splitOrientation() const;
-    void setSplitView(bool enabled, Qt::Orientation orientation = Qt::Horizontal);
+    void setSplitView(bool enabled, Qt::Orientation orientation = Qt::Horizontal,
+                      SplitViewFocusPolicy focusPolicy = SplitViewFocusPolicy::FocusNewView);
 
     // 以指定编码显示（Notepad++ 风格：不修改文件内容，仅改变显示解码方式）
     // L1 模式：重新以指定编码解码并加载到 QsciScintilla
@@ -373,6 +380,7 @@ public:
     bool canRedoCommand() const;
     bool hasSelectionCommand() const;
     bool canModifyCommand() const;
+    bool ownsUserInputObject(const QObject *object) const;
     // Current user-visible payload size in bytes.  The windowed mmap provider
     // owns the authoritative 64-bit size for S2/S3 read-only analysis;
     // Scintilla owns it only for sub-32-MiB ordinary/secure documents.
@@ -409,7 +417,9 @@ public:
     bool openLargeFileL2(const QString &path, QString *errMsg = nullptr,
                          L2Presentation presentation = L2Presentation::Text,
                          L2ContentKind contentKind = L2ContentKind::Text,
-                         std::optional<TextEncoding> forcedEncoding = std::nullopt);
+                         std::optional<TextEncoding> forcedEncoding = std::nullopt,
+                         const PersistenceReadPolicy &readPolicy = {},
+                         bool requireReadOnly = false);
     // 仅供 S1 兼容 Hex 路径保存；32 MiB 以上由策略门禁拒绝。
 
     // ==== 会话恢复/保存专用：零副作用 + S1/只读 mmap 自动分流 ====
@@ -442,6 +452,7 @@ public:
 
 protected:
     bool eventFilter(QObject* obj, QEvent* ev) override;
+    bool handleHexAccessibleFocusTraversal(QEvent *event);
 
 signals:
     void modificationChanged(bool modified);
@@ -474,6 +485,7 @@ signals:
                                           const QString &reason);
 
 private:
+    friend class HexMouseSelectionController;
     bool createDocumentSnapshotImpl(qint64 maximumBytes,
                                     DocumentSnapshot *snapshot,
                                     QString *error,
@@ -542,15 +554,16 @@ private:
     // dirty by metadata-only changes such as an encoding conversion.
     bool m_metadataModified = false;
     VirtualFileView   *m_l2View = nullptr;  // 懒创建，仅 openLargeFileL2 成功后非空
+    EditorSearchSource *m_searchSource = nullptr;
     WindowedReadOnlyProvider *m_windowedReadOnlyProvider = nullptr;
+    // QSaveFile commit on Windows requires the source mmap to be closed. A
+    // failed commit must remap the old source without erasing dirty patches.
+    bool m_persistenceBackingSuspendedWithEdits = false;
     bool               m_l2SaveNeeded = false;  // 对应 L2 saveNeededChanged 信号
     int                m_lastL2Line = 0;         // L2 光标缓存（getCursorPosition 用）
     int                m_lastL2Col  = 0;
     qint64             m_lastL2Byte = -1;        // L2 光标字节缓存（findNext 起始位置）
-    struct L1SearchHit {
-        qint64 byteOffset = -1;
-        qint32 byteLength = 0;
-    };
+    using L1SearchHit = EditableTextFindAllHit;
     QVector<L1SearchHit> m_l1SearchCache;
     QString            m_l1SearchCachePattern;
     bool               m_l1SearchCacheRegex = false;
@@ -621,10 +634,10 @@ private:
     VirtualFileView *ensureL2View();
     WindowedReadOnlyProvider *ensureWindowedReadOnlyProvider();
     bool windowedReadOnlyActive() const;
-    bool ensureWindowedSearchSource(QString *error = nullptr);
     // findAllL2Async 的内部启动：LineIndex 已完整 → 实际调 LargeFileSearch::findAllViaTaskManager
     void startPendingL2Search();
-    bool pendingL2SearchSourceIsCurrent() const;
+    bool pendingL2SearchSourceIsCurrent();
+    bool validateSearchSource();
     // 清理 m_pendingL2Search 所有连接并重置为 inactive
     void resetPendingL2Search();
     void advanceContentRevision();
@@ -661,7 +674,7 @@ private:
     bool m_hexOverwriteMode = true;
     bool m_adjustingHexCaret = false;
     bool m_adjustingAsciiCaret = false;
-    bool m_hexMouseSelecting = false;
+    HexMouseSelectionController m_hexMouseSelection;
     int m_hexWheelAngleRemainder = 0;
     int m_hexWheelPixelRemainder = 0;
     QVector<QPair<qint64, qint32>> m_l2SearchHighlights;

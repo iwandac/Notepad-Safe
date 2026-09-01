@@ -5,12 +5,31 @@
 
 #include <QColor>
 #include <QAbstractTextDocumentLayout>
+#include <QApplication>
 #include <QFont>
+#include <QPalette>
 #include <QPlainTextEdit>
 #include <QTextBlock>
 #include <QTextBlockFormat>
 #include <QTextCursor>
 #include <QtMath>
+
+inline void applyEditorSurfacePalette(QsciScintilla *editor, const QPalette &palette)
+{
+    if (!editor)
+        return;
+    // These Scintilla APIs leave lexer-owned token styles intact. Only the
+    // non-lexer paper/text and common editor chrome follow the app palette.
+    editor->setPaper(palette.color(QPalette::Base));
+    editor->setColor(palette.color(QPalette::Text));
+    editor->setMarginsBackgroundColor(palette.color(QPalette::Window));
+    editor->setMarginsForegroundColor(palette.color(QPalette::WindowText));
+    editor->setCaretLineBackgroundColor(palette.color(QPalette::AlternateBase));
+    editor->setSelectionBackgroundColor(palette.color(QPalette::Highlight));
+    editor->setSelectionForegroundColor(palette.color(QPalette::HighlightedText));
+    // Both fold-margin checkerboard colors are backgrounds, not glyph colors.
+    editor->setFoldMarginColors(palette.color(QPalette::Window), palette.color(QPalette::Window));
+}
 
 // User-visible editor chrome must not depend on the backing provider.  S1's
 // full Scintilla document and S2/S3's bounded projection call this same
@@ -27,8 +46,7 @@ inline void applySharedEditorSurfaceStyle(QsciScintilla *editor)
     editor->setFont(font);
     editor->setMarginsFont(font);
 
-    editor->setMarginsBackgroundColor(QColor(240, 240, 240));
-    editor->setMarginsForegroundColor(QColor(120, 120, 120));
+    applyEditorSurfacePalette(editor, QApplication::palette());
     editor->setMarginType(1, QsciScintilla::SymbolMargin);
     editor->setMarginWidth(1, 16);
 
@@ -38,13 +56,10 @@ inline void applySharedEditorSurfaceStyle(QsciScintilla *editor)
     editor->setIndentationGuides(true);
 
     editor->setCaretLineVisible(true);
-    editor->setCaretLineBackgroundColor(QColor(245, 245, 220));
     editor->setCaretWidth(2);
 
     editor->setScrollWidth(1);
     editor->setScrollWidthTracking(true);
-    editor->setSelectionBackgroundColor(QColor(51, 153, 255));
-    editor->setSelectionForegroundColor(QColor(255, 255, 255));
 
     editor->setWrapVisualFlags(QsciScintilla::WrapFlagByText);
     editor->setWrapIndentMode(QsciScintilla::WrapIndentSame);

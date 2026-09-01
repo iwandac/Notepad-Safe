@@ -12,8 +12,9 @@ namespace {
 
 class BuiltinDocumentProvider final : public IDocumentProvider {
 public:
-    explicit BuiltinDocumentProvider(DocumentProviderDescriptor descriptor)
-        : descriptor_(std::move(descriptor))
+    BuiltinDocumentProvider(DocumentProviderDescriptor descriptor,
+                            const PersistenceAdapterRegistry &persistence)
+        : descriptor_(std::move(descriptor)), persistence_(persistence)
     {
     }
 
@@ -27,11 +28,16 @@ public:
             if (error) *error = QStringLiteral("文档视图不可用。");
             return false;
         }
-        return surface->openSurface(request, error);
+        auto configured = request;
+        // Resolve on the UI thread at each open, including routes registered
+        // after this provider was created. Only this immutable value escapes.
+        configured.readPolicy = persistence_.readPolicySnapshot();
+        return surface->openSurface(configured, error);
     }
 
 private:
     DocumentProviderDescriptor descriptor_;
+    const PersistenceAdapterRegistry &persistence_;
 };
 
 
@@ -51,8 +57,8 @@ AppComposition::AppComposition()
          DocumentContentKind::Binary, true, DocumentPresentationKind::Text, 100},
     };
     for (const auto &descriptor : descriptors) {
-        documentProviders_.registerProvider(descriptor, [descriptor]() {
-            return std::make_unique<BuiltinDocumentProvider>(descriptor);
+        documentProviders_.registerProvider(descriptor, [this, descriptor]() {
+            return std::make_unique<BuiltinDocumentProvider>(descriptor, persistenceAdapters_);
         });
     }
     persistenceAdapters_.registerAdapter(
@@ -66,7 +72,11 @@ AppComposition::AppComposition()
             return path.endsWith(QLatin1String(".nsafe"), Qt::CaseInsensitive)
                 || path.endsWith(QLatin1String(".kdbx"), Qt::CaseInsensitive)
                 || KdbxFormatProbe::inspectFile(path).recognized;
-        });
+        }, {12, [](const QString &path, QByteArrayView prefix) {
+            return path.endsWith(QLatin1String(".nsafe"), Qt::CaseInsensitive)
+                || path.endsWith(QLatin1String(".kdbx"), Qt::CaseInsensitive)
+                || KdbxFormatProbe::inspectHeader(prefix).recognized;
+        }});
 }
 
 AppComposition::SecurityRuntime AppComposition::createSecurityRuntime()

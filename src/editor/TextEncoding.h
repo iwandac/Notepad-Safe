@@ -5,6 +5,7 @@
 #include <QVector>
 #include <atomic>
 #include <functional>
+#include <optional>
 
 // 文本编码类型
 enum class TextEncoding {
@@ -58,6 +59,9 @@ struct DecodeResult {
 constexpr qsizetype EncodingDetectionBudgetBytes = 1024 * 1024;
 EncodingDetection detectEncoding(const QByteArray &data);
 EncodingDetection detectFileEncoding(const QString &path);
+// The same sampling algorithm on an already admitted, caller-owned handle.
+EncodingDetection detectFileEncoding(qint64 size,
+    const std::function<QByteArray(qint64, qsizetype)> &readAt);
 
 // 从字节流解码文本（自动检测编码）
 // 检测顺序：BOM → UTF-8 严格验证 → UTF-16 启发式 → 受支持代码页评分
@@ -144,6 +148,10 @@ bool windowsCodePageForEncoding(TextEncoding encoding, quint32 *codePage);
 
 // 编码名称（用于 UI 显示）
 QString encodingName(TextEncoding encoding);
+
+// Exact inverse for the finite set of persisted encodingName values. Unknown
+// names (including case/whitespace aliases) leave automatic detection in charge.
+std::optional<TextEncoding> encodingFromName(const QString &name);
 
 // 严格 UTF-8 验证（不含 BOM）
 bool isValidUtf8(const QByteArray &data);

@@ -10,6 +10,13 @@ void restoreDocumentSessionView(EditorTab *tab, const SessionTab &state)
 {
     if (!tab)
         return;
+    // SessionManager owns legacy syntax validation/clamping. Apply that saved
+    // presentation choice after both clean loading and recovery-payload retry.
+    tab->setSyntax(static_cast<Syntax>(state.syntax));
+    if (state.presentation == QLatin1String("hex") && state.hexInsertMode
+        && tab->isHexPresentation() && tab->hexOverwriteMode()) {
+        tab->toggleHexOverwriteMode();
+    }
     if (state.cursorByteOffset >= 0) {
         const qint64 selectionStart = qMin(state.selectionStartByte,
                                            state.selectionEndByte);
@@ -27,6 +34,7 @@ void restoreDocumentSessionView(EditorTab *tab, const SessionTab &state)
     if (state.splitView && tab->canSplitView()) {
         tab->setSplitView(
             true, state.splitOrientation == QLatin1String("vertical")
-                      ? Qt::Vertical : Qt::Horizontal);
+                      ? Qt::Vertical : Qt::Horizontal,
+            EditorTab::SplitViewFocusPolicy::PreserveCurrentFocus);
     }
 }

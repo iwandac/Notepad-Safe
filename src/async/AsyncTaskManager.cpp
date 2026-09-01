@@ -89,6 +89,11 @@ QHash<int, QByteArray> AsyncTaskManager::roleNames() const
     rn[TaskStateTextRole]         = "stateText";
     rn[TaskPriorityTextRole]      = "priorityText";
     rn[TaskTypeTextRole]          = "typeText";
+    rn[TaskUserStatusRole]        = "userStatus";
+    rn[TaskUserProgressRole]      = "userProgress";
+    rn[TaskUserErrorRole]         = "userError";
+    rn[Qt::AccessibleTextRole]    = "accessibleText";
+    rn[Qt::AccessibleDescriptionRole] = "accessibleDescription";
     return rn;
 }
 
@@ -110,10 +115,12 @@ QVariant AsyncTaskManager::data(const QModelIndex &index, int role) const
         t = taskAtUnlocked(tasks_, history_, index.row());
     }
     switch (role) {
-    case Qt::DisplayRole:           return QStringLiteral("%1 [%2] %3%")
-        .arg(t.title, t.stateText(),
-             t.percentHundredths() < 0 ? QStringLiteral("-")
-                 : QString::number(t.percentHundredths() / 100.0, 'f', 2));
+    case Qt::DisplayRole:
+    case Qt::AccessibleTextRole:
+    case Qt::ToolTipRole:           return t.userText().summary;
+    // AccessibleText already contains the complete public row. Do not expose
+    // diagnostic descriptions or make a screen reader repeat the same row.
+    case Qt::AccessibleDescriptionRole: return QString();
     case TaskIdRole:                return t.id;
     case TaskBatchIdRole:           return t.batchId;
     case TaskTypeRole:              return static_cast<int>(t.type);
@@ -141,6 +148,9 @@ QVariant AsyncTaskManager::data(const QModelIndex &index, int role) const
     case TaskStateTextRole:         return t.stateText();
     case TaskPriorityTextRole:      return t.priorityText();
     case TaskTypeTextRole:          return t.typeText();
+    case TaskUserStatusRole:        return t.userText().status;
+    case TaskUserProgressRole:      return t.userText().progress;
+    case TaskUserErrorRole:         return t.userText().failure;
     }
     return QVariant();
 }
@@ -620,6 +630,13 @@ void AsyncTaskManager::pushHistory(const AsyncTask &t)
 
 void AsyncTaskManager::onTickStats()
 {
+    // Reuse the existing one-second tick for derived ETA display/a11y. This
+    // does not alter progress, scheduling or any task state.
+    const int activeRows = queuedCount() + runningCount();
+    if (activeRows > 0) {
+        emit dataChanged(index(0), index(activeRows - 1),
+            {Qt::DisplayRole, Qt::AccessibleTextRole, Qt::ToolTipRole, TaskUserStatusRole});
+    }
     emitSummarySnapshot();
     int maxT = AsyncThreadPool::instance().maxThreads();
     int act  = AsyncThreadPool::instance().totalActiveThreadCount();

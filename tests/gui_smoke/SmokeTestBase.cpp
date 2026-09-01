@@ -1,4 +1,5 @@
 #include "SmokeTestBase.h"
+#include "RegisteredReadFixture.h"
 
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QWidget>
@@ -50,7 +51,7 @@ bool SmokeTestBase::openL2(const QString& filePath, QString* errMsg) {
         return false;
     }
     QString err;
-    const bool ok = tab_->openLargeFileL2(filePath, &err);
+    const bool ok = openWindowedFixture(tab_, filePath, &err);
     if (!ok) {
         if (errMsg) *errMsg = err;
         return false;
@@ -94,7 +95,7 @@ QString SmokeTestBase::saveAsTempAndReopen(QString* errMsg) {
         return {};
     }
     tab_->shutdownL2BeforeClose();
-    if (!tab_->openLargeFileL2(tmp, &err)) {
+    if (!openWindowedFixture(tab_, tmp, &err)) {
         if (errMsg) *errMsg = QStringLiteral("重打开失败: %1").arg(err);
         return {};
     }

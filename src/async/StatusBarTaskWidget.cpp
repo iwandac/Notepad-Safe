@@ -67,10 +67,10 @@ void StatusBarTaskWidget::onThreadCountChanged(int running, int maxThreads)
 {
     m_runningThreads = running;
     m_maxThreads = maxThreads;
-    const int active = AsyncTaskManager::instance().cancellableCount();
-    QString tooltip = tr("打开后台任务；活跃任务 %1，失败 %2，工作线程 %3/%4")
-                          .arg(active).arg(m_failedTasks)
-                          .arg(running).arg(maxThreads);
+    auto &manager = AsyncTaskManager::instance();
+    const int active = manager.queuedCount() + manager.runningCount();
+    QString tooltip = tr("打开后台任务；活跃任务 %1，失败 %2")
+                          .arg(active).arg(m_failedTasks);
     if (m_longestRemainingMs >= 0)
         tooltip += tr("；最长预计还需 %1")
                        .arg(compactDuration(m_longestRemainingMs));
@@ -184,6 +184,7 @@ void StatusBarTaskWidget::showLongTaskBubble(qint64 taskId,
     layout->setContentsMargins(12, 10, 12, 10);
     layout->setSpacing(6);
     auto *heading = new QLabel(tr("后台任务需要较长时间"), bubble);
+    heading->setTextFormat(Qt::PlainText);
     QFont headingFont = heading->font();
     headingFont.setBold(true);
     heading->setFont(headingFont);
@@ -192,6 +193,7 @@ void StatusBarTaskWidget::showLongTaskBubble(qint64 taskId,
         ? tr("%1\n预计还需 %2").arg(title, compactDuration(remainingMs))
         : tr("%1\n已运行 %2").arg(title, compactDuration(elapsedMs));
     auto *message = new QLabel(timing, bubble);
+    message->setTextFormat(Qt::PlainText);
     message->setWordWrap(true);
     message->setMaximumWidth(320);
     layout->addWidget(message);

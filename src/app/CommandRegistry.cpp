@@ -101,11 +101,21 @@ void CommandRegistry::applyContext(const CommandContext &context) const
 
     setEnabled(QStringLiteral("search.find"), document
         || (context.accountsWorkspace && context.accountCanSearch));
-    setEnabled(QStringLiteral("search.replace"), document);
+    // Replace is a text mutation command. Binary/Hex targets (including the
+    // permanently read-only B2/B3 providers) must not advertise a top-level
+    // command that the real dialog then has to reject. Keep Find available.
+    setEnabled(QStringLiteral("search.replace"),
+               document && context.canModify
+                   && context.document->contentKind == DocumentContentKind::Text);
     setEnabled(QStringLiteral("view.panel.searchResults"), document);
 
     setEnabled(QStringLiteral("view.wordWrap"),
                document && !context.readOnlyByPolicy);
+    const bool tail = document && context.tailAvailable && !context.accountsWorkspace
+        && allowedByDocument(QStringLiteral("view.tail.toggle"), context.document);
+    setEnabled(QStringLiteral("view.tail.toggle"), tail);
+    setChecked(QStringLiteral("view.tail.toggle"), tail && context.tailEnabled);
+    setEnabled(QStringLiteral("view.tail.resume"), tail && context.tailCanResume);
     setEnabled(QStringLiteral("edit.hexInsertMode"), context.editableHex);
     setChecked(QStringLiteral("edit.hexInsertMode"),
                context.editableHex && context.hexInsertMode);
@@ -175,6 +185,13 @@ bool CommandRegistry::allowedByDocument(const QString &commandId,
     const QString featureId = FeatureRegistry::featureIdForCommand(commandId);
     if (featureId.isEmpty())
         return false;
+    if (commandId == QLatin1String("view.tail.toggle")
+        || commandId == QLatin1String("view.tail.resume"))
+        return state && state->securityClass == DocumentSecurityClass::OrdinaryDocument
+            && state->persistence != DocumentPersistence::SecureFile
+            && !state->location.isEmpty()
+            && state->capabilities.testFlag(DocumentCapability::Read)
+            && !state->capabilities.testFlag(DocumentCapability::Edit);
     if (commandId.startsWith(QLatin1String("menu."))
         || commandId.startsWith(QLatin1String("view."))
         || commandId.startsWith(QLatin1String("help."))
@@ -191,6 +208,9 @@ bool CommandRegistry::allowedByDocument(const QString &commandId,
         return hasSelection && state->capabilities.testFlag(DocumentCapability::Edit);
     if (commandId.startsWith(QLatin1String("edit.")))
         return state->capabilities.testFlag(DocumentCapability::Edit);
+    if (commandId == QLatin1String("search.replace"))
+        return state->contentKind == DocumentContentKind::Text
+            && state->capabilities.testFlag(DocumentCapability::Edit);
     if (commandId.startsWith(QLatin1String("search."))
         || commandId.startsWith(QLatin1String("bookmark.")))
         return state->capabilities.testFlag(DocumentCapability::Search);

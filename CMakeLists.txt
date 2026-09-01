@@ -103,6 +103,7 @@ add_library(notepadsafe_async_runtime STATIC
     src/async/AsyncThreadPool.cpp
     src/async/AsyncTaskManager.cpp
     src/async/AsyncSerialQueue.cpp
+    src/async/DedicatedThread.cpp
 )
 target_include_directories(notepadsafe_async_runtime PUBLIC
     ${CMAKE_SOURCE_DIR}/src/async
@@ -113,6 +114,10 @@ target_link_libraries(notepadsafe_async_runtime PUBLIC
 )
 
 add_library(notepadsafe_file_runtime STATIC
+    src/file_runtime/OrdinaryReadSource.h
+    src/file_runtime/OrdinaryReadSource.cpp
+    src/file_runtime/ReadOnlyTextAnalysis.h
+    src/file_runtime/ReadOnlyTextAnalysis.cpp
     src/editor/TextEncoding.cpp
     src/editor/DynamicThresholds.cpp
     src/editor/LineIndex.cpp
@@ -120,6 +125,7 @@ add_library(notepadsafe_file_runtime STATIC
     src/editor/FileContentProbe.cpp
 )
 target_include_directories(notepadsafe_file_runtime PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/file_runtime
     ${CMAKE_SOURCE_DIR}/src/editor
     ${CMAKE_SOURCE_DIR}/src/domain
 )
@@ -133,6 +139,12 @@ target_link_libraries(notepadsafe_file_runtime PUBLIC
 add_library(notepadsafe_search_runtime STATIC
     src/search/SearchSession.h
     src/search/EditableTextSearch.cpp
+    src/search/EditableTextFindAllTask.h
+    src/search/EditableTextFindAllTask.cpp
+    src/search/EditableTextNavigationScan.h
+    src/search/EditableTextNavigationScan.cpp
+    src/search/ReadOnlySearchSource.h
+    src/search/ReadOnlySearchSource.cpp
     src/search/EncodedRegexCompiler.cpp
     src/search/Pcre2Regex.cpp
     src/search/LargeFileSearch.cpp
@@ -155,6 +167,7 @@ target_link_libraries(notepadsafe_search_runtime PUBLIC
 # Stable product-domain policies. Keep file-tier and draft-storage rules free of
 # QWidget/QScintilla dependencies so they can be tested at exact byte boundaries.
 add_library(notepadsafe_domain STATIC
+    src/domain/AppDataLocation.cpp
     src/domain/DocumentSession.h
     src/domain/SessionDocumentPort.h
     src/domain/FileTierPolicy.cpp
@@ -268,17 +281,31 @@ endif()
 # the test harness out of this target; everything below is production code.
 set(NOTEPADSAFE_EDITOR_RUNTIME_SOURCES
     src/editor/DocumentSearchSurface.h
-      src/editor/EditorTab.cpp
-      src/editor/EditorTabPersistence.cpp
-      src/editor/EditorTabCommands.cpp
+    src/editor/EditorTab.cpp
+    src/editor/EditorTabPersistence.cpp
+    src/editor/EditorTabCommands.cpp
+    src/editor/DocumentClipboardCommands.cpp
+    src/editor/EditorTabAccessibility.cpp
+    src/editor/EditorSurfaceAccessibility.cpp
     src/editor/EditorTabLargeDocument.cpp
     src/editor/EditorTabHex.cpp
+    src/editor/HexMouseSelectionController.cpp
+    src/editor/HexMouseSelectionController.h
+    src/editor/WindowedHexMouseSelectionController.cpp
+    src/editor/WindowedHexMouseSelectionController.h
     src/editor/HexProjection.cpp
     src/editor/EditorTabLargeDocumentPersistence.cpp
     src/editor/EditorTabSearch.cpp
+    src/editor/EditorSearchSource.h
+    src/editor/EditorSearchSource.cpp
     src/editor/VirtualFileView.cpp
     src/editor/WindowedReadOnlyProvider.cpp
+    src/editor/WindowedReadOnlyProviderLineIndex.cpp
+    src/editor/ReadOnlyTailController.h
+    src/editor/ReadOnlyTailController.cpp
     src/search/SearchResultsModel.cpp
+    src/search/SearchNavigationRequest.h
+    src/search/SearchNavigationRequest.cpp
 )
 
 add_library(notepadsafe_editor_runtime STATIC
@@ -342,6 +369,20 @@ target_link_libraries(notepadsafe_document_runtime PUBLIC
 
 # ============ 应用 Shell ============
 
+add_library(notepadsafe_single_instance STATIC
+    src/app/SingleInstanceCoordinator.cpp
+)
+target_include_directories(notepadsafe_single_instance PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/app
+    ${CMAKE_SOURCE_DIR}/src/domain
+)
+target_link_libraries(notepadsafe_single_instance PUBLIC
+    notepadsafe_domain
+    notepadsafe_async_runtime
+    Qt6::Core
+    Qt6::Network
+)
+
 # MainWindow and its platform-facing widgets are production code. Keep them in
 # one target so the formal executable and Shell GUI journeys cannot silently
 # compile different implementations.
@@ -350,21 +391,32 @@ add_library(notepadsafe_app STATIC
     src/app/SecureDocumentPersistence.cpp
     src/app/SecureDocumentPersistencePort.h
     src/app/StartupCoordinator.cpp
+    src/app/StartupTrace.cpp
      src/app/CommandRegistry.cpp
     src/app/DocumentOpenWorkflow.cpp
     src/app/DocumentSessionView.cpp
     src/app/SaveAsDialog.cpp
     src/app/SensitiveText.cpp
      src/window/FileCredentialDialog.cpp
-     src/window/MainWindow.cpp
-     src/window/MainWindowCommands.cpp
-     src/window/MainWindowDocuments.cpp
-     src/window/MainWindowSession.cpp
+    src/window/MainWindow.cpp
+    src/window/MainWindowCommands.cpp
+    src/window/DocumentStatusPresentation.cpp
+    src/window/DocumentTailActions.h
+    src/window/DocumentTailActions.cpp
+    src/window/MainWindowDocuments.cpp
+    src/window/MainWindowExternalOpen.cpp
+    src/window/MainWindowOpenRouting.cpp
+    src/window/MainWindowSession.cpp
+    src/window/RecoveryIssuePage.cpp
+    src/window/WorkspaceRecoveryCoordinator.cpp
     src/search/FindReplaceDialog.cpp
-     src/search/SearchResultsController.cpp
-     src/search/SearchResultsDelegate.cpp
+    src/search/SingleFindAllRequest.cpp
+    src/search/SingleFindAllRequest.h
+    src/search/SearchResultsController.cpp
+    src/search/SearchResultsDelegate.cpp
      src/search/SearchResultsViewPolicy.cpp
      src/search/SearchResultsDock.cpp
+     src/search/SearchResultsFeedback.cpp
     src/async/StatusBarTaskWidget.cpp
     src/async/AsyncTaskPanelDialog.cpp
     src/vault/VaultDock.cpp
@@ -395,6 +447,7 @@ target_link_libraries(notepadsafe_app PUBLIC
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
+    Qt6::Network
     Qt6::Concurrent
     Qt6::PrintSupport
     Qt6::Svg
@@ -421,6 +474,7 @@ target_compile_definitions(notepad-safe PRIVATE
 )
 
 target_link_libraries(notepad-safe PRIVATE
+    notepadsafe_single_instance
     notepadsafe_app
     notepadsafe_editor_runtime
     notepadsafe_domain
@@ -585,6 +639,7 @@ add_executable(test_session
 )
 target_include_directories(test_session PRIVATE ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
 target_link_libraries(test_session PRIVATE
+    notepadsafe_app
     notepadsafe_session_runtime
     notepadsafe_editor_runtime
     notepadsafe_domain
@@ -601,6 +656,12 @@ if(WIN32)
     target_link_libraries(test_session PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
 qt_import_plugins(test_session INCLUDE Qt6::QWindowsIntegrationPlugin)
+
+add_executable(test_session_preservation tests/test_session_preservation.cpp)
+target_include_directories(test_session_preservation PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(test_session_preservation PRIVATE notepadsafe_app Qt6::Test)
+qt_import_plugins(test_session_preservation INCLUDE Qt6::QWindowsIntegrationPlugin)
 
 # 测试 4: 设置持久化 & 菜单 UI 勾选同步（纯逻辑，不创建 QWidget）
 # 防回归："开启自动换行后关闭再打开，菜单勾选状态不同步"
@@ -633,6 +694,10 @@ if(WIN32)
     target_link_libraries(test_architecture_contracts PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
 
+add_executable(test_tail_command_contracts tests/test_tail_command_contracts.cpp)
+target_include_directories(test_tail_command_contracts PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(test_tail_command_contracts PRIVATE notepadsafe_app Qt6::Test)
+
 add_executable(test_startup_composition tests/test_startup_composition.cpp)
 target_include_directories(test_startup_composition PRIVATE
     ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
@@ -642,6 +707,10 @@ if(WIN32)
     target_link_libraries(test_startup_composition PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
 qt_import_plugins(test_startup_composition INCLUDE Qt6::QWindowsIntegrationPlugin)
+
+add_executable(test_startup_trace tests/test_startup_trace.cpp)
+target_include_directories(test_startup_trace PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(test_startup_trace PRIVATE notepadsafe_app Qt6::Core Qt6::Test)
 
 # Frozen real-file matrix used by local adjacent/release validation. The files
 # are intentionally not source-controlled because they total about 310 MiB.
@@ -695,6 +764,32 @@ if(WIN32)
     target_link_libraries(test_vault_contract PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
 
+add_executable(test_single_instance
+    tests/test_single_instance.cpp
+)
+target_include_directories(test_single_instance PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(test_single_instance PRIVATE
+    notepadsafe_single_instance
+    Qt6::Core
+    Qt6::Network
+    Qt6::Test
+)
+if(WIN32)
+    target_link_libraries(test_single_instance PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+
+add_executable(single_instance_unresponsive_owner
+    tests/single_instance_unresponsive_owner.cpp
+)
+target_include_directories(single_instance_unresponsive_owner PRIVATE
+    ${APP_INCLUDE_DIRS})
+target_link_libraries(single_instance_unresponsive_owner PRIVATE
+    notepadsafe_domain Qt6::Core Qt6::Network)
+if(WIN32)
+    target_link_libraries(single_instance_unresponsive_owner PRIVATE
+        ${WIN_SYSTEM_LIBS})
+endif()
+
 if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     add_executable(test_kdbx_backend tests/test_kdbx_backend.cpp)
     target_include_directories(test_kdbx_backend PRIVATE
@@ -717,17 +812,39 @@ if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     endif()
 endif()
 
+add_executable(test_ordinary_read_source tests/test_ordinary_read_source.cpp)
+target_include_directories(test_ordinary_read_source PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(test_ordinary_read_source PRIVATE
+    notepadsafe_app notepadsafe_file_runtime Qt6::Core Qt6::Test)
+if(WIN32)
+    target_link_libraries(test_ordinary_read_source PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+
+if(WIN32)
+    # Manual native-rename diagnostic: successful integrity checks do not imply
+    # every rename primitive supports replacing an open target on this host.
+    add_executable(test_windows_read_rename EXCLUDE_FROM_ALL tests/test_windows_read_rename.cpp)
+    target_include_directories(test_windows_read_rename PRIVATE ${APP_INCLUDE_DIRS})
+    target_link_libraries(test_windows_read_rename PRIVATE
+        notepadsafe_file_runtime Qt6::Core Qt6::Test ${WIN_SYSTEM_LIBS})
+endif()
+
 set(NOTEPADSAFE_NON_GUI_TEST_TARGETS
+    test_ordinary_read_source
     test_textencoding
     test_search
     test_pcre2_regex
     test_largefile_encoded_search
     test_session
+    test_session_preservation
     test_settings_ui
     test_filetierpolicy
     test_architecture_contracts
+    test_tail_command_contracts
     test_startup_composition
+    test_startup_trace
     test_vault_contract
+    test_single_instance
 )
 if(TARGET test_testfile_matrix)
     list(APPEND NOTEPADSAFE_NON_GUI_TEST_TARGETS test_testfile_matrix)
@@ -772,21 +889,44 @@ if(WIN32)
     target_link_libraries(e2e_l2_content_visible PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
 
+# HX-R01: formal executable/process-boundary recovery. The harness links no
+# product runtime and drives only the shipping executable through Win32 input.
+if(WIN32)
+    add_executable(e2e_hex_process_recovery
+        tests/e2e_hex_process_recovery.cpp
+    )
+    target_link_libraries(e2e_hex_process_recovery PRIVATE
+        Qt6::Core
+        ${WIN_SYSTEM_LIBS}
+    )
+    add_dependencies(e2e_hex_process_recovery notepad-safe)
+endif()
+
 # 测试目标
 enable_testing()
+add_test(NAME ordinary_read_source COMMAND test_ordinary_read_source)
 add_test(NAME textencoding COMMAND test_textencoding)
 add_test(NAME search       COMMAND test_search)
 add_test(NAME pcre2_regex  COMMAND test_pcre2_regex)
 add_test(NAME largefile_encoded_search COMMAND test_largefile_encoded_search)
 add_test(NAME session      COMMAND test_session)
+add_test(NAME session_preservation COMMAND test_session_preservation)
+set_tests_properties(session_preservation PROPERTIES
+    LABELS "quick;recovery;NSP-RECOVERY" RUN_SERIAL TRUE TIMEOUT 30)
 add_test(NAME settings_ui  COMMAND test_settings_ui)
 add_test(NAME filetierpolicy COMMAND test_filetierpolicy)
 add_test(NAME architecture_contracts COMMAND test_architecture_contracts)
 set_tests_properties(architecture_contracts PROPERTIES
     LABELS "quick;architecture;tools;providers" TIMEOUT 30)
+add_test(NAME tail_command_contracts COMMAND test_tail_command_contracts)
+set_tests_properties(tail_command_contracts PROPERTIES
+    LABELS "quick;architecture;NSP-LARGEFILE" TIMEOUT 30)
 add_test(NAME startup_composition COMMAND test_startup_composition)
 set_tests_properties(startup_composition PROPERTIES
     LABELS "quick;startup;architecture" TIMEOUT 30)
+add_test(NAME startup_trace COMMAND test_startup_trace)
+set_tests_properties(startup_trace PROPERTIES
+    LABELS "quick;startup;diagnostics" TIMEOUT 30)
 if(TARGET test_testfile_matrix)
     add_test(NAME testfile_matrix COMMAND test_testfile_matrix)
     set_tests_properties(testfile_matrix PROPERTIES
@@ -795,6 +935,24 @@ if(TARGET test_testfile_matrix)
     )
 endif()
 add_test(NAME vault_contract COMMAND test_vault_contract)
+add_test(NAME single_instance COMMAND test_single_instance)
+set_tests_properties(single_instance PROPERTIES
+    LABELS "quick;architecture;ipc;single-instance" TIMEOUT 30)
+if(WIN32)
+    find_program(NOTEPADSAFE_POWERSHELL_EXECUTABLE
+        NAMES pwsh.exe powershell.exe)
+    if(NOTEPADSAFE_POWERSHELL_EXECUTABLE)
+        add_test(NAME single_instance_process
+            COMMAND ${NOTEPADSAFE_POWERSHELL_EXECUTABLE}
+                -NoLogo -NoProfile -NonInteractive
+                -ExecutionPolicy Bypass
+                -File ${CMAKE_SOURCE_DIR}/tests/e2e_single_instance.ps1
+                -Exe $<TARGET_FILE:notepad-safe>
+                -OwnerHelper $<TARGET_FILE:single_instance_unresponsive_owner>)
+        set_tests_properties(single_instance_process PROPERTIES
+            LABELS "release;process;ipc;single-instance" TIMEOUT 150)
+    endif()
+endif()
 if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
     add_test(NAME kdbx_backend COMMAND test_kdbx_backend)
     set_tests_properties(kdbx_backend PROPERTIES LABELS "vault;integration" TIMEOUT 120)
@@ -826,6 +984,15 @@ if(WIN32)
     set_tests_properties(architecture_boundary PROPERTIES
         LABELS "quick;architecture"
         TIMEOUT 30
+    )
+    add_test(NAME release_gate_contract
+        COMMAND ${NOTEPADSAFE_POWERSHELL_EXECUTABLE}
+            -NoProfile -ExecutionPolicy Bypass
+            -File ${CMAKE_SOURCE_DIR}/tools/test_release_gate_contract.ps1
+    )
+    set_tests_properties(release_gate_contract PROPERTIES
+        LABELS "quick;architecture;release;tools;non-gui"
+        TIMEOUT 60
     )
 endif()
 
@@ -859,8 +1026,8 @@ endif()
 #  GUI 冒烟测试组件（tests/gui_smoke/）
 #  - 所有 target 走 Qt6 Test（QTEST_MAIN），真实 GUI 事件模拟（QTest::mouseClick 等）
 #  - Editor/Search/Session/Async 链接正式 notepadsafe_editor_runtime；测试不再
-#    重编一套 GUI_SMOKE_SHARED_SOURCES。只有需要 Shell 旅程的目标额外编译
-#    notepadsafe_app，测试入口仍由 QTEST_MAIN 提供。
+#    重编一套 GUI_SMOKE_SHARED_SOURCES。共享夹具链接 notepadsafe_app 以使用
+#    实际注册的只读准入策略；不实例化主窗口，测试入口仍由 QTEST_MAIN 提供。
 #  - 构建与执行由 run_all_gui_smoke.bat 统一管理
 # ============================================================================
 add_library(notepadsafe_gui_test_support STATIC
@@ -872,6 +1039,7 @@ target_include_directories(notepadsafe_gui_test_support PUBLIC
     ${CMAKE_SOURCE_DIR}/tests/gui_smoke
 )
 target_link_libraries(notepadsafe_gui_test_support PUBLIC
+    notepadsafe_app
     notepadsafe_document_runtime
     notepadsafe_editor_runtime
     Qt6::Test
@@ -903,6 +1071,127 @@ target_link_libraries(gui_smoke_coord PRIVATE
 # —— smoke_find_replace：Ctrl+H 快捷键 / 替换内容正确性 / 跳转 / 替换全部 ——
 add_executable(gui_smoke_findreplace
     tests/gui_smoke/smoke_find_replace.cpp
+    ${APP_QRC_FILE}
+)
+
+add_executable(gui_smoke_hex_readonly_search
+    tests/gui_smoke/smoke_hex_readonly_search.cpp
+    ${APP_QRC_FILE}
+)
+
+# HX-R01/HX-P03: editable B1 Hex recovery primitives and external-save
+# conflict protection. Kept separate from the broad shell smoke executable so
+# recovery regressions have stable case IDs and bounded per-case timeouts.
+add_executable(gui_smoke_hex_recovery
+    tests/gui_smoke/smoke_hex_recovery.cpp
+    ${APP_QRC_FILE}
+)
+
+# HX-R01: damaged/stale encrypted recovery points remain user-resolvable and
+# can only be discarded through an explicit, tested product action.
+add_executable(gui_smoke_recovery_issue
+    tests/gui_smoke/smoke_recovery_issue.cpp
+    ${APP_QRC_FILE}
+)
+
+# R3 baseline: pending and freshly restored encrypted drafts remain discoverable.
+add_executable(gui_smoke_recovery_preservation
+    tests/gui_smoke/smoke_recovery_preservation.cpp
+    ${APP_QRC_FILE}
+)
+
+add_executable(gui_smoke_recovery_intent
+    tests/gui_smoke/smoke_recovery_intent.cpp
+    ${APP_QRC_FILE}
+)
+
+add_executable(gui_smoke_startup_shell
+    tests/gui_smoke/smoke_startup_shell.cpp
+    ${APP_QRC_FILE}
+)
+if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
+    target_compile_definitions(gui_smoke_startup_shell PRIVATE NOTEPADSAFE_HAS_KDBX_BACKEND=1)
+endif()
+
+# Product task presentation uses the same task manager and delegate as the EXE.
+add_executable(gui_smoke_task_product_language
+    tests/gui_smoke/smoke_task_product_language.cpp
+    ${APP_QRC_FILE}
+)
+
+add_executable(gui_smoke_document_product_language
+    tests/gui_smoke/smoke_document_product_language.cpp
+    ${APP_QRC_FILE}
+)
+
+add_executable(gui_smoke_task_real_errors
+    tests/gui_smoke/smoke_task_real_errors.cpp
+    ${APP_QRC_FILE}
+)
+
+add_executable(gui_smoke_search_lifecycle
+    tests/gui_smoke/smoke_search_lifecycle.cpp
+    ${APP_QRC_FILE}
+)
+add_executable(gui_smoke_l2_queued_cancel_process
+    tests/gui_smoke/smoke_l2_queued_cancel_process.cpp
+    ${APP_QRC_FILE}
+)
+add_executable(gui_smoke_search_real_failure
+    tests/gui_smoke/smoke_search_real_failure.cpp
+    ${APP_QRC_FILE}
+)
+add_executable(gui_smoke_search_capacity
+    tests/gui_smoke/smoke_search_capacity.cpp
+    ${APP_QRC_FILE}
+)
+add_executable(gui_smoke_search_external_changes
+    tests/gui_smoke/smoke_search_external_changes.cpp
+    ${APP_QRC_FILE}
+)
+add_executable(gui_smoke_search_malformed_encoding
+    tests/gui_smoke/smoke_search_malformed_encoding.cpp
+    ${APP_QRC_FILE}
+)
+add_executable(gui_smoke_readonly_search_source
+    tests/gui_smoke/smoke_readonly_search_source.cpp
+    ${APP_QRC_FILE}
+)
+add_executable(gui_smoke_read_admission_open
+    tests/gui_smoke/smoke_read_admission_open.cpp
+    ${APP_QRC_FILE}
+)
+add_executable(gui_smoke_tail_follow
+    tests/gui_smoke/smoke_tail_follow.cpp
+    ${APP_QRC_FILE}
+)
+add_executable(gui_smoke_tail_presentation
+    tests/gui_smoke/smoke_tail_presentation.cpp
+    ${APP_QRC_FILE}
+)
+foreach(search_lifecycle_target IN ITEMS
+        gui_smoke_search_lifecycle gui_smoke_l2_queued_cancel_process
+        gui_smoke_search_real_failure gui_smoke_search_capacity
+        gui_smoke_search_external_changes gui_smoke_search_malformed_encoding
+        gui_smoke_readonly_search_source gui_smoke_read_admission_open
+        gui_smoke_tail_follow gui_smoke_tail_presentation)
+    target_include_directories(${search_lifecycle_target} PRIVATE
+        ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+    target_link_libraries(${search_lifecycle_target} PRIVATE
+        notepadsafe_app notepadsafe_gui_test_support Qt6::Test)
+endforeach()
+
+# HX-L01/L02/HX-A01: B1 Hex DPI/theme/accessibility, context-menu routing,
+# and atomic clipboard-budget behaviour.
+add_executable(gui_smoke_hex_accessibility
+    tests/gui_smoke/smoke_hex_accessibility.cpp
+    ${APP_QRC_FILE}
+)
+
+# HX-N04/N05/HX-S01/S02/S03: real B2/B3 Hex/ASCII mouse gestures cross
+# bounded read-only projection windows while mutation entrances remain closed.
+add_executable(gui_smoke_windowed_hex_mouse
+    tests/gui_smoke/smoke_windowed_hex_mouse.cpp
     ${APP_QRC_FILE}
 )
 
@@ -951,6 +1240,193 @@ target_link_libraries(gui_smoke_findreplace PRIVATE
     Qt6::TaskTree
     Qt6::Test
     ${QSCINTILLA_LIB}
+)
+
+target_include_directories(gui_smoke_hex_readonly_search PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_hex_readonly_search PRIVATE
+    notepadsafe_app
+    notepadsafe_gui_test_support
+    notepadsafe_editor_runtime
+    notepadsafe_domain
+    notepadsafe_search_runtime
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::PrintSupport
+    Qt6::Svg
+    Qt6::SvgWidgets
+    Qt6::TaskTree
+    Qt6::Test
+    ${QSCINTILLA_LIB}
+)
+
+target_include_directories(gui_smoke_hex_recovery PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_hex_recovery PRIVATE
+    notepadsafe_app
+    notepadsafe_gui_test_support
+    notepadsafe_editor_runtime
+    notepadsafe_domain
+    notepadsafe_search_runtime
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::PrintSupport
+    Qt6::Svg
+    Qt6::SvgWidgets
+    Qt6::TaskTree
+    Qt6::Test
+    ${QSCINTILLA_LIB}
+)
+if(WIN32)
+    target_link_libraries(gui_smoke_hex_recovery PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+
+target_include_directories(gui_smoke_recovery_issue PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_recovery_issue PRIVATE
+    notepadsafe_app
+    notepadsafe_gui_test_support
+    notepadsafe_editor_runtime
+    notepadsafe_domain
+    notepadsafe_search_runtime
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::PrintSupport
+    Qt6::Svg
+    Qt6::SvgWidgets
+    Qt6::TaskTree
+    Qt6::Test
+    ${QSCINTILLA_LIB}
+)
+
+target_include_directories(gui_smoke_recovery_preservation PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_recovery_preservation PRIVATE
+    notepadsafe_app
+    notepadsafe_gui_test_support
+    Qt6::Test
+)
+
+target_include_directories(gui_smoke_recovery_intent PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_recovery_intent PRIVATE
+    notepadsafe_app
+    notepadsafe_gui_test_support
+    Qt6::Test
+)
+
+target_include_directories(gui_smoke_startup_shell PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_startup_shell PRIVATE
+    notepadsafe_app
+    notepadsafe_gui_test_support
+    Qt6::Test
+)
+
+target_include_directories(gui_smoke_task_product_language PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_task_product_language PRIVATE
+    notepadsafe_app
+    notepadsafe_gui_test_support
+    Qt6::Test
+)
+
+target_include_directories(gui_smoke_document_product_language PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_document_product_language PRIVATE
+    notepadsafe_app
+    notepadsafe_gui_test_support
+    Qt6::Test
+)
+
+target_include_directories(gui_smoke_task_real_errors PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_task_real_errors PRIVATE
+    notepadsafe_app
+    notepadsafe_gui_test_support
+    Qt6::Test
+)
+
+target_include_directories(gui_smoke_hex_accessibility PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_hex_accessibility PRIVATE
+    notepadsafe_app
+    notepadsafe_gui_test_support
+    notepadsafe_editor_runtime
+    notepadsafe_domain
+    notepadsafe_search_runtime
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::PrintSupport
+    Qt6::Svg
+    Qt6::SvgWidgets
+    Qt6::TaskTree
+    Qt6::Test
+    ${QSCINTILLA_LIB}
+)
+if(WIN32)
+    target_link_libraries(gui_smoke_hex_accessibility PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+
+target_include_directories(gui_smoke_windowed_hex_mouse PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(gui_smoke_windowed_hex_mouse PRIVATE
+    notepadsafe_app
+    notepadsafe_gui_test_support
+    notepadsafe_editor_runtime
+    notepadsafe_domain
+    notepadsafe_search_runtime
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::PrintSupport
+    Qt6::Svg
+    Qt6::SvgWidgets
+    Qt6::TaskTree
+    Qt6::Test
+    ${QSCINTILLA_LIB}
+)
+
+# Manual HX-1D B1 visual evidence capture. This is deliberately excluded from
+# the default test/build graph: it drives the same product shell/runtime as the
+# formal executable, but only a human review may promote its output to RG-07.
+add_executable(hex_visual_evidence EXCLUDE_FROM_ALL
+    tests/visual/hex_visual_evidence.cpp
+    ${APP_QRC_FILE}
+)
+target_include_directories(hex_visual_evidence PRIVATE
+    ${APP_INCLUDE_DIRS} ${QSCINTILLA_INCLUDE_DIR})
+target_link_libraries(hex_visual_evidence PRIVATE
+    notepadsafe_app
+    notepadsafe_editor_runtime
+    notepadsafe_domain
+    notepadsafe_search_runtime
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Concurrent
+    Qt6::PrintSupport
+    Qt6::Svg
+    Qt6::SvgWidgets
+    Qt6::TaskTree
+    ${QSCINTILLA_LIB}
+)
+if(WIN32)
+    target_link_libraries(hex_visual_evidence PRIVATE ${WIN_SYSTEM_LIBS})
+endif()
+qt_import_plugins(hex_visual_evidence
+    INCLUDE Qt6::QWindowsIntegrationPlugin
+    INCLUDE Qt6::QSvgPlugin
+    INCLUDE Qt6::QSvgIconPlugin
 )
 
 # —— smoke_smallfixes_menu_ui：§16 组 1 · 小修复组（替换快捷键 Ctrl+R 一致性 + L2 菜单禁用 7 项 + lifecycle）——
@@ -1060,6 +1536,27 @@ endif()
 set(NOTEPADSAFE_GUI_SMOKE_TARGETS
     gui_smoke_coord
     gui_smoke_findreplace
+    gui_smoke_hex_readonly_search
+    gui_smoke_hex_recovery
+    gui_smoke_recovery_issue
+    gui_smoke_recovery_preservation
+    gui_smoke_recovery_intent
+    gui_smoke_startup_shell
+    gui_smoke_task_product_language
+    gui_smoke_document_product_language
+    gui_smoke_task_real_errors
+    gui_smoke_search_lifecycle
+    gui_smoke_l2_queued_cancel_process
+    gui_smoke_search_real_failure
+    gui_smoke_search_capacity
+    gui_smoke_search_external_changes
+    gui_smoke_search_malformed_encoding
+    gui_smoke_readonly_search_source
+    gui_smoke_read_admission_open
+    gui_smoke_tail_follow
+    gui_smoke_tail_presentation
+    gui_smoke_hex_accessibility
+    gui_smoke_windowed_hex_mouse
     gui_smoke_large_readonly
     gui_smoke_smallfixes
     gui_smoke_vault
@@ -1076,13 +1573,20 @@ add_custom_target(notepadsafe_gui_smoke_tests
 )
 
 function(notepadsafe_register_qt_cases target source tier timeout feature)
-    cmake_parse_arguments(CASE "" "" "KDBX_CASES" ${ARGN})
+    cmake_parse_arguments(CASE "" "" "KDBX_CASES;EXCLUDE_CASES" ${ARGN})
+    # New/renamed Qt slots must regenerate CTest even in an incremental build.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_SOURCE_DIR}/${source}")
     file(STRINGS "${CMAKE_SOURCE_DIR}/${source}" qt_case_lines
         REGEX "^[ \t]*void[ \t]+[A-Za-z0-9_]+[ \t]*\\(\\)")
     foreach(qt_case_line IN LISTS qt_case_lines)
         string(REGEX MATCH "void[ \t]+([A-Za-z0-9_]+)" _ "${qt_case_line}")
         set(qt_case "${CMAKE_MATCH_1}")
+        if(qt_case IN_LIST CASE_EXCLUDE_CASES)
+            continue()
+        endif()
         if(qt_case STREQUAL "initTestCase"
+           OR qt_case MATCHES "_data$"
            OR qt_case STREQUAL "cleanupTestCase"
            OR qt_case STREQUAL "init"
            OR qt_case STREQUAL "cleanup"
@@ -1108,6 +1612,179 @@ notepadsafe_register_qt_cases(gui_smoke_coord
     tests/gui_smoke/smoke_coord_editops.cpp adjacent 120 NSP-EDIT)
 notepadsafe_register_qt_cases(gui_smoke_findreplace
     tests/gui_smoke/smoke_find_replace.cpp adjacent 180 NSP-SEARCH)
+notepadsafe_register_qt_cases(gui_smoke_hex_readonly_search
+    tests/gui_smoke/smoke_hex_readonly_search.cpp adjacent 180 NSP-SEARCH)
+notepadsafe_register_qt_cases(gui_smoke_hex_recovery
+    tests/gui_smoke/smoke_hex_recovery.cpp adjacent 180 NSP-RECOVERY
+    EXCLUDE_CASES close) # NoDeleteSharingFileLock helper, not a Qt slot.
+notepadsafe_register_qt_cases(gui_smoke_recovery_issue
+    tests/gui_smoke/smoke_recovery_issue.cpp adjacent 180 NSP-RECOVERY)
+notepadsafe_register_qt_cases(gui_smoke_recovery_preservation
+    tests/gui_smoke/smoke_recovery_preservation.cpp adjacent 30 NSP-RECOVERY)
+notepadsafe_register_qt_cases(gui_smoke_recovery_intent
+    tests/gui_smoke/smoke_recovery_intent.cpp adjacent 30 NSP-RECOVERY)
+notepadsafe_register_qt_cases(gui_smoke_startup_shell
+    tests/gui_smoke/smoke_startup_shell.cpp adjacent 30 "NSP-SHELL;NSP-FILE;NSP-SECURE")
+notepadsafe_register_qt_cases(gui_smoke_task_product_language
+    tests/gui_smoke/smoke_task_product_language.cpp adjacent 60 NSP-TASKS)
+notepadsafe_register_qt_cases(gui_smoke_document_product_language
+    tests/gui_smoke/smoke_document_product_language.cpp adjacent 90
+    "NSP-VIEW;NSP-RECOVERY;NSP-SEARCH;NSP-SHELL")
+notepadsafe_register_qt_cases(gui_smoke_task_real_errors
+    tests/gui_smoke/smoke_task_real_errors.cpp adjacent 90 NSP-TASKS)
+# These files also contain no-argument workload helpers, not Qt test slots.
+# Register only their explicit business cases; child scenarios remain owned
+# and bounded by the parent test process.
+foreach(search_lifecycle_case IN ITEMS l1QueuedCancelSettlesAndAllowsImmediateRerun
+        allOpenQueuedTargetCloseSettlesAndAllowsNewQuery
+        l1LateCompletionPreservesNewSingleQuery
+        l1QueuedNavigationCancelSettlesAndAllowsImmediateRerun)
+    add_test(NAME gui_smoke_search_lifecycle.${search_lifecycle_case}
+        COMMAND gui_smoke_search_lifecycle ${search_lifecycle_case})
+    set_tests_properties(gui_smoke_search_lifecycle.${search_lifecycle_case}
+        PROPERTIES LABELS "gui;smoke;adjacent;NSP-SEARCH;NSP-TASKS"
+        RUN_SERIAL TRUE TIMEOUT 60)
+endforeach()
+foreach(search_process_case IN ITEMS queuedFindAllCancellation queuedFindOneCancellation
+        dualLaneSourceOwnership)
+    set(search_process_rows cancelAndWait sourceClose taskAddedCancel taskAddedClose
+        stopCancelClosesSource sourceCloseReenters)
+    if(search_process_case STREQUAL "queuedFindAllCancellation")
+        list(APPEND search_process_rows terminalRerun querySwitchBack querySwitchBackInvalidRegex
+            hideReopen sourceChangeTerminalReentry)
+    elseif(search_process_case STREQUAL "queuedFindOneCancellation")
+        list(APPEND search_process_rows mappingPendingClose mappingPendingCancel
+            mappingPendingFailure canceledNavigationKeepsNewQueryBusy)
+    else()
+        set(search_process_rows navigationFirst findAllFirst)
+    endif()
+    # One owned child per CTest deadline. Do not let a cumulative outer timeout
+    # kill the parent before it can clean up its own child on a product failure.
+    foreach(search_process_row IN LISTS search_process_rows)
+        set(search_process_test
+            "gui_smoke_l2_queued_cancel_process.${search_process_case}.${search_process_row}")
+        add_test(NAME ${search_process_test}
+            COMMAND gui_smoke_l2_queued_cancel_process "${search_process_case}:${search_process_row}")
+        set_tests_properties(${search_process_test}
+            PROPERTIES LABELS "gui;smoke;adjacent;NSP-SEARCH;NSP-TASKS;process"
+            RUN_SERIAL TRUE TIMEOUT 60)
+    endforeach()
+endforeach()
+foreach(readonly_search_case IN ITEMS
+        completedSpoolSurvivesCachedNavigationAndDifferentQuery
+        partialBatchCancellationSurvivesDockReopenAndFreshQuery)
+    add_test(NAME gui_smoke_readonly_search_source.${readonly_search_case}
+        COMMAND gui_smoke_readonly_search_source ${readonly_search_case})
+    set_tests_properties(gui_smoke_readonly_search_source.${readonly_search_case}
+        PROPERTIES LABELS "gui;smoke;adjacent;NSP-SEARCH;NSP-FILE"
+        RUN_SERIAL TRUE TIMEOUT 60)
+endforeach()
+foreach(read_admission_row IN ITEMS ordinarySmallReplacement actualSecureSmallReplacement)
+    add_test(NAME gui_smoke_read_admission_open.initialReadOnlyRouteSurvivesAtomicReplacement.${read_admission_row}
+        COMMAND gui_smoke_read_admission_open initialReadOnlyRouteSurvivesAtomicReplacement:${read_admission_row})
+    set_tests_properties(gui_smoke_read_admission_open.initialReadOnlyRouteSurvivesAtomicReplacement.${read_admission_row}
+        PROPERTIES LABELS "gui;smoke;adjacent;NSP-FILE;NSP-SECURITY" RUN_SERIAL TRUE TIMEOUT 60)
+endforeach()
+foreach(tail_case IN ITEMS defaultOffAndUnsupportedTargets
+        enableAboveEofPausesWithoutMoving menuFollowPreservesUtf8CrlfBoundaries
+        pausedAppendPreservesNativeReadingAndResume sourceFaultStopsAndNeverAutoResumes
+        secureReplacementStopsWithoutUnlock navigationPausesTail
+        disablingBeforeLatePaintDoesNotReclaimReadingPosition splitAppendCompletesProjection
+        disablingDuringTextChangedDoesNotRearmEofPaint pageUpDuringWindowReadyPausesBeforeLatePaint)
+    add_test(NAME gui_smoke_tail_follow.${tail_case}
+        COMMAND gui_smoke_tail_follow ${tail_case})
+    set_tests_properties(gui_smoke_tail_follow.${tail_case}
+        PROPERTIES LABELS "gui;smoke;adjacent;NSP-LARGEFILE;NSP-FILE"
+        RUN_SERIAL TRUE TIMEOUT 60)
+endforeach()
+foreach(tail_presentation_case IN ITEMS darkBeforeOpenAndThemeChangesKeepReadonlyTextReadable
+        tailAndOrdinaryReadonlyPositionUseBrowsingOffset)
+    add_test(NAME gui_smoke_tail_presentation.${tail_presentation_case}
+        COMMAND gui_smoke_tail_presentation ${tail_presentation_case})
+    set_tests_properties(gui_smoke_tail_presentation.${tail_presentation_case}
+        PROPERTIES LABELS "gui;smoke;adjacent;NSP-LARGEFILE;NSP-VIEW;NSP-ACCESSIBILITY"
+        RUN_SERIAL TRUE TIMEOUT 90)
+endforeach()
+add_test(NAME gui_smoke_search_real_failure.spoolCreationFailureSettlesDomainAndTask
+    COMMAND gui_smoke_search_real_failure spoolCreationFailureSettlesDomainAndTask)
+set_tests_properties(gui_smoke_search_real_failure.spoolCreationFailureSettlesDomainAndTask
+    PROPERTIES LABELS "gui;smoke;adjacent;NSP-SEARCH;NSP-TASKS"
+    RUN_SERIAL TRUE TIMEOUT 60)
+foreach(search_capacity_case IN ITEMS uiFindAllCapacityAndNavigation publicSynchronousFindAllCapacity)
+    foreach(search_capacity_row IN ITEMS literal-exact-200000 literal-overflow-200001
+            regex-exact-200000 regex-overflow-200001)
+        set(search_capacity_test "gui_smoke_search_capacity.${search_capacity_case}.${search_capacity_row}")
+        add_test(NAME ${search_capacity_test}
+            COMMAND gui_smoke_search_capacity "${search_capacity_case}:${search_capacity_row}")
+        set_tests_properties(${search_capacity_test}
+            PROPERTIES LABELS "gui;smoke;adjacent;NSP-SEARCH" RUN_SERIAL TRUE TIMEOUT 60)
+    endforeach()
+endforeach()
+foreach(search_capacity_replace_row IN ITEMS literal-overflow-refusal regex-overflow-refusal)
+    set(search_capacity_replace_test
+        "gui_smoke_search_capacity.partialReplaceAllRefusesWithoutChanges.${search_capacity_replace_row}")
+    add_test(NAME ${search_capacity_replace_test}
+        COMMAND gui_smoke_search_capacity
+            "partialReplaceAllRefusesWithoutChanges:${search_capacity_replace_row}")
+    set_tests_properties(${search_capacity_replace_test}
+        PROPERTIES LABELS "gui;smoke;adjacent;NSP-SEARCH" RUN_SERIAL TRUE TIMEOUT 60)
+endforeach()
+get_property(recovery_registered_tests DIRECTORY PROPERTY TESTS)
+foreach(search_external_row IN ITEMS append sameIdentityTruncate sameSizeAtomicReplace
+        spooledSameIdentityTruncate spooledSameSizeAtomicReplace)
+    set(search_external_test
+        "gui_smoke_search_external_changes.completedSearchInvalidatesAndReruns.${search_external_row}")
+    add_test(NAME ${search_external_test}
+        COMMAND gui_smoke_search_external_changes
+            "completedSearchInvalidatesAndReruns:${search_external_row}")
+    set_tests_properties(${search_external_test}
+        PROPERTIES LABELS "gui;smoke;adjacent;NSP-SEARCH;NSP-FILE" RUN_SERIAL TRUE TIMEOUT 60)
+endforeach()
+foreach(search_secure_replacement_row IN ITEMS prePollReads automaticRefresh)
+    set(search_secure_replacement_test
+        "gui_smoke_search_external_changes.ordinaryReadOnlyRejectsSecureReplacement.${search_secure_replacement_row}")
+    add_test(NAME ${search_secure_replacement_test}
+        COMMAND gui_smoke_search_external_changes
+            "ordinaryReadOnlyRejectsSecureReplacement:${search_secure_replacement_row}")
+    set_tests_properties(${search_secure_replacement_test}
+        PROPERTIES LABELS "gui;smoke;adjacent;NSP-SEARCH;NSP-FILE;NSP-SECURITY"
+        RUN_SERIAL TRUE TIMEOUT 60)
+endforeach()
+foreach(recovery_test IN LISTS recovery_registered_tests)
+    if(recovery_test MATCHES "^gui_smoke_recovery_issue\\.tc_2b1_")
+        set_property(TEST "${recovery_test}" APPEND PROPERTY LABELS
+            NSP-FILE NSP-SHELL NSP-ENCODING NSP-LANGUAGE NSP-VIEW)
+    endif()
+endforeach()
+foreach(search_malformed_row IN ITEMS utf16le-malformed utf16be-malformed gbk-orphan-tail)
+    set(search_malformed_test
+        "gui_smoke_search_malformed_encoding.malformedLiteralSearchPreservesSourceByteRanges.${search_malformed_row}")
+    add_test(NAME ${search_malformed_test}
+        COMMAND gui_smoke_search_malformed_encoding
+            "malformedLiteralSearchPreservesSourceByteRanges:${search_malformed_row}")
+    set_tests_properties(${search_malformed_test}
+        PROPERTIES LABELS "gui;smoke;adjacent;NSP-SEARCH;NSP-ENCODING" RUN_SERIAL TRUE TIMEOUT 60)
+endforeach()
+notepadsafe_register_qt_cases(gui_smoke_hex_accessibility
+    tests/gui_smoke/smoke_hex_accessibility.cpp adjacent 180 NSP-ACCESSIBILITY)
+set_tests_properties(
+    gui_smoke_hex_accessibility.tc_hx_1d_layout_theme_accessibility
+    PROPERTIES ENVIRONMENT
+        "QT_QPA_PLATFORM=windows:dpiawareness=0;QT_SCALE_FACTOR=1.0;NOTEPADSAFE_EXPECTED_DPR=1.0")
+set(hex_dpi_cases 125 200)
+set(hex_dpi_values 1.25 2.0)
+foreach(scale_case scale_value IN ZIP_LISTS hex_dpi_cases hex_dpi_values)
+    set(scale_test "gui_smoke_hex_accessibility.tc_hx_1d_layout_theme_accessibility_${scale_case}")
+    add_test(NAME "${scale_test}" COMMAND gui_smoke_hex_accessibility
+        tc_hx_1d_layout_theme_accessibility)
+    set_tests_properties("${scale_test}" PROPERTIES
+        LABELS "gui;smoke;adjacent;NSP-ACCESSIBILITY;dpi-${scale_case}"
+        RUN_SERIAL TRUE TIMEOUT 180
+        ENVIRONMENT
+            "QT_QPA_PLATFORM=windows:dpiawareness=0;QT_SCALE_FACTOR=${scale_value};NOTEPADSAFE_EXPECTED_DPR=${scale_value}")
+endforeach()
+notepadsafe_register_qt_cases(gui_smoke_windowed_hex_mouse
+    tests/gui_smoke/smoke_windowed_hex_mouse.cpp adjacent 300 NSP-LARGEFILE)
 notepadsafe_register_qt_cases(gui_smoke_large_readonly
     tests/gui_smoke/smoke_large_readonly.cpp adjacent 300 NSP-LARGEFILE)
 notepadsafe_register_qt_cases(gui_smoke_smallfixes
@@ -1140,10 +1817,22 @@ set_tests_properties(quick.readonly_repeated_copy PROPERTIES
 if(WIN32)
     add_test(NAME e2e_startup_verify     COMMAND e2e_startup_verify)
     add_test(NAME e2e_l2_content_visible COMMAND e2e_l2_content_visible)
-    set_tests_properties(e2e_startup_verify e2e_l2_content_visible PROPERTIES
+    add_test(NAME e2e_hex_process_recovery
+        COMMAND e2e_hex_process_recovery $<TARGET_FILE:notepad-safe>)
+    set_tests_properties(
+        e2e_startup_verify
+        e2e_l2_content_visible
+        PROPERTIES
         RUN_SERIAL TRUE
         TIMEOUT 60
         LABELS "gui;e2e"
+    )
+    set_tests_properties(
+        e2e_hex_process_recovery
+        PROPERTIES
+        RUN_SERIAL TRUE
+        TIMEOUT 120
+        LABELS "gui;e2e;recovery"
     )
 endif()
 

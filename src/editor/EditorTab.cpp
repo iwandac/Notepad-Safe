@@ -1,9 +1,11 @@
 #include "EditorTab.h"
+#include "EditorSurfaceAccessibility.h"
 #include "EditorSurfaceStyle.h"
 // Hex character rows use the shared measured Scintilla-authoritative grid.
 #include "ByteClipboard.h"
 #include "VirtualFileView.h"
 #include "WindowedReadOnlyProvider.h"
+#include "EditorSearchSource.h"
 #include "FileTierPolicy.h"
 #include "SearchResultsModel.h"
 #include "Pcre2Regex.h"
@@ -148,9 +150,22 @@ bool EditorTab::representsDiskFile(const DiskFileVersion &candidate) const
 }
 
 EditorTab::EditorTab(QWidget *parent)
-    : DocumentSearchSurface(parent)
+    : DocumentSearchSurface(parent), m_hexMouseSelection(this)
 {
+    m_searchSource = new EditorSearchSource(this, [this] {
+        return EditorSearchSource::Resources{m_l2View, m_windowedReadOnlyProvider,
+            m_l2Mode && m_l2ReadOnlyByPolicy && !isSecureDocument(),
+            m_documentSession.state().location};
+    });
+    connect(m_searchSource, &EditorSearchSource::ready,
+            this, [this] { emit l2FileOpenedChanged(true); });
+    connect(m_searchSource, &EditorSearchSource::failed,
+            this, [this](const QString &error) {
+                m_lastSearchError = error;
+                emit l2LineBuildFinished(false);
+            });
     m_editor = new QsciScintilla(this);
+    configurePrimaryEditorAccessibility(m_editor);
     m_stack  = new QStackedWidget(this);
     m_stack->setContentsMargins(0, 0, 0, 0);
     m_stack->addWidget(m_editor);   // index 0 = L1 (QsciScintilla)
@@ -167,6 +182,7 @@ EditorTab::EditorTab(QWidget *parent)
 }
 
 EditorTab::~EditorTab() {
+    m_searchSource->closeAndOwnerAlive();
     // ⚠️  注意：此处是 EditorTab 析构体内部！虽然 EditorTab 刚进入析构、成员还完整，
     //     但 QObject 事件循环可能已派发指向本对象/子对象的 QueuedConnection。
     //     任何 processEvents 调用都可能触发半析构对象的 method invoke → 0xC0000005。
@@ -177,7 +193,7 @@ EditorTab::~EditorTab() {
     //
     //  此处析构体里仅做 dtor-safe 兜底：如果 MainWindow 路径没执行到（如异常析构），
     //  手动调 closeFile(false)—— 禁止 processEvents，保守等待 500ms 让 worker 自退出。
-    if (m_l1Splitter) {
+    {
         QSignalBlocker blocker(this);
         setSplitView(false);
     }
@@ -202,15 +218,19 @@ bool EditorTab::openSurface(const DocumentSurfaceOpenRequest &request,
         request.path, error,
         hex ? L2Presentation::Hex : L2Presentation::Text,
         binary ? L2ContentKind::Binary : L2ContentKind::Text,
-        request.forcedEncoding);
+        request.forcedEncoding, request.readPolicy, request.requireReadOnly);
     if (opened && hex)
         setViewModeL2(ViewMode::Hex);
     return opened;
 }
 
 void EditorTab::shutdownL2BeforeClose() {
+    const QPointer<EditorTab> owner(this);
+    if (!m_searchSource->closeAndOwnerAlive()) return;
     if (m_windowedReadOnlyProvider)
         m_windowedReadOnlyProvider->closeFile();
+    if (!owner)
+        return;
     if (Q_LIKELY(!m_l2Mode || !m_l2View)) return;
     if (!m_l2View->isOpen()) {
         // 虽然没 open，但 Scintilla 可能 reparent 到了 viewport；先回到 stack 避免下一次
@@ -235,6 +255,8 @@ void EditorTab::shutdownL2BeforeClose() {
            "canceling LineIndex build (allow processEvents because MainWindow is still alive).",
            qUtf8Printable(tabTitle()));
     m_l2View->closeFile(/*allowProcessEvents=*/true);
+    if (!owner)
+        return;
     bridgeReparentEditorToStack();
     m_bridge.syncVfvDebounce.stop();
     clearL2BridgeBaseline();
@@ -442,6 +464,7 @@ bool EditorTab::loadFile(const QString &path,
     if (m_windowedReadOnlyProvider)
         m_windowedReadOnlyProvider->closeFile();
     m_l2Mode = false;
+    if (!m_searchSource->closeAndOwnerAlive()) return false;
     emit l2ModeStatusChanged();
     if (m_stack) m_stack->setCurrentWidget(l1Page());
 
@@ -638,6 +661,7 @@ void EditorTab::initializeSecureDocument(const QUuid &id, const QString &title,
                                          const QString &plainText,
                                          const QString &filePath)
 {
+    if (!m_searchSource->closeAndOwnerAlive()) return;
     Q_ASSERT(!id.isNull());
     m_metadataModified = false;
     m_documentSession.setSecureTransitioning(true);
@@ -1250,7 +1274,8 @@ Qt::Orientation EditorTab::splitOrientation() const
     return m_l1Splitter ? m_l1Splitter->orientation() : Qt::Horizontal;
 }
 
-void EditorTab::setSplitView(bool enabled, Qt::Orientation orientation)
+void EditorTab::setSplitView(bool enabled, Qt::Orientation orientation,
+                             SplitViewFocusPolicy focusPolicy)
 {
     if (enabled && !canSplitView())
         return;
@@ -1358,7 +1383,8 @@ void EditorTab::setSplitView(bool enabled, Qt::Orientation orientation)
             this, &EditorTab::commandCapabilitiesChanged);
     if (wasCurrent && m_stack)
         m_stack->setCurrentWidget(m_l1Splitter);
-    m_splitEditor->setFocus();
+    if (focusPolicy == SplitViewFocusPolicy::FocusNewView)
+        m_splitEditor->setFocus();
     emit commandCapabilitiesChanged();
 }
 
@@ -1381,8 +1407,10 @@ void EditorTab::setDisplayEncoding(TextEncoding enc)
         m_encodingDecodeErrors = false;
         m_l2View->setDisplayEncoding(enc);
         invalidateL2ProjectionSearchState();
+        const QPointer<EditorTab> owner(this);
         if (m_windowedReadOnlyProvider)
             m_windowedReadOnlyProvider->setTextEncoding(enc);
+        if (!owner) return;
         if (windowedReadOnlyActive()) {
             clearL2BridgeBaseline();
             emit encodingChanged(m_encoding);
@@ -1571,45 +1599,6 @@ void EditorTab::cut()
     activeTextEditor()->cut();
 }
 
-void EditorTab::copy()
-{
-    if (windowedReadOnlyActive()) {
-        QString error;
-        if (!m_windowedReadOnlyProvider->copySelection(&error) && !error.isEmpty()) {
-            if (auto *window = qobject_cast<QMainWindow *>(this->window()))
-                window->statusBar()->showMessage(error, 5000);
-            QApplication::beep();
-        }
-        return;
-    }
-    if (isL2Mode() && m_l2View) {
-        if (m_l2View->viewMode() == ViewMode::Hex) {
-            const bool asciiFocused = m_hexAsciiPreview
-                && (m_hexAsciiPreview->hasFocus()
-                    || m_hexAsciiPreview->viewport()->hasFocus());
-            if (asciiFocused) {
-                QKeyEvent event(QEvent::KeyPress, Qt::Key_C, Qt::ControlModifier);
-                (void)handleHexAsciiKeyPress(&event);
-                return;
-            }
-            qint64 start = 0;
-            qint64 end = 0;
-            if (hexSelectionByteRange(&start, &end) && end > start) {
-                QByteArray selected = m_l2View->readByteRange(start, end);
-
-                ByteClipboard::setHexSelection(selected);
-                if (isSecureBinaryDocument() && !selected.isEmpty())
-                    selected.fill(0);
-
-            }
-            return;
-        }
-        m_editor->copy();
-        return;
-    }
-    activeTextEditor()->copy();
-}
-
 void EditorTab::paste()
 {
     if (isReadOnlyByPolicy()) return;
@@ -1646,11 +1635,14 @@ void EditorTab::setFocusEditor()
 
 void EditorTab::gotoByteOffset(qint64 byteOffset, int selectLength)
 {
-    if (windowedReadOnlyActive()) {
+    if (windowedReadOnlyActive() || m_searchSource->usesWindowedSource()) {
+        const QPointer<EditorTab> owner(this);
+        if (!validateSearchSource()) return;
         byteOffset = qBound<qint64>(
             0, byteOffset,
             qMax<qint64>(0, m_windowedReadOnlyProvider->fileSize() - 1));
         m_windowedReadOnlyProvider->goToOffset(byteOffset, selectLength);
+        if (!owner || !validateSearchSource()) return;
         m_lastL2Byte = byteOffset;
         m_windowedReadOnlyProvider->editor()->setFocus();
         return;

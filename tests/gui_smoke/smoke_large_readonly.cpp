@@ -1,4 +1,5 @@
 #include <QtTest/QTest>
+#include "RegisteredReadFixture.h"
 #include <QtTest/QSignalSpy>
 
 #include <QApplication>
@@ -337,7 +338,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(window.isActiveWindow(), 1000);
 
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error,
+        QVERIFY2(openWindowedFixture(tab, path, &error,
                                       L2Presentation::Hex,
                                       L2ContentKind::Binary), qPrintable(error));
         QVERIFY(tab->isL2Mode());
@@ -522,7 +523,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(window.isActiveWindow(), 1000);
 
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error,
+        QVERIFY2(openWindowedFixture(tab, path, &error,
                                       L2Presentation::Hex,
                                       L2ContentKind::Binary), qPrintable(error));
         QTRY_VERIFY_WITH_TIMEOUT(tab->l2View() && tab->l2View()->isOpen(), 5000);
@@ -771,13 +772,19 @@ private slots:
         auto *layout = new QVBoxLayout(&window);
         layout->setContentsMargins(0, 0, 0, 0);
         auto *provider = new WindowedReadOnlyProvider(&window);
+        // This byte-grid fixture is Binary content, just as the production
+        // document route declares it; Hex presentation alone is not a kind.
+        provider->setBinaryContent(true);
         layout->addWidget(provider);
         window.show();
         QVERIFY(QTest::qWaitForWindowExposed(&window));
         QString error;
         QVERIFY2(provider->openFile(path,
                                     WindowedReadOnlyProvider::Presentation::Hex,
+                                    registeredReadFixturePolicy(),
                                     &error), qPrintable(error));
+        QVERIFY(provider->binaryContent());
+        QCOMPARE(provider->textEncoding(), TextEncoding::Utf8);
         auto *hex = provider->editor();
         auto *ascii = provider->asciiPreview();
         QVERIFY(hex && ascii && ascii->isVisibleTo(provider));
@@ -797,6 +804,13 @@ private slots:
             QsciScintillaBase::SCI_TEXTHEIGHT, 0UL));
         for (QTextBlock block = ascii->document()->firstBlock();
              block.isValid(); block = block.next()) {
+            const qreal measured = ascii->document()->documentLayout()->blockBoundingRect(block).height();
+            if (qRound(measured) != windowedRowHeight)
+                qInfo() << "HEX_ROW_ALIGNMENT" << "block=" << block.blockNumber()
+                        << "blocks=" << ascii->document()->blockCount() << "height=" << measured
+                        << "grid=" << windowedRowHeight << "font=" << ascii->font()
+                        << "margin=" << ascii->document()->documentMargin()
+                        << "text=" << block.text();
             QCOMPARE(qRound(ascii->document()->documentLayout()
                                 ->blockBoundingRect(block).height()),
                      windowedRowHeight);
@@ -905,6 +919,7 @@ private slots:
         QString error;
         QVERIFY2(provider->openFile(path,
                                     WindowedReadOnlyProvider::Presentation::Hex,
+                                    registeredReadFixturePolicy(),
                                     &error), qPrintable(error));
         auto *hex = provider->editor();
         auto *ascii = provider->asciiPreview();
@@ -984,6 +999,7 @@ private slots:
         QString error;
         QVERIFY2(provider->openFile(path,
                                     WindowedReadOnlyProvider::Presentation::Hex,
+                                    registeredReadFixturePolicy(),
                                     &error), qPrintable(error));
         QCOMPARE(provider->editor()->marginType(0), QsciScintilla::TextMargin);
         QVERIFY(provider->asciiPreview()->isVisibleTo(provider));
@@ -1044,7 +1060,7 @@ private slots:
         QElapsedTimer opening;
         opening.start();
         QString error;
-        QVERIFY2(tab->openLargeFileL2(sourcePath, &error),
+        QVERIFY2(openWindowedFixture(tab, sourcePath, &error),
                  qPrintable(error));
         QVERIFY2(opening.elapsed() < 1000,
                  "S2 open must return with mmap preview instead of waiting for Scintilla");
@@ -1131,7 +1147,7 @@ private slots:
         // must not submit a task or attach a full Scintilla document.
         QSignalSpy tasksAdded(&AsyncTaskManager::instance(), &AsyncTaskManager::taskAdded);
         tab->shutdownL2BeforeClose();
-        QVERIFY2(tab->openLargeFileL2(sourcePath, &error), qPrintable(error));
+        QVERIFY2(openWindowedFixture(tab, sourcePath, &error), qPrintable(error));
         QVERIFY(tab->isL2Mode());
         tab->gotoByteOffset(dragged);
         QTest::qWait(500);
@@ -1190,7 +1206,7 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&window));
 
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
+        QVERIFY2(openWindowedFixture(tab, path, &error), qPrintable(error));
         auto *provider = tab->windowedReadOnlyProvider();
         QVERIFY(provider);
         auto *horizontal = provider->editor()->horizontalScrollBar();
@@ -1234,6 +1250,7 @@ private slots:
         QString error;
         QVERIFY2(provider->openFile(path,
                                     WindowedReadOnlyProvider::Presentation::Text,
+                                    registeredReadFixturePolicy(),
                                     &error), qPrintable(error));
         provider->setWordWrap(true);
         QVERIFY(!provider->wordWrap());
@@ -1334,6 +1351,7 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&window));
         QString error;
         QVERIFY2(provider->openFile(path, WindowedReadOnlyProvider::Presentation::Text,
+                                    registeredReadFixturePolicy(),
                                     &error), qPrintable(error));
         QSignalSpy changed(provider, &WindowedReadOnlyProvider::sourceFileChanged);
         const qint64 originalSize = provider->fileSize();
@@ -1397,21 +1415,64 @@ private slots:
         layout->addWidget(tab);
         window.show();
         QVERIFY(QTest::qWaitForWindowExposed(&window));
+        auto &replaceTasks = AsyncTaskManager::instance();
+        QSignalSpy analysisAdded(&replaceTasks, &AsyncTaskManager::taskAdded);
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
+        QVERIFY2(openWindowedFixture(tab, path, &error), qPrintable(error));
         QVERIFY(tab->isL2Mode());
         QVERIFY(tab->windowedReadOnlyProvider());
         QVERIFY(tab->l2View());
         QVERIFY2(!tab->l2View()->isOpen(),
                  "the hidden legacy VirtualFileView must not mmap a windowed document");
         QCOMPARE(tab->l2View()->mmapSize(), qint64(0));
+        auto *provider = tab->windowedReadOnlyProvider();
+        const auto originalState = tab->documentState();
+        const auto originalStamp = provider->sourceStamp();
+        QList<qint64> analysisTasks;
+        for (const auto &added : analysisAdded) {
+            const qint64 id = added.front().toLongLong();
+            if (replaceTasks.taskById(id).categoryTag == QStringLiteral("LineNumberIndex"))
+                analysisTasks.append(id);
+        }
+        QCOMPARE(analysisTasks.size(), 1);
+        // This case proves no persistent legacy mapping remains while idle.
+        // MoveFileExW can reject even FILE_SHARE_DELETE readers on Windows;
+        // wait for this actual analysis reader to exit, not for an arbitrary delay.
+        QTRY_COMPARE_WITH_TIMEOUT(replaceTasks.taskById(analysisTasks.front()).state,
+                                  AsyncTaskState::Finished, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!provider->characterCountPending(), 15000);
+        QCOMPARE(provider->characterCount(), qint64(33) * block.size());
+        QCOMPARE(tab->documentState().id, originalState.id);
+        QCOMPARE(tab->documentState().revision, originalState.revision);
+        QCOMPARE(tab->documentState().capabilities, originalState.capabilities);
+        QVERIFY(!tab->isModified());
+        QVERIFY(!tab->l2View()->isOpen());
+        QCOMPARE(tab->l2View()->mmapSize(), qint64(0));
+        DiskFileStamp idleStamp;
+        captureDiskFileStamp(path, &idleStamp);
+        QVERIFY(sameDiskFileStamp(originalStamp, idleStamp));
+        QCryptographicHash expectedHash(QCryptographicHash::Sha256);
+        for (int index = 0; index < 33; ++index) expectedHash.addData(block);
+        {
+            QFile unchanged(path);
+            QVERIFY(unchanged.open(QIODevice::ReadOnly));
+            QCryptographicHash actualHash(QCryptographicHash::Sha256);
+            QVERIFY(actualHash.addData(&unchanged));
+            QCOMPARE(actualHash.result(), expectedHash.result());
+        }
         QByteArray replacement = QByteArrayLiteral(
             "PRODUCTION_REPLACED marker=NO_HIDDEN_MMAP\n");
         replacement += QByteArray(1024 * 1024, 'r');
         QSaveFile changed(path);
         QVERIFY(changed.open(QIODevice::WriteOnly));
         QCOMPARE(changed.write(replacement), qint64(replacement.size()));
-        QVERIFY2(changed.commit(), qPrintable(changed.errorString()));
+        const bool analysisPendingAtReplace = tab->windowedReadOnlyProvider()->characterCountPending();
+        const int workersAtReplace = replaceTasks.activeThreadCount();
+        const bool replaced = changed.commit();
+        qInfo() << "PRODUCTION_REPLACE_PHASE" << "pending=" << analysisPendingAtReplace
+                << "workers=" << workersAtReplace << "committed=" << replaced
+                << "error=" << changed.errorString();
+        QVERIFY2(replaced, qPrintable(changed.errorString()));
         QTRY_COMPARE_WITH_TIMEOUT(tab->windowedReadOnlyProvider()->fileSize(),
                                   qint64(replacement.size()), 5000);
         tab->gotoByteOffset(0);
@@ -1444,7 +1505,7 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&window));
         QSignalSpy stateChanged(tab, &EditorTab::largeDocumentRuntimeStateChanged);
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
+        QVERIFY2(openWindowedFixture(tab, path, &error), qPrintable(error));
         QCOMPARE(tab->largeDocumentRuntimeState(),
                  EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis);
         QVERIFY(tab->isL2Mode());
@@ -1475,7 +1536,7 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&window));
         QSignalSpy added(&AsyncTaskManager::instance(), &AsyncTaskManager::taskAdded);
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
+        QVERIFY2(openWindowedFixture(tab, path, &error), qPrintable(error));
         QTest::qWait(500);
         QCOMPARE(nonWindowedAnalysisTasks(added), 0);
         QCOMPARE(tab->largeDocumentRuntimeState(),
@@ -1515,7 +1576,7 @@ private slots:
         window.show();
         QVERIFY(QTest::qWaitForWindowExposed(&window));
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
+        QVERIFY2(openWindowedFixture(tab, path, &error), qPrintable(error));
         QCOMPARE(tab->largeDocumentRuntimeState(),
                  EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis);
         QVERIFY(tab->isL2Mode());
@@ -1554,7 +1615,7 @@ private slots:
         QElapsedTimer opening;
         opening.start();
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error), qPrintable(error));
+        QVERIFY2(openWindowedFixture(tab, path, &error), qPrintable(error));
         const qint64 openingMs = opening.elapsed();
         qInfo().noquote() << QStringLiteral(
             "[PERF] near-2-GiB read-only preview opened in %1 ms").arg(openingMs);
@@ -1595,7 +1656,7 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&window));
 
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error,
+        QVERIFY2(openWindowedFixture(tab, path, &error,
                                       L2Presentation::Hex,
                                       L2ContentKind::Binary), qPrintable(error));
         QVERIFY(tab->isL2Mode());
@@ -1696,7 +1757,7 @@ private slots:
 
         QSignalSpy tasksAdded(&AsyncTaskManager::instance(), &AsyncTaskManager::taskAdded);
         QString error;
-        QVERIFY2(tab->openLargeFileL2(path, &error,
+        QVERIFY2(openWindowedFixture(tab, path, &error,
                                       L2Presentation::Hex,
                                       L2ContentKind::Binary), qPrintable(error));
         QVERIFY(tab->isL2Mode());
@@ -1788,7 +1849,7 @@ private slots:
 
         QString error;
         QSignalSpy tasksAdded(&AsyncTaskManager::instance(), &AsyncTaskManager::taskAdded);
-        QVERIFY2(tab->openLargeFileL2(sourcePath, &error), qPrintable(error));
+        QVERIFY2(openWindowedFixture(tab, sourcePath, &error), qPrintable(error));
         QVERIFY(tab->isL2Mode());
         QVERIFY(tab->isReadOnlyByPolicy());
         QCOMPARE(tab->largeDocumentRuntimeState(),
@@ -1820,7 +1881,7 @@ private slots:
 
         EditorTab tab;
         QString error;
-        QVERIFY2(tab.openLargeFileL2(sourcePath, &error), qPrintable(error));
+        QVERIFY2(openWindowedFixture(&tab, sourcePath, &error), qPrintable(error));
         QVERIFY(tab.isL2Mode());
         QVERIFY(tab.isReadOnlyByPolicy());
 
@@ -1851,7 +1912,7 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&tinyWindow));
 
         QString error;
-        QVERIFY2(tab->openLargeFileL2(tinyPath, &error,
+        QVERIFY2(openWindowedFixture(tab, tinyPath, &error,
                                       L2Presentation::Hex,
                                       L2ContentKind::Binary), qPrintable(error));
         QTRY_VERIFY_WITH_TIMEOUT(tab->l2View() && tab->l2View()->isOpen(), 5000);
@@ -1900,6 +1961,7 @@ private slots:
         QVERIFY(QTest::qWaitForWindowExposed(&lineWindow));
         QVERIFY2(provider->openFile(linesPath,
                                     WindowedReadOnlyProvider::Presentation::Text,
+                                    registeredReadFixturePolicy(),
                                     &error), qPrintable(error));
         QTRY_VERIFY_WITH_TIMEOUT(!provider->characterCountPending(), 15000);
         provider->goToOffset(4LL * 1024 * 1024);
@@ -1947,6 +2009,7 @@ private slots:
         QString error;
         QVERIFY2(provider->openFile(path,
                                     WindowedReadOnlyProvider::Presentation::Text,
+                                    registeredReadFixturePolicy(),
                                     &error), qPrintable(error));
 
         qint64 lineTaskId = -1;
@@ -1989,6 +2052,64 @@ private slots:
         window.close();
     }
 
+    void queuedLineNumberCancellationSettlesAndCanBeRequestedAgain()
+    {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        const QString path = temporary.filePath(QStringLiteral("queued-line-index.log"));
+        QSaveFile output(path);
+        QVERIFY(output.open(QIODevice::WriteOnly));
+        const QByteArray line = QByteArrayLiteral("queued-line-index-row\n");
+        for (int i = 0; i < 400000; ++i)
+            QCOMPARE(output.write(line), qint64(line.size()));
+        QVERIFY(output.commit());
+        const qint64 size = QFileInfo(path).size();
+        QVERIFY(size > 4LL * 1024 * 1024);
+        const QByteArray originalHash = fileSha256(path);
+        QVERIFY(!originalHash.isEmpty());
+
+        QWidget window;
+        auto *layout = new QVBoxLayout(&window);
+        auto *provider = new WindowedReadOnlyProvider(&window);
+        layout->addWidget(provider);
+
+        auto &tasks = AsyncTaskManager::instance();
+        qint64 canceledTaskId = -1;
+        const QMetaObject::Connection cancelQueued = connect(
+            &tasks, &AsyncTaskManager::taskAdded, &window,
+            [&](qint64 taskId) {
+                const AsyncTask task = tasks.taskById(taskId);
+                if (task.categoryTag != QStringLiteral("LineNumberIndex"))
+                    return;
+                QVERIFY2(canceledTaskId < 0,
+                         "opening one provider must submit one fused line-number task");
+                canceledTaskId = taskId;
+                tasks.cancel(taskId);
+            }, Qt::DirectConnection);
+
+        QString error;
+        QVERIFY2(provider->openFile(path,
+                                    WindowedReadOnlyProvider::Presentation::Text,
+                                    registeredReadFixturePolicy(),
+                                    &error), qPrintable(error));
+        QVERIFY(canceledTaskId > 0);
+        QCOMPARE(tasks.taskById(canceledTaskId).state, AsyncTaskState::Canceled);
+        QTRY_VERIFY_WITH_TIMEOUT(!provider->characterCountPending(), 3000);
+        QCOMPARE(provider->characterCount(), qint64(-1));
+
+        const DiskFileStamp originalStamp = provider->sourceStamp();
+        QVERIFY(originalStamp.valid);
+        QObject::disconnect(cancelQueued);
+        // Returning to Text is a real public request path. It starts analysis
+        // only when both the character and line-number pending state settled.
+        provider->setPresentation(WindowedReadOnlyProvider::Presentation::Hex);
+        provider->setPresentation(WindowedReadOnlyProvider::Presentation::Text);
+        QTRY_VERIFY_WITH_TIMEOUT(!provider->characterCountPending(), 30000);
+        QCOMPARE(provider->characterCount(), size);
+        QVERIFY(sameDiskFileStamp(provider->sourceStamp(), originalStamp));
+        QCOMPARE(fileSha256(path), originalHash);
+    }
+
     void readonlyTextNativeSelectionSupersedesSearchSelectionForEveryCopy()
     {
         QTemporaryDir temporary;
@@ -2011,6 +2132,7 @@ private slots:
         QString error;
         QVERIFY2(provider->openFile(path,
                                     WindowedReadOnlyProvider::Presentation::Text,
+                                    registeredReadFixturePolicy(),
                                     &error), qPrintable(error));
 
         const QByteArray first = QByteArrayLiteral("first-copy-token");

@@ -10,12 +10,14 @@
 #include <QDir>
 #include <QDataStream>
 #include <QScopeGuard>
+#include <QThread>
 #include <QTemporaryFile>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QUuid>
 #include <QPointer>
 #include <cstring>
+#include <exception>
 #include <algorithm>
 #include <utility>
 
@@ -75,8 +77,252 @@ bool readOverrunRecord(QDataStream &stream, quint32 version,
 
 } // namespace
 
+struct LargeFileSearch::WorkerReservation {
+    enum class Phase { Pending, Running, Settled };
+    std::atomic<Phase> phase{Phase::Pending};
+    bool released = false; // workerMutex_; distinct from winning the atomic claim.
+    qint64 taskId = 0; // The following binding/connection fields are engine-thread only.
+    struct Terminal { qint64 id; AsyncTaskState state; AsyncErrorInfo error; };
+    QVector<Terminal> earlyTerminals;
+    QMetaObject::Connection terminalConnection;
+    std::function<void(const QString &, const QString &)> failure;
+    // Only the winning Pending canceller or Running worker writes the outcome.
+    // The engine reads it only after the existing mutex/CV release barrier.
+    QString raw;
+    QString userMessage;
+    std::function<void()> completion;
+};
+
+LargeFileSearch::WorkerReservationPtr LargeFileSearch::reserveWorker(
+    std::function<void(const QString &, const QString &)> failure)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    auto worker = std::make_shared<WorkerReservation>();
+    worker->failure = std::move(failure);
+    {
+        std::lock_guard<std::mutex> lock(workerMutex_);
+        if (shuttingDown_ || stoppingWorkers_ || workerReservations_ != 0 || currentWorker_)
+            return {};
+        currentWorker_ = worker;
+        ++workerReservations_;
+    }
+    std::weak_ptr<WorkerReservation> weak = worker;
+    worker->terminalConnection = connect(&AsyncTaskManager::instance(),
+        &AsyncTaskManager::taskFinished, this,
+        [this, weak](qint64 id, AsyncTaskState state) {
+            if (const auto reservation = weak.lock())
+                observeWorkerTerminal(reservation, id, state,
+                    AsyncTaskManager::instance().taskById(id).error);
+        });
+    return worker;
+}
+
+bool LargeFileSearch::claimWorker(const WorkerReservationPtr &worker)
+{
+    auto expected = WorkerReservation::Phase::Pending;
+    return worker->phase.compare_exchange_strong(expected,
+        WorkerReservation::Phase::Running, std::memory_order_acq_rel);
+}
+
+void LargeFileSearch::setWorkerFailure(const WorkerReservationPtr &worker,
+                                      const QString &raw, const QString &userMessage)
+{
+    worker->raw = raw;
+    worker->userMessage = userMessage;
+    worker->completion = {};
+}
+
+void LargeFileSearch::setWorkerCompletion(const WorkerReservationPtr &worker,
+                                         std::function<void()> completion)
+{
+    worker->raw.clear();
+    worker->userMessage.clear();
+    worker->completion = std::move(completion);
+}
+
+void LargeFileSearch::recordWorkerException(const WorkerReservationPtr &worker)
+{
+    QString raw;
+    try {
+        throw;
+    } catch (const std::exception &error) {
+        raw = QString::fromUtf8(error.what());
+    } catch (...) {
+        raw = QObject::tr("未知异常(非std::exception)");
+    }
+    if (raw.isEmpty())
+        raw = QObject::tr("搜索任务异常退出。");
+    setWorkerFailure(worker, raw,
+        QObject::tr("查找未完成；可查看技术详情后重试，或缩小查找范围。"));
+}
+
+void LargeFileSearch::releaseWorker(const WorkerReservationPtr &worker)
+{
+    std::lock_guard<std::mutex> lock(workerMutex_);
+    Q_ASSERT(!worker->released && workerReservations_ > 0);
+    worker->released = true;
+    --workerReservations_;
+    workerIdle_.notify_all();
+}
+
+void LargeFileSearch::finishWorker(const WorkerReservationPtr &worker)
+{
+    // Queue while the reservation still protects this QObject. Even when the
+    // GUI receives it immediately, deliverWorker waits for the final release.
+    auto release = qScopeGuard([this, worker] {
+        auto expected = WorkerReservation::Phase::Running;
+        const bool owned = worker->phase.compare_exchange_strong(expected,
+            WorkerReservation::Phase::Settled, std::memory_order_acq_rel);
+        Q_ASSERT(owned);
+        if (owned)
+            releaseWorker(worker);
+    });
+    QMetaObject::invokeMethod(this, [this, worker] { deliverWorker(worker); },
+                              Qt::QueuedConnection);
+}
+
+bool LargeFileSearch::isCurrentWorker(const WorkerReservationPtr &worker) const
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    return currentWorker_ == worker && !shuttingDown_ && !stoppingWorkers_;
+}
+
+void LargeFileSearch::deliverWorker(const WorkerReservationPtr &worker)
+{
+    if (!isCurrentWorker(worker))
+        return;
+    {
+        std::unique_lock<std::mutex> lock(workerMutex_);
+        workerIdle_.wait(lock, [&worker] { return worker->released; });
+    }
+    QObject::disconnect(worker->terminalConnection);
+    cancel_.store(false, std::memory_order_release);
+    currentWorker_.reset();
+    const QPointer<LargeFileSearch> owner(this);
+    emit sourceBecameIdle();
+    if (!owner) return;
+    // No query/connection cleanup after invoking user code: a direct receiver
+    // may start the next query, replace the source, or destroy this engine.
+    if (!worker->raw.isEmpty())
+        worker->failure(worker->raw, worker->userMessage);
+    else if (worker->completion)
+        worker->completion();
+}
+
+void LargeFileSearch::observeWorkerTerminal(const WorkerReservationPtr &worker,
+    qint64 taskId, AsyncTaskState state, const AsyncErrorInfo &error)
+{
+    if (!isCurrentWorker(worker))
+        return;
+    if (worker->taskId == 0) {
+        worker->earlyTerminals.push_back({taskId, state, error});
+        return;
+    }
+    if (worker->taskId != taskId)
+        return;
+    auto expected = WorkerReservation::Phase::Pending;
+    if (!worker->phase.compare_exchange_strong(expected,
+            WorkerReservation::Phase::Settled, std::memory_order_acq_rel))
+        return; // UI Queued/Canceled does not prove the worker has not entered.
+    const bool canceled = state == AsyncTaskState::Canceled;
+    setWorkerFailure(worker,
+        canceled ? QObject::tr("已取消。") : (error.message.isEmpty()
+            ? QObject::tr("搜索任务未能启动。") : error.message),
+        canceled ? QObject::tr("查找已停止，结果不完整；可重新查找。")
+            : QObject::tr("查找未完成；可查看技术详情后重试，或缩小查找范围。"));
+    releaseWorker(worker);
+    QMetaObject::invokeMethod(this, [this, worker] { deliverWorker(worker); },
+                              Qt::QueuedConnection);
+}
+
+void LargeFileSearch::bindWorkerTask(const WorkerReservationPtr &worker, qint64 taskId)
+{
+    worker->taskId = taskId;
+    if (!isCurrentWorker(worker)) {
+        AsyncTaskManager::instance().cancel(taskId);
+        return;
+    }
+    lastTaskId_ = taskId;
+    const auto early = std::move(worker->earlyTerminals);
+    for (const auto &terminal : early) {
+        if (terminal.id == taskId)
+            observeWorkerTerminal(worker, taskId, terminal.state, terminal.error);
+    }
+}
+
+void LargeFileSearch::abandonWorker(const WorkerReservationPtr &worker)
+{
+    QObject::disconnect(worker->terminalConnection);
+    if (currentWorker_ == worker)
+        currentWorker_.reset();
+    auto expected = WorkerReservation::Phase::Pending;
+    if (worker->phase.compare_exchange_strong(expected,
+            WorkerReservation::Phase::Settled, std::memory_order_acq_rel))
+        releaseWorker(worker);
+}
+
+void LargeFileSearch::stopWorkers(bool permanent)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    WorkerReservationPtr worker;
+    bool alreadyStopping;
+    {
+        std::lock_guard<std::mutex> lock(workerMutex_);
+        alreadyStopping = stoppingWorkers_;
+        stoppingWorkers_ = true;
+        shuttingDown_ = shuttingDown_ || permanent;
+        worker = currentWorker_;
+    }
+    cancel_.store(true, std::memory_order_release);
+    const qint64 taskId = lastTaskId_;
+    // Retire Pending before calling the manager: taskAdded can re-enter here
+    // before submit has returned an id, and cancel() itself emits direct signals.
+    if (worker)
+        abandonWorker(worker);
+    const QPointer<LargeFileSearch> owner(this);
+    if (taskId > 0)
+        AsyncTaskManager::instance().cancel(taskId);
+    if (!owner)
+        return;
+
+    std::unique_lock<std::mutex> lock(workerMutex_);
+    workerIdle_.wait(lock, [this] { return workerReservations_ == 0; });
+    lastTaskId_ = 0;
+    stoppingWorkers_ = alreadyStopping;
+    if (!shuttingDown_ && !alreadyStopping)
+        cancel_.store(false, std::memory_order_release);
+}
+
+void LargeFileSearch::cancelAndWait()
+{
+    const QPointer<LargeFileSearch> owner(this);
+    stopWorkers(false);
+    if (owner) emit sourceBecameIdle();
+}
+
 void LargeFileSearch::findAll(const QString& pattern, const Options& opts) {
     findAllViaTaskManager(pattern, opts, QString());
+}
+
+QString LargeFileSearch::failureUserMessage(const QString &raw) const
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (failurePresentation_.raw == raw && !failurePresentation_.userMessage.isEmpty())
+        return failurePresentation_.userMessage;
+    return QObject::tr("查找未完成；可查看技术详情后重试，或缩小查找范围。");
+}
+
+void LargeFileSearch::publishFailure(const QString &raw, const QString &userMessage)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    // Scoped signal context, not retained failure history. Nested emissions
+    // restore their caller's context and rejected starts overwrite no state.
+    const FailurePresentation previous = failurePresentation_;
+    QPointer<LargeFileSearch> guard(this);
+    failurePresentation_ = {raw, userMessage};
+    emit failed(raw);
+    if (guard)
+        guard->failurePresentation_ = previous;
 }
 
 // ============================================================================
@@ -85,16 +331,47 @@ void LargeFileSearch::findAll(const QString& pattern, const Options& opts) {
 qint64 LargeFileSearch::findAllViaTaskManager(const QString& pattern, const Options& opts,
                                               const QString& fileDisplayName)
 {
+    const QPointer<LargeFileSearch> idleOwner(this);
+    const auto idleOnRejection = qScopeGuard([idleOwner] {
+        if (idleOwner && !idleOwner->sourceInUse()) emit idleOwner->sourceBecameIdle();
+    });
     if (!mmapBase_) {
-        emit failed(QStringLiteral("数据源未设置。"));
+        publishFailure(QStringLiteral("数据源未设置。"),
+            QObject::tr("文件尚未准备好进行查找；请稍后重试。"));
         return -1;
     }
-    // 如果已经被 requestCancel，立即取消不启动 worker
+    QByteArray literalBytes;
+    bool usePcre2 = false;
+    QString patternError;
+    if (!preparePattern(pattern, opts, &literalBytes,
+                              &usePcre2, &patternError)) {
+        publishFailure(patternError,
+            QObject::tr("查找条件无法使用；请检查表达式或字节格式后重试。"));
+        return -1;
+    }
+
+    const auto worker = reserveWorker([this](const QString &raw, const QString &userMessage) {
+        publishFailure(raw, userMessage);
+    });
+    if (!worker) {
+        publishFailure(QStringLiteral("已有搜索正在运行。"),
+            QObject::tr("已有查找正在进行；请等待完成或停止后再试。"));
+        return -1;
+    }
+    QPointer<LargeFileSearch> owner(this);
+    auto releaseOnSubmitFailure = qScopeGuard([owner, worker] {
+        if (owner)
+            owner->abandonWorker(worker);
+    });
+    // Rejecting an overlap must not reset an active query's cancellation,
+    // matches, or spool. All mutations follow the exclusive reservation.
     if (cancel_.exchange(false, std::memory_order_acq_rel)) {
-        emit failed(QStringLiteral("已取消。"));
+        abandonWorker(worker);
+        releaseOnSubmitFailure.dismiss();
+        publishFailure(QStringLiteral("已取消。"),
+            QObject::tr("查找已停止，结果不完整；可重新查找。"));
         return -1;
     }
-    std::atomic_thread_fence(std::memory_order_release);
     memMatches_.clear();
     storageFailed_ = false;
     scanError_.clear();
@@ -108,21 +385,6 @@ qint64 LargeFileSearch::findAllViaTaskManager(const QString& pattern, const Opti
     if (!overrunFile_.isEmpty()) { QFile::remove(overrunFile_); overrunFile_.clear(); }
     memMatches_.reserve(int(qMin<qint64>(maxMemMatches_, qint64(2000000))));
 
-    QByteArray literalBytes;
-    bool usePcre2 = false;
-    QString patternError;
-    if (!preparePattern(pattern, opts, &literalBytes,
-                              &usePcre2, &patternError)) {
-        emit failed(patternError);
-        return -1;
-    }
-
-    if (!reserveWorker()) {
-        emit failed(QStringLiteral("已有搜索正在运行。"));
-        return -1;
-    }
-    auto releaseOnSubmitFailure = qScopeGuard([this] { releaseWorker(); });
-
     const qint64 virtualSize = patchList_ ? patchList_->virtualSize(mmapSize_) : mmapSize_;
 
     const QString displayName = fileDisplayName.isEmpty()
@@ -135,65 +397,90 @@ qint64 LargeFileSearch::findAllViaTaskManager(const QString& pattern, const Opti
         .arg(opts.caseSensitive ? QObject::tr("是") : QObject::tr("否"))
         .arg(opts.wholeWord ? QObject::tr("是") : QObject::tr("否"));
 
-    lastTaskId_ = AsyncTaskManager::instance().submit(
+    const qint64 submittedTaskId = AsyncTaskManager::instance().submit(
         AsyncTaskType::LargeFileSearch,
         AsyncTaskPriority::High,
         title,
         desc,
-        /* workerFn = */ [this, virtualSize, pattern, opts]
+        /* workerFn = */ [this, worker, virtualSize, pattern, opts]
         (qint64 taskId, AsyncCancelPtr cancel,
          std::function<void(qint64,qint64)> reportProgress,
          std::function<void(const AsyncErrorInfo&)> reportError)
         {
-            Q_UNUSED(reportError);
-            auto release = qScopeGuard([this] { releaseWorker(); });
-            const auto isCancelled = [&]() {
-                return (cancel && cancel->load(std::memory_order_acquire))
-                    || cancel_.load(std::memory_order_relaxed);
-            };
-            Options taskOptions = opts;
-            taskOptions.reportPhase = [taskId](
-                const QString &phase, int index, int count,
-                qint64 done, qint64 total) {
-                AsyncTaskManager::instance().updateTaskPhase(
-                    taskId, phase, index, count, done, total);
-            };
-            const bool ok = scanAllBounded(
-                virtualSize, pattern, taskOptions, isCancelled,
-                [this, reportProgress, virtualSize](qint64 done) {
-                    reportProgress(done, virtualSize);
-                    QMetaObject::invokeMethod(this, "progress", Qt::QueuedConnection,
-                                              Q_ARG(qint64, done), Q_ARG(qint64, virtualSize));
-                },
-                [this](const QVector<LargeFileSearchMatch> &batch) {
-                    QMetaObject::invokeMethod(
-                        this, "partialBatch", Qt::QueuedConnection,
-                        Q_ARG(QVector<LargeFileSearchMatch>, batch));
-                    return true;
-                });
-            if (!ok) {
-                QMetaObject::invokeMethod(
-                    this, "failed", Qt::QueuedConnection,
-                    Q_ARG(QString, storageFailed_
-                        ? QObject::tr("搜索结果临时存储写入失败。")
-                        : (!scanError_.isEmpty() ? scanError_
-                                                : QObject::tr("已取消。"))));
+            // No dereference of the captured engine before the shared claim:
+            // a canceled Pending wrapper may outlive the engine and its source.
+            if (!LargeFileSearch::claimWorker(worker))
                 return;
+            auto release = qScopeGuard([this, worker] { finishWorker(worker); });
+            try {
+                const auto isCancelled = [&]() {
+                    return (cancel && cancel->load(std::memory_order_acquire))
+                        || cancel_.load(std::memory_order_relaxed);
+                };
+                Options taskOptions = opts;
+                taskOptions.reportPhase = [taskId](
+                    const QString &phase, int index, int count,
+                    qint64 done, qint64 total) {
+                    AsyncTaskManager::instance().updateTaskPhase(
+                        taskId, phase, index, count, done, total);
+                };
+                const bool ok = scanAllBounded(
+                    virtualSize, pattern, taskOptions, isCancelled,
+                    [this, worker, reportProgress, virtualSize](qint64 done) {
+                        reportProgress(done, virtualSize);
+                        QMetaObject::invokeMethod(this, [this, worker, done, virtualSize] {
+                            if (isCurrentWorker(worker))
+                                emit progress(done, virtualSize);
+                        }, Qt::QueuedConnection);
+                    },
+                    [this, worker](const QVector<LargeFileSearchMatch> &batch) {
+                        QMetaObject::invokeMethod(this, [this, worker, batch] {
+                            if (isCurrentWorker(worker))
+                                emit partialBatch(batch);
+                        }, Qt::QueuedConnection);
+                        return true;
+                    });
+                if (!ok) {
+                    const QString raw = storageFailed_
+                        ? QObject::tr("搜索结果临时存储写入失败。")
+                        : (!scanError_.isEmpty() ? scanError_ : QObject::tr("已取消。"));
+                    const QString userMessage = storageFailed_
+                        ? QObject::tr("搜索结果临时保存失败，查找未完成；请检查临时目录是否可用，查看技术详情后重试。")
+                        : (!scanError_.isEmpty()
+                            ? QObject::tr("查找未完成；可查看技术详情后重试，或缩小查找范围。")
+                            : QObject::tr("查找已停止，结果不完整；可重新查找。"));
+                    setWorkerFailure(worker, raw, userMessage);
+                    if (storageFailed_ || !scanError_.isEmpty()) {
+                        AsyncErrorInfo taskError;
+                        taskError.message = raw;
+                        taskError.userMessage = userMessage;
+                        reportError(taskError);
+                    }
+                    return;
+                }
+                std::atomic_thread_fence(std::memory_order_release);
+                const qint64 count = qint64(memMatches_.size()) + overrunCount_;
+                reportProgress(virtualSize, virtualSize);
+                QMetaObject::invokeMethod(this, [this, worker, virtualSize] {
+                    if (isCurrentWorker(worker))
+                        emit progress(virtualSize, virtualSize);
+                }, Qt::QueuedConnection);
+                setWorkerCompletion(worker, [this, count] { emit finished(count); });
+            } catch (...) {
+                recordWorkerException(worker);
+                throw; // Preserve the Manager's existing exception diagnostics/state.
             }
-            std::atomic_thread_fence(std::memory_order_release);
-            const qint64 count = qint64(memMatches_.size()) + overrunCount_;
-            reportProgress(virtualSize, virtualSize);
-            QMetaObject::invokeMethod(this, "progress", Qt::QueuedConnection,
-                                      Q_ARG(qint64, virtualSize), Q_ARG(qint64, virtualSize));
-            QMetaObject::invokeMethod(this, "finished", Qt::QueuedConnection,
-                                      Q_ARG(qint64, count));
         },
         /* batchId = */ 0,
         /* categoryTag = */ QLatin1String("Search"),
         /* progressTotalInit = */ virtualSize
     );
+    if (owner)
+        owner->bindWorkerTask(worker, submittedTaskId);
+    else
+        AsyncTaskManager::instance().cancel(submittedTaskId);
     releaseOnSubmitFailure.dismiss();
-    return lastTaskId_;
+    return submittedTaskId;
 }
 
 qint64 LargeFileSearch::findOneViaTaskManager(
@@ -201,6 +488,10 @@ qint64 LargeFileSearch::findOneViaTaskManager(
     bool forward, bool wrap, const QString &fileDisplayName,
     QObject *callbackContext, OneMatchCallback callback)
 {
+    const QPointer<LargeFileSearch> idleOwner(this);
+    const auto idleOnRejection = qScopeGuard([idleOwner] {
+        if (idleOwner && !idleOwner->sourceInUse()) emit idleOwner->sourceBecameIdle();
+    });
     if (!mmapBase_) {
         if (callback)
             callback(false, {}, QObject::tr("数据源未就绪。"));
@@ -215,75 +506,96 @@ qint64 LargeFileSearch::findOneViaTaskManager(
             callback(false, {}, validationError);
         return -1;
     }
-    if (!reserveWorker()) {
+    QPointer<QObject> guard(callbackContext);
+    const auto worker = reserveWorker([guard, callback](const QString &raw, const QString &) {
+        if (guard && callback)
+            QMetaObject::invokeMethod(guard, [callback, raw] { callback(false, {}, raw); },
+                                      Qt::QueuedConnection);
+    });
+    if (!worker) {
         if (callback)
             callback(false, {}, QObject::tr("搜索任务正在运行。"));
         return -1;
     }
-    auto releaseOnSubmitFailure = qScopeGuard([this] { releaseWorker(); });
+    QPointer<LargeFileSearch> owner(this);
+    auto releaseOnSubmitFailure = qScopeGuard([owner, worker] {
+        if (owner)
+            owner->abandonWorker(worker);
+    });
     cancel_.store(false, std::memory_order_release);
     const qint64 virtualSize = patchList_
         ? patchList_->virtualSize(mmapSize_) : mmapSize_;
     const QString displayName = fileDisplayName.isEmpty()
         ? QObject::tr("大文件") : fileDisplayName;
-    QPointer<QObject> guard(callbackContext);
-    lastTaskId_ = AsyncTaskManager::instance().submit(
+    const qint64 submittedTaskId = AsyncTaskManager::instance().submit(
         AsyncTaskType::LargeFileSearch, AsyncTaskPriority::Highest,
         forward ? QObject::tr("查找下一个: %1").arg(displayName)
                 : QObject::tr("查找上一个: %1").arg(displayName),
         QObject::tr("定向扫描，找到一处即返回"),
-        [this, virtualSize, pattern, opts, fromByte, forward, wrap,
+        [this, worker, virtualSize, pattern, opts, fromByte, forward, wrap,
          guard, callback = std::move(callback)]
         (qint64 taskId, AsyncCancelPtr cancel,
          std::function<void(qint64, qint64)> reportProgress,
          std::function<void(const AsyncErrorInfo &)> reportError) mutable {
-            auto release = qScopeGuard([this] { releaseWorker(); });
-            const auto isCancelled = [this, cancel]() {
-                return (cancel && cancel->load(std::memory_order_acquire))
-                    || cancel_.load(std::memory_order_acquire);
-            };
-            LargeFileSearchMatch found;
-            found.byteOffset = -1;
-            QString error;
-            Options taskOptions = opts;
-            taskOptions.reportPhase = [taskId](
-                const QString &phase, int index, int count,
-                qint64 done, qint64 total) {
-                AsyncTaskManager::instance().updateTaskPhase(
-                    taskId, phase, index, count, done, total);
-            };
-            const bool ok = scanOneBounded(
-                virtualSize, pattern, taskOptions, fromByte, forward, wrap,
-                isCancelled,
-                [reportProgress, virtualSize](qint64 done) {
-                    reportProgress(qMin(done, virtualSize), virtualSize);
-                },
-                &found, &error);
-            if (!ok && error.isEmpty() && isCancelled())
-                error = QObject::tr("已取消。");
-            if (!ok && !error.isEmpty() && error != QObject::tr("已取消。")) {
-                AsyncErrorInfo taskError;
-                taskError.message = error;
-                reportError(taskError);
-            }
-            // The callback re-enables the navigation controls.  Release the
-            // engine reservation before posting it so an immediate second F3
-            // or button click cannot observe an enabled UI backed by a still-
-            // busy search lane.
-            releaseWorker();
-            release.dismiss();
-            if (!guard || !callback)
+            if (!LargeFileSearch::claimWorker(worker))
                 return;
-            const bool matched = ok && found.byteOffset >= 0;
-            QMetaObject::invokeMethod(
-                guard, [callback = std::move(callback), matched,
-                        found = std::move(found), error = std::move(error)]() mutable {
-                    callback(matched, std::move(found), std::move(error));
-                }, Qt::QueuedConnection);
+            auto release = qScopeGuard([this, worker] { finishWorker(worker); });
+            try {
+                const auto isCancelled = [this, cancel]() {
+                    return (cancel && cancel->load(std::memory_order_acquire))
+                        || cancel_.load(std::memory_order_acquire);
+                };
+                LargeFileSearchMatch found;
+                found.byteOffset = -1;
+                QString error;
+                Options taskOptions = opts;
+                taskOptions.reportPhase = [taskId](
+                    const QString &phase, int index, int count,
+                    qint64 done, qint64 total) {
+                    AsyncTaskManager::instance().updateTaskPhase(
+                        taskId, phase, index, count, done, total);
+                };
+                const bool ok = scanOneBounded(
+                    virtualSize, pattern, taskOptions, fromByte, forward, wrap,
+                    isCancelled,
+                    [reportProgress, virtualSize](qint64 done) {
+                        reportProgress(qMin(done, virtualSize), virtualSize);
+                    },
+                    &found, &error);
+                if (!ok && error.isEmpty() && isCancelled())
+                    error = QObject::tr("已取消。");
+                if (!ok && !error.isEmpty() && error != QObject::tr("已取消。")) {
+                    AsyncErrorInfo taskError;
+                    taskError.message = error;
+                    taskError.userMessage = QObject::tr("未能完成定位匹配。请检查查找条件，查看技术详情后重试。");
+                    reportError(taskError);
+                }
+                const bool matched = ok && found.byteOffset >= 0;
+                // The engine queues while protected, then releases before its GUI
+                // completion posts to the external context. No worker-side QPointer
+                // check/use window remains after source-close can cross the barrier.
+                setWorkerCompletion(worker,
+                    [guard, callback = std::move(callback), matched,
+                     found = std::move(found), error = std::move(error)]() mutable {
+                        if (guard && callback)
+                            QMetaObject::invokeMethod(guard,
+                                [callback = std::move(callback), matched,
+                                 found = std::move(found), error = std::move(error)]() mutable {
+                                    callback(matched, std::move(found), std::move(error));
+                                }, Qt::QueuedConnection);
+                    });
+            } catch (...) {
+                recordWorkerException(worker);
+                throw;
+            }
         },
         0, QLatin1String("SearchNavigation"), virtualSize);
+    if (owner)
+        owner->bindWorkerTask(worker, submittedTaskId);
+    else
+        AsyncTaskManager::instance().cancel(submittedTaskId);
     releaseOnSubmitFailure.dismiss();
-    return lastTaskId_;
+    return submittedTaskId;
 }
 
 // ============================================================================

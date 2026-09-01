@@ -13,6 +13,7 @@
 #include "AsyncSerialQueue.h"
 #include "AsyncUiOperation.h"
 #include "VaultDock.h"
+#include "WorkspaceRecoveryCoordinator.h"
 #include "SecureDocumentContract.h"
 #include "SecuritySessionPort.h"
 #include "AppComposition.h"
@@ -170,7 +171,6 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
                     applyAppearanceMode();
             });
 
-    // ============================================================
     //  启动阶段会话恢复触发权移交给 main.cpp !!
     //  原做法 v1：构造内同步 restoreSession() → 构造阻塞 → w.show() 永远执行不到
     //  原做法 v2：构造内 QTimer::singleShot(0, deferredRestoreSession)
@@ -182,8 +182,8 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
     // ============================================================
     //   【此处不允许再注册任何启动会话恢复的 timer / 调用】
 
-    // "没有标签就创建新标签"—— 同样延后到 deferredRestoreSession 结束后再判断
-    // （否则空 tab + 异步恢复叠加导致多 1 个空白 tab）
+    // 空会话保持可操作的空窗口，不自动补建空白标签。
+    // 只有用户显式新建，才进入原有安全或普通文档创建流程。
 
     // 自动保存定时器（每 30 秒保存未保存内容）
     connect(&m_autosaveTimer, &QTimer::timeout, this, [this]() {

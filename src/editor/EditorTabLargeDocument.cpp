@@ -1,17 +1,19 @@
 #include "EditorTab.h"
 #include "HexProjection.h"
 #include "EditorSurfaceStyle.h"
+#include "EditorSurfaceAccessibility.h"
 // Hex character rows use the shared measured Scintilla-authoritative grid.
 #include "ByteClipboard.h"
 #include "VirtualFileView.h"
 #include "WindowedReadOnlyProvider.h"
+#include "ReadOnlyTailController.h"
+#include "EditorSearchSource.h"
 #include "FileTierPolicy.h"
 #include "SearchResultsModel.h"
 #include "Pcre2Regex.h"
 #include "EditableTextSearch.h"
 #include "AsyncTaskManager.h"
 #include "DraftStore.h"
-
 #include <QVBoxLayout>
 #include <QLabel>
 #include <QStackedWidget>
@@ -56,9 +58,9 @@
 #include <climits>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <stdexcept>
 #include <string>
-
 
 #ifdef Q_OS_WIN
 #ifndef NOMINMAX
@@ -91,9 +93,6 @@
 #include <Qsci/qscilexerproperties.h>
 #include <Qsci/qscilexermasm.h>
 
-
-
-
 // ============================================================================
 //  L2 视图模式（Text / Hex）
 // ============================================================================
@@ -112,9 +111,11 @@ void EditorTab::setViewModeL2(ViewMode mode)
     m_l2View->setViewMode(mode);
     invalidateL2ProjectionSearchState();
     if (windowedReadOnlyActive()) {
+        const QPointer<EditorTab> owner(this);
         m_windowedReadOnlyProvider->setPresentation(
             mode == ViewMode::Hex ? WindowedReadOnlyProvider::Presentation::Hex
                                   : WindowedReadOnlyProvider::Presentation::Text);
+        if (!owner) return;
         // editor() remains the compatibility surface queried by commands,
         // session tests and accessibility tooling even while the windowed
         // provider owns the visible projection. Keep its gutter semantics in
@@ -157,7 +158,7 @@ qint64 EditorTab::currentByteOffset() const
     // m_lastL2Byte is a compatibility/search cache. Programmatic navigation
     // and byte selections update VirtualFileView directly, so session state
     // must read the provider's authoritative 64-bit caret position.
-    if (windowedReadOnlyActive())
+    if (windowedReadOnlyActive() || m_searchSource->usesWindowedSource())
         return m_windowedReadOnlyProvider->globalOffset();
     if (m_l2Mode && m_l2View)
         return m_l2View->cursorByte();
@@ -228,6 +229,8 @@ WindowedReadOnlyProvider *EditorTab::ensureWindowedReadOnlyProvider()
 {
     if (!m_windowedReadOnlyProvider) {
         m_windowedReadOnlyProvider = new WindowedReadOnlyProvider(this);
+        connect(m_windowedReadOnlyProvider->tailController(), &ReadOnlyTailController::stateChanged,
+                this, &EditorTab::commandCapabilitiesChanged);
         m_windowedReadOnlyProvider->setObjectName(
             QStringLiteral("productionWindowedReadOnlyProvider"));
         m_windowedReadOnlyProvider->editor()->setWhitespaceVisibility(
@@ -267,12 +270,15 @@ WindowedReadOnlyProvider *EditorTab::ensureWindowedReadOnlyProvider()
                 &WindowedReadOnlyProvider::sourceFileChanged,
                 this, [this](qint64, qint64) {
             advanceContentRevision();
-            refreshDiskVersionBaseline();
-            if (auto *window = qobject_cast<QMainWindow *>(this->window())) {
-                window->statusBar()->showMessage(
-                    QObject::tr("源文件已在磁盘上变化；已刷新只读视图并取消旧的编辑准备"),
-                    8000);
-            }
+        });
+        connect(m_windowedReadOnlyProvider,
+                &WindowedReadOnlyProvider::sourceVersionAccepted,
+                this, [this, provider = m_windowedReadOnlyProvider](QString path, DiskFileVersion version) {
+            if (provider == m_windowedReadOnlyProvider && m_l2ReadOnlyByPolicy
+                && !isSecureDocument() && version.valid && !version.sampleHash.isEmpty()
+                && sameDiskFilePath(path, version.absolutePath)
+                && sameDiskFilePath(path, m_documentSession.state().location))
+                m_documentSession.setDiskVersion(std::move(version));
         });
         connect(m_windowedReadOnlyProvider,
                 &WindowedReadOnlyProvider::sourceReloadFailed,
@@ -317,7 +323,7 @@ EditorTab::LargeDocumentRuntimeState EditorTab::largeDocumentRuntimeState() cons
 
 qint64 EditorTab::contentSizeBytes() const
 {
-    if (windowedReadOnlyActive() && m_windowedReadOnlyProvider)
+    if (windowedReadOnlyActive() || m_searchSource->usesWindowedSource())
         return m_windowedReadOnlyProvider->fileSize();
     if (m_l2Mode && m_l2View && m_l2View->isOpen())
         return m_l2View->virtualFileSize();
@@ -335,7 +341,7 @@ qint64 EditorTab::contentCharacterCount() const
     const bool hexMode = isL2Active() && viewModeL2() == ViewMode::Hex;
     if (hexMode)
         return contentSizeBytes();
-    if (windowedReadOnlyActive() && m_windowedReadOnlyProvider)
+    if (windowedReadOnlyActive() || m_searchSource->usesWindowedSource())
         return m_windowedReadOnlyProvider->characterCount();
 
     if (m_characterCountRevision == m_documentSession.state().revision
@@ -361,52 +367,6 @@ qint64 EditorTab::contentCharacterCount() const
     return count;
 }
 
-bool EditorTab::ensureWindowedSearchSource(QString *error)
-{
-    // Search-source availability is a document capability, not a presentation
-    // detail.  QStackedWidget::currentWidget() is appropriate for routing
-    // visible-editor commands, but it is not a reliable lifetime marker for
-    // the already-open production provider (dialogs and transient view changes
-    // can make the provider non-current without closing its source file).
-    const bool hasWindowedSource = m_l2Mode && m_windowedReadOnlyProvider
-        && m_windowedReadOnlyProvider->fileSize() > 0
-        && !m_documentSession.state().location.isEmpty();
-    if (!hasWindowedSource) {
-        const bool hasMappedSource = m_l2View && m_l2View->isOpen();
-        if (!hasMappedSource && error) {
-            *error = QObject::tr(
-                "当前大文件搜索源不可用（文档模式=%1，窗口源=%2，文件大小=%3，路径=%4）。")
-                .arg(m_l2Mode ? QObject::tr("大文件") : QObject::tr("普通文件"))
-                .arg(m_windowedReadOnlyProvider ? QObject::tr("存在")
-                                                : QObject::tr("不存在"))
-                .arg(m_windowedReadOnlyProvider
-                         ? m_windowedReadOnlyProvider->fileSize() : -1)
-                .arg(m_documentSession.state().location.isEmpty() ? QObject::tr("为空")
-                                          : QObject::tr("存在"));
-        }
-        return hasMappedSource;
-    }
-    if (m_l2View && (m_l2View->isOpen() || m_l2View->mmapSize() > 0))
-        return true;
-    if (m_documentSession.state().location.isEmpty()) {
-        if (error)
-            *error = QObject::tr("当前大文件没有可搜索的磁盘源。");
-        return false;
-    }
-    VirtualFileView *view = ensureL2View();
-    view->setFullLineIndexBuildEnabled(false);
-    view->setViewMode(m_windowedReadOnlyProvider->presentation()
-                          == WindowedReadOnlyProvider::Presentation::Hex
-                      ? ViewMode::Hex : ViewMode::Text);
-    QString openError;
-    if (!view->openFile(m_documentSession.state().location, &openError)) {
-        if (error)
-            *error = openError;
-        return false;
-    }
-    return true;
-}
-
 void EditorTab::ensureHexAsciiPreview(QWidget *parent)
 {
     if (!parent)
@@ -414,7 +374,6 @@ void EditorTab::ensureHexAsciiPreview(QWidget *parent)
     if (!m_hexAsciiPreview) {
         m_hexAsciiPreview = new QPlainTextEdit(parent);
         m_hexAsciiPreview->setObjectName(QStringLiteral("HexAsciiPreview"));
-        m_hexAsciiPreview->setAccessibleName(QStringLiteral("编码字符预览"));
         m_hexAsciiPreview->setToolTip(
             QStringLiteral("字符栏（按当前编码进行多字节解码；编辑仍作用于原始字节）"));
         m_hexAsciiPreview->setFont(m_editor->font());
@@ -428,9 +387,6 @@ void EditorTab::ensureHexAsciiPreview(QWidget *parent)
         m_hexAsciiPreview->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         m_hexAsciiPreview->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         m_hexAsciiPreview->document()->setDocumentMargin(0);
-        m_hexAsciiPreview->setStyleSheet(QStringLiteral(
-            "QPlainTextEdit { border: 0; border-left: 1px solid #c8c8c8;"
-            " background: #fafafa; padding-left: 8px; }"));
         m_hexAsciiPreview->installEventFilter(this);
         m_hexAsciiPreview->viewport()->installEventFilter(this);
         emit externalDropSurfaceCreated(m_hexAsciiPreview);
@@ -439,6 +395,7 @@ void EditorTab::ensureHexAsciiPreview(QWidget *parent)
                 this, &EditorTab::syncHexSelectionFromAscii);
         connect(m_hexAsciiPreview, &QPlainTextEdit::selectionChanged,
                 this, &EditorTab::syncHexSelectionFromAscii);
+        configureEditableHexOverlayAccessibility(m_editor, m_hexAsciiPreview, m_l2View->verticalScrollBar());
     } else if (m_hexAsciiPreview->parentWidget() != parent) {
         m_hexAsciiPreview->setParent(parent);
     }
@@ -498,6 +455,7 @@ void EditorTab::layoutL2Overlay()
 
     const bool hex = m_l2View->viewMode() == ViewMode::Hex;
     if (!hex) {
+        configureEditorPresentationAccessibility(m_editor, false);
         m_editor->setAttribute(Qt::WA_InputMethodEnabled, true);
         m_l2View->setHorizontalScrollBarPolicy(
             m_l2View->wordWrap() ? Qt::ScrollBarAlwaysOff
@@ -514,8 +472,8 @@ void EditorTab::layoutL2Overlay()
                                 m_l2View->horizontalScrollBar()->value());
         return;
     }
-
     ensureHexAsciiPreview(viewport);
+    configureEditorPresentationAccessibility(m_editor, true);
     m_editor->setAttribute(Qt::WA_InputMethodEnabled, false);
     // The B1 Hex document has exactly one user-visible position truth: the
     // provider's global vertical bar. The projected Scintilla and the mirrored
@@ -968,8 +926,8 @@ void EditorTab::bridgePopulateScintilla(qint64 s, qint64 e)
     if (!m_bridge.baseline.isEmpty() && isSecureBinaryDocument())
         m_bridge.baseline.fill(0);
     m_bridge.baseline    = std::move(bytes);
-    m_bridge.windowStart = s;
-    m_bridge.windowLen   = e - s;
+    m_bridge.windowStart = s; m_bridge.windowLen = e - s;
+    m_hexMouseSelection.applySourceSelectionToProjection(m_l2View->selectionAnchorByte(), m_l2View->selectionCaretByte());
     if (m_l2View->viewMode() == ViewMode::Text)
         refreshTextProjectionMargin();
     if (m_l2View->viewMode() == ViewMode::Text)
@@ -1073,6 +1031,9 @@ bool EditorTab::bridgeFlushOverlayToPatches(QString* errMsg)
 
 void EditorTab::advanceContentRevision()
 {
+    auto *navigation = m_searchSource->engine(true);
+    const qint64 navigationTaskId = navigation && navigation->sourceInUse()
+        ? navigation->lastTaskId() : 0;
     m_documentSession.advanceRevision();
     m_l1SearchCacheValid = false;
     m_l1SearchCache.clear();
@@ -1081,19 +1042,30 @@ void EditorTab::advanceContentRevision()
     m_l2NavigationHitValid = false;
     m_l2SearchCacheValid = false;
     clearSearchHighlights();
-    if (m_l1FindAllTaskId > 0) {
-        AsyncTaskManager::instance().cancel(m_l1FindAllTaskId);
-        m_l1FindAllTaskId = 0;
-    }
+    const QPointer<EditorTab> owner(this);
+    const qint64 l1TaskId = std::exchange(m_l1FindAllTaskId, 0);
+    if (navigationTaskId > 0) navigation->requestCancel();
+    if (l1TaskId > 0) AsyncTaskManager::instance().cancel(l1TaskId);
+    if (!owner) return;
     cancelPendingL2SearchForContentChange();
-    emit contentChanged(m_documentSession.state().revision);
+    if (navigationTaskId > 0) AsyncTaskManager::instance().cancel(navigationTaskId);
+    if (owner) emit contentChanged(m_documentSession.state().revision);
+}
+
+bool EditorTab::validateSearchSource()
+{
+    const QPointer<EditorTab> owner(this);
+    QString error;
+    const bool current = m_searchSource->validateCurrent(&error);
+    if (owner && !current) m_lastSearchError = error;
+    return owner && current;
 }
 
 void EditorTab::cancelPendingL2SearchForContentChange()
 {
     if (!m_pendingL2Search.active || !m_l2View)
         return;
-    if (LargeFileSearch *search = m_l2View->searchEngine()) {
+    if (LargeFileSearch *search = m_searchSource->engine(); search && search->sourceInUse()) {
         search->requestCancel();
         if (search->lastTaskId() > 0)
             AsyncTaskManager::instance().cancel(search->lastTaskId());

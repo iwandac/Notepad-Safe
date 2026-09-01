@@ -127,9 +127,14 @@ bool EditorTab::eventFilter(QObject* obj, QEvent* ev)
             break;
         }
     }
-    if (hexOverlayObject && ev->type() == QEvent::MouseButtonPress
-        && static_cast<QMouseEvent *>(ev)->button() == Qt::LeftButton) {
-        m_hexMouseSelecting = true;
+    if (hexOverlayObject) {
+        const auto result = handleHexAccessibleFocusTraversal(ev)
+            ? HexMouseSelectionController::FilterResult::Consume
+            : m_hexMouseSelection.filter(obj, ev);
+        if (result == HexMouseSelectionController::FilterResult::Consume)
+            return true;
+        if (result == HexMouseSelectionController::FilterResult::SourceRelease)
+            return QWidget::eventFilter(obj, ev);
     }
     if (hexOverlayObject && ev->type() == QEvent::Wheel) {
         auto *wheel = static_cast<QWheelEvent *>(ev);
@@ -208,12 +213,12 @@ bool EditorTab::eventFilter(QObject* obj, QEvent* ev)
             // observe the previous model/status position. This path only
             // changes the opposite Hex pane, so it does not interfere with the
             // ASCII widget's native release/selection state machine.
-            m_hexMouseSelecting = false;
+            m_hexMouseSelection.finishNativeSelection();
             syncHexSelectionFromAscii();
             return QWidget::eventFilter(obj, ev);
         }
         QTimer::singleShot(0, this, [this, asciiSurface]() {
-            m_hexMouseSelecting = false;
+            m_hexMouseSelection.finishNativeSelection();
             if (asciiSurface)
                 syncHexSelectionFromAscii();
             else
@@ -235,28 +240,7 @@ bool EditorTab::eventFilter(QObject* obj, QEvent* ev)
 
 bool EditorTab::asciiSelectionByteRange(qint64 *start, qint64 *end) const
 {
-    if (!start || !end || !m_hexAsciiPreview || !m_l2View
-        || m_l2View->viewMode() != ViewMode::Hex || m_bridge.windowStart < 0) {
-        return false;
-    }
-    const QTextCursor cursor = m_hexAsciiPreview->textCursor();
-    const auto mapPosition = [this](int position) {
-        const QTextBlock block = m_hexAsciiPreview->document()->findBlock(position);
-        if (!block.isValid())
-            return m_bridge.windowLen;
-        const qint64 column = qBound<qint64>(
-            0LL, qint64(position - block.position()),
-            qint64(qMin(m_hexBytesPerRow, block.text().size())));
-        return qMin(m_bridge.windowLen,
-                    qint64(block.blockNumber()) * m_hexBytesPerRow + column);
-    };
-    qint64 localStart = mapPosition(cursor.selectionStart());
-    qint64 localEnd = mapPosition(cursor.selectionEnd());
-    if (localEnd < localStart)
-        std::swap(localStart, localEnd);
-    *start = m_bridge.windowStart + localStart;
-    *end = m_bridge.windowStart + localEnd;
-    return true;
+    return m_hexMouseSelection.asciiSelectionByteRange(start, end);
 }
 
 bool EditorTab::handleHexInsertModeKey(QKeyEvent *event)
@@ -316,6 +300,8 @@ void EditorTab::setAsciiCaret(qint64 globalByte)
 void EditorTab::syncAsciiSelectionFromHex()
 {
     if (m_adjustingHexCaret || m_adjustingAsciiCaret || m_bridge.applying
+        || m_hexMouseSelection.sourceSelectionActive()
+        || m_hexMouseSelection.sourceAuthoritative()
         || !m_hexAsciiPreview || !m_hexAsciiPreview->isVisible()) {
         return;
     }
@@ -330,7 +316,7 @@ void EditorTab::syncAsciiSelectionFromHex()
     // caret on a separator space even though the source model has already
     // resolved that position to the following byte.  Keep the byte model and
     // the visible caret identical after every native mouse/cursor update.
-    if (end == start && !m_hexMouseSelecting) {
+    if (end == start && !m_hexMouseSelection.selecting()) {
         const qint64 local = qBound<qint64>(
             0, start - m_bridge.windowStart, m_bridge.windowLen);
         const int line = int(qMin<qint64>(local / m_hexBytesPerRow, INT_MAX));
@@ -341,7 +327,7 @@ void EditorTab::syncAsciiSelectionFromHex()
             QsciScintillaBase::SCI_GETCURRENTPOS);
         if (expected >= 0 && actual != expected)
             setHexCaret(start, nibble);
-    } else if (!m_hexMouseSelecting) {
+    } else if (!m_hexMouseSelection.selecting()) {
         const auto boundaryPosition = [this](qint64 globalByte) -> long {
             const qint64 local = qBound<qint64>(
                 0, globalByte - m_bridge.windowStart, m_bridge.windowLen);
@@ -431,20 +417,33 @@ void EditorTab::syncAsciiSelectionFromHex()
     const int first = int(m_editor->SendScintilla(
         QsciScintillaBase::SCI_GETFIRSTVISIBLELINE));
     m_hexAsciiPreview->verticalScrollBar()->setValue(first);
-    m_l2View->selectBytes(start, end);
+    const long sourceAnchorPosition = m_editor->SendScintilla(
+        QsciScintillaBase::SCI_GETANCHOR);
+    const long sourceCaretPosition = m_editor->SendScintilla(
+        QsciScintillaBase::SCI_GETCURRENTPOS);
+    const bool sourceForward = sourceCaretPosition >= sourceAnchorPosition;
+    m_l2View->selectBytes(sourceForward ? start : end,
+                          sourceForward ? end : start);
     m_lastL2Byte = end > start ? end : start;
 }
 
 void EditorTab::syncHexSelectionFromAscii()
 {
     if (m_adjustingAsciiCaret || m_adjustingHexCaret || m_bridge.applying
-        || m_hexMouseSelecting || !m_hexAsciiPreview) {
+        || m_hexMouseSelection.selecting()
+        || m_hexMouseSelection.sourceSelectionActive()
+        || m_hexMouseSelection.sourceAuthoritative()
+        || !m_hexAsciiPreview) {
         return;
     }
     qint64 start = 0;
     qint64 end = 0;
     if (!asciiSelectionByteRange(&start, &end))
         return;
+    const QTextCursor directionalCursor = m_hexAsciiPreview->textCursor();
+    const bool forward = directionalCursor.position() >= directionalCursor.anchor();
+    const qint64 anchorByte = forward ? start : end;
+    const qint64 caretByte = forward ? end : start;
 
     const auto overlayPosition = [this](qint64 globalByte) -> long {
         const qint64 local = qBound<qint64>(
@@ -456,8 +455,8 @@ void EditorTab::syncHexSelectionFromAscii()
         return m_editor->positionFromLineIndex(line, column);
     };
 
-    const long first = overlayPosition(start);
-    const long last = overlayPosition(end);
+    const long first = overlayPosition(anchorByte);
+    const long last = overlayPosition(caretByte);
     if (first < 0 || last < 0)
         return;
     m_adjustingHexCaret = true;
@@ -467,7 +466,7 @@ void EditorTab::syncHexSelectionFromAscii()
         m_editor->SendScintilla(QsciScintillaBase::SCI_GOTOPOS, first);
     }
     m_adjustingHexCaret = false;
-    m_l2View->selectBytes(start, end);
+    m_l2View->selectBytes(anchorByte, caretByte);
     m_lastL2Line = int(qMin<qint64>(start / m_hexBytesPerRow, INT_MAX));
     m_lastL2Col = int(start % m_hexBytesPerRow);
     m_lastL2Byte = end > start ? end : start;
@@ -605,6 +604,7 @@ bool EditorTab::replaceHexAsciiBytes(qint64 from, qint64 to, QByteArray bytes,
             bytes.fill(0);
         return false;
     }
+    m_hexMouseSelection.relinquishAuthority();
 
     const qint64 caret = from + bytes.size();
     const bool updatedInPlace = updateFixedHexProjection(from, oldLength, bytes);
@@ -650,6 +650,11 @@ bool EditorTab::handleHexAsciiKeyPress(QKeyEvent *event)
     if (event->matches(QKeySequence::Copy) || event->matches(QKeySequence::Cut)) {
         if (!selected)
             return true;
+        QString limitError;
+        if (!ByteClipboard::payloadWithinLimit(end - start, &limitError)) {
+            showError(limitError);
+            return true;
+        }
         QByteArray bytes = m_l2View->readByteRange(start, end);
         ByteClipboard::setCharacterSelection(bytes, m_l2View->displayEncoding());
         if (isSecureBinaryDocument() && !bytes.isEmpty())
@@ -669,6 +674,13 @@ bool EditorTab::handleHexAsciiKeyPress(QKeyEvent *event)
                 showError(QObject::tr("剪贴板文本无法用当前字符栏编码无损表示。"));
                 return true;
             }
+        }
+        QString limitError;
+        if (!ByteClipboard::payloadWithinLimit(pasted.size(), &limitError)) {
+            if (isSecureBinaryDocument() && !pasted.isEmpty())
+                pasted.fill(0);
+            showError(limitError);
+            return true;
         }
         qint64 overwriteEnd = end;
         if (!selected && m_hexOverwriteMode) {
@@ -919,53 +931,7 @@ bool EditorTab::handleHexInputMethodEvent(QInputMethodEvent *event,
 bool EditorTab::hexSelectionByteRange(qint64 *start, qint64 *end,
                                       int *nibble) const
 {
-    if (!start || !end || !m_editor || !m_l2View
-        || m_l2View->viewMode() != ViewMode::Hex
-        || m_bridge.windowStart < 0) {
-        return false;
-    }
-
-    long selectionStart = m_editor->SendScintilla(
-        QsciScintillaBase::SCI_GETSELECTIONSTART);
-    long selectionEnd = m_editor->SendScintilla(
-        QsciScintillaBase::SCI_GETSELECTIONEND);
-    if (selectionEnd < selectionStart)
-        std::swap(selectionStart, selectionEnd);
-    const bool selected = selectionEnd > selectionStart;
-
-    const auto mapPosition = [this](long position, bool endBoundary,
-                                    int *outNibble) -> qint64 {
-        int line = 0;
-        int column = 0;
-        m_editor->lineIndexFromPosition(position, &line, &column);
-        line = qMax(0, line);
-        column = qMax(0, column);
-        qint64 byteInLine = endBoundary ? (qint64(column) + 2) / 3
-                                        : qint64(column) / 3;
-        int localNibble = column % 3;
-        if (!endBoundary && localNibble == 2) {
-            ++byteInLine;
-            localNibble = 0;
-        }
-        byteInLine = qBound<qint64>(qint64(0), byteInLine,
-                                    qint64(m_hexBytesPerRow));
-        if (outNibble)
-            *outNibble = qBound(0, localNibble, 1);
-        return qint64(line) * m_hexBytesPerRow + byteInLine;
-    };
-
-    int localNibble = 0;
-    qint64 localStart = mapPosition(selectionStart, false, &localNibble);
-    qint64 localEnd = selected
-        ? mapPosition(selectionEnd, true, nullptr)
-        : localStart;
-    const qint64 windowEnd = m_bridge.windowStart + m_bridge.windowLen;
-    *start = qBound(m_bridge.windowStart,
-                    m_bridge.windowStart + localStart, windowEnd);
-    *end = qBound(*start, m_bridge.windowStart + localEnd, windowEnd);
-    if (nibble)
-        *nibble = localNibble;
-    return true;
+    return m_hexMouseSelection.hexSelectionByteRange(start, end, nibble);
 }
 
 void EditorTab::setHexCaret(qint64 globalByte, int nibble)
@@ -1023,6 +989,7 @@ bool EditorTab::handleHexKeyPress(QKeyEvent *event)
         QApplication::beep();
     };
     const auto refresh = [this](qint64 caretByte, int caretNibble) {
+        m_hexMouseSelection.relinquishAuthority();
         m_l2View->syncActiveWindowToCursor(caretByte);
         bridgePopulateScintilla(m_l2View->activeWindowByteStart(),
                                 m_l2View->activeWindowByteEnd());
@@ -1179,9 +1146,14 @@ bool EditorTab::handleHexKeyPress(QKeyEvent *event)
         return true;
     }
 
-    if (!hasSelection
-        && (event->modifiers() == Qt::ControlModifier)
+    if ((event->modifiers() == Qt::ControlModifier)
         && (event->key() == Qt::Key_Home || event->key() == Qt::Key_End)) {
+        // A pointer drag publishes a source-authoritative byte range which is
+        // intentionally independent of Scintilla's projected text selection.
+        // Ctrl+Home/End is a collapsing navigation command: release that range
+        // before moving, otherwise the next edit still replaces the stale
+        // source selection even though the visible caret moved.
+        m_hexMouseSelection.relinquishAuthority();
         if (event->key() == Qt::Key_Home)
             setHexCaret(0, 0);
         else
@@ -1223,6 +1195,13 @@ bool EditorTab::handleHexKeyPress(QKeyEvent *event)
                           : parseError);
             return true;
         }
+        QString limitError;
+        if (!ByteClipboard::payloadWithinLimit(pasted.size(), &limitError)) {
+            if (isSecureBinaryDocument() && !pasted.isEmpty())
+                pasted.fill(0);
+            showError(limitError);
+            return true;
+        }
         QString error;
         qint64 replaced = end - start;
         if (!hasSelection && m_hexOverwriteMode) {
@@ -1250,6 +1229,11 @@ bool EditorTab::handleHexKeyPress(QKeyEvent *event)
     if (event->matches(QKeySequence::Cut)) {
         if (!hasSelection)
             return true;
+        QString limitError;
+        if (!ByteClipboard::payloadWithinLimit(end - start, &limitError)) {
+            showError(limitError);
+            return true;
+        }
         QString flushError;
         if (!bridgeFlushOverlayToPatches(&flushError)) {
             showError(flushError);

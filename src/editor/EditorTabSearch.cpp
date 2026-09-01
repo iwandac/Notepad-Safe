@@ -1,4 +1,5 @@
 #include "EditorTab.h"
+#include "EditorSearchSource.h"
 #include "EditorSurfaceStyle.h"
 // Hex character rows use the shared measured Scintilla-authoritative grid.
 #include "ByteClipboard.h"
@@ -8,6 +9,8 @@
 #include "SearchResultsModel.h"
 #include "Pcre2Regex.h"
 #include "EditableTextSearch.h"
+#include "EditableTextFindAllTask.h"
+#include "SearchNavigationRequest.h"
 #include "AsyncTaskManager.h"
 #include "DraftStore.h"
 
@@ -66,29 +69,6 @@
 #include <windows.h>
 #endif
 
-#include <Qsci/qscilexer.h>
-#include <Qsci/qscilexercpp.h>
-#include <Qsci/qscilexerpython.h>
-#include <Qsci/qscilexerjson.h>
-#include <Qsci/qscilexerhtml.h>
-#include <Qsci/qscilexerxml.h>
-#include <Qsci/qscilexersql.h>
-#include <Qsci/qscilexeryaml.h>
-#include <Qsci/qscilexermarkdown.h>
-#include <Qsci/qscilexerjavascript.h>
-#include <Qsci/qscilexerjava.h>
-#include <Qsci/qscilexercsharp.h>
-#include <Qsci/qscilexercss.h>
-#include <Qsci/qscilexerbash.h>
-#include <Qsci/qscilexerbatch.h>
-#include <Qsci/qscilexercmake.h>
-#include <Qsci/qscilexermakefile.h>
-#include <Qsci/qscilexerlua.h>
-#include <Qsci/qscilexerruby.h>
-#include <Qsci/qscilexerperl.h>
-#include <Qsci/qscilexerdiff.h>
-#include <Qsci/qscilexerproperties.h>
-#include <Qsci/qscilexermasm.h>
 
 // ============================================================================
 //  搜索分流：L1=PCRE2 内存快照；L2=PCRE2 mmap/patch 快照
@@ -102,6 +82,7 @@ struct L2SearchAwaiter {
     bool       done = false;
     qint64     total = 0;
     QString    err;
+    QString    userMessage;
 };
 
 } // namespace
@@ -116,52 +97,55 @@ SearchResultsModel* EditorTab::findAllL2(const QString& pattern, bool regex,
         return nullptr;
     // Production S2/S3/B2/B3 uses WindowedReadOnlyProvider for presentation
     // and deliberately does not create the hidden mmap search backend while
-    // opening. ensureWindowedSearchSource() owns that lazy initialization.
+    // opening. m_searchSource->ensure() owns that lazy initialization.
     if (m_pendingL2Search.active)
         return nullptr;
 
     QString sourceError;
-    if (!ensureWindowedSearchSource(&sourceError)) {
+    const QPointer<EditorTab> sourceOwner(this);
+    const bool sourceAccepted = m_searchSource->ensure(&sourceError);
+    if (!sourceOwner) return nullptr;
+    if (!sourceAccepted) {
         m_lastSearchError = sourceError;
         return nullptr;
     }
 
-    // The production windowed provider opens immediately, while its hidden
-    // compatibility search mapping is installed asynchronously.  Find Next
-    // still uses this synchronous facade, so keep the GUI event loop alive
+    // The production windowed provider opens immediately, while the independent
+    // search mapping is installed asynchronously. Keep the GUI event loop alive
     // until the accepted mapping reaches a usable state instead of searching
     // a null subject or returning a false zero result.
-    if (!m_l2View || !m_l2View->isOpen()) {
+    if (!m_searchSource->isReady()) {
         bool mappingReady = false;
         bool mappingFailed = false;
         QEventLoop mappingLoop;
         QTimer mappingTimeout;
         mappingTimeout.setSingleShot(true);
         const QMetaObject::Connection openedConnection = connect(
-            m_l2View, &VirtualFileView::fileOpenedChanged, &mappingLoop,
+            this, &EditorTab::l2FileOpenedChanged, &mappingLoop,
             [&](bool opened) {
-                if (opened && m_l2View && m_l2View->isOpen()) {
+                if (sourceOwner && opened && m_searchSource->isReady()) {
                     mappingReady = true;
                     mappingLoop.quit();
                 }
             });
         const QMetaObject::Connection failedConnection = connect(
-            m_l2View, &VirtualFileView::lineBuildFinished, &mappingLoop,
+            this, &EditorTab::l2LineBuildFinished, &mappingLoop,
             [&](bool success) {
-                if (!success && (!m_l2View || !m_l2View->isOpen())) {
+                if (sourceOwner && !success) {
                     mappingFailed = true;
                     mappingLoop.quit();
                 }
             });
         connect(&mappingTimeout, &QTimer::timeout,
                 &mappingLoop, &QEventLoop::quit);
+        connect(this, &QObject::destroyed, &mappingLoop, &QEventLoop::quit);
         mappingTimeout.start(120000);
-        if (!m_l2View || !m_l2View->isOpen())
-            mappingLoop.exec();
+        mappingLoop.exec();
         QObject::disconnect(openedConnection);
         QObject::disconnect(failedConnection);
         mappingTimeout.stop();
-        mappingReady = mappingReady || (m_l2View && m_l2View->isOpen());
+        if (!sourceOwner) return nullptr;
+        mappingReady = !mappingFailed && (mappingReady || m_searchSource->isReady());
         if (!mappingReady) {
             m_lastSearchError = mappingFailed
                 ? QObject::tr("无法建立大文件搜索映射。")
@@ -185,7 +169,7 @@ SearchResultsModel* EditorTab::findAllL2(const QString& pattern, bool regex,
     // Byte offsets are authoritative. An incomplete LineIndex may postpone the
     // row label, but must never postpone scanning or exact navigation.
 
-    LargeFileSearch *s = m_l2View->searchEngine();  // 懒创建 + setSource 已内部完成
+    LargeFileSearch *s = m_searchSource->engine();
     if (!s) return nullptr;
 
     LargeFileSearch::Options opts;
@@ -209,7 +193,8 @@ SearchResultsModel* EditorTab::findAllL2(const QString& pattern, bool regex,
     QMetaObject::Connection c2 = QObject::connect(s, &LargeFileSearch::failed,
         &aw.loop,
         [&](const QString& msg){ aw.done = true; aw.err = msg;
-            if (mw) mw->statusBar()->showMessage(QObject::tr("搜索失败：%1").arg(msg), 5000);
+            aw.userMessage = s->failureUserMessage(msg);
+            if (mw) mw->statusBar()->showMessage(aw.userMessage, 5000);
             aw.loop.quit(); });
     QMetaObject::Connection c3 = QObject::connect(s, &LargeFileSearch::progress,
         &aw.loop,
@@ -221,23 +206,21 @@ SearchResultsModel* EditorTab::findAllL2(const QString& pattern, bool regex,
     // 取消入口：暂由 statusBar 提供（后续 AsyncTaskPanel 统一取消按钮）；此处保留接口但不连 QProgressDialog
     Q_UNUSED(mw);
 
+    connect(this, &QObject::destroyed, &aw.loop, &QEventLoop::quit);
     s->findAllViaTaskManager(pattern, opts, fileName());
-    if (!aw.done)
+    if (sourceOwner && !aw.done)
         aw.loop.exec();
 
     QObject::disconnect(c1); QObject::disconnect(c2); QObject::disconnect(c3);
-    if (m_documentSession.state().revision != searchRevision)
+    if (!sourceOwner || !validateSearchSource() || m_documentSession.state().revision != searchRevision)
         return nullptr;
-    if (!aw.err.isEmpty() || aw.total <= 0) {
-        // 0 匹配也返回空的 model（Dock 可以显示 0 结果）
-    }
     auto *model = new SearchResultsModel(parentForModel);
     model->setBytePositionMode(searchBytePosition);
     model->setTextEncoding(searchEncoding);
     model->setResults(s->memoryMatches(), s->overrunFilePath(), s->overrunCount(),
                       s->overrunCheckpoints(), s->overrunGroupedCount(), 2);
     if (!aw.err.isEmpty())
-        model->setIncompleteReason(aw.err);
+        model->setIncompleteReason(aw.err, aw.userMessage);
     m_lastSearchError = aw.err;
     m_l2SearchCachePattern = pattern;
     m_l2SearchCacheRegex = regex;
@@ -284,21 +267,17 @@ bool EditorTab::l2ProjectionMatches(TextEncoding encoding,
         && isHexPresentation() == byteContextMode;
 }
 
-bool EditorTab::pendingL2SearchSourceIsCurrent() const
+bool EditorTab::pendingL2SearchSourceIsCurrent()
 {
-    if (!m_pendingL2Search.active
-        || m_documentSession.state().revision != m_pendingL2Search.contentRevision
-        || m_documentSession.state().location != m_pendingL2Search.sourcePathAtStart
-        || contentSizeBytes() != m_pendingL2Search.sourceSizeAtStart) {
-        return false;
-    }
-    if (m_pendingL2Search.diskVersionAtStart.valid
-        && compareDiskFileVersion(m_pendingL2Search.sourcePathAtStart,
-                                  m_pendingL2Search.diskVersionAtStart)
-               != ExternalFileState::Unchanged) {
-        return false;
-    }
-    return true;
+    return m_pendingL2Search.active
+        && m_documentSession.state().revision == m_pendingL2Search.contentRevision
+        && m_documentSession.state().location == m_pendingL2Search.sourcePathAtStart
+        && contentSizeBytes() == m_pendingL2Search.sourceSizeAtStart
+        && (m_searchSource->usesWindowedSource() ? validateSearchSource()
+            : !m_pendingL2Search.diskVersionAtStart.valid
+                || compareDiskFileVersion(m_pendingL2Search.sourcePathAtStart,
+                                          m_pendingL2Search.diskVersionAtStart)
+                       == ExternalFileState::Unchanged);
 }
 
 void EditorTab::startPendingL2Search()
@@ -307,7 +286,12 @@ void EditorTab::startPendingL2Search()
         resetPendingL2Search();
         return;
     }
-    if (!pendingL2SearchSourceIsCurrent()) {
+    const QPointer<EditorTab> sourceOwner(this);
+    const quint64 pendingRevision = m_pendingL2Search.contentRevision;
+    const bool sourceCurrent = pendingL2SearchSourceIsCurrent();
+    if (!sourceOwner || !m_pendingL2Search.active
+        || m_pendingL2Search.contentRevision != pendingRevision) return;
+    if (!sourceCurrent) {
         const QString pattern = m_pendingL2Search.pattern;
         const QString name = fileName();
         resetPendingL2Search();
@@ -318,7 +302,7 @@ void EditorTab::startPendingL2Search()
     QObject::disconnect(m_pendingL2Search.waitMapFailedConn);
     m_pendingL2Search.waitLineBuildConn = QMetaObject::Connection{};
     m_pendingL2Search.waitMapFailedConn = QMetaObject::Connection{};
-    LargeFileSearch *s = m_l2View->searchEngine();
+    LargeFileSearch *s = m_searchSource->engine();
     if (!s) {
         auto *empty = new SearchResultsModel(m_pendingL2Search.parentForModel);
         empty->setBytePositionMode(m_pendingL2Search.bytePositionModeAtStart);
@@ -386,8 +370,10 @@ void EditorTab::startPendingL2Search()
         [this, that, s, parentForModel, patternCopy, fileNameCopy,
          revisionCopy, encodingCopy, bytePositionCopy,
          byteContextCopy](qint64 /*total*/) {
-            if (!that) return;
-            if (!that->pendingL2SearchSourceIsCurrent()
+            const bool sourceCurrent = that && that->pendingL2SearchSourceIsCurrent();
+            if (!that || !that->m_pendingL2Search.active
+                || that->m_pendingL2Search.contentRevision != revisionCopy) return;
+            if (!sourceCurrent
                 || that->m_documentSession.state().revision != revisionCopy) {
                 that->clearSearchHighlights();
                 that->resetPendingL2Search();
@@ -425,25 +411,28 @@ void EditorTab::startPendingL2Search()
             } else {
                 that->clearSearchHighlights();
             }
-            emit findAllL2Finished(model, patternCopy, fileNameCopy);
             that->resetPendingL2Search();
+            emit findAllL2Finished(model, patternCopy, fileNameCopy);
         });
 
     m_pendingL2Search.searchFailedConn = QObject::connect(
         s, &LargeFileSearch::failed, this,
         [this, that, s, parentForModel, patternCopy, fileNameCopy,
          revisionCopy, encodingCopy, bytePositionCopy](const QString& msg) {
-            if (!that) return;
-            if (!that->pendingL2SearchSourceIsCurrent()
+            const bool sourceCurrent = that && that->pendingL2SearchSourceIsCurrent();
+            if (!that || !that->m_pendingL2Search.active
+                || that->m_pendingL2Search.contentRevision != revisionCopy) return;
+            if (!sourceCurrent
                 || that->m_documentSession.state().revision != revisionCopy) {
                 that->clearSearchHighlights();
                 that->resetPendingL2Search();
                 emit that->findAllL2Finished(nullptr, patternCopy, fileNameCopy);
                 return;
             }
+            const QString userMessage = s->failureUserMessage(msg);
             if (auto *mw = qobject_cast<QMainWindow*>(that->window());
                 mw && mw->statusBar()) {
-                mw->statusBar()->showMessage(QObject::tr("搜索失败：%1").arg(msg), 8000);
+                mw->statusBar()->showMessage(userMessage, 8000);
             }
             that->m_l2SearchCacheValid = false;
             that->m_lastSearchError = msg;
@@ -452,9 +441,9 @@ void EditorTab::startPendingL2Search()
             partial->setTextEncoding(encodingCopy);
             partial->setResults(s->memoryMatches(), s->overrunFilePath(), s->overrunCount(),
                                 s->overrunCheckpoints(), s->overrunGroupedCount(), 2);
-            partial->setIncompleteReason(msg);
-            emit findAllL2Finished(partial, patternCopy, fileNameCopy);
+            partial->setIncompleteReason(msg, userMessage);
             that->resetPendingL2Search();
+            emit findAllL2Finished(partial, patternCopy, fileNameCopy);
         });
 
     // 走 AsyncTaskManager 派发
@@ -477,7 +466,10 @@ bool EditorTab::findAllL2Async(const QString& pattern, bool regex,
     }
 
     QString sourceError;
-    if (!ensureWindowedSearchSource(&sourceError)) {
+    const QPointer<EditorTab> sourceOwner(this);
+    const bool sourceAccepted = m_searchSource->ensure(&sourceError);
+    if (!sourceOwner) return sourceAccepted;
+    if (!sourceAccepted) {
         m_lastSearchError = sourceError;
         return false;
     }
@@ -486,7 +478,7 @@ bool EditorTab::findAllL2Async(const QString& pattern, bool regex,
     if (!bridgeFlushOverlayToPatches(&flushError)) {
         m_lastSearchError = flushError;
         if (auto *mw = qobject_cast<QMainWindow*>(this->window()))
-            mw->statusBar()->showMessage(QObject::tr("无法准备搜索快照：%1").arg(flushError), 5000);
+            mw->statusBar()->showMessage(QObject::tr("无法准备当前内容进行查找；请稍后重试。"), 5000);
         return false;
     }
 
@@ -509,32 +501,26 @@ bool EditorTab::findAllL2Async(const QString& pattern, bool regex,
     m_pendingL2Search.contentRevision = m_documentSession.state().revision;
     m_pendingL2Search.parentForModel = parentForModel;
 
-    if (m_l2View->isOpen()) {
+    if (m_searchSource->isReady()) {
         // Search starts from the stable byte snapshot immediately. Line/column
         // decoration is optional and may still be building in the background.
         startPendingL2Search();
         return true;
     }
 
-    // VirtualFileView::openFile() accepts mmap work asynchronously. mmapSize()
-    // is populated immediately for progress reporting, while isOpen() only
-    // becomes true when onMmapReady installs the mapped pointer. Treat that
-    // interval as an accepted, cancelable search-preparation state instead of
-    // reporting a false zero-result completion.
+    // Source preparation is accepted work, not a false zero-result completion.
     m_pendingL2Search.waitLineBuildConn = connect(
-        m_l2View, &VirtualFileView::fileOpenedChanged, this,
+        this, &EditorTab::l2FileOpenedChanged, this,
         [this](bool opened) {
-            if (!m_pendingL2Search.active || !opened || !m_l2View
-                || !m_l2View->isOpen()) {
+            if (!m_pendingL2Search.active || !opened || !m_searchSource->isReady()) {
                 return;
             }
             startPendingL2Search();
         });
     m_pendingL2Search.waitMapFailedConn = connect(
-        m_l2View, &VirtualFileView::lineBuildFinished, this,
+        this, &EditorTab::l2LineBuildFinished, this,
         [this](bool success) {
-            if (!m_pendingL2Search.active || success || !m_l2View
-                || m_l2View->isOpen()) {
+            if (!m_pendingL2Search.active || success) {
                 return;
             }
             const QString patternCopy = m_pendingL2Search.pattern;
@@ -546,7 +532,8 @@ bool EditorTab::findAllL2Async(const QString& pattern, bool regex,
             partial->setBytePositionMode(
                 m_pendingL2Search.bytePositionModeAtStart);
             partial->setTextEncoding(m_pendingL2Search.encodingAtStart);
-            partial->setIncompleteReason(message);
+            partial->setIncompleteReason(message,
+                QObject::tr("无法准备文件进行查找；请检查文件是否可用后重试，或查看技术详情。"));
             resetPendingL2Search();
             emit findAllL2Finished(partial, patternCopy, fileNameCopy);
         });
@@ -560,16 +547,14 @@ void EditorTab::cancelFindAllL2()
         m_l1FindAllTaskId = 0;
     }
     if (!m_pendingL2Search.active) {
-        if (m_l2View) {
-            if (LargeFileSearch *search = m_l2View->searchEngine()) {
-                search->requestCancel();
-                if (search->lastTaskId() > 0)
-                    AsyncTaskManager::instance().cancel(search->lastTaskId());
-            }
+        if (LargeFileSearch *search = m_searchSource->engine()) {
+            search->requestCancel();
+            if (search->lastTaskId() > 0)
+                AsyncTaskManager::instance().cancel(search->lastTaskId());
         }
         return;
     }
-    if (!m_l2View || !m_l2View->isOpen()) {
+    if (!m_searchSource->isReady()) {
         const QString patternCopy = m_pendingL2Search.pattern;
         const QString fileNameCopy = fileName();
         QObject *parentForModel = m_pendingL2Search.parentForModel;
@@ -577,7 +562,8 @@ void EditorTab::cancelFindAllL2()
         partial->setBytePositionMode(
             m_pendingL2Search.bytePositionModeAtStart);
         partial->setTextEncoding(m_pendingL2Search.encodingAtStart);
-        partial->setIncompleteReason(QObject::tr("搜索已取消。"));
+        partial->setIncompleteReason(QObject::tr("搜索已取消。"),
+            QObject::tr("查找已停止，结果不完整；可重新查找。"));
         resetPendingL2Search();
         emit findAllL2Finished(partial, patternCopy, fileNameCopy);
         return;
@@ -589,7 +575,8 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
                          bool wholeWord, bool forward, bool wrap,
                          bool hexBytes)
 {
-    if (pattern.isEmpty()) return false;
+    const QPointer<EditorTab> sourceOwner(this);
+    if (pattern.isEmpty() || !validateSearchSource()) return false;
     if (!isL2Mode()) {
         m_lastSearchError.clear();
         if (hexBytes) {
@@ -788,11 +775,11 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
     if (!cacheMatches) {
         auto *model = findAllL2(pattern, regex, caseSensitive, wholeWord,
                                 nullptr, hexBytes);
-        if (!model) return false;
+        if (!sourceOwner || !model) return false;
         delete model;  // 搜索引擎保留有界内存结果与磁盘 spool
         if (!m_lastSearchError.isEmpty()) return false;
     }
-    LargeFileSearch *s = m_l2View->searchEngine();
+    LargeFileSearch *s = m_searchSource->engine();
     if (!s) return false;
     LargeFileSearchMatch m;
     const bool navigationHitMatches = m_l2NavigationHitValid
@@ -809,7 +796,7 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
         from = forward
             ? m_l2NavigationHit.byteOffset + m_l2NavigationHit.byteLength - 1
             : m_l2NavigationHit.byteOffset;
-    } else if (windowedReadOnlyActive()
+    } else if ((windowedReadOnlyActive() || m_searchSource->usesWindowedSource())
         && m_windowedReadOnlyProvider->selectionEndOffset()
                > m_windowedReadOnlyProvider->selectionStartOffset()) {
         const qint64 selectionStart =
@@ -857,6 +844,7 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
     }
     if (off < 0) return false;
     gotoByteOffset(m.byteOffset, m.length);
+    if (!sourceOwner || !validateSearchSource()) return false;
     m_lastL2Byte = m.byteOffset;
     return true;
 }
@@ -866,6 +854,9 @@ bool EditorTab::findNextL2Async(
     bool forward, bool wrap, bool hexBytes, QObject *callbackContext,
     std::function<void(bool found, QString error)> callback)
 {
+    QPointer<EditorTab> self(this);
+    QPointer<QObject> context(callbackContext ? callbackContext : this);
+    if (!SearchNavigationRequest::acceptsContext(context, this)) return false;
     m_lastSearchError.clear();
     if (pattern.isEmpty())
         return false;
@@ -887,7 +878,8 @@ bool EditorTab::findNextL2Async(
             || m_editor->length() <= L1InlineNavigationBudgetBytes) {
             const bool found = findNext(pattern, regex, caseSensitive,
                                         wholeWord, forward, wrap, false);
-            if (callback)
+            if (self && context
+                && SearchNavigationRequest::acceptsContext(context, self) && callback)
                 callback(found, m_lastSearchError);
             return true;
         }
@@ -919,162 +911,55 @@ bool EditorTab::findNextL2Async(
                 ++boundary;
             }
         }
-        const qint64 snapshotSize = subject.size();
         QPointer<EditorTab> that(this);
-        QPointer<QObject> guard(callbackContext);
+        const QUuid documentId = m_documentSession.state().id;
         const QString displayName = fileName().isEmpty()
             ? QObject::tr("未命名文档") : fileName();
-        AsyncTaskManager::instance().submit(
-            AsyncTaskType::LargeFileSearch, AsyncTaskPriority::Highest,
-            forward ? QObject::tr("查找下一个: %1").arg(displayName)
-                    : QObject::tr("查找上一个: %1").arg(displayName),
-            QObject::tr("找到一处即返回"),
-            [that, guard, subject = std::move(subject), pattern, regex,
-             caseSensitive, wholeWord, forward, wrap, boundary,
-             currentZeroLengthHitAtEnd, revision,
-             wipeSnapshot, callback = std::move(callback)]
-            (qint64 taskId, AsyncCancelPtr cancel,
-             std::function<void(qint64, qint64)> reportProgress,
-             std::function<void(const AsyncErrorInfo &)> reportError) mutable {
-                const auto wipe = qScopeGuard([&] {
-                    if (wipeSnapshot && !subject.isEmpty())
-                        subject.fill(0);
-                });
-                QString error;
-                qint64 foundOffset = -1;
-                qint64 foundLength = 0;
-                const auto cancelled = [&] {
-                    return cancel && cancel->load(std::memory_order_acquire);
-                };
-                AsyncTaskManager::instance().updateTaskPhase(
-                    taskId, regex ? QObject::tr("执行正则匹配")
-                                  : QObject::tr("定向扫描字面值"),
-                    1, 1, 0, subject.size());
-                bool ok = true;
-                if (!regex) {
-                    auto literal = findEditableTextLiteralHits(
-                        subject, pattern, caseSensitive, wholeWord, cancelled,
-                        [reportProgress, total = qint64(subject.size())](qint64 done) {
-                            reportProgress(done, total);
-                        }, true, !forward, boundary);
-                    if (literal.isEmpty() && !cancelled() && wrap) {
-                        literal = findEditableTextLiteralHits(
-                            subject, pattern, caseSensitive, wholeWord, cancelled,
-                            [reportProgress, total = qint64(subject.size())](qint64 done) {
-                                reportProgress(done, total);
-                            }, true, !forward,
-                            forward ? 0 : subject.size() + 1);
-                    }
-                    if (!literal.isEmpty()) {
-                        foundOffset = literal.first().byteOffset;
-                        foundLength = literal.first().byteLength;
-                    }
-                    ok = !cancelled();
-                } else {
-                    Pcre2Regex compiled;
-                    ok = compiled.compile(pattern, false, caseSensitive,
-                                          wholeWord, &error);
-                    const auto scanForward = [&](qint64 start) {
-                    const auto result = compiled.scan(
-                        reinterpret_cast<const uchar *>(subject.constData()),
-                        subject.size(), cancelled,
-                        [reportProgress, total = qint64(subject.size())](qint64 done) {
-                            reportProgress(done, total);
-                        },
-                        [&](qint64 offset, qint64 length) {
-                            foundOffset = offset;
-                            foundLength = length;
-                            return false;
-                        }, &error, {}, {}, start);
-                    return result != Pcre2Regex::ScanResult::Failed
-                        && !cancelled();
-                    };
-                    if (ok && forward) {
-                    if (!currentZeroLengthHitAtEnd) {
-                        ok = scanForward(qBound<qint64>(0, boundary,
-                                                       subject.size()));
-                    }
-                    if (ok && foundOffset < 0 && wrap && boundary > 0)
-                        ok = scanForward(0);
-                    } else if (ok) {
-                    const auto result = compiled.scan(
-                        reinterpret_cast<const uchar *>(subject.constData()),
-                        subject.size(), cancelled,
-                        [reportProgress, total = qint64(subject.size())](qint64 done) {
-                            reportProgress(done, total);
-                        },
-                        [&](qint64 offset, qint64 length) {
-                            if (offset >= boundary)
-                                return false;
-                            foundOffset = offset;
-                            foundLength = length;
-                            return true;
-                        }, &error);
-                    ok = result != Pcre2Regex::ScanResult::Failed && !cancelled();
-                    if (ok && foundOffset < 0 && wrap && boundary < subject.size()) {
-                        const auto wrapped = compiled.scan(
-                            reinterpret_cast<const uchar *>(subject.constData()),
-                            subject.size(), cancelled, {},
-                            [&](qint64 offset, qint64 length) {
-                                foundOffset = offset;
-                                foundLength = length;
-                                return true;
-                            }, &error, {}, {}, boundary);
-                        ok = wrapped != Pcre2Regex::ScanResult::Failed
-                            && !cancelled();
-                    }
-                    }
-                }
-                if (!ok && error.isEmpty() && cancelled())
-                    error = QObject::tr("已取消。");
-                if (!ok && !error.isEmpty() && error != QObject::tr("已取消。")) {
-                    AsyncErrorInfo taskError;
-                    taskError.message = error;
-                    reportError(taskError);
-                }
-                if (!guard || !callback)
+        const qint64 taskId = startEditableTextNavigationTask(
+            std::move(subject), pattern, regex, caseSensitive, wholeWord,
+            forward, wrap, boundary, currentZeroLengthHitAtEnd, displayName,
+            wipeSnapshot, this, context,
+            [that, context, callback = std::move(callback), documentId, revision,
+             pattern, regex, caseSensitive, wholeWord](
+                qint64, EditableTextNavigationResult result) mutable {
+                if (!context || !SearchNavigationRequest::acceptsContext(context, that))
                     return;
-                QMetaObject::invokeMethod(
-                    guard,
-                    [that, callback = std::move(callback), revision,
-                     foundOffset, foundLength, ok, pattern, regex,
-                     caseSensitive, wholeWord,
-                     error = std::move(error)]() mutable {
-                        if (!that) {
-                            callback(false, QObject::tr("文档已关闭。"));
-                            return;
-                        }
-                        if (that->m_documentSession.state().revision != revision) {
-                            that->m_lastSearchError = QObject::tr(
-                                "文档已变更，请重新查找。");
-                            callback(false, that->m_lastSearchError);
-                            return;
-                        }
-                        const bool found = ok && foundOffset >= 0;
-                        that->m_lastSearchError = error;
-                        if (found) {
-                            that->m_l1NavigationHit = {
-                                foundOffset, qint32(foundLength)};
-                            that->m_l1NavigationPattern = pattern;
-                            that->m_l1NavigationRegex = regex;
-                            that->m_l1NavigationCaseSensitive = caseSensitive;
-                            that->m_l1NavigationWholeWord = wholeWord;
-                            that->m_l1NavigationRevision = revision;
-                            that->m_l1NavigationHitValid = true;
-                            that->m_editor->SendScintilla(
-                                QsciScintillaBase::SCI_SETSEL, long(foundOffset),
-                                long(foundOffset + foundLength));
-                            const int line = int(that->m_editor->SendScintilla(
-                                QsciScintillaBase::SCI_LINEFROMPOSITION,
-                                long(foundOffset)));
-                            that->m_editor->ensureLineVisible(line);
-                            that->m_editor->ensureCursorVisible();
-                            that->m_editor->setFocus();
-                        }
-                        callback(found, error);
-                    }, Qt::QueuedConnection);
-            }, 0, QLatin1String("SearchNavigation"), snapshotSize);
-        return true;
+                if (!that) {
+                    if (callback) callback(false, QObject::tr("文档已关闭。"));
+                    return;
+                }
+                if (that->m_documentSession.state().id != documentId
+                    || that->m_documentSession.state().revision != revision) {
+                    that->m_lastSearchError = QObject::tr("文档已变更，请重新查找。");
+                    if (callback) callback(false, that->m_lastSearchError);
+                    return;
+                }
+                const bool found = result.ok && result.byteOffset >= 0;
+                that->m_lastSearchError = result.error;
+                if (found) {
+                    that->m_l1NavigationHit = {
+                        result.byteOffset, qint32(result.byteLength)};
+                    that->m_l1NavigationPattern = pattern;
+                    that->m_l1NavigationRegex = regex;
+                    that->m_l1NavigationCaseSensitive = caseSensitive;
+                    that->m_l1NavigationWholeWord = wholeWord;
+                    that->m_l1NavigationRevision = revision;
+                    that->m_l1NavigationHitValid = true;
+                    that->m_editor->SendScintilla(
+                        QsciScintillaBase::SCI_SETSEL, long(result.byteOffset),
+                        long(result.byteOffset + result.byteLength));
+                    if (!that || !context
+                        || !SearchNavigationRequest::acceptsContext(context, that)) return;
+                    const int line = int(that->m_editor->SendScintilla(
+                        QsciScintillaBase::SCI_LINEFROMPOSITION, long(result.byteOffset)));
+                    that->m_editor->ensureLineVisible(line);
+                    that->m_editor->ensureCursorVisible();
+                    that->m_editor->setFocus();
+                }
+                if (context && SearchNavigationRequest::acceptsContext(context, that)
+                    && callback) callback(found, result.error);
+            });
+        return taskId > 0;
     }
 
     const bool cacheMatches = m_l2SearchCacheValid
@@ -1089,72 +974,96 @@ bool EditorTab::findNextL2Async(
     if (cacheMatches) {
         const bool found = findNext(pattern, regex, caseSensitive, wholeWord,
                                     forward, wrap, hexBytes);
-        if (callback)
+        if (self && context
+            && SearchNavigationRequest::acceptsContext(context, self) && callback)
             callback(found, m_lastSearchError);
         return true;
     }
     QString sourceError;
-    if (!ensureWindowedSearchSource(&sourceError)) {
+    const bool sourceReady = m_searchSource->ensure(&sourceError);
+    if (!self || !context || !SearchNavigationRequest::acceptsContext(context, self)) return false;
+    if (!sourceReady) {
         m_lastSearchError = sourceError;
         if (callback) callback(false, sourceError);
         return false;
     }
-    if (!m_l2View || !m_l2View->isOpen()) {
+    if (!m_searchSource->isReady()) {
         // The production provider is already usable while the lazy mmap search
         // source is still being installed.  Accept the user's navigation once
         // and continue it as soon as the mapping is ready; requiring another
         // click both loses the original command and makes the first-hit path
         // appear synchronous with preparation.
         struct PendingNavigation {
-            QMetaObject::Connection opened;
-            QMetaObject::Connection failed;
+            QVector<QMetaObject::Connection> connections;
             QPointer<QObject> callbackGuard;
             std::function<void(bool, QString)> callback;
             bool completed = false;
         };
         auto pending = std::make_shared<PendingNavigation>();
-        pending->callbackGuard = callbackContext ? callbackContext : this;
+        pending->callbackGuard = context;
         pending->callback = std::move(callback);
         QPointer<EditorTab> tabGuard(this);
+        auto *dispatcher = &AsyncTaskManager::instance();
         const auto finishPreparation = [pending]() {
-            QObject::disconnect(pending->opened);
-            QObject::disconnect(pending->failed);
+            if (pending->completed) return false;
             pending->completed = true;
+            for (const auto &connection : std::as_const(pending->connections))
+                QObject::disconnect(connection);
+            pending->connections.clear();
+            return true;
         };
-        pending->opened = connect(
-            m_l2View, &VirtualFileView::fileOpenedChanged, this,
+        pending->connections.append(connect(
+            context, &QObject::destroyed, dispatcher, [pending, finishPreparation] {
+                pending->callbackGuard.clear();
+                finishPreparation();
+                pending->callback = {};
+            }));
+        if (auto *request = qobject_cast<SearchNavigationRequest *>(context.data())) {
+            pending->connections.append(connect(
+                request, &SearchNavigationRequest::retired, dispatcher,
+                [pending, finishPreparation] {
+                    finishPreparation();
+                    pending->callback = {};
+                }));
+        }
+        pending->connections.append(connect(
+            this, &QObject::destroyed, dispatcher, [pending, finishPreparation, dispatcher] {
+                if (!finishPreparation()) return;
+                QMetaObject::invokeMethod(dispatcher, [pending] {
+                    if (pending->callbackGuard && pending->callback)
+                        pending->callback(false, QObject::tr("文档已关闭。"));
+                }, Qt::QueuedConnection);
+            }));
+        pending->connections.append(connect(
+            this, &EditorTab::l2FileOpenedChanged, dispatcher,
             [tabGuard, pending, finishPreparation, pattern, regex,
              caseSensitive, wholeWord, forward, wrap, hexBytes](bool opened) mutable {
-                if (pending->completed || !opened || !tabGuard
-                    || !tabGuard->m_l2View || !tabGuard->m_l2View->isOpen()) {
-                    return;
-                }
-                finishPreparation();
-                if (!pending->callbackGuard)
-                    return;
+                if (!opened || !tabGuard || !tabGuard->m_searchSource->isReady() || !finishPreparation()
+                    || !pending->callbackGuard
+                    || !SearchNavigationRequest::acceptsContext(
+                        pending->callbackGuard, tabGuard)) return;
                 auto continuation = std::move(pending->callback);
                 tabGuard->findNextL2Async(
                     pattern, regex, caseSensitive, wholeWord, forward, wrap,
-                    hexBytes, pending->callbackGuard.data(),
-                    std::move(continuation));
-            });
-        pending->failed = connect(
-            m_l2View, &VirtualFileView::lineBuildFinished, this,
+                    hexBytes, pending->callbackGuard.data(), std::move(continuation));
+            }));
+        pending->connections.append(connect(
+            this, &EditorTab::l2LineBuildFinished, dispatcher,
             [tabGuard, pending, finishPreparation](bool success) mutable {
-                if (pending->completed || success || !tabGuard
-                    || (tabGuard->m_l2View && tabGuard->m_l2View->isOpen())) {
-                    return;
-                }
-                finishPreparation();
+                if (pending->completed || success || !tabGuard) return;
+                if (!finishPreparation() || !pending->callbackGuard
+                    || !SearchNavigationRequest::acceptsContext(
+                        pending->callbackGuard, tabGuard)) return;
                 const QString message = QObject::tr("无法建立大文件搜索映射。");
                 tabGuard->m_lastSearchError = message;
-                if (pending->callbackGuard && pending->callback)
-                    pending->callback(false, message);
-            });
+                if (pending->callback) pending->callback(false, message);
+            }));
         return true;
     }
     QString flushError;
-    if (!bridgeFlushOverlayToPatches(&flushError)) {
+    const bool flushed = bridgeFlushOverlayToPatches(&flushError);
+    if (!self || !context || !SearchNavigationRequest::acceptsContext(context, self)) return false;
+    if (!flushed) {
         m_lastSearchError = flushError;
         if (callback) callback(false, flushError);
         return false;
@@ -1163,7 +1072,7 @@ bool EditorTab::findNextL2Async(
     // Navigation owns a separate search lane.  A background Find All may keep
     // publishing its index, while this Highest-priority task stops at the
     // first directional match and updates the editor immediately.
-    LargeFileSearch *search = m_l2View->navigationSearchEngine();
+    LargeFileSearch *search = m_searchSource->engine(true);
     if (!search) {
         m_lastSearchError = QObject::tr("搜索引擎未就绪。");
         if (callback) callback(false, m_lastSearchError);
@@ -1184,7 +1093,7 @@ bool EditorTab::findNextL2Async(
         from = forward
             ? m_l2NavigationHit.byteOffset + m_l2NavigationHit.byteLength - 1
             : m_l2NavigationHit.byteOffset;
-    } else if (windowedReadOnlyActive()
+    } else if ((windowedReadOnlyActive() || m_searchSource->usesWindowedSource())
         && m_windowedReadOnlyProvider->selectionEndOffset()
                > m_windowedReadOnlyProvider->selectionStartOffset()) {
         const qint64 selectionStart =
@@ -1215,17 +1124,21 @@ bool EditorTab::findNextL2Async(
     const TextEncoding searchEncoding = opts.textEncoding;
     const bool searchByteContext = opts.byteContextMode;
     QPointer<EditorTab> guard(this);
+    const QUuid documentId = m_documentSession.state().id;
     const qint64 taskId = search->findOneViaTaskManager(
         pattern, opts, from, forward, wrap, fileName(),
-        callbackContext ? callbackContext : this,
-        [guard, revision, searchEncoding, searchByteContext,
+        context,
+        [guard, context, documentId, revision, searchEncoding, searchByteContext,
          pattern, regex, caseSensitive, wholeWord, hexBytes,
          callback = std::move(callback)](
             bool found, LargeFileSearchMatch match, QString error) mutable {
-            if (!guard)
-                return;
-            if (guard->m_documentSession.state().revision != revision) {
-                error = QObject::tr("文档已变化，请重新查找。");
+            const bool sourceCurrent = guard && context && guard->validateSearchSource();
+            if (!guard || !context
+                || !SearchNavigationRequest::acceptsContext(context, guard)) return;
+            if (!sourceCurrent || guard->m_documentSession.state().id != documentId
+                || guard->m_documentSession.state().revision != revision) {
+                error = sourceCurrent ? QObject::tr("文档已变化，请重新查找。")
+                                      : guard->m_lastSearchError;
                 found = false;
             } else if (!guard->l2ProjectionMatches(searchEncoding,
                                                    searchByteContext)) {
@@ -1245,8 +1158,12 @@ bool EditorTab::findNextL2Async(
                 guard->m_l2NavigationRevision = revision;
                 guard->m_l2NavigationHitValid = true;
                 guard->gotoByteOffset(match.byteOffset, match.length);
-                guard->m_lastL2Byte = match.byteOffset;
-                guard->m_lastSearchError.clear();
+                const bool positioned = guard && guard->validateSearchSource();
+                if (!guard || !context
+                    || !SearchNavigationRequest::acceptsContext(context, guard)) return;
+                found = positioned;
+                error = positioned ? QString{} : guard->m_lastSearchError;
+                guard->m_lastSearchError = error;
             } else if (error.isEmpty()
                        && guard->m_l2NavigationHitValid
                        && guard->m_l2NavigationRevision == revision
@@ -1267,26 +1184,29 @@ bool EditorTab::findNextL2Async(
                     guard->m_l2NavigationHit.byteOffset,
                     guard->m_l2NavigationHit.byteLength);
             }
-            if (callback)
-                callback(found, std::move(error));
+            const bool completionSourceCurrent = guard && guard->validateSearchSource();
+            if (guard && context
+                && SearchNavigationRequest::acceptsContext(context, guard) && callback)
+                callback(found && completionSourceCurrent,
+                         completionSourceCurrent ? std::move(error) : guard->m_lastSearchError);
         });
     return taskId > 0;
 }
 
 void EditorTab::resetSearchPosition(bool forward)
 {
-    if (windowedReadOnlyActive()) {
+    const QPointer<EditorTab> owner(this);
+    if (!validateSearchSource()) return;
+    if (windowedReadOnlyActive() || m_searchSource->usesWindowedSource()) {
         const qint64 boundary = forward
             ? 0 : qMax<qint64>(0, m_windowedReadOnlyProvider->fileSize() - 1);
         m_windowedReadOnlyProvider->goToOffset(boundary);
+        if (!owner || !validateSearchSource()) return;
         m_lastL2Byte = forward ? -1 : std::numeric_limits<qint64>::max();
         return;
     }
     if (isL2Mode() && m_l2View) {
-        if (forward)
-            m_l2View->gotoByteOffset(0);
-        else
-            m_l2View->gotoByteOffset(std::numeric_limits<qint64>::max());
+        m_l2View->gotoByteOffset(forward ? 0 : std::numeric_limits<qint64>::max());
         m_l2View->clearSelection();
         // gotoByteOffset emits cursor updates. Assign the search sentinel last
         // so those updates cannot turn forward reset (-1) into byte 0 and skip
@@ -1294,14 +1214,9 @@ void EditorTab::resetSearchPosition(bool forward)
         m_lastL2Byte = forward ? -1 : std::numeric_limits<qint64>::max();
         return;
     }
-    if (forward) {
-        m_lastL1MatchIndex = -1;
-        m_editor->setCursorPosition(0, 0);
-    } else {
-        m_lastL1MatchIndex = -1;
-        const int lastLine = qMax(0, m_editor->lines() - 1);
-        m_editor->setCursorPosition(lastLine, m_editor->text(lastLine).size());
-    }
+    m_lastL1MatchIndex = -1;
+    const int line = forward ? 0 : qMax(0, m_editor->lines() - 1);
+    m_editor->setCursorPosition(line, forward ? 0 : m_editor->text(line).size());
 }
 
 bool EditorTab::currentSelectionMatchesSearch(
@@ -1349,7 +1264,7 @@ bool EditorTab::currentSelectionMatchesSearch(
             && found->byteLength == end - start;
     }
 
-    const bool hasWindowedSelection = windowedReadOnlyActive()
+    const bool hasWindowedSelection = (windowedReadOnlyActive() || m_searchSource->usesWindowedSource())
         && m_windowedReadOnlyProvider->selectionEndOffset()
                > m_windowedReadOnlyProvider->selectionStartOffset();
     if (!m_l2View || (!hasWindowedSelection && !m_l2View->hasSelection())) {
@@ -1387,7 +1302,7 @@ bool EditorTab::currentSelectionMatchesSearch(
                                 m_l2SearchCacheByteContext)) {
         return false;
     }
-    LargeFileSearch *search = m_l2View->searchEngine();
+    LargeFileSearch *search = m_searchSource->engine();
     if (!search)
 
         return false;
@@ -1569,9 +1484,13 @@ void EditorTab::replaceCurrent(const QString &replaceText)
 int EditorTab::replaceAll(const QString &find, const QString &replace, bool regex,
                           bool caseSensitive, bool wholeWord)
 {
-    if (find.isEmpty()) return 0;
     if (!isL2Mode()) {
         findAll(find, regex, caseSensitive, wholeWord);
+        if (m_lastFindAllTruncated) {
+            m_lastSearchError = QObject::tr(
+                "查找结果未完整生成，未进行任何替换。请缩小查找范围后重试。");
+            return 0;
+        }
         if (!m_lastSearchError.isEmpty() || !m_l1SearchCacheValid)
             return 0;
         const QVector<L1SearchHit> hits = m_l1SearchCache;
@@ -1636,7 +1555,7 @@ int EditorTab::replaceAll(const QString &find, const QString &replace, bool rege
         return hits.size();
     }
     // L2：调 LargeFileSearch::replaceAll 分段原子替换（临时仍同步执行，但移除 WindowModal 进度窗避免阻塞）
-    if (!m_l2View) return 0;
+    if (find.isEmpty() || !m_l2View) return 0;
     LargeFileSearch *s = m_l2View->searchEngine();
     if (!s) return 0;
 

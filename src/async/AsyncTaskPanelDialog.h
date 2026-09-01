@@ -28,6 +28,7 @@ private slots:
     void onCancelAll();
     void onClearHistory();
     void updateActionStates();
+    void refreshSelectedTask();
 
 private:
     QLabel  *m_summaryQueued, *m_summaryRunning, *m_summaryDone;
@@ -36,6 +37,11 @@ private:
     QListView *m_listView;
     QPlainTextEdit *m_detailsEdit;
     QStyledItemDelegate *m_delegate;
+    QLabel *m_selectedSummary;
+    QPushButton *m_detailsToggle;
+    QWidget *m_technicalDetails;
+    qint64 m_selectedTaskId = 0;
+    bool m_modelResetting = false;
 };
 
 #endif // ASYNCTASKPANELDIALOG_H

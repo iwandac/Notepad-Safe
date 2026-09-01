@@ -72,8 +72,17 @@ public:
 
     int groupedCount() const;
     qint64 totalMatches() const { return totalMatchCount_; }
-    void setIncompleteReason(const QString &reason) { incompleteReason_ = reason; }
+    void setIncompleteReason(const QString &reason, const QString &userReason = {}) {
+        incompleteReason_ = reason;
+        incompleteUserReason_ = reason.isEmpty() ? QString() : userReason;
+    }
     QString incompleteReason() const { return incompleteReason_; }
+    QString incompleteUserReason() const {
+        if (!isIncomplete()) return {};
+        return incompleteUserReason_.isEmpty()
+            ? QStringLiteral("查找未完成；可查看技术详情后重试，或缩小查找范围。")
+            : incompleteUserReason_;
+    }
     bool isIncomplete() const { return !incompleteReason_.isEmpty(); }
     void setBytePositionMode(bool enabled) { bytePositionMode_ = enabled; }
     bool bytePositionMode() const { return bytePositionMode_; }
@@ -116,6 +125,7 @@ private:
     QVector<GroupedSearchLine> groupedLines_;
     qint64 totalMatchCount_ = 0;
     QString incompleteReason_;
+    QString incompleteUserReason_;
     bool bytePositionMode_ = false;
     TextEncoding textEncoding_ = TextEncoding::Utf8;
 

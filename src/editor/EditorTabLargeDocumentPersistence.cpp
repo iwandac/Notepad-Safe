@@ -4,6 +4,7 @@
 #include "ByteClipboard.h"
 #include "VirtualFileView.h"
 #include "WindowedReadOnlyProvider.h"
+#include "EditorSearchSource.h"
 #include "FileTierPolicy.h"
 #include "SearchResultsModel.h"
 #include "Pcre2Regex.h"
@@ -104,8 +105,8 @@ SessionTab captureEditorSessionTab(const EditorTab *tab)
         state.cursorByteOffset = tab->currentByteOffset();
         state.selectionStartByte = tab->l2View()->selectionStart();
         state.selectionEndByte = tab->l2View()->selectionEnd();
-        state.presentation = tab->viewModeL2() == ViewMode::Hex
-            ? QStringLiteral("hex") : QStringLiteral("text");
+        state.presentation = tab->viewModeL2() == ViewMode::Hex ? QStringLiteral("hex") : QStringLiteral("text");
+        state.hexInsertMode = state.presentation == QLatin1String("hex") && !tab->hexOverwriteMode();
     } else if (tab->editor()) {
         state.cursorByteOffset = tab->editor()->SendScintilla(
             QsciScintillaBase::SCI_GETCURRENTPOS);
@@ -199,11 +200,12 @@ constexpr quint32 BinaryRecoveryVersion = 1;
 bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
                                 L2Presentation presentation,
                                 L2ContentKind contentKind,
-                                std::optional<TextEncoding> forcedEncoding)
+                                std::optional<TextEncoding> forcedEncoding,
+                                const PersistenceReadPolicy &readPolicy,
+                                bool requireReadOnly)
 {
+    if (!m_searchSource->closeAndOwnerAlive()) return false;
     setSplitView(false);
-    // S2 promotion is deliberately disabled: all mapped documents >= 32 MiB
-    // use the same read-only provider as S3.
     const bool inheritedWordWrap = m_editor
         && m_editor->wrapMode() != QsciScintilla::WrapNone;
     QFileInfo fi(path);
@@ -212,9 +214,32 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
         return false;
     }
     const bool binaryHex = presentation == L2Presentation::Hex;
+    const bool binaryContent = contentKind == L2ContentKind::Binary;
+    const bool readOnlyByPolicy = requireReadOnly
+        || FileTierPolicy::classify(fi.size()).isReadOnlyByPolicy();
+    const bool useWindowedReadOnly = readOnlyByPolicy;
+    VirtualFileView *v = ensureL2View();
+    WindowedReadOnlyProvider *provider = nullptr;
+    EncodingDetection admittedDetection;
+    if (useWindowedReadOnly) {
+        provider = ensureWindowedReadOnlyProvider();
+        provider->setBinaryContent(binaryContent);
+        const auto providerPresentation = binaryHex
+            ? WindowedReadOnlyProvider::Presentation::Hex
+            : WindowedReadOnlyProvider::Presentation::Text;
+        const QPointer<EditorTab> owner(this);
+        const bool opened = provider->openFile(path, providerPresentation, readPolicy,
+                                               errMsg, forcedEncoding, &admittedDetection);
+        if (!owner) return false;
+        if (!opened) {
+            m_l2Mode = false;
+            if (v->isOpen()) v->closeFile(true);
+            return false;
+        }
+    }
     m_documentSession.setContentKind(contentKind == L2ContentKind::Binary
         ? DocumentContentKind::Binary : DocumentContentKind::Text);
-    if (isBinaryDocument()) {
+    if (forcedEncoding || isBinaryDocument()) {
         // Binary and mixed-byte documents have one predictable default text
         // projection: UTF-8 multibyte decoding with U+FFFD for malformed
         // units. A previous document's selected codec must never leak into a
@@ -224,46 +249,31 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
                                           : EncodingOrigin::Fallback;
         m_encodingConfidence = forcedEncoding ? EncodingConfidence::Certain
                                                : EncodingConfidence::Low;
-        m_encodingDecodeErrors = true;
+        m_encodingDecodeErrors = isBinaryDocument();
     } else {
-        if (forcedEncoding) {
-            m_encoding = *forcedEncoding;
-            m_encodingOrigin = EncodingOrigin::UserSelected;
-            m_encodingConfidence = EncodingConfidence::Certain;
-            // Large files are validated incrementally by conversion. Opening
-            // remains bounded and does not pretend that a sample proves the
-            // entire byte stream.
-            m_encodingDecodeErrors = false;
-        } else {
-            const EncodingDetection detection = detectFileEncoding(path);
-            m_encoding = detection.encoding;
-            m_encodingOrigin = detection.origin;
-            m_encodingConfidence = detection.confidence;
-            m_encodingDecodeErrors = detection.decodeErrors;
-        }
+        const EncodingDetection detection = useWindowedReadOnly
+            ? admittedDetection : detectFileEncoding(path);
+        m_encoding = detection.encoding;
+        m_encodingOrigin = detection.origin;
+        m_encodingConfidence = detection.confidence;
+        m_encodingDecodeErrors = detection.decodeErrors;
     }
-    const FileTierDecision tier = FileTierPolicy::classify(fi.size());
-    const bool readOnlyByPolicy = tier.isReadOnlyByPolicy();
-    const bool useWindowedReadOnly = readOnlyByPolicy;
-
-    VirtualFileView *v = ensureL2View();
     v->setFullLineIndexBuildEnabled(!useWindowedReadOnly && !isBinaryDocument());
     v->setWordWrap(readOnlyByPolicy ? false : inheritedWordWrap);
     setSecurePayloadLimitExclusive(0);
-    // Select the representation before openFile starts emitting progress.  A
-    // binary document never needs the text line-index pipeline, even when it
-    // is only a few bytes long and is routed through the mmap/Hex editor.
+    // Select representation before opening; binary needs no text line index.
     v->setViewMode(binaryHex ? ViewMode::Hex : ViewMode::Text);
     v->setDisplayEncoding(m_encoding);
     // 确保 VirtualFileView 已加入 stack（ensureL2View 会 addWidget 到 index=1）
-    QString localErr;
-    if (!useWindowedReadOnly && !v->openFile(path, &localErr)) {
-        if (errMsg) *errMsg = localErr;
+    if (!useWindowedReadOnly && !v->openFile(path, errMsg)) {
         return false;
     }
     // 成功：切到 L2 视图并标记模式
     m_documentSession.setLocation(fi.absoluteFilePath());
-    refreshDiskVersionBaseline();
+    if (useWindowedReadOnly)
+        m_documentSession.setDiskVersion(provider->sourceVersion());
+    else
+        refreshDiskVersionBaseline();
     m_l2Mode = true;
     // S2 and S3 intentionally expose the same capability: bounded mmap browse,
     // search and copy, with every mutation command disabled. The size tier is
@@ -274,24 +284,6 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
     m_lastL2Col  = 0;
     m_lastL2Byte = 0;
     if (useWindowedReadOnly) {
-        WindowedReadOnlyProvider *provider = ensureWindowedReadOnlyProvider();
-        provider->setBinaryContent(isBinaryDocument());
-        QString providerError;
-        const auto providerPresentation = binaryHex
-            ? WindowedReadOnlyProvider::Presentation::Hex
-            : WindowedReadOnlyProvider::Presentation::Text;
-        if (!provider->openFile(path, providerPresentation, &providerError)) {
-            if (v->isOpen())
-                v->closeFile(true);
-            m_l2Mode = false;
-            if (errMsg)
-                *errMsg = providerError;
-            return false;
-        }
-        provider->setTextEncoding(m_encoding);
-        if (!binaryHex) {
-            provider->setWordWrap(inheritedWordWrap);
-        }
         m_stack->setCurrentWidget(provider);
         provider->editor()->setFocus();
     } else {

@@ -1,10 +1,13 @@
 #include "EditorTab.h"
+#include "AppComposition.h"
 #include "FindReplaceDialog.h"
 #include "MainWindow.h"
 #include "SearchResultsDock.h"
 #include "SecureBuffer.h"
 #include "SecureDocumentService.h"
 #include "SecuritySessionService.h"
+#include "SessionManager.h"
+#include "StartupCoordinator.h"
 #include "VaultDock.h"
 #include "VirtualFileView.h"
 
@@ -13,6 +16,7 @@
 #include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
+#include <QCryptographicHash>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -23,8 +27,12 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPlainTextEdit>
+#include <QPointer>
+#include <QProgressDialog>
 #include <QPushButton>
+#include <QScopeGuard>
 #include <QElapsedTimer>
+#include <QSplitter>
 #include <QStackedWidget>
 #include <QStatusBar>
 #include <QTabWidget>
@@ -75,6 +83,66 @@ bool writeFixture(const QString &path, const QByteArray &contents)
     QFile file(path);
     return file.open(QIODevice::WriteOnly | QIODevice::Truncate)
            && file.write(contents) == contents.size();
+}
+
+bool isOwnedByWindow(const QObject *object, const MainWindow *window)
+{
+    if (!window) return false;
+    // QObject ownership crosses the top-level QDialog window boundary.
+    for (const QObject *owner = object; owner; owner = owner->parent()) {
+        if (owner == window) return true;
+    }
+    return false;
+}
+
+QString openThroughFileMenu(MainWindow *window, const QString &path)
+{
+    auto *action = window ? window->findChild<QAction *>(QStringLiteral("file.open")) : nullptr;
+    if (!action || !action->isEnabled() || !QFileInfo(path).isFile())
+        return QStringLiteral("explicit Open fixture/action is unavailable");
+    const bool previouslyNonNative = QApplication::testAttribute(Qt::AA_DontUseNativeDialogs);
+    QApplication::setAttribute(Qt::AA_DontUseNativeDialogs, true);
+    const QPointer<MainWindow> owner(window);
+    QPointer<QFileDialog> chooser;
+    bool clickedOpen = false;
+    QString error;
+    QElapsedTimer elapsed;
+    QTimer driver;
+    driver.setInterval(20);
+    const auto cleanup = qScopeGuard([&] {
+        driver.stop();
+        if (chooser && chooser->isVisible()) chooser->reject();
+        QApplication::setAttribute(Qt::AA_DontUseNativeDialogs, previouslyNonNative);
+    });
+    QObject::connect(&driver, &QTimer::timeout, &driver, [&] {
+        auto *modal = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        if (!owner || elapsed.elapsed() >= 8000) {
+            if (error.isEmpty()) error = QStringLiteral("explicit Open workflow exceeded its 8 s fixture deadline");
+            // Keep retiring only this owner's unfinished dialogs after timeout,
+            // including a subsequent product error box. Never close another window.
+            if (modal && isOwnedByWindow(modal, owner.data())) modal->reject();
+            return;
+        }
+        if (clickedOpen || !modal) return;
+        auto *candidate = qobject_cast<QFileDialog *>(modal);
+        if (!candidate || candidate->parentWidget() != owner.data()) return;
+        chooser = candidate;
+        chooser->selectFile(path);
+        const QStringList selected = chooser->selectedFiles();
+        if (selected.size() != 1
+            || QFileInfo(selected.front()).absoluteFilePath() != QFileInfo(path).absoluteFilePath()) return;
+        auto *buttons = chooser->findChild<QDialogButtonBox *>();
+        auto *open = buttons ? buttons->button(QDialogButtonBox::Open) : nullptr;
+        if (!open || !open->isVisible() || !open->isEnabled()) return;
+        clickedOpen = true;
+        QTest::mouseClick(open, Qt::LeftButton);
+    });
+    elapsed.start();
+    driver.start();
+    action->trigger(); // Public user command -> real Qt chooser -> normal interactive route.
+    driver.stop();
+    if (!clickedOpen && error.isEmpty()) error = QStringLiteral("owned QFileDialog Open button was not clicked");
+    return error;
 }
 
 QTreeWidgetItem *findTreeItem(QTreeWidget *tree, const QString &needle)
@@ -411,11 +479,12 @@ private slots:
 
         bool recoveryDialogWasShown = false;
         QTimer recoveryDialogTimer;
-        recoveryDialogTimer.setSingleShot(true);
+        recoveryDialogTimer.setInterval(20);
         connect(&recoveryDialogTimer, &QTimer::timeout, &recoveryDialogTimer, [&]() {
             auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
-            QVERIFY(dialog);
-            QCOMPARE(dialog->objectName(), QStringLiteral("fileCredentialDialog"));
+            if (!dialog || dialog->parentWidget() != window.get()
+                || dialog->objectName() != QStringLiteral("fileCredentialDialog")) return;
+            recoveryDialogTimer.stop();
             QVERIFY(dialog->windowTitle().contains(QStringLiteral("账户集合")));
             auto *kind = dialog->findChild<QComboBox *>(
                 QStringLiteral("fileCredentialKind"));
@@ -431,9 +500,10 @@ private slots:
             recoveryDialogWasShown = true;
             QTest::mouseClick(buttons->button(QDialogButtonBox::Open), Qt::LeftButton);
         });
-        recoveryDialogTimer.start(80);
-        window->openFilesFromExternal({foreignAccountsPath});
+        recoveryDialogTimer.start();
+        const QString accountOpenError = openThroughFileMenu(window.get(), foreignAccountsPath);
         recoveryDialogTimer.stop();
+        QVERIFY2(accountOpenError.isEmpty(), qPrintable(accountOpenError));
         QVERIFY(recoveryDialogWasShown);
         QVERIFY(QApplication::activeModalWidget() == nullptr);
         QTRY_VERIFY_WITH_TIMEOUT(stack->currentWidget()->objectName()
@@ -710,7 +780,8 @@ private slots:
         connect(&credentialDriver, &QTimer::timeout, window.get(),
                 [&, recoveryKey = foreignRecoveryKey]() {
             auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
-            if (!dialog || dialog->objectName() != QStringLiteral("fileCredentialDialog"))
+            if (!dialog || dialog->parentWidget() != window.get()
+                || dialog->objectName() != QStringLiteral("fileCredentialDialog"))
                 return;
             if (credentialStage == 0) {
                 if (!dialog->windowTitle().contains(QStringLiteral("其他密码")))
@@ -760,15 +831,16 @@ private slots:
         credentialWatchdog.setSingleShot(true);
         connect(&credentialWatchdog, &QTimer::timeout, window.get(), [&]() {
             credentialDriverTimedOut = true;
-            if (auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget()))
-                dialog->reject();
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (dialog && isOwnedByWindow(dialog, window.get())) dialog->reject();
         });
         credentialDriver.start();
         credentialWatchdog.start(8000);
 
-        window->openFilesFromExternal({firstPath});
+        const QString firstOpenError = openThroughFileMenu(window.get(), firstPath);
         credentialDriver.stop();
         credentialWatchdog.stop();
+        QVERIFY2(firstOpenError.isEmpty(), qPrintable(firstOpenError));
         QVERIFY(!credentialDriverTimedOut);
         QVERIFY(rejectedPasswordWasShown);
         QVERIFY(recoveryDialogWasShown);
@@ -779,16 +851,30 @@ private slots:
         QCOMPARE(first->editor()->text(), QStringLiteral("FOREIGN_RECOVERY_ONE"));
         auto *payloadSize = window->findChild<QLabel *>(QStringLiteral("status.size"));
         QVERIFY(payloadSize);
-        QCOMPARE(payloadSize->text(), QStringLiteral("20 B · Text · Text · 可编辑"));
+        QCOMPARE(payloadSize->text(), QStringLiteral("20 B · 文本 · 文本视图 · 可编辑"));
         QVERIFY(QFileInfo(firstPath).size() > first->editor()->length());
         first->editor()->append(QStringLiteral("!"));
         QTRY_COMPARE_WITH_TIMEOUT(
-            payloadSize->text(), QStringLiteral("21 B · Text · Text · 可编辑"), 1000);
+            payloadSize->text(), QStringLiteral("21 B · 文本 · 文本视图 · 可编辑"), 1000);
 
         // The recovery secret is remembered by identityId + keyVersion in the
         // device session. A second document from that identity must therefore
         // behave exactly like an ordinary file and open without another dialog.
-        window->openFilesFromExternal({secondPath});
+        bool secondUnexpectedDialog = false;
+        QTimer secondDialogGuard;
+        secondDialogGuard.setInterval(20);
+        connect(&secondDialogGuard, &QTimer::timeout, &secondDialogGuard, [&] {
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (!dialog || !isOwnedByWindow(dialog, window.get()) || qobject_cast<QFileDialog *>(dialog)
+                || dialog->objectName() == QStringLiteral("securityOperationProgress")) return;
+            secondUnexpectedDialog = true;
+            dialog->reject();
+        });
+        secondDialogGuard.start();
+        const QString secondOpenError = openThroughFileMenu(window.get(), secondPath);
+        secondDialogGuard.stop();
+        QVERIFY2(secondOpenError.isEmpty(), qPrintable(secondOpenError));
+        QVERIFY(!secondUnexpectedDialog);
         QVERIFY(QApplication::activeModalWidget() == nullptr);
         QCOMPARE(tabs->count(), initialTabCount + 2);
         auto *second = currentEditor(window.get());
@@ -811,6 +897,7 @@ private slots:
         const QString body = QStringLiteral(
             "Restart-safe private note\r\n不会写入明文会话\r\n");
         QString encryptedDraftPath;
+        QString createdDocumentId;
         {
             auto window = std::make_unique<MainWindow>();
             window->resize(980, 680);
@@ -825,6 +912,8 @@ private slots:
             EditorTab *created = currentEditor(window.get());
             QVERIFY(created && created->isSecureDocument());
             QVERIFY(created->filePath().isEmpty());
+            createdDocumentId = created->captureSessionTab().documentId;
+            QVERIFY(!createdDocumentId.isEmpty());
             created->editor()->setText(body);
             QTRY_VERIFY_WITH_TIMEOUT(!created->autosavePath().isEmpty()
                                          && QFileInfo::exists(created->autosavePath()),
@@ -848,6 +937,8 @@ private slots:
             QStringLiteral("session.json"))));
 
         auto restarted = std::make_unique<MainWindow>();
+        QSignalSpy restoreCompleted(restarted.get(), &MainWindow::sessionRestoreCompleted);
+        QVERIFY(restoreCompleted.isValid());
         restarted->resize(980, 680);
         restarted->show();
         QVERIFY(QTest::qWaitForWindowExposed(restarted.get()));
@@ -870,20 +961,452 @@ private slots:
                                  5000);
         QTRY_COMPARE_WITH_TIMEOUT(currentEditor(restarted.get())->editor()->text(),
                                   body, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(restoreCompleted.count(), 1, 2000);
         promptWatcher.stop();
         QVERIFY(!unexpectedPrompt);
         QVERIFY(QApplication::activeModalWidget() == nullptr);
         EditorTab *restored = currentEditor(restarted.get());
         QCOMPARE(QFileInfo(restored->autosavePath()).absoluteFilePath(),
                  QFileInfo(encryptedDraftPath).absoluteFilePath());
-        QTRY_VERIFY_WITH_TIMEOUT(!QFileInfo::exists(dataDirectory.filePath(
-                                     QStringLiteral("session.json"))), 2000);
+        const SessionTab restoredState = restored->captureSessionTab();
+        QVERIFY(restoredState.secureDocument);
+        QCOMPARE(restoredState.documentId, createdDocumentId);
+        // UI restoration is not a replacement durable publication. A fresh
+        // reader must still discover this exact encrypted draft after finish.
+        SessionManager freshSession(dataDirectory.path());
+        const SessionData persisted = freshSession.loadSession();
+        QCOMPARE(persisted.tabs.size(), qsizetype(1));
+        QCOMPARE(persisted.activeTab, 0);
+        QVERIFY(persisted.tabs.first().secureDocument);
+        QCOMPARE(persisted.tabs.first().documentId, restoredState.documentId);
+        QCOMPARE(persisted.tabs.first().autosavePath, restoredState.autosavePath);
+        QCOMPARE(restoreCompleted.count(), 1);
         QVERIFY(restarted->grab().save(QDir::current().filePath(
             QStringLiteral("gui-secure-draft-restart.png"))));
 
         restarted->close();
         restarted.reset();
         qunsetenv("NOTEPADSAFE_DATADIR");
+    }
+
+    void laterSecureRestoreKeepsOrdinaryCurrentDocument_data()
+    {
+        QTest::addColumn<bool>("missingSecure");
+        QTest::addColumn<bool>("enterAccounts");
+        QTest::addColumn<bool>("splitSecure");
+        QTest::newRow("success") << false << false << false;
+        QTest::newRow("missing-secure") << true << false << false;
+        QTest::newRow("enter-accounts") << false << true << false;
+        QTest::newRow("enter-accounts-split") << false << true << true;
+    }
+
+    void laterSecureRestoreKeepsOrdinaryCurrentDocument()
+    {
+        QFETCH(bool, missingSecure);
+        QFETCH(bool, enterAccounts);
+        QFETCH(bool, splitSecure);
+        QTemporaryDir dataDirectory;
+        QVERIFY(dataDirectory.isValid());
+        const bool hadProfile = qEnvironmentVariableIsSet("NOTEPADSAFE_DATADIR");
+        const QByteArray previousProfile = qgetenv("NOTEPADSAFE_DATADIR");
+        const auto restoreProfile = qScopeGuard([&] {
+            if (hadProfile) qputenv("NOTEPADSAFE_DATADIR", previousProfile);
+            else qunsetenv("NOTEPADSAFE_DATADIR");
+        });
+        QVERIFY(qputenv("NOTEPADSAFE_DATADIR", dataDirectory.path().toUtf8()));
+        const auto readBytes = [](const QString &path) {
+            QFile file(path);
+            return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};
+        };
+        const auto hash = [](const QByteArray &bytes) {
+            return QCryptographicHash::hash(bytes, QCryptographicHash::Sha256);
+        };
+        const QString ordinaryPath = dataDirectory.filePath(QStringLiteral("preferred.txt"));
+        const QByteArray ordinaryBody("ordinary active before later secure restore\n");
+        const QString secondPath = dataDirectory.filePath(QStringLiteral("background.txt"));
+        const QByteArray secondBody("second ordinary document stays in the background\n");
+        const QString secureBody = QStringLiteral("SECURE_LATER_RESTORE_CANARY\n真实安全正文\n");
+        QVERIFY(writeFixture(ordinaryPath, ordinaryBody));
+        QVERIFY(writeFixture(secondPath, secondBody));
+        QCOMPARE(readBytes(ordinaryPath), ordinaryBody);
+        QCOMPARE(readBytes(secondPath), secondBody);
+        const QByteArray ordinaryHash = hash(ordinaryBody);
+        const QByteArray secondHash = hash(secondBody);
+        QString securePath, secureDocumentId;
+        {
+            auto seed = std::make_unique<MainWindow>();
+            seed->resize(980, 680);
+            seed->show();
+            seed->raise();
+            seed->activateWindow();
+            QVERIFY(QTest::qWaitForWindowExposed(seed.get()));
+            seed->openFilesFromExternal({ordinaryPath});
+            auto *ordinary = currentEditor(seed.get());
+            QVERIFY(ordinary && !ordinary->isSecureDocument());
+            QCOMPARE(ordinary->filePath(), ordinaryPath);
+            QCOMPARE(ordinary->editor()->text().toUtf8(), ordinaryBody);
+            seed->openFilesFromExternal({secondPath});
+            auto *second = currentEditor(seed.get());
+            QVERIFY(second && second != ordinary && !second->isSecureDocument());
+            QCOMPARE(second->filePath(), secondPath);
+            QCOMPARE(second->editor()->text().toUtf8(), secondBody);
+            driveIdentityCreationDialog(seed.get());
+            auto *newAction = seed->findChild<QAction *>(QStringLiteral("file.new"));
+            QVERIFY(newAction && newAction->isEnabled());
+            newAction->trigger();
+            QCOMPARE(seed->property("notepadsafeTestIdentityDriverResult").toString(),
+                     QStringLiteral("complete"));
+            auto *secure = currentEditor(seed.get());
+            QVERIFY(secure && secure->isSecureDocument());
+            secureDocumentId = secure->captureSessionTab().documentId;
+            QVERIFY(!secureDocumentId.isEmpty());
+            secure->editor()->setText(secureBody);
+            QTRY_VERIFY_WITH_TIMEOUT(!secure->autosavePath().isEmpty()
+                                         && QFileInfo::exists(secure->autosavePath()), 5000);
+            securePath = secure->autosavePath();
+            if (splitSecure) {
+                QVERIFY(secure->canSplitView());
+                secure->setSplitView(true, Qt::Vertical);
+                QVERIFY(secure->splitViewEnabled());
+                QCOMPARE(secure->splitOrientation(), Qt::Vertical);
+                auto *secondary = secure->findChild<QsciScintilla *>(QStringLiteral("secondaryScintillaEditor"));
+                QVERIFY(secondary && secondary != secure->editor());
+                QCOMPARE(QApplication::focusWidget(), static_cast<QWidget *>(secondary));
+                QCOMPARE(secondary->text(), secureBody);
+            }
+            auto *tabs = seed->findChild<QTabWidget *>();
+            QVERIFY(tabs);
+            QCOMPARE(tabs->count(), 3);
+            QCOMPARE(tabs->widget(0), ordinary);
+            QCOMPARE(tabs->widget(1), second);
+            QCOMPARE(tabs->widget(2), secure);
+            tabs->setCurrentWidget(ordinary);
+            // Normal product close checkpoints Secure content and publishes the
+            // real session in visible order, with the ordinary item active.
+            QVERIFY(seed->close());
+            QVERIFY(!seed->isVisible());
+        }
+        SessionManager freshSession(dataDirectory.path());
+        const SessionData before = freshSession.loadSession();
+        QCOMPARE(before.tabs.size(), qsizetype(3));
+        QCOMPARE(before.activeTab, 0);
+        QCOMPARE(before.tabs[0].filePath, ordinaryPath);
+        QVERIFY(!before.tabs[0].secureDocument && !before.tabs[0].modified);
+        QCOMPARE(before.tabs[1].filePath, secondPath);
+        QVERIFY(!before.tabs[1].secureDocument && !before.tabs[1].modified);
+        QVERIFY(before.tabs[2].secureDocument);
+        QCOMPARE(before.tabs[2].documentId, secureDocumentId);
+        QCOMPARE(before.tabs[2].autosavePath, securePath);
+        QCOMPARE(before.tabs[2].splitView, splitSecure);
+        if (splitSecure) QCOMPARE(before.tabs[2].splitOrientation, QStringLiteral("vertical"));
+        const QByteArray ciphertext = readBytes(securePath);
+        QCOMPARE(ciphertext.left(8).toHex().toUpper(), QByteArray("03D9A29A67FB4BB5"));
+        QVERIFY(!ciphertext.contains(secureBody.toUtf8()));
+        const QByteArray secureHash = hash(ciphertext);
+        QCOMPARE(hash(readBytes(ordinaryPath)), ordinaryHash);
+        QCOMPARE(hash(readBytes(secondPath)), secondHash);
+        QVERIFY(QFileInfo::exists(dataDirectory.filePath(QStringLiteral("security-session-v1.bin"))));
+        const QString backupPath = dataDirectory.filePath(QStringLiteral("retained-secure-backup.nsafe"));
+        if (missingSecure) {
+            // Move only this fixture's sealed file; retain its bytes for the
+            // failure cut, rather than deleting a draft or rewriting metadata.
+            QVERIFY(QFileInfo(securePath).canonicalFilePath().startsWith(
+                QDir(dataDirectory.path()).canonicalPath() + QLatin1Char('/')));
+            QVERIFY(!QFileInfo::exists(backupPath));
+            QVERIFY(QFile::rename(securePath, backupPath));
+            QVERIFY(!QFileInfo::exists(securePath));
+            QCOMPARE(hash(readBytes(backupPath)), secureHash);
+        }
+
+        auto restarted = std::make_unique<MainWindow>();
+        QSignalSpy completed(restarted.get(), &MainWindow::sessionRestoreCompleted);
+        QVERIFY(completed.isValid());
+        auto *tabs = restarted->findChild<QTabWidget *>();
+        QVERIFY(tabs);
+        QPointer<EditorTab> ordinary;
+        QUuid ordinaryId;
+        quint64 ordinaryRevision = 0;
+        int cuts = 0;
+        QString cutError;
+        bool unexpectedPrompt = false;
+        bool enteringAccounts = false, accountsEntered = false;
+        int workspaceDepartures = 0;
+        auto *workspace = restarted->findChild<QStackedWidget *>(QStringLiteral("WorkspaceStack"));
+        QPointer<QWidget> accountsPage;
+        QPointer<VaultDock> accountsVault;
+        QPointer<QLineEdit> accountsFilter;
+        int documentFocusTransfers = 0;
+        const QString filterPrefix = QStringLiteral("recovery-intent-");
+        const QString filterSuffix = QStringLiteral("still-here");
+        const QString accountsPath = dataDirectory.filePath(QStringLiteral("accounts.kdbx"));
+        QByteArray accountsHash;
+        QTimer promptWatcher;
+        StartupCoordinator startup;
+        QObject observation; // Revoke all callbacks before their captured locals.
+        connect(&promptWatcher, &QTimer::timeout, &observation, [&] {
+            if (auto *modal = qobject_cast<QDialog *>(QApplication::activeModalWidget())) {
+                // Real account creation may display its normal crypto progress
+                // window. This is not an unexpected credential/identity prompt.
+                if (enterAccounts && enteringAccounts && qobject_cast<QProgressDialog *>(modal)
+                    && modal->objectName() == QStringLiteral("securityOperationProgress")) return;
+                unexpectedPrompt = true;
+                modal->reject();
+            }
+        });
+        connect(restarted->statusBar(), &QStatusBar::messageChanged, &observation,
+                [&](const QString &message) {
+            if (message != QStringLiteral("正在恢复会话… 1/3 个标签页")) return;
+            if (++cuts != 1) return;
+            ordinary = currentEditor(restarted.get());
+            if (completed.count() != 0 || tabs->count() != 1 || !ordinary
+                || ordinary->isSecureDocument() || ordinary->filePath() != ordinaryPath
+                || ordinary->editor()->text().toUtf8() != ordinaryBody || ordinary->isModified()) {
+                cutError = QStringLiteral("ordinary item was not fully current before later Secure restore");
+                return;
+            }
+            ordinaryId = ordinary->documentState().id;
+            ordinaryRevision = ordinary->contentRevision();
+            if (!enterAccounts) return;
+            auto *accountsAction = restarted->findChild<QAction *>(QStringLiteral("tools.accounts"));
+            if (!workspace || !accountsAction || !accountsAction->isEnabled()) {
+                cutError = QStringLiteral("real Accounts command is not available at the 1/3 cut");
+                return;
+            }
+            enteringAccounts = true;
+            const auto finishEnteringAccounts = qScopeGuard([&] { enteringAccounts = false; });
+            accountsAction->trigger(); // Actual synchronous product identity/account flow, not a timing probe.
+            accountsPage = workspace->currentWidget();
+            accountsVault = restarted->findChild<VaultDock *>(QStringLiteral("VaultDock"));
+            if (completed.count() != 0 || tabs->count() != 1 || !accountsPage
+                || accountsPage->objectName() != QStringLiteral("AccountsWorkspace")
+                || !accountsPage->isVisible() || !accountsVault || !accountsVault->isVisible()
+                || !accountsVault->isSecureStoreOpen() || !QFileInfo(accountsPath).isFile()
+                || QFileInfo(accountsVault->secureStorePath()).absoluteFilePath()
+                       != QFileInfo(accountsPath).absoluteFilePath()) {
+                cutError = QStringLiteral("Accounts was not really open while later recovery items remained pending");
+                return;
+            }
+            // An empty store intentionally has no search input. Create one real
+            // account through its visible controls before freezing focus/hash.
+            auto *create = accountsVault->findChild<QPushButton *>(QStringLiteral("accountsEmptyCreateButton"));
+            if (!create || !create->isVisible() || !create->isEnabled()) {
+                cutError = QStringLiteral("empty Accounts page has no usable Create button");
+                return;
+            }
+            QTest::mouseClick(create, Qt::LeftButton);
+            auto *title = accountsVault->findChild<QLineEdit *>(QStringLiteral("vaultTitleEdit"));
+            auto *username = accountsVault->findChild<QLineEdit *>(QStringLiteral("vaultUsernameEdit"));
+            auto *save = accountsVault->findChild<QPushButton *>(QStringLiteral("vaultSaveButton"));
+            if (!title || !title->isVisible() || !title->isEnabled() || title->isReadOnly()
+                || !username || !username->isVisible() || !username->isEnabled() || username->isReadOnly()
+                || !save || !save->isVisible() || !save->isEnabled()) {
+                cutError = QStringLiteral("real Create did not expose editable account fields and Save");
+                return;
+            }
+            const QString accountTitle = filterPrefix + filterSuffix;
+            const QString accountUsername = QStringLiteral("recovery-fixture@example.test");
+            QTest::mouseClick(title, Qt::LeftButton);
+            QTest::keyClick(title, Qt::Key_A, Qt::ControlModifier);
+            QTest::keyClicks(title, accountTitle);
+            QTest::mouseClick(username, Qt::LeftButton);
+            QTest::keyClick(username, Qt::Key_A, Qt::ControlModifier);
+            QTest::keyClicks(username, accountUsername);
+            QTest::mouseClick(save, Qt::LeftButton);
+            auto *accountTree = accountsVault->findChild<QTreeWidget *>(QStringLiteral("vaultEntryTree"));
+            auto *savedAccount = findTreeItem(accountTree, accountTitle);
+            if (completed.count() != 0 || tabs->count() != 1 || workspace->currentWidget() != accountsPage
+                || !accountsVault->isSecureStoreOpen() || accountsVault->canSaveActiveEntry()
+                || !savedAccount || accountTree->currentItem() != savedAccount
+                || savedAccount->text(0) != accountTitle || title->text() != accountTitle
+                || username->text() != accountUsername || save->isVisible()) {
+                cutError = QStringLiteral("real account Save did not finish/select its entry before recovery resumed");
+                return;
+            }
+            const QByteArray accountsCiphertext = readBytes(accountsPath);
+            if (accountsCiphertext.left(8).toHex().toUpper() != QByteArray("03D9A29A67FB4BB5")) {
+                cutError = QStringLiteral("real Accounts workflow did not create this fixture's KDBX store");
+                return;
+            }
+            accountsHash = hash(accountsCiphertext);
+            accountsEntered = true;
+            connect(workspace, &QStackedWidget::currentChanged, &observation, [&](int) {
+                if (!accountsPage || workspace->currentWidget() != accountsPage)
+                    ++workspaceDepartures;
+            }, Qt::DirectConnection);
+            accountsFilter = accountsVault->findChild<QLineEdit *>(QStringLiteral("vaultFilterEdit"));
+            if (!accountsFilter || !accountsFilter->isVisible() || !accountsFilter->isEnabled()
+                || !accountsFilter->text().isEmpty()) {
+                cutError = QStringLiteral("Accounts filter is not a usable empty input at the recovery cut");
+                return;
+            }
+            QTest::mouseClick(accountsFilter, Qt::LeftButton);
+            if (QApplication::focusWidget() != accountsFilter) {
+                cutError = QStringLiteral("real Accounts filter click did not establish actual keyboard focus");
+                return;
+            }
+            QTest::keyClicks(QApplication::focusWidget(), filterPrefix);
+            if (accountsFilter->text() != filterPrefix || QApplication::focusWidget() != accountsFilter) {
+                cutError = QStringLiteral("prefix did not reach the focused Accounts filter");
+                return;
+            }
+            connect(qApp, &QApplication::focusChanged, &observation, [&](QWidget *, QWidget *now) {
+                if (!now) return;
+                auto *progress = qobject_cast<QProgressDialog *>(now->window());
+                if (progress && progress->objectName() == QStringLiteral("securityOperationProgress")) return;
+                for (int i = 0; i < tabs->count(); ++i) {
+                    auto *document = qobject_cast<EditorTab *>(tabs->widget(i));
+                    if (document && (now == document || document->isAncestorOf(now))) {
+                        ++documentFocusTransfers;
+                        break;
+                    }
+                }
+            }, Qt::DirectConnection);
+            qInfo() << "SECURE_RESTORE_ACCOUNTS_ENTERED_GUARDS_OK" << "completed" << completed.count()
+                    << "deliveredDocuments" << tabs->count() << "actualFilterFocus" << (QApplication::focusWidget() == accountsFilter);
+        }, Qt::DirectConnection);
+        startup.observe(restarted.get(), {});
+        promptWatcher.start(20);
+        restarted->resize(980, 680);
+        restarted->show();
+        restarted->raise();
+        restarted->activateWindow();
+        startup.releasePostPaintWork();
+        QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 10000);
+        promptWatcher.stop();
+        QCOMPARE(cuts, 1);
+        QVERIFY2(cutError.isEmpty(), qPrintable(cutError));
+        QVERIFY(ordinary && !ordinaryId.isNull());
+        QCOMPARE(tabs->count(), missingSecure ? 2 : 3);
+        QCOMPARE(tabs->widget(0), ordinary.data());
+        auto *second = qobject_cast<EditorTab *>(tabs->widget(1));
+        QVERIFY(second && !second->isSecureDocument() && !second->isModified());
+        QVERIFY(!second->isReadOnlyByPolicy());
+        QCOMPARE(second->filePath(), secondPath);
+        QCOMPARE(second->editor()->text().toUtf8(), secondBody);
+        QCOMPARE(second->documentState().securityClass, DocumentSecurityClass::OrdinaryDocument);
+        QVERIFY(second->documentState().capabilities.testFlag(DocumentCapability::Read));
+        QVERIFY(second->documentState().capabilities.testFlag(DocumentCapability::Edit));
+        QVERIFY(!second->documentState().id.isNull());
+        QVERIFY(second->documentState().id != ordinaryId);
+        if (missingSecure) {
+            QVERIFY(!QFileInfo::exists(securePath));
+            QCOMPARE(hash(readBytes(backupPath)), secureHash);
+        } else {
+            auto *secure = qobject_cast<EditorTab *>(tabs->widget(2));
+            QVERIFY(secure && secure->isSecureDocument());
+            QCOMPARE(secure->editor()->text(), secureBody);
+            QCOMPARE(secure->documentState().securityClass, DocumentSecurityClass::SecureDocument);
+            QVERIFY(secure->documentState().capabilities.testFlag(DocumentCapability::Read));
+            QVERIFY(secure->documentState().capabilities.testFlag(DocumentCapability::Edit));
+            QCOMPARE(secure->captureSessionTab().documentId, secureDocumentId);
+            QCOMPARE(secure->autosavePath(), securePath);
+            QVERIFY(!secure->documentState().id.isNull());
+            QVERIFY(secure->documentState().id != ordinaryId);
+            QVERIFY(secure->documentState().id != second->documentState().id);
+            QCOMPARE(hash(readBytes(securePath)), secureHash);
+            QCOMPARE(secure->splitViewEnabled(), splitSecure);
+            if (splitSecure) {
+                QCOMPARE(secure->splitOrientation(), Qt::Vertical);
+                auto *splitter = secure->findChild<QSplitter *>(QStringLiteral("editorSplitView"));
+                auto *secondary = secure->findChild<QsciScintilla *>(QStringLiteral("secondaryScintillaEditor"));
+                QVERIFY(splitter && secondary && secondary != secure->editor());
+                QCOMPARE(splitter->count(), 2);
+                QCOMPARE(splitter->orientation(), Qt::Vertical);
+                QCOMPARE(splitter->widget(0), secure->editor());
+                QCOMPARE(splitter->widget(1), secondary);
+                QVERIFY(secure->editor()->isVisibleTo(secure) && secondary->isVisibleTo(secure));
+                QCOMPARE(secondary->text(), secureBody);
+                void *const sharedDocument = secure->editor()->SendScintillaPtrResult(QsciScintillaBase::SCI_GETDOCPOINTER);
+                QVERIFY(sharedDocument);
+                QCOMPARE(secondary->SendScintillaPtrResult(QsciScintillaBase::SCI_GETDOCPOINTER), sharedDocument);
+            }
+        }
+        QCOMPARE(ordinary->documentState().id, ordinaryId);
+        QCOMPARE(ordinary->contentRevision(), ordinaryRevision);
+        QCOMPARE(ordinary->editor()->text().toUtf8(), ordinaryBody);
+        QVERIFY(!ordinary->isModified() && !ordinary->isSecureDocument());
+        QVERIFY(!ordinary->isReadOnlyByPolicy());
+        QCOMPARE(ordinary->documentState().securityClass, DocumentSecurityClass::OrdinaryDocument);
+        QVERIFY(ordinary->documentState().capabilities.testFlag(DocumentCapability::Read));
+        QVERIFY(ordinary->documentState().capabilities.testFlag(DocumentCapability::Edit));
+        QCOMPARE(hash(readBytes(ordinaryPath)), ordinaryHash);
+        QCOMPARE(hash(readBytes(secondPath)), secondHash);
+        const SessionData after = freshSession.loadSession();
+        QCOMPARE(after.tabs.size(), qsizetype(3));
+        QCOMPARE(after.activeTab, 0);
+        QCOMPARE(after.tabs[0].filePath, ordinaryPath);
+        QVERIFY(!after.tabs[0].secureDocument);
+        QCOMPARE(after.tabs[1].filePath, secondPath);
+        QVERIFY(!after.tabs[1].secureDocument);
+        QVERIFY(after.tabs[2].secureDocument);
+        QCOMPARE(after.tabs[2].documentId, secureDocumentId);
+        QCOMPARE(after.tabs[2].autosavePath, securePath);
+        QCOMPARE(after.tabs[2].splitView, splitSecure);
+        if (splitSecure) QCOMPARE(after.tabs[2].splitOrientation, QStringLiteral("vertical"));
+        QVERIFY(!unexpectedPrompt);
+        QVERIFY(QApplication::activeModalWidget() == nullptr);
+        if (enterAccounts) {
+            QVERIFY(accountsEntered);
+            QVERIFY(QFileInfo(accountsPath).isFile());
+            QCOMPARE(hash(readBytes(accountsPath)), accountsHash);
+        }
+        qInfo() << "SECURE_LATER_RESTORE_DATA_GUARDS_OK" << "missingSecure" << missingSecure
+                << "enterAccounts" << enterAccounts << "completed" << completed.count()
+                << "visibleDocuments" << tabs->count() << "workspaceDepartures" << workspaceDepartures
+                << "accountsOpen" << (accountsVault && accountsVault->isSecureStoreOpen())
+                << "documentFocusTransfers" << documentFocusTransfers << "splitSecure" << splitSecure;
+        if (enterAccounts) {
+            QVERIFY(workspace && accountsPage && accountsVault);
+            QCOMPARE(workspace->currentWidget(), accountsPage.data());
+            QVERIFY(accountsPage->isVisible() && accountsVault->isVisible());
+            QVERIFY(accountsVault->isSecureStoreOpen());
+            QCOMPARE(QFileInfo(accountsVault->secureStorePath()).absoluteFilePath(),
+                     QFileInfo(accountsPath).absoluteFilePath());
+            QCOMPARE(workspaceDepartures, 0); // No final reopen can hide an intermediate workspace takeover.
+            QVERIFY(accountsFilter);
+            QCOMPARE(accountsFilter->text(), filterPrefix);
+            QCOMPARE(QApplication::focusWidget(), accountsFilter.data());
+            const QList<QPointer<EditorTab>> documents{ordinary, second,
+                qobject_cast<EditorTab *>(tabs->widget(2))};
+            QList<QUuid> ids;
+            QList<quint64> revisions;
+            QList<bool> dirty;
+            for (const auto &document : documents) {
+                QVERIFY(document);
+                ids.append(document->documentState().id);
+                revisions.append(document->contentRevision());
+                dirty.append(document->isModified());
+            }
+            // Deliver to the ACTUAL focus owner; never re-click or setFocus here.
+            QTest::keyClicks(QApplication::focusWidget(), filterSuffix);
+            QCOMPARE(QApplication::focusWidget(), accountsFilter.data());
+            QCOMPARE(accountsFilter->text(), filterPrefix + filterSuffix);
+            for (int i = 0; i < documents.size(); ++i) {
+                QVERIFY(documents[i]);
+                QCOMPARE(documents[i]->documentState().id, ids[i]);
+                QCOMPARE(documents[i]->contentRevision(), revisions[i]);
+                QCOMPARE(documents[i]->isModified(), dirty[i]);
+            }
+            QCOMPARE(documents[0]->editor()->text().toUtf8(), ordinaryBody);
+            QCOMPARE(documents[1]->editor()->text().toUtf8(), secondBody);
+            QCOMPARE(documents[2]->editor()->text(), secureBody);
+            if (splitSecure) {
+                auto *secondary = documents[2]->findChild<QsciScintilla *>(QStringLiteral("secondaryScintillaEditor"));
+                QVERIFY(secondary);
+                QCOMPARE(secondary->text(), secureBody);
+            }
+            QCOMPARE(hash(readBytes(ordinaryPath)), ordinaryHash);
+            QCOMPARE(hash(readBytes(secondPath)), secondHash);
+            QCOMPARE(hash(readBytes(securePath)), secureHash);
+            QCOMPARE(hash(readBytes(accountsPath)), accountsHash);
+            QCOMPARE(documentFocusTransfers, 0);
+            const QString screenshot = QDir::current().filePath(splitSecure
+                ? QStringLiteral("3a-accounts-focus-split.png") : QStringLiteral("3a-accounts-focus-text.png"));
+            QVERIFY2(restarted->grab().save(screenshot), qPrintable(screenshot));
+        } else {
+            QCOMPARE(tabs->currentWidget(), ordinary.data());
+        }
+        // Destruction is cleanup only; do not republish after the frozen cut.
     }
 
     void operationLeaseWorkspaceLifecycle()
@@ -1055,6 +1578,121 @@ private slots:
         QVERIFY(!secureTab->editor()->text().contains(QStringLiteral("MARKER_SHARED")));
         QVERIFY(!QFileInfo::exists(dataDirectory.filePath(
             QStringLiteral("security-session-v1.bin"))));
+
+        window->close();
+        window.reset();
+        qunsetenv("NOTEPADSAFE_DATADIR");
+    }
+
+    void externalOpenPreservesAccountsAndSecuritySession()
+    {
+        QTemporaryDir dataDirectory;
+        QVERIFY(dataDirectory.isValid());
+        qputenv("NOTEPADSAFE_DATADIR", dataDirectory.path().toUtf8());
+
+        AppComposition composition;
+        QVERIFY(composition.inferenceProviders().registerProvider(
+            {QStringLiteral("test.remote"), QStringLiteral("1"),
+             QStringLiteral("test"), QStringLiteral("test-only"), {},
+             QStringLiteral("remote"), QStringLiteral("network"), true},
+            []() { return std::unique_ptr<IInferenceProvider>{}; }));
+        auto window = std::make_unique<MainWindow>(nullptr, &composition);
+        window->resize(1180, 760);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window.get()));
+
+        driveIdentityCreationDialog(window.get());
+        QVERIFY(QMetaObject::invokeMethod(window.get(), "newFile",
+                                          Qt::DirectConnection));
+        QCOMPARE(window->property("notepadsafeTestIdentityDriverResult").toString(),
+                 QStringLiteral("complete"));
+        auto *secureTab = currentEditor(window.get());
+        auto *tabs = window->findChild<QTabWidget *>();
+        auto *stack = window->findChild<QStackedWidget *>(
+            QStringLiteral("WorkspaceStack"));
+        QVERIFY(secureTab && secureTab->isSecureDocument() && tabs && stack);
+        secureTab->editor()->setText(QStringLiteral("secure session marker"));
+        QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(secureTab->autosavePath()), 5000);
+        const QString secureText = secureTab->editor()->text();
+        const QString capsule = dataDirectory.filePath(
+            QStringLiteral("security-session-v1.bin"));
+        QVERIFY(QFileInfo::exists(capsule));
+
+        auto *tailToggle = window->findChild<QAction *>(QStringLiteral("view.tail.toggle"));
+        auto *tailResume = window->findChild<QAction *>(QStringLiteral("view.tail.resume"));
+        QVERIFY(tailToggle && tailResume);
+        QVERIFY(!tailToggle->isEnabled() && !tailToggle->isChecked() && !tailResume->isEnabled());
+        tailToggle->trigger();
+        tailResume->trigger();
+        QCOMPARE(secureTab->editor()->text(), secureText);
+        QVERIFY(!tailToggle->isChecked());
+
+        auto *accountsAction = window->findChild<QAction *>(
+            QStringLiteral("tools.accounts"));
+        QVERIFY(accountsAction);
+        accountsAction->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(stack->currentWidget()->objectName()
+                                     == QStringLiteral("AccountsWorkspace"), 4000);
+        auto *vault = window->findChild<VaultDock *>(QStringLiteral("VaultDock"));
+        auto *filter = vault ? vault->findChild<QLineEdit *>(
+            QStringLiteral("vaultFilterEdit")) : nullptr;
+        auto *tree = vault ? vault->findChild<QTreeWidget *>(
+            QStringLiteral("vaultEntryTree")) : nullptr;
+        QVERIFY(vault && vault->isSecureStoreOpen() && filter && tree);
+        filter->setText(QStringLiteral("preserve-filter"));
+        if (tree->topLevelItemCount() > 0)
+            tree->setCurrentItem(tree->topLevelItem(0));
+        QWidget *const accountsPage = stack->currentWidget();
+        QTreeWidgetItem *const selectedAccountItem = tree->currentItem();
+        const QString vaultPath = vault->secureStorePath();
+        const int tabCountBefore = tabs->count();
+        const int heavyCallsBefore = composition.heavyFactoryCalls();
+        QCOMPARE(composition.inferenceProviders().instantiatedCount(), 0);
+
+        QVERIFY(!tailToggle->isEnabled() && !tailToggle->isChecked() && !tailResume->isEnabled());
+        tailToggle->trigger();
+        tailResume->trigger();
+        QCOMPARE(stack->currentWidget(), accountsPage);
+        QCOMPARE(vault->secureStorePath(), vaultPath);
+        QCOMPARE(secureTab->editor()->text(), secureText);
+        QCOMPARE(composition.heavyFactoryCalls(), heavyCallsBefore);
+        QVERIFY(!tailToggle->isChecked());
+
+        const QString plainPath = dataDirectory.filePath(
+            QStringLiteral("background-external.txt"));
+        QVERIFY(writeFixture(plainPath, QByteArray("ordinary external text\n")));
+        window->openFilesFromExternal({plainPath});
+        QCOMPARE(stack->currentWidget(), accountsPage);
+        QVERIFY(vault->isSecureStoreOpen());
+        QCOMPARE(vault->secureStorePath(), vaultPath);
+        QCOMPARE(filter->text(), QStringLiteral("preserve-filter"));
+        QCOMPARE(tree->currentItem(), selectedAccountItem);
+        QCOMPARE(tabs->count(), tabCountBefore + 1);
+        QVERIFY(!secureTab->isSecureDocumentMasked());
+        QCOMPARE(secureTab->editor()->text(), secureText);
+        QVERIFY(QFileInfo::exists(capsule));
+        QCOMPARE(composition.heavyFactoryCalls(), heavyCallsBefore);
+        QCOMPARE(composition.inferenceProviders().instantiatedCount(), 0);
+        QVERIFY(QApplication::activeModalWidget() == nullptr);
+
+        const QString rejectedSecurePath = dataDirectory.filePath(
+            QStringLiteral("external-must-not-unlock.nsafe"));
+        QVERIFY(writeFixture(rejectedSecurePath, QByteArray("not inspected")));
+        window->openFilesFromExternal({rejectedSecurePath});
+        QCOMPARE(stack->currentWidget(), accountsPage);
+        QVERIFY(vault->isSecureStoreOpen());
+        QCOMPARE(vault->secureStorePath(), vaultPath);
+        QCOMPARE(filter->text(), QStringLiteral("preserve-filter"));
+        QCOMPARE(tree->currentItem(), selectedAccountItem);
+        QCOMPARE(tabs->count(), tabCountBefore + 1);
+        QCOMPARE(window->statusBar()->currentMessage(),
+                 QStringLiteral("%1 未打开。为保护安全文件，外部请求不会解锁；请在窗口内用文件→打开。")
+                     .arg(QFileInfo(rejectedSecurePath).fileName()));
+        QVERIFY(!secureTab->isSecureDocumentMasked());
+        QCOMPARE(secureTab->editor()->text(), secureText);
+        QCOMPARE(composition.heavyFactoryCalls(), heavyCallsBefore);
+        QCOMPARE(composition.inferenceProviders().instantiatedCount(), 0);
+        QVERIFY(QApplication::activeModalWidget() == nullptr);
 
         window->close();
         window.reset();

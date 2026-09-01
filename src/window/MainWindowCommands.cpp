@@ -1,10 +1,12 @@
 #include "MainWindow.h"
+#include "RecoveryIssuePage.h"
 #include "EditorTab.h"
 #include "FileContentProbe.h"
 #include "FindReplaceDialog.h"
 #include "SearchResultsDock.h"
 #include "SearchResultsController.h"
 #include "SessionManager.h"
+#include "WorkspaceRecoveryCoordinator.h"
 #include "TextEncoding.h"
 #include "FileTierPolicy.h"
 #include "VirtualFileView.h"
@@ -19,6 +21,10 @@
 #include "SensitiveText.h"
 #include "CommandRegistry.h"
 #include "DocumentOpenWorkflow.h"
+#include "DocumentStatusPresentation.h"
+#include "EditorSurfaceStyle.h"
+#include "DocumentTailActions.h"
+#include "MessageBoxPresentation.h"
 
 #include <QTabWidget>
 #include <QTabBar>
@@ -71,6 +77,7 @@
 #include <QDir>
 #include <QUuid>
 #include <QPointer>
+#include <QScopeGuard>
 #include <QClipboard>
 #include <QCryptographicHash>
 #include <QDesktopServices>
@@ -178,7 +185,7 @@ void MainWindow::createStatusBar()
 {
     m_statusPos = new QLabel(QStringLiteral("行: 1, 列: 1"));
     m_statusPos->setObjectName(QStringLiteral("status.position"));
-    m_statusPos->setAccessibleName(QStringLiteral("光标位置"));
+    m_statusPos->setAccessibleName(QStringLiteral("文档位置"));
     m_statusPos->setMinimumWidth(120);
     statusBar()->addPermanentWidget(m_statusPos);
 
@@ -233,6 +240,7 @@ void MainWindow::createStatusBar()
     // 不让实现细节永久挤占编辑状态栏。
     m_taskWidget = new StatusBarTaskWidget(this);
     statusBar()->addPermanentWidget(m_taskWidget);
+    updateStatusBar();
 }
 
 // ============ 编辑操作 ============
@@ -523,39 +531,6 @@ void MainWindow::registerDropProxy(QWidget *w)
     }
 }
 
-// ============ 外部文件打开（命令行/拖放通用） ============
-
-void MainWindow::openFilesFromExternal(const QStringList &paths)
-{
-    if (paths.isEmpty()) return;
-    int anyEmptyUntitledIdx = -1;
-    // 只有当只有一个"未命名 且 空 且 未修改"的标签时，第一个文件才覆盖该标签
-    if (m_tabs->count() == 1) {
-        auto *t0 = qobject_cast<EditorTab *>(m_tabs->widget(0));
-        if (t0 && t0->isUntitled() && !t0->isModified()
-            && t0->editor()->text().isEmpty()) {
-            anyEmptyUntitledIdx = 0;
-        }
-    }
-    int idx = 0;
-    for (const QString &p : paths) {
-        if (p.isEmpty()) continue;
-        QFileInfo fi(p);
-        if (!fi.isFile()) continue;
-        EditorTab *reuseTab = nullptr;
-        if (idx == 0 && anyEmptyUntitledIdx >= 0)
-            reuseTab = qobject_cast<EditorTab *>(m_tabs->widget(anyEmptyUntitledIdx));
-        // openPathUnified owns tab creation for every non-placeholder file.
-        // This keeps drag/drop and command-line opens on the same duplicate-
-        // detection path as File > Open and Recent Files.
-        if (!openPathUnified(p, reuseTab)) {
-            QMessageBox::warning(this, QStringLiteral("错误"),
-                QStringLiteral("无法打开文件: %1").arg(p));
-        }
-        ++idx;
-    }
-}
-
 // ============ 编码 ============
 
 void MainWindow::setEncodingFromAction()
@@ -679,7 +654,9 @@ AsyncTaskType::EncodingConversion, AsyncTaskPriority::Highest,
             }
             if (!result->converted && result->error != QStringLiteral("转换已取消。")) {
                 AsyncErrorInfo asyncError;
-                asyncError.message = QStringLiteral("编码转换未完成。");
+                asyncError.message = result->error.isEmpty()
+                    ? QStringLiteral("编码转换未完成。") : result->error;
+                asyncError.userMessage = QStringLiteral("编码转换未完成。请检查目标位置和所选编码，查看技术详情后重试。");
                 reportError(asyncError);
             }
         }, 0, QStringLiteral("Encoding"), 1000, tab->isL2Active());
@@ -697,7 +674,13 @@ AsyncTaskType::EncodingConversion, AsyncTaskPriority::Highest,
     const QString error = result->error;
     if (!converted) {
         if (error != QStringLiteral("转换已取消。")) {
-            QMessageBox::warning(this, QStringLiteral("编码转换失败"), error);
+            QMessageBox failure(QMessageBox::Warning, QStringLiteral("编码转换失败"),
+                QStringLiteral("编码转换未完成。请检查目标位置和所选编码，查看技术详情后重试。"),
+                QMessageBox::Ok, this);
+            failure.setTextFormat(Qt::PlainText);
+            failure.setDetailedText(error);
+            localizeProductMessageBox(failure);
+            failure.exec();
         }
         return;
     }
@@ -792,10 +775,10 @@ void MainWindow::applyDarkMode(bool dark)
         pal.setColor(QPalette::ToolTipText, QColor(0, 0, 0));
     }
     qApp->setPalette(pal);
-    // The native Windows style does not consistently honor QPalette text
-    // roles for owner-drawn menus. Without these narrow overrides it produces
-    // black menu text on our dark background. Keep the stylesheet limited to
-    // menus/tooltips so individual editor/account control styles still work.
+    // Native Windows painting can ignore dark palette roles. Keep paired
+    // colors scoped to menus, the main toolbar and Find dialog inputs;
+    // account/editor controls retain their own styles. Light/high contrast
+    // remove every override below and keep the platform style intact.
     qApp->setStyleSheet(!m_highContrastMode && dark ? QStringLiteral(
         "QMenuBar { background-color:#2d2d30; color:#d0d0d0; }"
         "QMenuBar::item:selected { background-color:#3c3c40; color:#ffffff; }"
@@ -804,6 +787,15 @@ void MainWindow::applyDarkMode(bool dark)
         "QMenu::item:selected { background-color:#0078d7; color:#ffffff; }"
         "QMenu::item:disabled { color:#7d7d7d; }"
         "QMenu::separator { height:1px; background:#505055; margin:4px 8px; }"
+        "QToolBar#MainToolBar QToolButton { color:#d0d0d0; background-color:#2d2d30; border:1px solid transparent; }"
+        "QToolBar#MainToolBar QToolButton:enabled:hover { color:#ffffff; background-color:#3c3c40; }"
+        "QToolBar#MainToolBar QToolButton:enabled:pressed { color:#ffffff; background-color:#0078d7; }"
+        "QToolBar#MainToolBar QToolButton:enabled:focus { border-color:#7ab8ef; }"
+        "QToolBar#MainToolBar QToolButton:disabled { color:#9a9a9a; background-color:#2d2d30; }"
+        "FindReplaceDialog QLineEdit { color:#d0d0d0; background-color:#1e1e1e; border:1px solid #66666a;"
+        " selection-color:#ffffff; selection-background-color:#0078d7; }"
+        "FindReplaceDialog QLineEdit:enabled:focus { border-color:#7ab8ef; }"
+        "FindReplaceDialog QLineEdit:disabled { color:#9a9a9a; background-color:#2d2d30; border-color:#55555a; }"
         "QToolTip { color:#d0d0d0; background-color:#3c3c40; border:1px solid #66666a; }")
         : QString());
 
@@ -812,32 +804,7 @@ void MainWindow::applyDarkMode(bool dark)
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
         if (!tab)
             continue;
-        auto *e = tab->editor();
-        if (m_highContrastMode) {
-            e->setPaper(pal.color(QPalette::Base));
-            e->setColor(pal.color(QPalette::Text));
-            e->setMarginsBackgroundColor(pal.color(QPalette::Window));
-            e->setMarginsForegroundColor(pal.color(QPalette::WindowText));
-            e->setCaretLineBackgroundColor(pal.color(QPalette::AlternateBase));
-            e->setSelectionBackgroundColor(pal.color(QPalette::Highlight));
-            e->setSelectionForegroundColor(pal.color(QPalette::HighlightedText));
-        } else if (dark) {
-            e->setPaper(QColor(30, 30, 30));
-            e->setColor(QColor(208, 208, 208));
-            e->setMarginsBackgroundColor(QColor(45, 45, 48));
-            e->setMarginsForegroundColor(QColor(150, 150, 150));
-            e->setCaretLineBackgroundColor(QColor(60, 60, 64));
-            e->setSelectionBackgroundColor(QColor(0, 120, 215));
-            e->setSelectionForegroundColor(QColor(255, 255, 255));
-        } else {
-            e->setPaper(QColor(255, 255, 255));
-            e->setColor(QColor(0, 0, 0));
-            e->setMarginsBackgroundColor(QColor(240, 240, 240));
-            e->setMarginsForegroundColor(QColor(120, 120, 120));
-            e->setCaretLineBackgroundColor(QColor(245, 245, 220));
-            e->setSelectionBackgroundColor(QColor(51, 153, 255));
-            e->setSelectionForegroundColor(QColor(255, 255, 255));
-        }
+        applyEditorSurfacePalette(tab->editor(), pal);
     }
 }
 
@@ -934,6 +901,8 @@ void MainWindow::syncCommandStates(EditorTab *tab)
         context.conversionAvailable = context.displayEncodingAvailable
             && !tab->isBinaryDocument();
         context.dualPresentation = hasDocument && tab->isL2Active();
+        DocumentTailActions::installAndPopulate(m_tailActions, this, *m_commandRegistry, tab, context,
+            [this] { return currentTab(); }, [this] { syncCommandStates(currentTab()); });
         m_commandRegistry->applyContext(context);
     }
     if (m_statusModified && accountsWorkspace) {
@@ -1090,23 +1059,44 @@ void MainWindow::showTabContextMenu(const QPoint &position)
     menu->popup(popupPosition);
 }
 
-void MainWindow::closeTabUnchecked(int index)
+void MainWindow::closeTabUnchecked(int index, bool checkSave)
 {
-    if (!m_tabs || index < 0 || index >= m_tabs->count())
+    if (!m_tabs || index < 0 || index >= m_tabs->count()
+        || m_windowCloseInProgress || m_closingTabs.contains(m_tabs->widget(index))
+        || WorkspaceRecoveryCoordinator::forWindow(this).isInFlight(m_tabs->widget(index)))
         return;
-    QWidget *widget = m_tabs->widget(index);
-    auto *tab = qobject_cast<EditorTab *>(widget);
+    const QPointer<MainWindow> owner(this);
+    const QPointer<QWidget> widget(m_tabs->widget(index));
+    QWidget *const closingIdentity = widget.data();
+    m_closingTabs.insert(closingIdentity);
+    const auto releaseClose = qScopeGuard([owner, closingIdentity] {
+        if (owner)
+            owner->m_closingTabs.remove(closingIdentity);
+    });
+    // Own the widget before Save can open a modal loop or cancel a task.
+    if (checkSave && !maybeSaveTab(index, /*closingApp=*/false))
+        return;
+    if (!owner || !widget || m_tabs->indexOf(widget) < 0)
+        return;
+    const QPointer<EditorTab> tab(qobject_cast<EditorTab *>(widget.data()));
     if (tab) {
         if (m_searchDock)
             m_searchDock->closeResultsFor(tab->documentState().id);
+        if (!owner || !tab)
+            return;
         if (tab->isSecureDocument() && m_securePersistence)
             closeSecureDocumentOnSecurityLane(tab->secureDocumentId());
         else
             m_session->discardRecovery(tab);
+        if (!owner || !tab)
+            return;
         tab->shutdownL2BeforeClose();
     }
-    m_tabs->removeTab(index);
-    delete widget;
+    if (!owner || !widget || m_tabs->indexOf(widget) < 0)
+        return;
+    WorkspaceRecoveryCoordinator::forWindow(this).noteAcceptedRemoval(widget);
+    m_tabs->removeTab(m_tabs->indexOf(widget));
+    delete widget.data();
 }
 
 void MainWindow::closeOtherTabs(int keepIndex)
@@ -1140,17 +1130,14 @@ void MainWindow::closeOtherTabs(int keepIndex)
 
 void MainWindow::onTabCloseRequested(int index)
 {
-    // closingApp=false: 单标签关闭模式
-    if (!maybeSaveTab(index, /*closingApp=*/false))
-        return;
-    closeTabUnchecked(index);
+    closeTabUnchecked(index, /*checkSave=*/true);
 }
 
 bool MainWindow::maybeSaveTab(int index, bool closingApp)
 {
     auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(index));
     if (!tab)
-        return true;
+        return !qobject_cast<RecoveryIssuePage *>(m_tabs->widget(index)) || closingApp;
 
     // 加密笔记采用 Note 风格自动保存；绝不进入明文 autosave，也不弹出
     // “另存为”对话框。保存失败时阻止关闭，避免静默丢失。
@@ -1228,13 +1215,14 @@ void MainWindow::onTabCursorPositionChanged(int line, int index)
         updateStatusBar();
         return;
     }
-    m_statusPos->setText(QStringLiteral("行: %1, 列: %2").arg(line + 1).arg(index + 1));
+    QString positionDescription;
+    m_statusPos->setText(documentPositionText(tab, line, index, &positionDescription));
+    m_statusPos->setAccessibleDescription(positionDescription);
 }
 
 void MainWindow::onTabTitleChanged(const QString &title)
 {
     Q_UNUSED(title);
-    // tab 文本在 lambda 中更新
 }
 
 void MainWindow::onTabEncodingChanged(TextEncoding encoding)
@@ -1284,8 +1272,11 @@ void MainWindow::onJumpToDocumentByteOffset(const QUuid &documentId,
     showDocumentWorkspace();
     m_tabs->setCurrentIndex(tabIndex);
     QPointer<EditorTab> target(tab);
-    QTimer::singleShot(0, tab, [target, byteOffset, length]() {
-        if (!target)
+    QTimer::singleShot(0, tab, [target, documentId, expectedRevision, byteOffset, length]() {
+        // Revalidate at delivery: edits or document replacement can occur
+        // after the request passed the early check and before this queued turn.
+        if (!target || target->documentState().id != documentId
+            || target->contentRevision() != expectedRevision)
             return;
         target->gotoByteOffset(byteOffset, length);
         target->setFocusEditor();
@@ -1330,19 +1321,17 @@ void MainWindow::updateStatusBar()
             m_hexEditModeButton->setToolTip(overwrite
                 ? QStringLiteral("覆盖模式：输入替换现有字节。单击或按 Insert 切换为插入模式")
                 : QStringLiteral("插入模式：输入新增字节。单击或按 Insert 切换为覆盖模式"));
+            m_hexEditModeButton->setAccessibleDescription(
+                m_hexEditModeButton->toolTip());
         }
     }
     if (m_hexInsertModeAction) {
         m_hexInsertModeAction->setEnabled(hexMode && tab->canModifyCommand());
         m_hexInsertModeAction->setChecked(hexMode && !tab->hexOverwriteMode());
     }
-    if (hexMode) {
-        const qint64 offset = qMax<qint64>(0, tab->currentByteOffset());
-        m_statusPos->setText(QStringLiteral("偏移: 0x%1")
-            .arg(QString::number(offset, 16).rightJustified(8, QLatin1Char('0')).toUpper()));
-    } else {
-        m_statusPos->setText(QStringLiteral("行: %1, 列: %2").arg(line + 1).arg(index + 1));
-    }
+    QString positionDescription;
+    m_statusPos->setText(documentPositionText(tab, line, index, &positionDescription));
+    m_statusPos->setAccessibleDescription(positionDescription);
     const QString origin = tab->encodingHasDecodeErrors()
         ? QStringLiteral(" · 包含非法字节")
         : tab->encodingOrigin() == EncodingOrigin::Fallback
@@ -1374,52 +1363,13 @@ void MainWindow::updateStatusBar()
     else if (s >= 0 && s < syntaxNames.size())
         m_statusSyntax->setText(syntaxNames[s]);
 
-    // Display the live payload size. EditorTab routes this to the active data
-    // provider, so an mmap S2/S3 preview never reports the unopened legacy
-    // VirtualFileView as 0 B and a secure note never reports its KDBX size.
-    const qint64 size = tab->contentSizeBytes();
-    QString sizeStr;
-    if (size < 1024)
-        sizeStr = QStringLiteral("%1 B").arg(size);
-    else if (size < 1024 * 1024)
-        sizeStr = QStringLiteral("%1 KB").arg(size / 1024.0, 0, 'f', 1);
-    else if (size < 1024LL * 1024 * 1024)
-        sizeStr = QStringLiteral("%1 MB").arg(size / (1024.0 * 1024), 0, 'f', 2);
-    else
-        sizeStr = QStringLiteral("%1 GB").arg(size / (1024.0 * 1024 * 1024), 0, 'f', 2);
-
-    const QString documentType = tab->isBinaryDocument()
-        ? QStringLiteral("Binary") : QStringLiteral("Text");
-    const QString presentation = hexMode
-        ? QStringLiteral("Hex") : QStringLiteral("Text");
-    const bool readOnlyAnalysis = tab->isReadOnlyByPolicy()
-        || tab->largeDocumentRuntimeState()
-               == EditorTab::LargeDocumentRuntimeState::ReadOnlyAnalysis;
-    const QString capability = readOnlyAnalysis
-        ? QStringLiteral("只读分析") : QStringLiteral("可编辑");
-    m_statusSize->setText(QStringLiteral("%1 · %2 · %3 · %4")
-                              .arg(sizeStr, documentType, presentation, capability));
-    m_statusSize->setToolTip(
-        QStringLiteral("源文件实际字节大小 · 文档类型 · 呈现方式 · 当前能力"));
-
-    const qint64 characters = tab->contentCharacterCount();
-    if (hexMode) {
-        m_statusCharacters->setText(
-            QStringLiteral("字节数: %1").arg(QLocale().toString(characters)));
-        m_statusCharacters->setToolTip(QStringLiteral("十六进制文档的原始字节总数"));
-    } else if (tab->isBinaryDocument()) {
-        m_statusCharacters->setText(QStringLiteral("字符数: 不做全文统计"));
-        m_statusCharacters->setToolTip(
-            QStringLiteral("Binary Text 仅按当前窗口解码，避免低价值全文扫描"));
-    } else if (characters >= 0) {
-        m_statusCharacters->setText(
-            QStringLiteral("字符数: %1").arg(QLocale().toString(characters)));
-        m_statusCharacters->setToolTip(QStringLiteral("当前文本的 Unicode 字符总数"));
-    } else {
-        m_statusCharacters->setText(QStringLiteral("字符数: 统计中…"));
-        m_statusCharacters->setToolTip(
-            QStringLiteral("正在后台扫描窗口化只读文档，不阻塞浏览"));
-    }
+    const auto presentation = documentStatusPresentation(*tab);
+    m_statusSize->setText(presentation.sizeText);
+    m_statusSize->setToolTip(presentation.sizeDescription);
+    m_statusSize->setAccessibleDescription(presentation.sizeDescription);
+    m_statusCharacters->setText(presentation.characterText);
+    m_statusCharacters->setToolTip(presentation.characterDescription);
+    m_statusCharacters->setAccessibleDescription(presentation.characterDescription);
 
     m_statusModified->setText(tab->isModified() ? QStringLiteral("● 已修改") : QStringLiteral(""));
 }
@@ -1487,27 +1437,21 @@ void MainWindow::rebuildRecentFilesMenu()
 // ============ 拖放 ============
 
 // 判断 MIME 是否含至少一个可打开的本地文件
-static bool mimeHasLocalFiles(const QMimeData *mime)
-{
-    if (!mime || !mime->hasUrls()) return false;
-    for (const QUrl &u : mime->urls()) {
-        QString p = u.toLocalFile();
-        if (!p.isEmpty() && QFileInfo(p).isFile())
-            return true;
-    }
-    return false;
-}
-
 static QStringList filePathsFromMime(const QMimeData *mime)
 {
     QStringList res;
     if (!mime || !mime->hasUrls()) return res;
     for (const QUrl &u : mime->urls()) {
         QString p = u.toLocalFile();
-        if (!p.isEmpty() && QFileInfo(p).isFile())
+        if (u.isLocalFile() && !p.isEmpty())
             res << p;
     }
     return res;
+}
+
+static bool mimeHasLocalFiles(const QMimeData *mime)
+{
+    return !filePathsFromMime(mime).isEmpty();
 }
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
@@ -1519,9 +1463,7 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
     EditorTab *sourceTab = nullptr;
     for (int index = 0; m_tabs && index < m_tabs->count(); ++index) {
         auto *candidate = qobject_cast<EditorTab *>(m_tabs->widget(index));
-        if (candidate && candidate->editor()
-            && (watched == candidate->editor()
-                || watched == candidate->editor()->viewport())) {
+        if (candidate && candidate->ownsUserInputObject(watched)) {
             sourceTab = candidate;
             break;
         }

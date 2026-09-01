@@ -1,6 +1,7 @@
 #pragma once
 
 #include "PersistenceAdapter.h"
+#include "PersistenceReadPolicy.h"
 
 #include <QList>
 #include <functional>
@@ -15,10 +16,12 @@ public:
 
     bool registerAdapter(PersistenceAdapterDescriptor descriptor,
                          Factory factory);
-    bool registerRoute(PersistenceAdapterDescriptor descriptor, Route route);
+    bool registerRoute(PersistenceAdapterDescriptor descriptor, Route route,
+                       PersistenceReadProbe readProbe = {});
     bool registerAdapter(std::unique_ptr<IPersistenceAdapter> adapter);
     QList<PersistenceAdapterDescriptor> descriptors() const;
     std::optional<PersistenceAdapterDescriptor> resolve(const QString &path);
+    PersistenceReadPolicy readPolicySnapshot() const;
     PersistenceResult saveBest(IDocumentContentPort *content,
                                const PersistenceSaveRequest &request);
     PersistenceResult saveFor(DocumentPersistence persistence,
@@ -35,6 +38,7 @@ private:
         Route route;
         Factory factory;
         std::unique_ptr<IPersistenceAdapter> instance;
+        PersistenceReadProbe readProbe;
     };
     std::vector<Entry> entries_;
     int instantiatedCount_ = 0;

@@ -1,5 +1,6 @@
 #include "SearchResultsDock.h"
 #include "SearchResultsController.h"
+#include "SearchResultsFeedback.h"
 #include "SearchResultsDelegate.h"
 #include "SearchResultsViewPolicy.h"
 #include "SearchResultsAggregateModel.h"
@@ -7,15 +8,12 @@
 
 #include <QTreeView>
 #include <QVBoxLayout>
-#include <QLabel>
-#include <QPushButton>
 #include <QHeaderView>
 #include <QStackedWidget>
 #include <QPointer>
 #include <QMouseEvent>
 #include <QHoverEvent>
 #include <QUuid>
-#include <QSizePolicy>
 #include <limits>
 #include <utility>
 
@@ -39,20 +37,8 @@ SearchResultsDock::SearchResultsDock(SearchResultsController &controller,
     layout->setContentsMargins(2, 2, 2, 2);
     layout->setSpacing(2);
 
-    auto *summaryRow = new QHBoxLayout;
-    summaryRow->setContentsMargins(0, 0, 0, 0);
-    m_summary = new QLabel(container);
-    m_summary->setObjectName(QStringLiteral("searchResultsSummary"));
-    m_summary->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    m_summary->setMinimumWidth(0);
-    m_summary->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    m_rerunButton = new QPushButton(QStringLiteral("重新搜索"), container);
-    m_rerunButton->setObjectName(QStringLiteral("searchResultsRerunButton"));
-    m_rerunButton->setToolTip(QStringLiteral("使用当前查找条件重新生成有效结果"));
-    m_rerunButton->hide();
-    summaryRow->addWidget(m_summary, 1);
-    summaryRow->addWidget(m_rerunButton);
-    layout->addLayout(summaryRow);
+    m_feedback = new SearchResultsFeedback(container);
+    layout->addWidget(m_feedback);
 
     // All providers share one virtual QTreeView.
     m_stack = new QStackedWidget(container);
@@ -68,8 +54,9 @@ SearchResultsDock::SearchResultsDock(SearchResultsController &controller,
     m_stack->setCurrentIndex(0);
     connect(m_treeView, &QTreeView::doubleClicked,
             this, &SearchResultsDock::onModelDoubleClicked);
-    connect(m_rerunButton, &QPushButton::clicked, this, [this]() {
-        const SearchResultTarget &target = m_controller->rerunTarget();
+    connect(m_feedback, &SearchResultsFeedback::rerunRequested, this, [this]() {
+        // Keep a value snapshot: an earlier receiver may clear the controller.
+        const SearchResultTarget target = m_controller->rerunTarget();
         emit rerunRequested(target.documentId, target.expectedRevision);
     });
 
@@ -79,19 +66,24 @@ SearchResultsDock::SearchResultsDock(SearchResultsController &controller,
 }
 SearchResultsDock::~SearchResultsDock() = default;
 
+void SearchResultsDock::updateTechnicalDetails()
+{
+    m_feedback->setTechnicalDetails(searchResultDiagnostics(
+        m_model, m_controller->isMultiFile() ? m_multiModel : nullptr));
+}
+
 void SearchResultsDock::setRerunAvailable(bool available,
                                           const SearchResultTarget &preferredTarget)
 {
     m_controller->setRerunTarget(available ? preferredTarget
                                            : SearchResultTarget{});
-    if (m_rerunButton)
-        m_rerunButton->setVisible(available);
+    m_feedback->setRerunAvailable(available);
 }
 
 void SearchResultsDock::updateSummary(const QString &pattern, const QString &fileName,
                                       qint64 totalMatches)
 {
-    m_summary->setText(QStringLiteral("%1 · “%2” · %3 处")
+    m_feedback->setSummaryText(QStringLiteral("%1 · “%2” · %3 处")
                            .arg(fileName, pattern).arg(totalMatches));
 }
 
@@ -129,8 +121,8 @@ void SearchResultsDock::clearResults()
         delete oldSingleModel;
     delete m_multiModel;
     m_multiModel = nullptr;
-    if (m_summary)
-        m_summary->clear();
+    m_feedback->setSummaryText({});
+    m_feedback->resetTechnicalDetails();
     hide();
 }
 
@@ -140,6 +132,7 @@ void SearchResultsDock::setResultsModel(SearchResultsModel *model,
                                         const SearchResultTarget &target)
 {
     setRerunAvailable(false);
+    m_feedback->resetTechnicalDetails();
     m_controller->beginSingle(target);
     m_singlePreviewMatches.clear();
     SearchResultsModel *oldModel = m_model;
@@ -153,19 +146,20 @@ void SearchResultsDock::setResultsModel(SearchResultsModel *model,
         qint64 total = model->totalMatches();
         qint64 lines = model->groupedCount();
         const QString groupUnit = model->bytePositionMode()
-            ? QStringLiteral("个字节窗口") : QStringLiteral("行");
-        m_summary->setText(QStringLiteral("%1 · “%2” · %3 处 / %4 %5")
+            ? QStringLiteral("个预览片段") : QStringLiteral("行");
+        m_feedback->setSummaryText(QStringLiteral("%1 · “%2” · %3 处 / %4 %5")
                                .arg(fileName, pattern).arg(total)
                                .arg(lines).arg(groupUnit));
         if (model->isIncomplete()) {
-            m_summary->setText(
+            m_feedback->setSummaryText(
                 QStringLiteral("%1 · “%2” · 至少 %3 处（%4）")
                     .arg(fileName, pattern).arg(total)
-                    .arg(model->incompleteReason()));
+                    .arg(model->incompleteUserReason()));
         }
     } else {
         updateSummary(pattern, fileName, 0);
     }
+    updateTechnicalDetails();
 }
 
 void SearchResultsDock::beginSingleFileResults(const QString &pattern,
@@ -178,7 +172,7 @@ void SearchResultsDock::beginSingleFileResults(const QString &pattern,
     preview->setBytePositionMode(bytePositionMode);
     preview->setTextEncoding(encoding);
     setResultsModel(preview, pattern, fileName, target);
-    m_summary->setText(QStringLiteral("%1 · 正在搜索 “%2”…")
+    m_feedback->setSummaryText(QStringLiteral("%1 · 正在搜索 “%2”…")
                            .arg(fileName, pattern));
     show();
     raise();
@@ -203,7 +197,7 @@ void SearchResultsDock::appendSingleFilePreview(
     const int take = qMin(remaining, batch.size());
     for (int i = 0; i < take; ++i) m_singlePreviewMatches.append(batch.at(i));
     m_model->setResults(m_singlePreviewMatches, {}, 0);
-    m_summary->setText(QStringLiteral("%1 · 已发现至少 %2 处…")
+    m_feedback->setSummaryText(QStringLiteral("%1 · 已发现至少 %2 处…")
                            .arg(target.displayName).arg(m_singlePreviewMatches.size()));
 }
 
@@ -238,8 +232,8 @@ void SearchResultsDock::invalidateResultsFor(const QUuid &documentId)
             m_controller->markStale();
         }
         m_controller->invalidateRevision(targetId);
-        m_summary->setText(
-            QStringLiteral("在全部打开文件中搜索 “%1”：已找到至少 %2 处；%3 个文件不完整，%4 个已失效")
+        m_feedback->setSummaryText(
+            QStringLiteral("在全部打开文件中搜索 “%1”：已找到至少 %2 处；%3 个文件不完整，%4 个已失效；请重新查找。")
                 .arg(m_controller->pattern()).arg(m_controller->matchCount())
                 .arg(m_controller->incompleteCount()).arg(m_controller->staleCount()));
         setRerunAvailable(true);
@@ -248,13 +242,15 @@ void SearchResultsDock::invalidateResultsFor(const QUuid &documentId)
     }
 
     SearchResultsModel *oldModel = m_model;
+    const qint64 previousMatches = oldModel ? oldModel->totalMatches() : 0;
     m_model = nullptr;
     SearchResultsViewPolicy::bindModel(m_treeView, nullptr, false);
     if (oldModel && oldModel->QObject::parent() == this)
         delete oldModel;
     const SearchResultTarget invalidated = m_controller->singleTarget();
     m_controller->clear();
-    m_summary->setText(QStringLiteral("文档内容已修改，搜索结果已失效；请重新搜索。"));
+    m_feedback->setSummaryText(QStringLiteral("文档内容已修改，原有 %1 处搜索结果已失效；请重新搜索。")
+                       .arg(previousMatches));
     setRerunAvailable(true, invalidated);
     show();
 }
@@ -268,25 +264,28 @@ void SearchResultsDock::closeResultsFor(const QUuid &documentId)
         return;
     }
     SearchResultsModel *oldModel = m_model;
+    const qint64 previousMatches = oldModel ? oldModel->totalMatches() : 0;
     m_model = nullptr;
     SearchResultsViewPolicy::bindModel(m_treeView, nullptr, false);
     if (oldModel && oldModel->QObject::parent() == this)
         oldModel->deleteLater();
     m_controller->clear();
-    m_summary->setText(QStringLiteral("源文档已关闭，搜索结果已失效。"));
+    m_feedback->setSummaryText(QStringLiteral("源文档已关闭，原有 %1 处搜索结果已失效；请重新打开文件后查找。")
+                       .arg(previousMatches));
     setRerunAvailable(false);
 }
 
 void SearchResultsDock::beginMultiFileResults(const QString &pattern, int targetCount)
 {
     setRerunAvailable(false);
+    m_feedback->resetTechnicalDetails();
     m_controller->beginMulti(pattern);
     m_stack->setCurrentIndex(0);
     SearchResultsViewPolicy::bindModel(m_treeView, nullptr, false);
     delete m_multiModel;
     m_multiModel = new MultiSearchResultsModel(this);
     SearchResultsViewPolicy::bindModel(m_treeView, m_multiModel, true);
-    m_summary->setText(QStringLiteral("正在全部 %1 个打开文件中搜索 “%2”…")
+    m_feedback->setSummaryText(QStringLiteral("正在全部 %1 个打开文件中搜索 “%2”…")
                            .arg(targetCount).arg(pattern));
     show();
     raise();
@@ -314,7 +313,7 @@ void SearchResultsDock::appendMultiFilePreview(
     const QString targetId = m_controller->ensureMultiTarget(target);
     if (m_multiModel->appendPreview(targetId, batch, encoding,
                                     bytePositionMode)) {
-        m_summary->setText(QStringLiteral("正在全部打开文件中搜索 “%1”…")
+        m_feedback->setSummaryText(QStringLiteral("正在全部打开文件中搜索 “%1”…")
                                .arg(m_controller->pattern()));
     }
 }
@@ -333,8 +332,9 @@ void SearchResultsDock::appendMultiFileResults(const SearchResultTarget &target,
     if (incomplete)
         m_controller->markIncomplete();
     m_controller->addMatches(matches.size());
-    m_summary->setText(m_controller->incompleteCount() > 0
-        ? QStringLiteral("在全部打开文件中搜索 “%1”：已找到至少 %2 处；%3 个文件结果不完整")
+    updateTechnicalDetails();
+    m_feedback->setSummaryText(m_controller->incompleteCount() > 0
+        ? QStringLiteral("在全部打开文件中搜索 “%1”：已找到至少 %2 处；%3 个文件结果不完整；可查看技术详情后重试。")
               .arg(m_controller->pattern()).arg(m_controller->matchCount()).arg(m_controller->incompleteCount())
         : QStringLiteral("在全部打开文件中搜索 “%1”：已找到 %2 处")
               .arg(m_controller->pattern()).arg(m_controller->matchCount()));
@@ -360,8 +360,9 @@ void SearchResultsDock::appendMultiFileResults(const SearchResultTarget &target,
     if (model->isIncomplete())
         m_controller->markIncomplete();
     m_controller->addMatches(model->totalMatches());
-    m_summary->setText(m_controller->incompleteCount() > 0
-        ? QStringLiteral("在全部打开文件中搜索 “%1”：已找到至少 %2 处；%3 个文件结果不完整")
+    updateTechnicalDetails();
+    m_feedback->setSummaryText(m_controller->incompleteCount() > 0
+        ? QStringLiteral("在全部打开文件中搜索 “%1”：已找到至少 %2 处；%3 个文件结果不完整；可查看技术详情后重试。")
               .arg(m_controller->pattern()).arg(m_controller->matchCount()).arg(m_controller->incompleteCount())
         : QStringLiteral("在全部打开文件中搜索 “%1”：已找到 %2 处")
               .arg(m_controller->pattern()).arg(m_controller->matchCount()));
@@ -372,18 +373,18 @@ void SearchResultsDock::finishMultiFileResults(bool cancelled)
     if (!m_controller->isMultiFile())
         return;
     if (cancelled) {
-        m_summary->setText(
-            QStringLiteral("已取消在全部打开文件中搜索 “%1”；已保留 %2 处完成结果")
+        m_feedback->setSummaryText(
+            QStringLiteral("已取消在全部打开文件中搜索 “%1”；已保留 %2 处完成结果，可重新查找。")
                 .arg(m_controller->pattern()).arg(m_controller->matchCount()));
         return;
     }
     if (m_controller->staleCount() > 0 || m_controller->incompleteCount() > 0) {
-        m_summary->setText(
-            QStringLiteral("在全部打开文件中搜索 “%1”：找到至少 %2 处；%3 个文件不完整，%4 个已失效")
+        m_feedback->setSummaryText(
+            QStringLiteral("在全部打开文件中搜索 “%1”：找到至少 %2 处；%3 个文件不完整，%4 个已失效；可查看技术详情后重新查找。")
                 .arg(m_controller->pattern()).arg(m_controller->matchCount())
                 .arg(m_controller->incompleteCount()).arg(m_controller->staleCount()));
     } else {
-        m_summary->setText(QStringLiteral("在全部打开文件中搜索 “%1”：找到 %2 处匹配")
+        m_feedback->setSummaryText(QStringLiteral("在全部打开文件中搜索 “%1”：找到 %2 处匹配")
                                .arg(m_controller->pattern()).arg(m_controller->matchCount()));
     }
 }

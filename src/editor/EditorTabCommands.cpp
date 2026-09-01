@@ -8,7 +8,7 @@
 #include "SearchResultsModel.h"
 #include "Pcre2Regex.h"
 #include "EditableTextSearch.h"
-#include "AsyncTaskManager.h"
+#include "EditableTextFindAllTask.h"
 #include "DraftStore.h"
 
 #include <QVBoxLayout>
@@ -24,7 +24,6 @@
 #include <QStringConverter>
 #include <QStringDecoder>
 #include <QMimeType>
-#include <QProgressDialog>
 #include <QCoreApplication>
 #include <QEventLoop>
 #include <QTimer>
@@ -388,6 +387,12 @@ QVector<SearchMatch> EditorTab::findAll(const QString &pattern, bool regex,
 
     const QByteArray subject = m_editor->text().toUtf8();
     const auto recordMatch = [&](qint64 byteOffset, qint64 byteLength) {
+            // Retain at most 200000 rows. Only the next actual hit establishes
+            // that this is a prefix rather than a complete exact-capacity set.
+            if (matches.size() == 200000) {
+                m_lastFindAllTruncated = true;
+                return false;
+            }
             const int lineNum = int(m_editor->SendScintilla(
                 QsciScintillaBase::SCI_LINEFROMPOSITION, long(byteOffset)));
             const qint64 lineByteStart = m_editor->SendScintilla(
@@ -408,10 +413,6 @@ QVector<SearchMatch> EditorTab::findAll(const QString &pattern, bool regex,
             match.byteLength = qint32(byteLength);
             m_l1SearchCache.append({byteOffset, qint32(byteLength)});
             matches.append(std::move(match));
-            if (matches.size() >= 200000) {
-                m_lastFindAllTruncated = true;
-                return false;
-            }
             return true;
         };
     if (regex) {
@@ -441,17 +442,14 @@ QVector<SearchMatch> EditorTab::findAll(const QString &pattern, bool regex,
     } else {
         const QVector<EditableTextHit> literalHits = findEditableTextLiteralHits(
             subject, pattern, caseSensitive, wholeWord, {}, {}, false, false,
-            -1, 200000);
+            -1, 200001);
         for (const EditableTextHit &hit : literalHits) {
             if (!recordMatch(hit.byteOffset, hit.byteLength))
                 break;
         }
     }
     if (m_lastFindAllTruncated) {
-        m_lastFindAllTruncated = false;
-        m_lastSearchError = QObject::tr(
-            "匹配结果超过 200,000 处，当前文档无法在可用内存内完整保存结果。");
-        matches.clear();
+        // A readable prefix is not a complete directional-navigation cache.
         m_l1SearchCache.clear();
         return matches;
     }
@@ -469,179 +467,74 @@ bool EditorTab::findAllL1Async(
     QObject *callbackContext,
     std::function<void(QVector<SearchMatch>, bool, QString)> callback)
 {
-    m_lastSearchError.clear();
     if (isL2Mode() || pattern.isEmpty() || m_l1FindAllTaskId > 0)
         return false;
+    m_lastSearchError.clear();
 
     const quint64 revision = m_documentSession.state().revision;
     const bool wipeSnapshot = isSecureDocument();
     QByteArray subject = m_editor->text().toUtf8();
-    const qint64 snapshotSize = subject.size();
     const QString displayName = fileName().isEmpty()
         ? QObject::tr("未命名文档") : fileName();
     QPointer<EditorTab> that(this);
     QPointer<QObject> callbackGuard(callbackContext ? callbackContext : this);
 
-    m_l1FindAllTaskId = AsyncTaskManager::instance().submit(
-        AsyncTaskType::LargeFileSearch, AsyncTaskPriority::High,
-        QObject::tr("查找全部: %1").arg(displayName),
-        QObject::tr("扫描当前文档"),
-        [that, callbackGuard, subject = std::move(subject), pattern, regex,
-         caseSensitive, wholeWord, revision, wipeSnapshot,
-         callback = std::move(callback)](
-            qint64 taskId, AsyncCancelPtr cancel,
-            std::function<void(qint64, qint64)> reportProgress,
-            std::function<void(const AsyncErrorInfo &)> reportError) mutable {
-            const auto wipe = qScopeGuard([&] {
-                if (wipeSnapshot && !subject.isEmpty())
-                    subject.fill(0);
-            });
-            QVector<SearchMatch> matches;
-            QVector<L1SearchHit> hits;
-            matches.reserve(256);
-            hits.reserve(256);
-            bool truncated = false;
-            QString error;
-            const auto cancelled = [&] {
-                return cancel && cancel->load(std::memory_order_acquire);
+    const qint64 submittedId = startEditableTextFindAllTask(
+        std::move(subject), pattern, regex, caseSensitive, wholeWord, displayName,
+        wipeSnapshot, this, callbackGuard.data(),
+        [that, callbackGuard, revision, pattern, regex, caseSensitive, wholeWord,
+         callback = std::move(callback)](qint64 taskId, EditableTextFindAllResult result) mutable {
+            const auto notify = [&](QVector<SearchMatch> matches, bool truncated, QString error) {
+                if (callbackGuard && callback)
+                    callback(std::move(matches), truncated, std::move(error));
             };
-            AsyncTaskManager::instance().updateTaskPhase(
-                taskId, regex ? QObject::tr("执行正则匹配")
-                              : QObject::tr("扫描字面值"),
-                1, 1, 0, subject.size());
-            bool ok = true;
-            int lineNumber = 0;
-            qint64 lineStart = 0;
-            qint64 cachedContextStart = -1;
-            QString cachedContext;
-            const auto recordMatch = [&](qint64 byteOffset, qint64 byteLength) {
-                        if (byteLength < 0
-                            || byteLength > std::numeric_limits<qint32>::max()) {
-                            error = QObject::tr("单个匹配过长。");
-                            return false;
-                        }
-                        while (lineStart < byteOffset) {
-                            const qsizetype newline = subject.indexOf(
-                                '\n', qsizetype(lineStart));
-                            if (newline < 0 || newline >= byteOffset)
-                                break;
-                            lineStart = qint64(newline) + 1;
-                            ++lineNumber;
-                        }
-                        if (cachedContextStart != lineStart) {
-                            qsizetype lineEnd = subject.indexOf(
-                                '\n', qsizetype(lineStart));
-                            if (lineEnd < 0)
-                                lineEnd = subject.size();
-                            qint64 contextLength = qint64(lineEnd) - lineStart;
-                            if (contextLength > 0
-                                && subject.at(qsizetype(lineStart + contextLength - 1))
-                                       == '\r') {
-                                --contextLength;
-                            }
-                            cachedContext = QString::fromUtf8(
-                                subject.constData() + lineStart, contextLength);
-                            cachedContextStart = lineStart;
-                        }
-
-                        SearchMatch match;
-                        match.line = lineNumber;
-                        match.index = QString::fromUtf8(
-                            subject.constData() + lineStart,
-                            byteOffset - lineStart).size();
-                        match.length = QString::fromUtf8(
-                            subject.constData() + byteOffset, byteLength).size();
-                        match.text = QString::fromUtf8(
-                            subject.constData() + byteOffset, byteLength);
-                        match.context = cachedContext;
-                        match.byteOffset = byteOffset;
-                        match.byteLength = qint32(byteLength);
-                        hits.push_back({byteOffset, qint32(byteLength)});
-                        matches.push_back(std::move(match));
-                        if (matches.size() >= 200000) {
-                            error = QObject::tr(
-                                "匹配结果超过 200,000 处，当前文档无法在可用内存内完整保存结果。");
-                            return false;
-                        }
-                        return true;
-                    };
-            if (regex) {
-                Pcre2Regex compiled;
-                ok = compiled.compile(pattern, false, caseSensitive,
-                                      wholeWord, &error);
-                if (ok) {
-                const auto scanResult = compiled.scan(
-                    reinterpret_cast<const uchar *>(subject.constData()),
-                    subject.size(), cancelled,
-                    [reportProgress, total = qint64(subject.size())](qint64 done) {
-                        reportProgress(done, total);
-                    },
-                    recordMatch, &error);
-                ok = scanResult != Pcre2Regex::ScanResult::Failed
-                    && scanResult != Pcre2Regex::ScanResult::Cancelled
-                    && !cancelled() && error.isEmpty();
-                }
-            } else {
-                const QVector<EditableTextHit> literalHits = findEditableTextLiteralHits(
-                    subject, pattern, caseSensitive, wholeWord, cancelled,
-                    [reportProgress, total = qint64(subject.size())](qint64 done) {
-                        reportProgress(done, total);
-                    }, false, false, -1, 200000);
-                if (cancelled()) {
-                    ok = false;
-                } else {
-                    for (const EditableTextHit &hit : literalHits) {
-                        if (!recordMatch(hit.byteOffset, hit.byteLength)) {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (!ok && error.isEmpty() && cancelled())
-                error = QObject::tr("已取消。");
-            if (!ok && !error.isEmpty() && error != QObject::tr("已取消。")) {
-                AsyncErrorInfo taskError;
-                taskError.message = error;
-                reportError(taskError);
-            }
-            if (!callbackGuard || !callback)
+            if (!that) {
+                notify({}, false, QObject::tr("文档已关闭。"));
                 return;
-            QMetaObject::invokeMethod(
-                callbackGuard,
-                [that, taskId, revision, pattern, regex, caseSensitive,
-                 wholeWord, matches = std::move(matches), hits = std::move(hits),
-                 truncated, error = std::move(error), ok,
-                 callback = std::move(callback)]() mutable {
-                    if (!that) {
-                        callback({}, false, QObject::tr("文档已关闭。"));
-                        return;
-                    }
-                    if (that->m_l1FindAllTaskId == taskId)
-                        that->m_l1FindAllTaskId = 0;
-                    if (that->m_documentSession.state().revision != revision) {
-                        that->m_lastSearchError = QObject::tr(
-                            "文档已变更，请重新查找。");
-                        callback({}, false, that->m_lastSearchError);
-                        return;
-                    }
-                    that->m_lastSearchError = ok ? QString() : error;
-                    that->m_lastFindAllTruncated = truncated;
-                    if (ok) {
-                        that->m_l1SearchCache = std::move(hits);
-                        that->m_l1SearchCachePattern = pattern;
-                        that->m_l1SearchCacheRegex = regex;
-                        that->m_l1SearchCacheCaseSensitive = caseSensitive;
-                        that->m_l1SearchCacheWholeWord = wholeWord;
-                        that->m_l1SearchCacheRevision = revision;
-                        that->m_l1SearchCacheValid = true;
-                        that->m_lastL1MatchIndex = -1;
-                    }
-                    callback(ok ? std::move(matches) : QVector<SearchMatch>{},
-                             truncated, that->m_lastSearchError);
-                }, Qt::QueuedConnection);
-        }, 0, QLatin1String("SearchFindAll"), snapshotSize);
-    return m_l1FindAllTaskId > 0;
+            }
+            // A canceled request may still need UI settlement after its ID
+            // was cleared. A different active request owns the cache/error.
+            if (that->m_l1FindAllTaskId > 0 && that->m_l1FindAllTaskId != taskId) {
+                notify({}, false, QObject::tr("查找请求已失效，请重新查找。"));
+                return;
+            }
+            if (that->m_l1FindAllTaskId == 0) {
+                notify({}, false, QObject::tr("已取消。"));
+                return;
+            }
+            that->m_l1FindAllTaskId = 0;
+            if (that->m_documentSession.state().revision != revision) {
+                that->m_lastSearchError = QObject::tr("文档已变更，请重新查找。");
+                notify({}, false, that->m_lastSearchError);
+                return;
+            }
+            that->m_lastSearchError = result.ok ? QString() : result.error;
+            that->m_lastFindAllTruncated = result.truncated;
+            if (result.ok && result.truncated) {
+                that->m_l1SearchCache.clear();
+                that->m_l1SearchCacheValid = false;
+                that->m_lastL1MatchIndex = -1;
+            }
+            if (result.ok && !result.truncated) {
+                that->m_l1SearchCache = std::move(result.hits);
+                that->m_l1SearchCachePattern = pattern;
+                that->m_l1SearchCacheRegex = regex;
+                that->m_l1SearchCacheCaseSensitive = caseSensitive;
+                that->m_l1SearchCacheWholeWord = wholeWord;
+                that->m_l1SearchCacheRevision = revision;
+                that->m_l1SearchCacheValid = true;
+                that->m_lastL1MatchIndex = -1;
+            }
+            notify(result.ok ? std::move(result.matches) : QVector<SearchMatch>{},
+                   result.truncated, that->m_lastSearchError);
+        });
+    // taskAdded observers can close the document or submit a newer task before
+    // submit returns. Never dereference this or replace that newer task ID.
+    if (that && that->m_l1FindAllTaskId == 0)
+        that->m_l1FindAllTaskId = submittedId;
+    // Accepted work still owes a terminal notification if the owner closed
+    // during submit; returning false would make callers settle it twice.
+    return submittedId > 0;
 }
 
 void EditorTab::setSearchHighlights(const QVector<SearchMatch> &matches)

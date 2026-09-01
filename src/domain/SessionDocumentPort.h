@@ -4,6 +4,7 @@
 #include <QIODevice>
 #include <QString>
 #include <QUuid>
+#include <variant>
 
 struct SessionTab {
     static constexpr int MaximumPersistedSyntaxValue = 22;
@@ -20,6 +21,7 @@ struct SessionTab {
     bool secureDocument = false;
     QString documentId;
     QString presentation;
+    bool hexInsertMode = false;
     bool splitView = false;
     QString splitOrientation;
 };
@@ -65,3 +67,7 @@ public:
     virtual bool restoreSessionRecovery(const SessionRestoreRequest &request,
                                         QString *error) = 0;
 };
+
+// UI capture accepts a complete live document or an undelivered recovery record.
+// Retained records never require plaintext export or an invented live instance.
+using SessionCaptureEntry = std::variant<ISessionDocumentPort *, SessionTab>;

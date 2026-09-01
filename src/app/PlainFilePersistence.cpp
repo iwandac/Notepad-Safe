@@ -81,14 +81,30 @@ PersistenceResult PlainFilePersistence::save(
     };
     QSaveFile output(absolutePath);
     output.setDirectWriteFallback(false);
-    if (!output.open(QIODevice::WriteOnly)
-        || output.write(payload) != payload.size()) {
+    if (!output.open(QIODevice::WriteOnly)) {
         const QString error = output.errorString();
         output.cancelWriting();
         scrubPayload();
         return {PersistenceStatus::Error,
-                error.isEmpty()
-                    ? QStringLiteral("无法原子写入目标文件。") : error,
+                QStringLiteral(
+                    "无法创建原子保存候选文件 [plain.save.candidate.open]。"
+                    "原文件未更改。%1")
+                    .arg(error.isEmpty()
+                             ? QString()
+                             : QStringLiteral("\n%1").arg(error)),
+                {}};
+    }
+    if (output.write(payload) != payload.size()) {
+        const QString error = output.errorString();
+        output.cancelWriting();
+        scrubPayload();
+        return {PersistenceStatus::Error,
+                QStringLiteral(
+                    "无法完整写入原子保存候选文件 [plain.save.candidate.write]。"
+                    "原文件未更改。%1")
+                    .arg(error.isEmpty()
+                             ? QString()
+                             : QStringLiteral("\n%1").arg(error)),
                 {}};
     }
     scrubPayload();
@@ -108,8 +124,14 @@ PersistenceResult PlainFilePersistence::save(
         content->resumePersistenceBacking(originalPath, &restoreError);
         return {PersistenceStatus::Error,
                 restoreError.isEmpty()
-                    ? QStringLiteral("无法提交目标文件：%1").arg(commitError)
-                    : QStringLiteral("无法提交目标文件：%1；原文件重新打开失败：%2")
+                    ? QStringLiteral(
+                          "无法用完整候选文件原子替换原文件 "
+                          "[plain.save.commit]。原文件未更改。\n%1")
+                          .arg(commitError)
+                    : QStringLiteral(
+                          "无法用完整候选文件原子替换原文件 "
+                          "[plain.save.commit]。原文件未更改。\n%1；"
+                          "原文件重新打开失败：%2")
                           .arg(commitError, restoreError),
                 {}};
     }

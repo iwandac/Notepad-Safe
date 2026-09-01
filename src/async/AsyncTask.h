@@ -44,6 +44,9 @@ struct AsyncErrorInfo {
     QString sourceFile;              // __FILE__ 或任务内部来源
     int     sourceLine = 0;          // __LINE__
     QVector<QString> stackFrames;    // Windows CaptureStackBackTrace 导出的符号列表（可空）
+    // Explicit public explanation from a known producer. Never derive this by
+    // parsing message; the original diagnostic and error semantics stay intact.
+    QString userMessage;
 
     bool isNull() const { return message.isEmpty(); }
     QString toString() const;
@@ -54,6 +57,14 @@ struct AsyncErrorInfo {
  *        worker 周期检查 cancel.load(std::memory_order_acquire)。
  */
 using AsyncCancelPtr = QSharedPointer<std::atomic<bool>>;
+
+struct AsyncTaskUserText {
+    QString title;
+    QString status;
+    QString progress;
+    QString failure;
+    QString summary;
+};
 
 struct AsyncTask {
     qint64  id = 0;                  // 全局唯一 id（Manager 自增）
@@ -100,6 +111,8 @@ struct AsyncTask {
     QString stateText() const;
     QString priorityText() const;
     QString typeText() const;
+    // One presentation-only projection for painted rows, selection and a11y.
+    AsyncTaskUserText userText() const;
 };
 
 Q_DECLARE_METATYPE(AsyncTask)
