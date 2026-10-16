@@ -10,7 +10,9 @@ class Entry;
 // Production KDBX adapter. No KeePassXC type is exposed across this boundary.
 class KeePassXCVaultBackend final : public IVaultBackend {
 public:
-    KeePassXCVaultBackend();
+    // Disable only for private, disposable staging/recovery files. User files
+    // retain one verified pre-save version beside the original.
+    explicit KeePassXCVaultBackend(bool keepPreviousVersion = true);
     ~KeePassXCVaultBackend() override;
 
     VaultError create(const QString &filePath,
@@ -58,4 +60,5 @@ private:
 
     QSharedPointer<Database> database_;
     QString filePath_;
+    const bool keepPreviousVersion_;
 };

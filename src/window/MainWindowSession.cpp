@@ -43,14 +43,20 @@ std::unique_ptr<QSettings> createAppSettings()
 }
 } // namespace
 
-bool MainWindow::saveSessionNow(bool forceSnapshots)
+bool MainWindow::saveSessionNow(bool forceSnapshots, bool allowRecoveryChoice)
 {
     if (!forceSnapshots && AsyncSerialQueue::session().busy())
         return true; // Coalesce periodic autosaves; the next timer captures the latest revision.
 
+    bool preserveInvalidSession = false;
+    if (!WorkspaceRecoveryCoordinator::forWindow(this).prepareSessionSave(
+            forceSnapshots && allowRecoveryChoice, &preserveInvalidSession))
+        return false;
+    // Capture live ports only after the modal choice, which runs an event loop.
     int activeIndex = 0;
     const auto entries = WorkspaceRecoveryCoordinator::forWindow(this).captureEntries(&activeIndex);
-    auto plan = m_session->captureAsyncSaveEntries(entries, activeIndex, forceSnapshots);
+    auto plan = m_session->captureAsyncSaveEntries(entries, activeIndex, forceSnapshots,
+                                                  preserveInvalidSession);
     auto result = std::make_shared<std::shared_ptr<SessionManager::AsyncSaveResult>>();
 
     AsyncSerialQueue::Request request;
@@ -108,10 +114,9 @@ bool MainWindow::saveSessionNow(bool forceSnapshots)
             guarded->m_session->applyAsyncSave(*result, currentTabs);
             committed = state == AsyncTaskState::Finished
                         && guarded->m_session->asyncSaveSucceeded(*result);
-            if (state == AsyncTaskState::Failed) {
-                guarded->statusBar()->showMessage(
-                    QStringLiteral("恢复点提交失败；已有恢复文件仍被保留。"), 7000);
-            }
+            WorkspaceRecoveryCoordinator::forWindow(guarded).reportSessionSaveOutcome(
+                !committed, guarded->m_session->asyncSaveError(*result),
+                guarded->m_session->asyncSavePreservedPath(*result));
         }
         progress.close();
         loop.quit();
@@ -304,7 +309,7 @@ void MainWindow::closeEvent(QCloseEvent *event)
     // Step 2: establish the latest durable recovery responsibility before any
     // irreversible close preparation. A failed commit must leave Accounts and
     // the document workspace usable for a real retry.
-    if (!saveSessionNow(true)) {
+    if (!saveSessionNow(true, true)) {
         resumeTimers();
         event->ignore();
         return;

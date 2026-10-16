@@ -8,9 +8,15 @@
 
 std::unique_ptr<IVaultBackend> createProductionVaultBackend()
 {
+    return createProductionVaultBackend(true);
+}
+
+std::unique_ptr<IVaultBackend> createProductionVaultBackend(bool keepPreviousVersion)
+{
 #ifdef NOTEPADSAFE_HAS_KDBX_BACKEND
-    return std::make_unique<KeePassXCVaultBackend>();
+    return std::make_unique<KeePassXCVaultBackend>(keepPreviousVersion);
 #else
+    (void)keepPreviousVersion;
     return {};
 #endif
 }

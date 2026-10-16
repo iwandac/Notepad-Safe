@@ -7,10 +7,15 @@
 #include <QDebug>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QTemporaryDir>
 
 #include <cstring>
 #include <cstdio>
+
+#ifdef Q_OS_WIN
+#include <Windows.h>
+#endif
 
 namespace {
 
@@ -50,6 +55,259 @@ void verifyUnlock(const char *name, const char *masterPassword)
         service.listEntries(&listError);
         check(!listError.isError(), "unlocked fixture enumerates entries");
     }
+}
+
+QByteArray readBytes(const QString &path)
+{
+    QFile file(path);
+    check(file.open(QIODevice::ReadOnly), "retention fixture opens for byte comparison");
+    return file.isOpen() ? file.readAll() : QByteArray();
+}
+
+bool writeBytes(const QString &path, const QByteArray &bytes)
+{
+    QFile file(path);
+    const bool opened = file.open(QIODevice::WriteOnly | QIODevice::Truncate);
+    const bool written = opened && file.write(bytes) == bytes.size() && file.flush();
+    check(written, "retention fixture bytes are written");
+    return written;
+}
+
+QString previousBackupPath(const QString &path)
+{
+    return QDir(path + QStringLiteral(".backups")).filePath(
+        QFileInfo(path).completeBaseName() + QStringLiteral(".previous.kdbx"));
+}
+
+bool stageVersion(VaultService &service, const QUuid &entryId, const QString &title)
+{
+    VaultEntryData entry;
+    entry.id = entryId;
+    entry.title = title;
+    entry.notesUtf8 = password("retention-test-secret");
+    const VaultError result = service.upsertEntry(std::move(entry));
+    check(!result.isError(), "retention version is staged through the service");
+    return !result.isError();
+}
+
+void checkNoSaveCandidate(const QString &path)
+{
+    check(QFileInfo(path).dir().entryList({QStringLiteral(".notepadsafe-*.kdbx")},
+                                        QDir::Files | QDir::Hidden).isEmpty(),
+          "save candidates are removed after success or failure");
+}
+
+#ifdef Q_OS_WIN
+class ReadOnlyLease final {
+public:
+    explicit ReadOnlyLease(const QString &path)
+        : handle_(CreateFileW(reinterpret_cast<LPCWSTR>(path.utf16()), GENERIC_READ,
+                             FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL, nullptr)) {}
+    ~ReadOnlyLease() { release(); }
+    bool valid() const { return handle_ != INVALID_HANDLE_VALUE; }
+    void release()
+    {
+        if (valid())
+            CloseHandle(handle_);
+        handle_ = INVALID_HANDLE_VALUE;
+    }
+private:
+    Q_DISABLE_COPY(ReadOnlyLease)
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+};
+#endif
+
+void verifySingleBackupRetention(QTemporaryDir &temporaryDir)
+{
+    // Dots in the basename also exercise escaping in legacy-name matching.
+    const QString path = temporaryDir.filePath(QStringLiteral("retention.with.dots.kdbx"));
+    if (!QFile::copy(fixture("Format400.kdbx"), path)) {
+        check(false, "retention fixture is copied");
+        return;
+    }
+    VaultService service(std::make_unique<KeePassXCVaultBackend>());
+    auto master = password("t");
+    if (service.unlock(path, master).isError()) {
+        check(false, "retention fixture unlocks");
+        return;
+    }
+    const QUuid entryId = QUuid::createUuid();
+    const QDir backupDirectory(path + QStringLiteral(".backups"));
+    const QString backupPath = previousBackupPath(path);
+    const QString backupName = QFileInfo(backupPath).fileName();
+    for (int generation = 0; generation < 3; ++generation) {
+        const QByteArray beforeSave = readBytes(path);
+        if (!stageVersion(service, entryId, QStringLiteral("generation-%1").arg(generation)))
+            return;
+        const VaultError result = service.save();
+        check(!result.isError(), "three consecutive distinct versions save successfully");
+        if (result.isError())
+            return;
+        check(backupDirectory.entryList(QDir::Files) == QStringList{backupName},
+              "every successful save retains exactly one fixed-name backup");
+        check(readBytes(backupPath) == beforeSave,
+              "retained backup is byte-exactly the immediately preceding original");
+        check(readBytes(path) != beforeSave, "successful save replaces the original bytes");
+        VaultService previous(std::make_unique<KeePassXCVaultBackend>());
+        check(!previous.unlock(backupPath, master).isError(),
+              "each retained backup independently unlocks");
+        VaultError readError;
+        auto entry = previous.readEntry(entryId, &readError);
+        if (generation == 0) {
+            check(!entry, "first backup predates the inserted test entry");
+        } else {
+            check(entry && !readError.isError()
+                      && entry->title == QStringLiteral("generation-%1").arg(generation - 1),
+                  "independent backup contains the previous generation, not current data");
+        }
+        checkNoSaveCandidate(path);
+    }
+
+    QStringList legacyNames = {
+        QStringLiteral("retention.with.dots.20260101-120000-000.kdbx"),
+        QStringLiteral("retention.with.dots.20260101-120000-001.kdbx"),
+        QStringLiteral("retention.with.dots.20260102-120000-000.kdbx")};
+#ifdef Q_OS_WIN
+    legacyNames.append(QStringLiteral("Retention.With.Dots.20260102-120000-001.KDBX"));
+#endif
+    for (const QString &name : legacyNames)
+        check(QFile::copy(path, backupDirectory.filePath(name)), "legacy snapshot is seeded");
+    const QStringList unrelatedNames = {
+        QStringLiteral("manual.kdbx"),
+        QStringLiteral("other.20260101-120000-000.kdbx"),
+        QStringLiteral("retentionXwithXdots.20260101-120000-000.kdbx"),
+        QStringLiteral("retention.with.dots.20260101-120000-00.kdbx"),
+        QStringLiteral("retention.with.dots.20261301-120000-000.kdbx"),
+        QStringLiteral("retention.with.dots.20260101-120000-000.copy.kdbx"),
+        QStringLiteral("retention.with.dots.20260101-120000-000.txt")};
+    const QByteArray unrelatedBytes("unrelated-user-file\0unchanged", 29);
+    for (const QString &name : unrelatedNames)
+        writeBytes(backupDirectory.filePath(name), unrelatedBytes);
+    const QString directoryPath = backupDirectory.filePath(
+        QStringLiteral("retention.with.dots.20260103-120000-000.kdbx"));
+    check(QDir().mkpath(directoryPath), "matching-name directory is seeded");
+    const QString childPath = QDir(directoryPath).filePath(QStringLiteral("keep.txt"));
+    writeBytes(childPath, unrelatedBytes);
+
+    const QByteArray beforeMigration = readBytes(path);
+    if (!stageVersion(service, entryId, QStringLiteral("after-migration")))
+        return;
+    check(!service.save().isError(), "save migrates pre-existing timestamp snapshots");
+    check(readBytes(backupPath) == beforeMigration,
+          "migration retains the immediately preceding original");
+    for (const QString &name : legacyNames)
+        check(!QFileInfo::exists(backupDirectory.filePath(name)),
+              "strictly matching legacy snapshots are removed");
+    for (const QString &name : unrelatedNames)
+        check(readBytes(backupDirectory.filePath(name)) == unrelatedBytes,
+              "cleanup preserves unrelated and near-matching file bytes");
+    check(QFileInfo(directoryPath).isDir() && readBytes(childPath) == unrelatedBytes,
+          "cleanup never recursively deletes a matching-name directory");
+    check(backupDirectory.entryList(QDir::Files).size() == unrelatedNames.size() + 1,
+          "migration leaves one managed backup plus every unrelated file");
+
+#ifdef Q_OS_WIN
+    // Share-read leases permit integrity verification while blocking replacement
+    // or deletion. Each failure must remain retryable through the SAME service.
+    for (int fault = 0; fault < 3; ++fault) {
+        const QString legacyPath = backupDirectory.filePath(
+            QStringLiteral("retention.with.dots.20260104-120000-000.kdbx"));
+        if (fault == 1)
+            check(QFile::copy(path, legacyPath), "locked legacy snapshot is seeded");
+        const QString blockedPath = fault == 0 ? backupPath : fault == 1 ? legacyPath : path;
+        const QByteArray originalBefore = readBytes(path);
+        const QByteArray backupBefore = readBytes(backupPath);
+        if (!stageVersion(service, entryId, QStringLiteral("retry-%1").arg(fault)))
+            return;
+        ReadOnlyLease lease(blockedPath);
+        check(lease.valid(), "filesystem failure lease is acquired");
+        if (!lease.valid())
+            return;
+        const VaultError failed = service.save();
+        check(failed.code == VaultErrorCode::IoError,
+              "blocked backup write, legacy cleanup or original commit reports IO failure");
+        const QString expectedDiagnostic = fault == 0 ? QStringLiteral("vault.backup.write:")
+            : fault == 1 ? QStringLiteral("vault.backup.prune:")
+                         : QStringLiteral("vault.save.commit:");
+        check(failed.diagnosticCode.startsWith(expectedDiagnostic),
+              "filesystem lease reaches the intended failure boundary");
+        check(readBytes(path) == originalBefore,
+              "every injected pre-commit failure preserves the original bytes");
+        if (fault == 0) {
+            check(readBytes(backupPath) == backupBefore,
+                  "failed backup replacement preserves the existing backup bytes");
+        } else {
+            check(readBytes(backupPath) == originalBefore,
+                  "cleanup or commit failure may advance backup to the intact current original");
+        }
+        if (fault == 1)
+            check(readBytes(legacyPath) == originalBefore,
+                  "failed legacy cleanup preserves the locked snapshot");
+        checkNoSaveCandidate(path);
+        lease.release();
+        check(!service.save().isError(),
+              "same service retries successfully after each filesystem lease is released");
+        check(readBytes(backupPath) == originalBefore,
+              "successful retry retains the correct pre-save original");
+        check(readBytes(path) != originalBefore, "successful retry publishes staged data");
+        check(!QFileInfo::exists(legacyPath), "successful retry completes legacy cleanup");
+        check(backupDirectory.entryList(QDir::Files).size() == unrelatedNames.size() + 1,
+              "successful retry converges to one managed backup");
+        checkNoSaveCandidate(path);
+    }
+#endif
+}
+
+void verifyCorruptOriginalPreservesBackup(QTemporaryDir &temporaryDir)
+{
+    const QString path = temporaryDir.filePath(QStringLiteral("corrupt-original.kdbx"));
+    check(QFile::copy(fixture("Format400.kdbx"), path), "corruption fixture is copied");
+    const QString backupPath = previousBackupPath(path);
+    check(QDir().mkpath(QFileInfo(backupPath).absolutePath()), "corruption backup directory exists");
+    check(QFile::copy(path, backupPath), "corruption fixture has an existing backup");
+    const QByteArray backupBefore = readBytes(backupPath);
+    KeePassXCVaultBackend backend;
+    auto master = password("t");
+    // Bypass the service's external-file-change guard to exercise the backend's
+    // current-file verification after a successful unlock.
+    check(!backend.unlock(path, master, {}).isError(), "corruption fixture unlocks before damage");
+    const QByteArray damaged("damaged original database");
+    if (!writeBytes(path, damaged))
+        return;
+    const VaultError result = backend.save();
+    check(result.code == VaultErrorCode::CorruptDatabase,
+          "backend rejects an original corrupted after unlock");
+    check(result.diagnosticCode.startsWith(QStringLiteral("vault.save.current-verify:")),
+          "corruption reaches current-file verification rather than an unrelated failure");
+    check(readBytes(path) == damaged, "corrupt original is not overwritten");
+    check(readBytes(backupPath) == backupBefore,
+          "current-file verification fails before changing the existing backup");
+    checkNoSaveCandidate(path);
+}
+
+void verifyDisposableDatabaseDoesNotRetainCopies(QTemporaryDir &temporaryDir)
+{
+    const QString path = temporaryDir.filePath(QStringLiteral("disposable.kdbx"));
+    check(QFile::copy(fixture("Format400.kdbx"), path), "private staging fixture is copied");
+    VaultService service(std::make_unique<KeePassXCVaultBackend>(false));
+    auto master = password("t");
+    check(!service.unlock(path, master).isError(), "private staging fixture unlocks");
+    const QUuid entryId = QUuid::createUuid();
+    for (int generation = 0; generation < 2; ++generation) {
+        if (!stageVersion(service, entryId, QStringLiteral("private-%1").arg(generation)))
+            return;
+        check(!service.save().isError(), "private disposable database saves repeatedly");
+        check(!QFileInfo::exists(path + QStringLiteral(".backups")),
+              "private disposable saves never create a backup directory");
+        checkNoSaveCandidate(path);
+    }
+    service.lock();
+    check(!service.unlock(path, master).isError(), "private staging result independently reopens");
+    VaultError readError;
+    auto entry = service.readEntry(entryId, &readError);
+    check(entry && !readError.isError() && entry->title == QStringLiteral("private-1"),
+          "no-backup policy still persists the latest staging contents");
 }
 
 } // namespace
@@ -105,6 +363,8 @@ int main(int argc, char **argv)
         }
         check(!createResult.isError(), "new Argon2id/AES-256 KDBX database is created");
         check(QFile::exists(newlyCreated), "new KDBX file exists after atomic creation");
+        check(!QFileInfo::exists(newlyCreated + QStringLiteral(".backups")),
+              "first database creation has no previous version to retain");
         check(service.state() == VaultState::Open, "new KDBX remains open after creation");
     }
     {
@@ -240,8 +500,8 @@ int main(int argc, char **argv)
     const QDir backupDirectory(writableCopy + QStringLiteral(".backups"));
     const QStringList encryptedSnapshots = backupDirectory.entryList(
         {QStringLiteral("*.kdbx")}, QDir::Files, QDir::Name);
-    check(encryptedSnapshots.size() == 2,
-          "each save creates one encrypted pre-replacement snapshot");
+    check(encryptedSnapshots == QStringList{QStringLiteral("roundtrip.previous.kdbx")},
+          "repeated saves retain only the fixed-name previous encrypted version");
     if (!encryptedSnapshots.isEmpty()) {
         VaultService snapshotService(std::make_unique<KeePassXCVaultBackend>());
         auto master = password("t");
@@ -311,6 +571,10 @@ int main(int argc, char **argv)
         secrets.passwordUtf8.clear();
         secrets.totpSeedUtf8.clear();
     }
+
+    verifySingleBackupRetention(temporaryDir);
+    verifyCorruptOriginalPreservesBackup(temporaryDir);
+    verifyDisposableDatabaseDoesNotRetainCopies(temporaryDir);
 
     if (failures == 0)
         qInfo() << "KDBX backend: all checks passed";

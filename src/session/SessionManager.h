@@ -11,6 +11,8 @@
 
 // 完整会话
 struct SessionData {
+    enum class LoadStatus { Missing, Loaded, Invalid };
+    LoadStatus loadStatus = LoadStatus::Missing;
     int version = 2;
     QVector<SessionTab> tabs;
     int activeTab = 0;
@@ -43,11 +45,14 @@ public:
         bool forceSnapshots = false);
     std::shared_ptr<AsyncSavePlan> captureAsyncSaveEntries(
         const QVector<SessionCaptureEntry> &entries, int activeIndex,
-        bool forceSnapshots = false);
+        bool forceSnapshots = false, bool preserveInvalidSession = false);
     std::shared_ptr<AsyncSaveResult> writeAsyncSave(
         const std::shared_ptr<AsyncSavePlan> &plan) const;
     bool asyncSaveSucceeded(
         const std::shared_ptr<AsyncSaveResult> &result) const;
+    QString asyncSavePreservedPath(const std::shared_ptr<AsyncSaveResult> &result) const;
+    QString asyncSaveError(const std::shared_ptr<AsyncSaveResult> &result) const;
+    QString preservedRecoveryDir() const;
     void applyAsyncSave(const std::shared_ptr<AsyncSaveResult> &result,
                         const QVector<ISessionDocumentPort *> &tabs);
 
@@ -83,4 +88,5 @@ private:
 
     void ensureDirs();
     bool isManagedAutosavePath(const QString &path) const;
+    bool preserveSessionFiles(QString *preservedPath, QString *error) const;
 };

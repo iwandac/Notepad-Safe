@@ -13,6 +13,7 @@
 #include <QUuid>
 #include <QSet>
 #include <QBuffer>
+#include <QCryptographicHash>
 #include <limits>
 
 #ifdef Q_OS_WIN
@@ -93,6 +94,64 @@ QString SessionManager::sessionFilePath() const
 QString SessionManager::autosaveDir() const
 {
     return m_autosaveDir;
+}
+
+QString SessionManager::preservedRecoveryDir() const
+{
+    return m_dataDir + QStringLiteral("/recovery-preserved");
+}
+
+bool SessionManager::preserveSessionFiles(QString *preservedPath, QString *error) const
+{
+    // Copy, never move: any copy/verification/publication failure leaves the
+    // original manifest and bodies in place. Partial archives are also retained.
+    const QString archive = preservedRecoveryDir() + QLatin1Char('/')
+        + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const auto fail = [&] {
+        if (error)
+            *error = tr("旧会话资料未能完整保全，当前会话尚未提交。请检查磁盘空间和目录权限后重试。保全目录：%1")
+                         .arg(preservedRecoveryDir());
+        return false;
+    };
+    if (!QDir().mkpath(archive + QStringLiteral("/autosave")))
+        return fail();
+    const auto verifiedCopy = [](const QString &source, const QString &target) {
+        QFile input(source);
+        if (!input.copy(target))
+            return false;
+        QFile copied(target);
+        QCryptographicHash originalHash(QCryptographicHash::Sha256);
+        QCryptographicHash copiedHash(QCryptographicHash::Sha256);
+        return input.open(QIODevice::ReadOnly) && copied.open(QIODevice::ReadOnly)
+            && input.size() == copied.size()
+            && originalHash.addData(&input) && copiedHash.addData(&copied)
+            && originalHash.result() == copiedHash.result();
+    };
+    if (!verifiedCopy(sessionFilePath(), archive + QStringLiteral("/session.json")))
+        return fail();
+    QJsonArray mappings;
+    const auto drafts = QDir(m_autosaveDir).entryInfoList(
+        {"autosave_*.ndraft", "autosave_*.tmp", "tab_*.tmp"}, QDir::Files);
+    for (const auto &draft : drafts) {
+        const QString relative = QStringLiteral("autosave/") + draft.fileName();
+        if (draft.isSymLink() || !isManagedAutosavePath(draft.absoluteFilePath())
+            || !verifiedCopy(draft.absoluteFilePath(), archive + QLatin1Char('/') + relative))
+            return fail();
+        mappings.append(QJsonObject{{"originalPath", draft.absoluteFilePath()},
+                                    {"preservedPath", relative}});
+    }
+    // This marker is published only when every file was copied and verified.
+    // Preserve raw manifest bytes even for unknown versions; do not guess tab
+    // types, document identities or how to interpret unrecognized recovery data.
+    const QByteArray index = QJsonDocument(QJsonObject{
+        {"originalSessionPath", sessionFilePath()}, {"drafts", mappings}}).toJson();
+    QSaveFile marker(archive + QStringLiteral("/recovery-index.json"));
+    marker.setDirectWriteFallback(false);
+    if (!marker.open(QIODevice::WriteOnly) || marker.write(index) != index.size()
+        || !marker.commit())
+        return fail();
+    *preservedPath = archive;
+    return true;
 }
 
 QString SessionManager::generateAutosavePath() const
@@ -264,6 +323,7 @@ struct SessionManager::AsyncSavePlan {
     QString autosaveDir;
     QString sessionPath;
     bool valid = true;
+    bool preserveInvalidSession = false;
 };
 
 struct SessionManager::AsyncSaveResult {
@@ -278,6 +338,8 @@ struct SessionManager::AsyncSaveResult {
     QSet<QUuid> activeInstances;
     QDateTime capturedAtUtc;
     bool sessionWritten = false;
+    QString preservedPath;
+    QString error;
 };
 
 std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSave(
@@ -293,7 +355,7 @@ std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSave(
 
 std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSaveEntries(
     const QVector<SessionCaptureEntry> &entries, int activeIndex,
-    bool forceSnapshots)
+    bool forceSnapshots, bool preserveInvalidSession)
 {
     ensureDirs();
     auto plan = std::make_shared<AsyncSavePlan>();
@@ -301,6 +363,13 @@ std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSaveE
     plan->capturedAtUtc = QDateTime::currentDateTimeUtc();
     plan->autosaveDir = m_autosaveDir;
     plan->sessionPath = sessionFilePath();
+    plan->preserveInvalidSession = forceSnapshots && preserveInvalidSession;
+    // Periodic autosave never makes the decision to replace an invalid session.
+    if (loadSession().loadStatus == SessionData::LoadStatus::Invalid
+        && !plan->preserveInvalidSession) {
+        plan->valid = false;
+        return plan;
+    }
     constexpr qint64 largeSnapshotIntervalMs = 5LL * 60 * 1000;
 
     // Validate before exporting any live payload. Missing/corrupt managed drafts
@@ -350,7 +419,8 @@ std::shared_ptr<SessionManager::AsyncSavePlan> SessionManager::captureAsyncSaveE
         item.previousExists = !item.previousPath.isEmpty()
                               && QFileInfo::exists(item.previousPath);
         item.targetPath = item.previousPath;
-        if (!item.previousExists || !DraftStore::isEncryptedDraft(item.targetPath))
+        if (plan->preserveInvalidSession || !item.previousExists
+            || !DraftStore::isEncryptedDraft(item.targetPath))
             item.targetPath = generateAutosavePath();
         st.autosavePath = item.targetPath;
         item.existingSnapshot = QFileInfo::exists(item.targetPath);
@@ -392,10 +462,26 @@ std::shared_ptr<SessionManager::AsyncSaveResult> SessionManager::writeAsyncSave(
     auto result = std::make_shared<AsyncSaveResult>();
     if (!plan || !plan->valid)
         return result;
+    const auto scrubPlan = [&] {
+        for (auto &item : plan->items)
+            scrubSnapshot(item.payload);
+    };
+    if (plan->preserveInvalidSession && QFileInfo::exists(sessionFilePath())) {
+        // Preserve the current bytes even if someone repaired the manifest
+        // while the user's explicit choice was open.
+        if (!preserveSessionFiles(&result->preservedPath, &result->error)) {
+            scrubPlan();
+            return result;
+        }
+    } else if (loadSession().loadStatus == SessionData::LoadStatus::Invalid) {
+        scrubPlan();
+        return result;
+    }
     result->activeInstances = plan->activeInstances;
     result->capturedAtUtc = plan->capturedAtUtc;
     QSet<QString> toKeep;
     QJsonArray tabsArray;
+    bool snapshotsComplete = true;
 
     for (auto &item : plan->items) {
         AsyncSaveResult::ItemResult itemResult;
@@ -427,6 +513,7 @@ std::shared_ptr<SessionManager::AsyncSaveResult> SessionManager::writeAsyncSave(
                 }
             }
             scrubSnapshot(item.payload);
+            snapshotsComplete = snapshotsComplete && written;
             if (written) {
                 finalPath = item.targetPath;
                 itemResult.snapshotWritten = true;
@@ -470,6 +557,13 @@ std::shared_ptr<SessionManager::AsyncSaveResult> SessionManager::writeAsyncSave(
         tabsArray.append(obj);
     }
 
+    // Never publish a partial recovery point or collect old drafts when a
+    // required body failed. In particular, forced close must remain vetoed.
+    if (!snapshotsComplete
+        || (loadSession().loadStatus == SessionData::LoadStatus::Invalid
+            && result->preservedPath.isEmpty()))
+        return result;
+
     QJsonObject root;
     root["version"] = 2;
     root["tabs"] = tabsArray;
@@ -482,7 +576,7 @@ std::shared_ptr<SessionManager::AsyncSaveResult> SessionManager::writeAsyncSave(
     }
     // The old session must remain fully recoverable until the replacement
     // session file has committed atomically.
-    if (result->sessionWritten) {
+    if (result->sessionWritten && result->preservedPath.isEmpty()) {
         QDir dir(plan->autosaveDir);
         const auto oldFiles = dir.entryInfoList(
             {"autosave_*.ndraft", "autosave_*.tmp", "tab_*.tmp"}, QDir::Files);
@@ -498,6 +592,18 @@ bool SessionManager::asyncSaveSucceeded(
     const std::shared_ptr<AsyncSaveResult> &result) const
 {
     return result && result->sessionWritten;
+}
+
+QString SessionManager::asyncSavePreservedPath(
+    const std::shared_ptr<AsyncSaveResult> &result) const
+{
+    return result ? result->preservedPath : QString();
+}
+
+QString SessionManager::asyncSaveError(
+    const std::shared_ptr<AsyncSaveResult> &result) const
+{
+    return result ? result->error : QString();
 }
 
 void SessionManager::applyAsyncSave(
@@ -537,6 +643,9 @@ SessionData SessionManager::loadSession() const
 {
     SessionData data;
     QFile f(sessionFilePath());
+    if (!QFileInfo::exists(sessionFilePath()))
+        return data;
+    data.loadStatus = SessionData::LoadStatus::Invalid;
     if (!f.open(QIODevice::ReadOnly) || f.size() <= 0
         || f.size() > MaximumSessionFileBytes)
         return data;
@@ -548,10 +657,35 @@ SessionData SessionManager::loadSession() const
 
     QJsonObject root = doc.object();
     data.version = root["version"].toInt(1);
+    if (root.contains("version")
+        && (!root["version"].isDouble()
+            || root["version"].toDouble() != data.version))
+        return data;
     if (data.version < 1 || data.version > 2)
-        return SessionData{};
+        return data;
 
+    if (!root["tabs"].isArray())
+        return data;
     QJsonArray tabsArray = root["tabs"].toArray();
+    if (tabsArray.size() > MaximumSessionTabs)
+        return data;
+    for (const auto &entry : tabsArray) {
+        if (!entry.isObject())
+            return data;
+        const QJsonObject tab = entry.toObject();
+        for (const char *field : {"filePath", "autosavePath", "documentId"}) {
+            if (tab.contains(field) && !tab[field].isString())
+                return data;
+        }
+        for (const char *field : {"modified", "secureDocument"}) {
+            if (tab.contains(field) && !tab[field].isBool())
+                return data;
+        }
+        const QString draft = tab["autosavePath"].toString();
+        if (!tab["secureDocument"].toBool() && !draft.isEmpty()
+            && !isManagedAutosavePath(draft))
+            return data;
+    }
     const qsizetype tabCount = qMin<qsizetype>(tabsArray.size(), MaximumSessionTabs);
     data.tabs.reserve(tabCount);
     for (qsizetype i = 0; i < tabCount; ++i) {
@@ -591,11 +725,14 @@ SessionData SessionManager::loadSession() const
     }
     data.activeTab = data.tabs.isEmpty()
         ? 0 : qBound(0, root["activeTab"].toInt(0), data.tabs.size() - 1);
+    data.loadStatus = SessionData::LoadStatus::Loaded;
     return data;
 }
 
 void SessionManager::clearSession()
 {
+    if (loadSession().loadStatus == SessionData::LoadStatus::Invalid)
+        return;
     QFile::remove(sessionFilePath());
     QDir dir(m_autosaveDir);
     auto files = dir.entryList({"autosave_*.ndraft", "tab_*.tmp", "autosave_*.tmp"},
@@ -606,12 +743,21 @@ void SessionManager::clearSession()
 
 void SessionManager::cleanupOldAutosaves()
 {
+    const auto session = loadSession();
+    if (session.loadStatus == SessionData::LoadStatus::Invalid)
+        return;
+    QSet<QString> referenced;
+    for (const auto &tab : session.tabs) {
+        if (!tab.autosavePath.isEmpty())
+            referenced.insert(recoveryPathKey(tab.autosavePath));
+    }
     QDir dir(m_autosaveDir);
     auto files = dir.entryInfoList({"autosave_*.ndraft", "tab_*.tmp", "autosave_*.tmp"},
                                    QDir::Files);
     QDateTime threshold = QDateTime::currentDateTime().addDays(-7);
     for (const QFileInfo &fi : files) {
-        if (fi.lastModified() < threshold)
+        if (fi.lastModified() < threshold
+            && !referenced.contains(recoveryPathKey(fi.absoluteFilePath())))
             QFile::remove(fi.absoluteFilePath());
     }
 }

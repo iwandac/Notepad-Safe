@@ -312,7 +312,7 @@ private:
     bool isDocumentWorkspaceActive() const;
     void loadSettings();
     void saveSettings();
-    bool saveSessionNow(bool forceSnapshots = false);
+    bool saveSessionNow(bool forceSnapshots = false, bool allowRecoveryChoice = false);
     bool saveSecureTab(EditorTab *tab, bool allowInteractiveUnlock, bool showErrors = true);
     bool checkpointSecureTab(EditorTab *tab, QString *errorMessage = nullptr);
     static QString secureTitleFrom(EditorTab *tab);

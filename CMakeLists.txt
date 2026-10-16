@@ -663,6 +663,11 @@ target_include_directories(test_session_preservation PRIVATE
 target_link_libraries(test_session_preservation PRIVATE notepadsafe_app Qt6::Test)
 qt_import_plugins(test_session_preservation INCLUDE Qt6::QWindowsIntegrationPlugin)
 
+# Core-only fault injection: no QApplication, widgets, clipboard or desktop.
+add_executable(test_closeout_persistence tests/test_closeout_persistence.cpp)
+target_include_directories(test_closeout_persistence PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(test_closeout_persistence PRIVATE notepadsafe_app Qt6::Test)
+
 # 测试 4: 设置持久化 & 菜单 UI 勾选同步（纯逻辑，不创建 QWidget）
 # 防回归："开启自动换行后关闭再打开，菜单勾选状态不同步"
 add_executable(test_settings_ui
@@ -837,6 +842,7 @@ set(NOTEPADSAFE_NON_GUI_TEST_TARGETS
     test_largefile_encoded_search
     test_session
     test_session_preservation
+    test_closeout_persistence
     test_settings_ui
     test_filetierpolicy
     test_architecture_contracts
@@ -911,6 +917,9 @@ add_test(NAME pcre2_regex  COMMAND test_pcre2_regex)
 add_test(NAME largefile_encoded_search COMMAND test_largefile_encoded_search)
 add_test(NAME session      COMMAND test_session)
 add_test(NAME session_preservation COMMAND test_session_preservation)
+add_test(NAME closeout_persistence COMMAND test_closeout_persistence)
+set_tests_properties(closeout_persistence PROPERTIES
+    LABELS "quick;recovery;core-only" RUN_SERIAL TRUE TIMEOUT 60)
 set_tests_properties(session_preservation PROPERTIES
     LABELS "quick;recovery;NSP-RECOVERY" RUN_SERIAL TRUE TIMEOUT 30)
 add_test(NAME settings_ui  COMMAND test_settings_ui)
@@ -962,9 +971,12 @@ if(NOTEPADSAFE_ENABLE_KDBX_BACKEND)
         COMMAND test_security_identity --master-password-rotation)
     add_test(NAME security_recovery_verification
         COMMAND test_security_identity --recovery-verification)
+    add_test(NAME security_backup_retention
+        COMMAND test_security_identity --single-backup-lifecycle)
     set_tests_properties(
         security_identity_rotation
         security_recovery_verification
+        security_backup_retention
         PROPERTIES LABELS "vault;security" TIMEOUT 120
     )
 endif()

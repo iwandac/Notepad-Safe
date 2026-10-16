@@ -170,13 +170,10 @@ void test_untrusted_session_boundaries()
     CHECK(writeTestSessionFile(sm.sessionFilePath(), root), "写入越界会话 fixture");
 
     const SessionData bounded = sm.loadSession();
-    CHECK(bounded.tabs.size() == 256, "恢复标签数量被限制为 256");
-    CHECK(bounded.activeTab == 255, "活动标签索引被限制到已接受范围");
-    CHECK(!bounded.tabs.isEmpty() && bounded.tabs.first().syntax == int(Syntax::Asm)
-              && bounded.tabs.first().cursorLine == 0,
-          "损坏的枚举和负光标位置被收敛到有效值");
-    CHECK(!bounded.tabs.isEmpty() && bounded.tabs.first().autosavePath.isEmpty(),
-          "普通会话拒绝 autosave 目录外的恢复路径");
+    CHECK(bounded.tabs.isEmpty()
+              && bounded.loadStatus == SessionData::LoadStatus::Invalid,
+          "超限会话整体拒绝，不能截断后覆盖未接受的恢复记录");
+    CHECK(!sm.saveSession({}, 0, true), "无效清单阻止空会话覆盖");
 
     auto tab = std::make_unique<EditorTab>();
     CHECK(!sm.restoreAutosave(tab.get(), outsidePath),
@@ -184,6 +181,9 @@ void test_untrusted_session_boundaries()
     tab->editor()->setText(QStringLiteral("replacement"));
     tab->setModified(true);
     tab->setAutosavePath(outsidePath);
+    CHECK(!sm.saveSession({tab.get()}, 0, true), "无效清单仍保留待人工恢复");
+    root["tabs"] = QJsonArray{};
+    CHECK(writeTestSessionFile(sm.sessionFilePath(), root), "测试显式换成有效清单");
     CHECK(sm.saveSession({tab.get()}, 0, true), "无效旧路径不阻止建立新的受管恢复点");
     CHECK(QFileInfo::exists(outsidePath), "迁移清理不会删除 autosave 目录外的文件");
 

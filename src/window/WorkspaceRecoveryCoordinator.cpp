@@ -17,6 +17,8 @@
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTimer>
+#include <QMessageBox>
+#include <QPushButton>
 
 namespace {
 
@@ -48,6 +50,42 @@ WorkspaceRecoveryCoordinator &WorkspaceRecoveryCoordinator::forWindow(MainWindow
     return *window->m_workspaceRecovery;
 }
 
+bool WorkspaceRecoveryCoordinator::prepareSessionSave(bool allowPreservation,
+                                                       bool *preserveInvalidSession)
+{
+    *preserveInvalidSession = false;
+    // Only explicit close may ask. Expiry/lock and timer callbacks must never
+    // wait on a modal choice before concealing sensitive UI.
+    if (!allowPreservation
+        || window_->m_session->loadSession().loadStatus != SessionData::LoadStatus::Invalid)
+        return true;
+    QMessageBox choice(QMessageBox::Warning, QStringLiteral("保全上次会话"),
+        QStringLiteral("上次会话清单损坏、不可读或版本不支持。\n"
+                       "可以先保全原清单和旧恢复稿，再保存当前会话。保全或保存失败时不会继续关闭。\n"
+                       "旧会话不会自动恢复，保全副本留待修复，且不会被自动清理。\n保全目录：%1")
+            .arg(window_->m_session->preservedRecoveryDir()), QMessageBox::NoButton, window_);
+    choice.setObjectName(QStringLiteral("preserveInvalidSessionChoice"));
+    auto *preserve = choice.addButton(QStringLiteral("保全旧资料并保存当前会话"), QMessageBox::AcceptRole);
+    auto *cancel = choice.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+    choice.setDefaultButton(cancel);
+    choice.setEscapeButton(cancel);
+    choice.exec();
+    *preserveInvalidSession = choice.clickedButton() == preserve;
+    return *preserveInvalidSession;
+}
+
+void WorkspaceRecoveryCoordinator::reportSessionSaveOutcome(
+    bool failed, const QString &error, const QString &preservedPath)
+{
+    if (failed) {
+        window_->statusBar()->showMessage(
+            error.isEmpty() ? QStringLiteral("恢复点提交失败；已有恢复文件仍被保留。") : error, 0);
+    } else if (!preservedPath.isEmpty()) {
+        window_->statusBar()->showMessage(
+            QStringLiteral("当前会话已保存。旧会话资料保全于：%1").arg(preservedPath), 0);
+    }
+}
+
 void WorkspaceRecoveryCoordinator::ensureOriginalRecordsLoaded()
 {
     if (recordsLoaded_)
@@ -55,6 +93,10 @@ void WorkspaceRecoveryCoordinator::ensureOriginalRecordsLoaded()
     // Capture can precede scheduled restoration (including a first-paint close).
     // Only load the existing manifest; do not create surfaces or read draft bodies.
     const SessionData data = window_->m_session->loadSession();
+    if (data.loadStatus == SessionData::LoadStatus::Invalid) {
+        window_->statusBar()->showMessage(QStringLiteral(
+            "上次会话清单损坏、不可读或版本不支持；已暂停自动覆盖。关闭时可选择保全旧资料并保存当前会话。"), 0);
+    }
     for (const SessionTab &record : data.tabs)
         items_.append(Item{record, Phase::Pending, {}});
     activeTab_ = data.activeTab;

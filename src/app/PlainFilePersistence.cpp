@@ -118,6 +118,21 @@ PersistenceResult PlainFilePersistence::save(
                     ? QStringLiteral("无法释放文档的底层文件。") : backingError,
                 {}};
     }
+    // Snapshot export, encoding, candidate I/O and releasing mapped backing
+    // may take time or permit another writer. Check again after all of them.
+    // QSaveFile offers no filesystem compare-and-swap: a concurrent rename
+    // after this check remains a platform-level limitation.
+    if (request.requireExpectedVersion
+        && compareDiskFileVersion(absolutePath, request.expectedVersion)
+               != DiskFileState::Unchanged) {
+        output.cancelWriting();
+        QString restoreError;
+        content->resumePersistenceBacking(originalPath, &restoreError);
+        return {PersistenceStatus::Conflict,
+                QStringLiteral("磁盘文件在保存期间发生变化，已停止覆盖。")
+                    + (restoreError.isEmpty() ? QString()
+                       : QStringLiteral("\n重新打开原文件失败：%1").arg(restoreError)), {}};
+    }
     if (!output.commit()) {
         const QString commitError = output.errorString();
         QString restoreError;

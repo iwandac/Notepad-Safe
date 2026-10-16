@@ -2,9 +2,12 @@
 
 #include "SecurityIdentity.h"
 #include "DraftStore.h"
+#include "KdbxFormatProbe.h"
+#include "VaultBackupRetention.h"
 #include "VaultBackendFactory.h"
 #include "VaultService.h"
 
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -91,6 +94,19 @@ bool atomicCopy(const QString &sourcePath, const QString &destinationPath, QStri
         return false;
     }
     return true;
+}
+
+bool sameFileBytes(const QString &sourcePath, const QString &copyPath)
+{
+    QFile source(sourcePath);
+    QFile copy(copyPath);
+    if (!source.open(QIODevice::ReadOnly) || !copy.open(QIODevice::ReadOnly)
+        || source.size() != copy.size())
+        return false;
+    QCryptographicHash sourceHash(QCryptographicHash::Sha256);
+    QCryptographicHash copyHash(QCryptographicHash::Sha256);
+    return sourceHash.addData(&source) && copyHash.addData(&copy)
+        && source.size() == copy.size() && sourceHash.result() == copyHash.result();
 }
 
 } // namespace
@@ -759,7 +775,12 @@ VaultError SecureDocumentService::persist(Handle *handle,
         handle->sealedDatabaseCredential, &databaseCredential);
     if (error.isError())
         return error;
-    VaultService service(createProductionVaultBackend());
+    // A replacement candidate is discarded after publication; its backup would
+    // otherwise outlive the random .nsafe-new path on every Save As. Managed
+    // drafts already are the recovery copy, so they do not keep a second copy.
+    const bool keepPreviousVersion = !replacingOtherFile
+        && !isManagedDraftPath(writePath, handle->documentId);
+    VaultService service(createProductionVaultBackend(keepPreviousVersion));
     const bool create = !sameDestination;
     const bool createdFresh = create && !QFileInfo::exists(writePath);
     if (create) {
@@ -807,6 +828,31 @@ VaultError SecureDocumentService::persist(Handle *handle,
             return error;
         }
         QString copyError;
+        if (KdbxFormatProbe::inspectFile(destination).recognized) {
+            // Save As can replace a file using a different database credential.
+            // Retain its original ciphertext byte-for-byte instead of trying
+            // to unlock it with the replacement document's key. Plain targets
+            // must never enter a directory presented as encrypted backups.
+            QString backupPath;
+            error = VaultBackupRetention::prepare(destination, &backupPath);
+            if (!error.isError()
+                && !atomicCopy(destination, backupPath, &copyError)) {
+                error = documentError(VaultErrorCode::IoError,
+                    QStringLiteral("无法更新目标文件的上一份加密副本，原文件未被替换。"),
+                    QStringLiteral("secure-document.backup.write: ") + copyError);
+            }
+            if (!error.isError() && !sameFileBytes(destination, backupPath)) {
+                error = documentError(VaultErrorCode::IoError,
+                    QStringLiteral("目标文件的加密副本未通过完整性核对，原文件未被替换。"),
+                    QStringLiteral("secure-document.backup.verify"));
+            }
+            if (!error.isError())
+                error = VaultBackupRetention::prune(destination);
+            if (error.isError()) {
+                QFile::remove(writePath);
+                return error;
+            }
+        }
         if (!atomicCopy(writePath, destination, &copyError)) {
             QFile::remove(writePath);
             return documentError(VaultErrorCode::IoError,

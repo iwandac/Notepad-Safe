@@ -1,6 +1,7 @@
 #include "KeePassXCVaultBackend.h"
 
 #include "KdbxFormatProbe.h"
+#include "VaultBackupRetention.h"
 
 #include "core/Database.h"
 #include "core/Entry.h"
@@ -216,7 +217,10 @@ VaultError buildCompositeKey(const SecureBuffer &masterPasswordUtf8,
 
 } // namespace
 
-KeePassXCVaultBackend::KeePassXCVaultBackend() = default;
+KeePassXCVaultBackend::KeePassXCVaultBackend(bool keepPreviousVersion)
+    : keepPreviousVersion_(keepPreviousVersion)
+{
+}
 
 KeePassXCVaultBackend::~KeePassXCVaultBackend()
 {
@@ -1111,22 +1115,28 @@ VaultError KeePassXCVaultBackend::save()
                                 QStringLiteral("当前加密数据已损坏，拒绝覆盖；请先从备份恢复。"),
                                 QStringLiteral("vault.save.current-verify: ") + verificationError);
         }
-        const QString backupDirPath = filePath_ + QStringLiteral(".backups");
-        if (!QDir().mkpath(backupDirPath)) {
-            return backendError(VaultErrorCode::IoError,
-                                QStringLiteral("无法创建加密快照目录，原文件未被替换。"),
-                                QStringLiteral("vault.backup.directory"));
-        }
-        backupPath = QDir(backupDirPath).filePath(
-            target.completeBaseName() + QLatin1Char('.')
-            + QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd-HHmmss-zzz"))
-            + QStringLiteral(".kdbx"));
+    }
+    if (target.exists() && keepPreviousVersion_) {
+        const VaultError prepareError = VaultBackupRetention::prepare(filePath_, &backupPath);
+        if (prepareError.isError())
+            return prepareError;
         QString backupError;
         if (!atomicCopyFile(filePath_, backupPath, &backupError)) {
             return backendError(VaultErrorCode::IoError,
-                                QStringLiteral("无法创建保存前加密快照，原文件未被替换。"),
+                                QStringLiteral("无法更新保存前加密备份，原文件未被替换。"),
                                 QStringLiteral("vault.backup.write: ") + backupError);
         }
+        if (!verifyDatabaseFile(backupPath, verificationKey, &backupError)) {
+            return backendError(VaultErrorCode::CorruptDatabase,
+                                QStringLiteral("保存前加密备份未通过验证，原文件未被替换。"),
+                                QStringLiteral("vault.backup.verify: ") + backupError);
+        }
+        // Prune only after a verified replacement backup exists, but before
+        // committing the original. A cleanup error must not turn a committed
+        // save into a failure with an out-of-date VaultService disk version.
+        const VaultError pruneError = VaultBackupRetention::prune(filePath_);
+        if (pruneError.isError())
+            return pruneError;
     }
 
     QString commitError;
@@ -1140,7 +1150,9 @@ VaultError KeePassXCVaultBackend::save()
         if (!backupPath.isEmpty())
             atomicCopyFile(backupPath, filePath_, &restoreError);
         return backendError(VaultErrorCode::CorruptDatabase,
-                            QStringLiteral("保存后的加密数据未通过完整性验证，已尝试恢复上一快照。"),
+                            backupPath.isEmpty()
+                                ? QStringLiteral("保存后的加密数据未通过完整性验证。")
+                                : QStringLiteral("保存后的加密数据未通过完整性验证，已尝试恢复上一备份。"),
                             QStringLiteral("vault.save.final-verify: ") + verificationError
                                 + (restoreError.isEmpty() ? QString()
                                                          : QStringLiteral("; restore: ") + restoreError));

@@ -25,6 +25,9 @@ public:
     void cancelWindowClose();
     bool isInFlight(const QWidget *widget) const;
     void noteAcceptedRemoval(QWidget *widget);
+    bool prepareSessionSave(bool allowPreservation, bool *preserveInvalidSession);
+    void reportSessionSaveOutcome(bool failed, const QString &error,
+                                  const QString &preservedPath);
 
 private:
     enum class Phase { Pending, InFlight, Live, RetainedFailure, Closed };

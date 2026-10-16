@@ -5,7 +5,9 @@
 #include "VaultService.h"
 
 #include <QCoreApplication>
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTemporaryDir>
@@ -14,6 +16,10 @@
 
 #include <cstdio>
 #include <type_traits>
+
+#ifdef Q_OS_WIN
+#include <Windows.h>
+#endif
 
 namespace {
 
@@ -189,6 +195,181 @@ void testRecoveryVerification()
     recoveryKey.clear();
 }
 
+void testSingleBackupLifecycle()
+{
+    QTemporaryDir temporary;
+    check(temporary.isValid(), "single-backup temporary directory is available");
+    if (!temporary.isValid())
+        return;
+    const auto readFileBytes = [](const QString &path) {
+        QFile file(path);
+        check(file.open(QIODevice::ReadOnly),
+              "single-backup fixture opens for independent byte comparison");
+        return file.isOpen() ? file.readAll() : QByteArray();
+    };
+    const auto checkNoCandidate = [&temporary] {
+        check(QDir(temporary.path()).entryList(
+                  {QStringLiteral("*.nsafe-new.backups")},
+                  QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot).isEmpty(),
+              "Save As leaves no random candidate backup directories");
+        check(QDir(temporary.path()).entryList(
+                  {QStringLiteral("*.nsafe-new")}, QDir::Files | QDir::Hidden).isEmpty(),
+              "Save As removes its random candidate files");
+    };
+
+    SecuritySessionService session(temporary.filePath(QStringLiteral("identity")));
+    auto passphrase = secret("single backup correct horse battery staple");
+    QString recoveryKey;
+    const VaultError identityError = session.createIdentity(passphrase, &recoveryKey);
+    check(!identityError.isError(), "single-backup fixture creates an identity");
+    if (identityError.isError())
+        return;
+
+    const QString dataPath = temporary.filePath(QStringLiteral("document-data"));
+    SecureDocumentService documents(&session, dataPath);
+    SecureDocumentSnapshot draft;
+    const VaultError draftError = documents.newDraft(&draft);
+    check(!draftError.isError(), "single-backup fixture creates a managed draft");
+    if (draftError.isError())
+        return;
+    for (int revision = 0; revision < 3; ++revision) {
+        check(!documents.save(draft.documentId,
+                              QStringLiteral("draft revision %1").arg(revision),
+                              QStringLiteral("Managed draft")).isError(),
+              "repeated managed draft saves succeed");
+        check(!QFileInfo::exists(draft.backingPath + QStringLiteral(".backups")),
+              "managed recovery draft never creates a backup directory");
+    }
+    documents.closeAll();
+    SecureDocumentSnapshot reopenedDraft;
+    check(!documents.open(draft.backingPath, &reopenedDraft).isError()
+              && reopenedDraft.draft
+              && reopenedDraft.text == QStringLiteral("draft revision 2"),
+          "managed draft remains independently reopenable after repeated saves");
+
+    const QString namedPath = temporary.filePath(QStringLiteral("named.nsafe"));
+    check(!documents.save(reopenedDraft.documentId, QStringLiteral("named revision 0"),
+                          QStringLiteral("Named document"), namedPath).isError(),
+          "managed draft migrates to a named secure document");
+    check(!QFileInfo::exists(draft.backingPath)
+              && !QFileInfo::exists(draft.backingPath + QStringLiteral(".backups")),
+          "new managed draft migration leaves no draft or draft backup behind");
+    for (int revision = 0; revision < 3; ++revision) {
+        check(!documents.checkpointText(reopenedDraft.documentId,
+                    QStringLiteral("checkpoint revision %1").arg(revision)).isError(),
+              "repeated encrypted recovery checkpoints succeed");
+    }
+    const QDir recoveryDirectory(QDir(dataPath).filePath(QStringLiteral("secure-recovery")));
+    check(recoveryDirectory.entryList(QDir::Files | QDir::Hidden).size() == 1
+              && recoveryDirectory.entryList(
+                  {QStringLiteral("*.backups")},
+                  QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot).isEmpty(),
+          "repeated secure recovery checkpoints reuse one encrypted file");
+    check(!documents.save(reopenedDraft.documentId, QStringLiteral("named revision 1"),
+                          QStringLiteral("Named document")).isError(),
+          "named document keeps its normal save path after draft migration");
+    check(recoveryDirectory.entryList(QDir::Files | QDir::Hidden).isEmpty(),
+          "successful named save consumes the single recovery checkpoint");
+    check(QDir(namedPath + QStringLiteral(".backups")).entryList(
+              {QStringLiteral("*.kdbx")}, QDir::Files | QDir::Hidden).size() == 1,
+          "named secure document retains exactly one encrypted backup");
+    documents.closeAll();
+
+    const QDir backupDirectory(namedPath + QStringLiteral(".backups"));
+    const QString backupPath = backupDirectory.filePath(QStringLiteral("named.previous.kdbx"));
+    const QString oldBackupOne = backupDirectory.filePath(
+        QStringLiteral("named.20000101-000000-000.kdbx"));
+    const QString oldBackupTwo = backupDirectory.filePath(
+        QStringLiteral("named.20000102-000000-000.kdbx"));
+    check(QFile::copy(namedPath, oldBackupOne) && QFile::copy(namedPath, oldBackupTwo),
+          "Save As migration fixture contains legacy timestamp backups");
+    QString previousBody = QStringLiteral("named revision 1");
+    for (int revision = 0; revision < 3; ++revision) {
+        const QByteArray previousCiphertext = readFileBytes(namedPath);
+        const QString body = QStringLiteral("replacement revision %1").arg(revision);
+        SecureDocumentSnapshot replacement;
+        check(!documents.saveAsSecure(body, QStringLiteral("Replacement"), namedPath,
+                                      &replacement).isError(),
+              "repeated Save As over an existing file succeeds");
+        documents.closeAll();
+        check(readFileBytes(backupPath) == previousCiphertext,
+              "Save As keeps exactly the original target ciphertext as its previous version");
+        check(!QFileInfo::exists(oldBackupOne) && !QFileInfo::exists(oldBackupTwo)
+                  && backupDirectory.entryList(
+                      {QStringLiteral("*.kdbx")}, QDir::Files | QDir::Hidden).size() == 1,
+              "Save As converges old timestamp backups to one previous version");
+        SecureDocumentService previousReader(&session, dataPath);
+        SecureDocumentSnapshot previous;
+        check(!previousReader.open(backupPath, &previous).isError()
+                  && previous.text == previousBody,
+              "Save As backup independently reopens with the overwritten document's credential and body");
+        SecureDocumentService independentReader(&session, dataPath);
+        SecureDocumentSnapshot reopened;
+        check(!independentReader.open(namedPath, &reopened).isError()
+                  && reopened.text == body,
+              "each replacement independently reopens with its complete latest body");
+        checkNoCandidate();
+        previousBody = body;
+    }
+
+#ifdef Q_OS_WIN
+    const QByteArray beforeBlockedOverwrite = readFileBytes(namedPath);
+    const QByteArray beforeBlockedBackup = readFileBytes(backupPath);
+    HANDLE backupLease = CreateFileW(reinterpret_cast<LPCWSTR>(backupPath.utf16()),
+        GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(backupLease != INVALID_HANDLE_VALUE,
+          "Save As failure fixture holds the existing backup against replacement");
+    if (backupLease != INVALID_HANDLE_VALUE) {
+        SecureDocumentSnapshot blocked;
+        check(documents.saveAsSecure(QStringLiteral("retry after occupied backup"),
+                                      QStringLiteral("Retry"), namedPath, &blocked).isError(),
+              "Save As refuses to replace a target when its previous backup is occupied");
+        check(readFileBytes(namedPath) == beforeBlockedOverwrite
+                  && readFileBytes(backupPath) == beforeBlockedBackup,
+              "failed backup rotation preserves both existing target and previous backup bytes");
+        checkNoCandidate();
+        CloseHandle(backupLease);
+        check(!documents.saveAsSecure(QStringLiteral("retry after occupied backup"),
+                                       QStringLiteral("Retry"), namedPath, &blocked).isError(),
+              "Save As succeeds after the occupied backup is released");
+        documents.closeAll();
+        check(readFileBytes(backupPath) == beforeBlockedOverwrite,
+              "successful retry backs up the target that survived the failed attempt");
+        SecureDocumentService retryReader(&session, dataPath);
+        SecureDocumentSnapshot retried;
+        check(!retryReader.open(namedPath, &retried).isError()
+                  && retried.text == QStringLiteral("retry after occupied backup"),
+              "successful retry independently reopens its complete body");
+        checkNoCandidate();
+    }
+#endif
+
+    const QString plainPath = temporary.filePath(QStringLiteral("plaintext-target.txt"));
+    {
+        QFile plain(plainPath);
+        const QByteArray bytes("original plain text is not an encrypted backup");
+        check(plain.open(QIODevice::WriteOnly) && plain.write(bytes) == bytes.size(),
+              "plain overwrite fixture is written");
+    }
+    SecureDocumentSnapshot encryptedReplacement;
+    check(!documents.saveAsSecure(QStringLiteral("encrypted replacement for plain target"),
+                                  QStringLiteral("Plain target"), plainPath,
+                                  &encryptedReplacement).isError(),
+          "explicit Save As can replace a normal plaintext target");
+    documents.closeAll();
+    check(!QFileInfo::exists(plainPath + QStringLiteral(".backups")),
+          "plaintext target is never copied into an encrypted-backup directory");
+    SecureDocumentService plainReplacementReader(&session, dataPath);
+    SecureDocumentSnapshot reopenedPlainReplacement;
+    check(!plainReplacementReader.open(plainPath, &reopenedPlainReplacement).isError()
+              && reopenedPlainReplacement.text == QStringLiteral("encrypted replacement for plain target"),
+          "replacement of the plaintext target reopens as a complete secure document");
+    checkNoCandidate();
+    session.endSession(true);
+    passphrase.clear();
+    recoveryKey.fill(QChar(0));
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -204,6 +385,12 @@ int main(int argc, char **argv)
         testRecoveryVerification();
         if (failures == 0)
             qInfo() << "Recovery verification: all checks passed";
+        return failures == 0 ? 0 : 1;
+    }
+    if (app.arguments().contains(QStringLiteral("--single-backup-lifecycle"))) {
+        testSingleBackupLifecycle();
+        if (failures == 0)
+            qInfo() << "Single-backup lifecycle: all checks passed";
         return failures == 0 ? 0 : 1;
     }
     QTemporaryDir temporary;
