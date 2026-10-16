@@ -94,6 +94,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/generate_sbom.ps1 `
 - QScintilla/Scintilla 只通过编辑器适配边界使用；可迁移到直接 Scintilla Qt 端口。
 - KeePassXC 是 KDBX 行为供应商，不复制其整套桌面架构；产品服务层不暴露上游对象。
 - Botan 3、参考 Argon2 和 zlib 按 KeePassXC 闭包锁定；不自研 AES、KDF、Argon2 或认证加密。
-- ADR-022 固定 PCRE2 为唯一正则供应链和执行引擎。非 UTF-8 支持属于产品侧有界编译适配，
+- 当前锁文件与实现固定 PCRE2 为唯一正则供应链和执行引擎，语义见 [正则专项](REGEX_ENGINE_EXPLORATION.md)。非 UTF-8 支持属于产品侧有界编译适配，
   不引入第二个 matcher 或字符库；存储 Provider 或物理编码不能静默改变已声明语义。
 - 用户退出路径始终是标准 KDBX/恢复导出和显式明文另存为，依赖升级不得制造不可逆数据迁移。

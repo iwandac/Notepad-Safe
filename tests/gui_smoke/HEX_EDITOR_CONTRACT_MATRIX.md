@@ -1,8 +1,12 @@
 # Hex 编辑器专项契约矩阵
 
+> 2026-10-02 范围校准：这是既有专项契约索引，列出用例不代表本轮已执行；本版规则见 [回归方法](../../docs/TARGET_EXPERIENCE.md)。B2/B3 都是同一窗口化只读能力，2 GiB 样本验证偏移/资源，不是另一功能档位。
+
 本文件定义 Hex 模块的有限测试边界。执行器根据维度自动生成 pairwise、三元或穷举案例；
 它不是用户旅程。每个失败必须输出稳定 case ID，并同时检查 byte model、Hex/ASCII 投影、
 caret/selection、状态栏、dirty/Undo 和磁盘结果中适用的部分。
+
+本版具体步骤见[详细清单](../../docs/REGRESSION_CHECKLIST.md)的 HEX、PAR 和 SAV 组；BH/RH需用相同源片段成对验证。现有矩阵描述覆盖目标，不表示组合生成器或全部用例已实现/运行。
 
 ## 1. 状态维度
 

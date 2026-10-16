@@ -1,164 +1,39 @@
-# Notepad Safe
+# 文档索引
 
-> 基于 Qt 6.11 静态库 + QScintilla/Scintilla 的 Windows 加密笔记本与账号保险库。
-> 本仓库为**独立产品仓库**，clone 后可直接构建运行。
-> （原 Credential Vault 项目中的 `apps/qt-notepad` 已独立为该仓库，并统一重命名为 **Notepad Safe**）
+2026-10-02 按当前源码及未提交的保存/恢复修复重新整理。实现存在、测试存在、本轮执行通过是三个不同结论。
 
-> **当前状态：开发预览，产品成熟度仍在验收。** 下列勾选项表示存在实现与局部回归，不等于完整 GUI、性能和故障恢复通过。本次排除 Windows 安装、签名、打包分发；性能轮关闭后直接 AI-D0 设计收敛 → 第 5 轮基座 → 优先第 7 轮文本助手 / 独立第 6 轮代码可视化 → 第 9 轮组合验收，第 8 轮默认拒绝远程。权威进度见[产品成熟度路线图](ITERATION_ROADMAP.md)。已有 `tools/run_release_gate.ps1` 保留严格发布含义，不作为本次 AI 前置或宣称已通过。
+**先读 [产品目标与核心旅程](PRODUCT_GOALS.md)。** 它定义不变的目标、边界和 12 条必须跑通的核心旅程，是验收入口；下列文档是旅程失败或需要细节时的参考。当前Release仅为中间验证构建，核心旅程尚未执行。
 
----
+## 当前文档
 
-## 1. 特性速览
-
-- ✅ **单 exe**：静态构建；本次验证实际运行，不承诺安装分发已验收
-- ✅ **多标签页** + 会话自动恢复（崩溃/退出不丢未保存内容）
-- ✅ **编码检测**（UTF-8 / UTF-16 LE/BE / GBK，BOM + 启发式）
-- ✅ **原子保存**（.tmp → rename，防止崩溃损坏原文件）
-- ✅ **按需滚动条**（内容未超出窗口时不显示空滚动条）
-- ✅ **设置 ↔ 菜单勾选强同步**（重启后自动换行等菜单勾选与实际行为一致）
-- ✅ **查找 / 正则替换 / 全部替换**，结果 Dock 可虚拟化跳转
-- ✅ **语法高亮**：C++/Python/JSON/HTML/SQL/XML/YAML/Markdown/纯文本
-- ✅ **书签 / 行排序 / 复制行 / 删除行 / 上下移行**
-- ✅ **深色模式**（跟随系统 + 手动切换）
-- ✅ **mmap 大文件快速查看基础**（目标三档方案见 docs/DESIGN.md §6–§9）
-- ✅ **产品图标**（根目录 `notepad_safe.png` → EXE 图标 + 窗口运行时图标）
-- ✅ **测试与产品构建隔离**：非 GUI、GUI smoke、E2E 按脚本显式构建，不进入默认产品 compile/link 图
-
-## 2. 构建
-
-### 2.1 前置条件（一次性准备）
-
-| 组件 | 说明 |
+| 文档 | 职责 |
 |---|---|
-| MSVC 工具链 | 安装 VS 2022 及以上，勾选"使用 C++ 的桌面开发" |
-| Qt 6.11.x 静态库（MSVC 64-bit，/MT 构建） | 需自行编译静态版 Qt（推荐路径 `E:\programs\Qt_6.11.1-static-Release_msvc2026_64\msvc2026_64`） |
-| CMake ≥ 3.22 | 或 Visual Studio 自带 |
-| Ninja | 或 Visual Studio 自带 |
-| Python 3 | 首次从仓库内 Botan 源码生成最小静态库；也用于图标辅助脚本 |
+| [产品目标与核心旅程](PRODUCT_GOALS.md) | 一句话目标、不变边界、12 条核心旅程及其状态、完成标准 |
+| [项目入口](../README.md) | 产品范围、构建入口、数据位置 |
+| [功能清单](FEATURE_LEDGER.md) | 现有功能、模式适用性、能力限制 |
+| [源码架构](DESIGN.md) | 真实依赖、状态所有权、持久化、安全及复杂度 |
+| [回归方法](TARGET_EXPERIENCE.md) | 组合状态、操作序列、正确性判据和证据要求 |
+| [详细验证清单](REGRESSION_CHECKLIST.md) | 128个主用例、参数夹具、17组外观/输入组合、45组功能映射及当前差距 |
+| [统一回归计划](ITERATION_ROADMAP.md) | 128项的统一批次、下一步、构建时机、退出条件 |
+| [唯一执行账本](DAILY_USE_CLOSEOUT.md) | 当前汇总、保存/恢复/副本改动的实际结果、EXE身份与历史记录 |
+| [架构检查边界](ARCHITECTURE_CONVERGENCE.md) | 现有检查保护什么、不能证明什么 |
+| [正则专项](REGEX_ENGINE_EXPLORATION.md) | PCRE2 与原始编码适配的语义和拒绝规则 |
+| [供应链规程](SUPPLY_CHAIN.md) | 依赖锁、离线构建、摘要与更新 |
 
-> QScintilla、KeePassXC、Botan、Argon2、zlib 和 PCRE2 的锁定源码均随仓库保存在
-> `third_party/src`。仓库不再携带 QScintilla 预编译库；首次构建离线生成 QScintilla/Botan
-> 静态库到 `.deps/install`，后续按源码摘要、Qt/MSVC 版本命中缓存。
+冲突时先查源码与可复现结果，再修正文档。正式回归必须绑定当前候选，历史报告不可继承为本轮通过。
 
-### 2.2 设置 Qt 路径
+## 历史证据，仅供追溯
 
-把 Qt 静态库路径写入环境变量（推荐；不写入也可用默认路径 `E:\programs\Qt_6.11.1-static-Release_msvc2026_64\msvc2026_64`）：
+- [第 1 轮 Hex](ROUND1_HEX_PRODUCT_ACCEPTANCE.md)
+- [第 2 轮核心旅程](ROUND2_CORE_JOURNEYS_PRODUCT_ACCEPTANCE.md)
+- [第 3 轮性能与恢复](ROUND3_PERFORMANCE_RECOVERY_ACCEPTANCE.md)
+- [验证时间线](VALIDATION_TIMELINE.md)
+- [早期静态审查](STATIC_CODE_AUDIT.md)
 
-```bat
-setx NOTEPADSAFE_QT6_DIR "你的Qt静态库路径\msvc2026_64"
-:: 之后重开终端生效，或当前会话 set 临时生效
-```
+保留当时的样本、失败、测量与实现变化，不作为当前任务指令或整体验收结论。S2/S3、B2/B3 只用于识别历史夹具；当前大文件能力统一只读。
 
-### 2.3 一键构建
+已移除未来 AI、代码可视化、分发的分轮计划及重复外部产品参考。原文可由 Git 历史找回；不因此改变现有代码、安全约束或测试入口。重新立项时须重新决定范围，不自动恢复旧路线。
 
-```bat
-cd /d <repository-root>
-build.bat
-```
+测试目录的 [GUI 矩阵](../tests/gui_smoke/GUI_TEST_COVERAGE_MATRIX.md)、[Hex 契约](../tests/gui_smoke/HEX_EDITOR_CONTRACT_MATRIX.md)、[搜索契约](../tests/gui_smoke/SEARCH_REPLACE_CONTRACT_MATRIX.md)是专项索引；适用性应对照当前功能清单，列出用例不表示已运行。
 
-脚本内部流程：
-1. 调用 `vcvars64.bat`。
-2. 校验锁文件及六棵 `third_party/src` 实际源码树，拒绝嵌套 Git 和二进制生成物。
-3. 离线构建/复用 QScintilla 2.14.1 与最小 Botan 3.12.0 `/MT` 缓存。
-4. CMake 直接从 vendored PCRE2、Argon2、zlib 和 KeePassXC Core 编译。
-5. 产出：`build\notepad-safe.exe`。
-
-### 2.4 运行测试
-
-```bat
-run_tests.bat
-```
-
-该脚本显式开启测试构建并运行非 GUI 回归。GUI smoke 使用 `run_all_gui_smoke.bat`；真实进程
-E2E 按各轮运行质量合同显式执行。默认 `build.bat` 不生成任何测试或诊断目标。构建边界与归档清单见
-`docs/STATIC_CODE_AUDIT.md`。
-
-## 3. 使用
-
-直接双击 `build\notepad-safe.exe` 或命令行：
-
-```bat
-build\notepad-safe.exe            :: 启动空白窗口
-build\notepad-safe.exe a.txt      :: 启动并打开指定文件（支持多文件空格分隔）
-```
-
-**图标说明**：
-- EXE 文件图标 = `resources/app.ico`（16/32/48/64/128/256 六尺寸，Windows 资源管理器使用）
-- 窗口 / 任务栏图标 = `notepad_safe.png`（通过 `resources/app_resources.qrc` 内嵌，运行时 setWindowIcon）
-
-**数据目录**：
-- 会话 + 自动恢复：`%LOCALAPPDATA%\NotepadSafe\session.json` / `autosave\*.ndraft`
-  （普通 S1/B1 恢复数据使用 Windows DPAPI 当前用户密封；S2/S3/B2/B3 只读，不生成编辑日志；
-  旧版大文件编辑恢复格式只会被明确拒绝）
-- 设置：`HKEY_CURRENT_USER\Software\NotepadSafe\NotepadSafe`（或等效 ini，由 Qt QSettings 决定）
-
-> 为与原 Credential Vault 产品隔离，独立后 Notepad Safe 不读取/写入任何
-> `CredentialVault` 名下的设置或文件。
-
-## 4. 目录概览
-
-```
-notepadsafe/
-├── CMakeLists.txt              # 默认产品目标；测试/诊断显式 opt-in
-├── build.bat / run_tests.bat   # 产品构建与非 GUI 测试脚本
-├── prepare_dependencies.bat    # 统一的离线源码校验/依赖构建入口
-├── run_all_gui_smoke.bat       # GUI smoke 显式构建/执行
-├── src/                        # window/editor/search/session/async/vault/domain
-├── tests/                      # 活动单元、集成、GUI 与 E2E 测试
-├── archive/disabled/           # 不参与 CMake/CTest 的历史实现
-├── notepad_safe.png            # 原始图标（1254×1254，产品根）
-├── resources/
-│   ├── notepad_safe.png        # 运行时 PNG（app_resources.qrc 引用）
-│   ├── app.ico                 # 6 尺寸 ICO（EXE 图标）
-│   ├── app_icon.rc             # RC：IDI_APPLICATION + VS_VERSION_INFO
-│   ├── app_resources.qrc       # QRC：运行时图标
-│   └── make_ico.py             # 从 notepad_safe.png 重新生成 app.ico（辅助）
-├── third_party/
-│   ├── dependencies.lock.json  # 上游身份 + 仓库实树双重锁
-│   ├── patches/                # 可回放补丁记录
-│   └── src/                    # 六个运行时依赖的纯源码；无 .lib/.obj/.git
-├── .deps/                      # 可删除、可重建且被 Git 忽略的依赖产物
-├── tests/                      # 逻辑、组件、GUI 冒烟与真实进程 E2E 测试
-└── docs/
-    ├── README.md               # 用户文档（本文件）
-    ├── DESIGN.md               # 架构、安全边界和实现路线
-    ├── REGEX_ENGINE_EXPLORATION.md # 已接受的统一正则架构、方言与准入合同
-    ├── TARGET_EXPERIENCE.md    # 目标体验、功能总账与动态 GUI 验收
-    ├── REFERENCE_BASELINE.md   # 成熟产品/上游行为参考与探索停止规则
-    ├── ITERATION_ROADMAP.md    # 当前成熟度顺序、质量门与停止条件
-    ├── AI_PRODUCT_DESIGN.md    # AI 文档助手、代码可视化、数据权限与验收设计
-    ├── ROUND1_HEX_PRODUCT_ACCEPTANCE.md # 第 1 轮 Hex 用户结果、切片与退出证据
-    ├── ROUND2_CORE_JOURNEYS_PRODUCT_ACCEPTANCE.md # 第 2 轮单实例、搜索真值、Tail 与产品语言
-    ├── ROUND3_PERFORMANCE_RECOVERY_ACCEPTANCE.md # 第 3 轮性能、资源预算与故障恢复
-    ├── ROUND4_WINDOWS_DISTRIBUTION_ACCEPTANCE.md # 历史分发设计；本次明确排除
-    ├── ROUND5_DOCUMENT_TOOL_FOUNDATION_ACCEPTANCE.md # 第 5 轮范围授权、Artifact、Diff 与 Undo
-    ├── ROUND6_CODE_VISUALIZATION_ACCEPTANCE.md # 第 6 轮静态解析、产品说明与原生数据流图
-    ├── ROUND7_LOCAL_AI_TEXT_ASSISTANT_ACCEPTANCE.md # 第 7 轮本地模型、流式生成与差异应用
-    ├── ROUND8_REMOTE_AI_DECISION_ACCEPTANCE.md # 第 8 轮远程 AI 拒绝门或逐次授权
-    ├── ROUND9_AI_RELEASE_ACCEPTANCE.md # 第 9 轮 AI 组合产品验收；不含安装发布
-    └── SUPPLY_CHAIN.md         # 固定依赖的更新与验证规程
-```
-
-## 5. 目标架构
-
-架构与安全边界见 [架构设计](DESIGN.md)；用户可见目标和动态 GUI 验收方法见 [目标体验](TARGET_EXPERIENCE.md)；成熟产品能力的采用与拒绝边界见 [参考基线](REFERENCE_BASELINE.md)。当前顺序、进度与停止条件以[成熟度路线图](ITERATION_ROADMAP.md)为准。
-
-既有质量记录为[第 1 轮 Hex](ROUND1_HEX_PRODUCT_ACCEPTANCE.md)、[第 2 轮核心旅程](ROUND2_CORE_JOURNEYS_PRODUCT_ACCEPTANCE.md)；当前完成[第 3 轮性能/恢复](ROUND3_PERFORMANCE_RECOVERY_ACCEPTANCE.md)后，直接按 [AI 产品设计 §9](AI_PRODUCT_DESIGN.md#9-ai-d0性能轮之后的设计收敛与开发交接)做 AI-D0，不经过[历史第 4 轮分发](ROUND4_WINDOWS_DISTRIBUTION_ACCEPTANCE.md)。后续沿用[第 5 轮基座](ROUND5_DOCUMENT_TOOL_FOUNDATION_ACCEPTANCE.md)、[第 7 轮文本助手](ROUND7_LOCAL_AI_TEXT_ASSISTANT_ACCEPTANCE.md)、[第 6 轮代码可视化](ROUND6_CODE_VISUALIZATION_ACCEPTANCE.md)、[第 8 轮远程策略](ROUND8_REMOTE_AI_DECISION_ACCEPTANCE.md)和[第 9 轮组合产品验收](ROUND9_AI_RELEASE_ACCEPTANCE.md)。数字保留历史编号，不表示必须依数字串行；真实文本助手优先，所有语言完成不是其前置。主要边界包括：
-
-- 供应链版本锁定、更新验证、SBOM 和退出策略（机器锁见 `../third_party/dependencies.lock.json`，操作规程见 `SUPPLY_CHAIN.md`）。
-- 小于 32 MiB：Scintilla 完整编辑。
-- 32 MiB–2 GiB：窗口化 mmap 只读查看、复制和搜索，不编辑、不替换。
-- 大于 2 GiB：相同的窗口化 mmap 只读分析能力；S2/S3 仅保留尺寸分级。
-- 所有正则都由仓库锁定的 PCRE2 执行。S1 和 UTF-8 S2/S3 使用 UTF/UCP；非 UTF-8
-  S2/S3 仅把有界日志分析子集编译成等价字节模式，直接扫描原始 mmap 并保留源字节坐标，
-  不做全文转码和 offset 回映射。完整子集、拒绝边界、调度和 UI 合同见
-  [统一正则搜索架构](REGEX_ENGINE_EXPLORATION.md)。
-- KeePassXC Core + Botan + KDBX 4.x 的加密笔记和账号保险库。
-
-旧 S2 ILoader 后台晋升和独立 promotion 测试目标已禁用/移除；PatchList 仅服务小型 Hex 兼容路径，不代表大文件编辑能力。
-
-## 6. 许可证 & 第三方
-
-- Notepad Safe 代码：**GPL v3**（与 QScintilla 许可证一致）
-- Qt：根据您的 Qt 许可证（GPL / LGPL / 商业）
-- QScintilla 2.14.1：GPL v3，源码位于本仓库 `third_party/src/qscintilla-2.14.1`
+本次整理已执行架构边界检查、异步线程边界检查、文档本地链接检查和 `git diff --check`，均通过。没有构建、运行产品测试或操作客户端；已有未提交的保存/恢复源码修改保持原状。
