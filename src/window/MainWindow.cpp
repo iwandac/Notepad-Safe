@@ -243,7 +243,7 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
     // The title bar's security pill follows the device session. Polling
     // never creates the security backend; it stays hidden until one exists.
     auto *pillTimer = new QTimer(this);
-    pillTimer->setInterval(5000);
+    pillTimer->setInterval(1000);
     const auto refreshPill = [this]() {
         if (!m_titleBar || AsyncSerialQueue::security().busy())
             return;
@@ -268,7 +268,9 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
     });
     WindowChrome::install(this);
 
-    m_securityExpiryTimer.setInterval(60 * 1000);
+    // Every second, so expired content is masked before the title bar pill
+    // (also polled every second) can show 已锁定.
+    m_securityExpiryTimer.setInterval(1000);
     connect(&m_securityExpiryTimer, &QTimer::timeout, this, [this]() {
         if (AsyncSerialQueue::security().busy())
             return;

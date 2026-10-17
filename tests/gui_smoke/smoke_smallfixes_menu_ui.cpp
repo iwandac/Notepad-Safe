@@ -91,6 +91,7 @@
 #include "MainWindow.h"
 #include "AppComposition.h"
 #include "EditorTab.h"
+#include <QDockWidget>
 #include "ThemeTokens.h"
 #include "TitleBar.h"
 #include "WindowedReadOnlyProvider.h"
@@ -3836,6 +3837,47 @@ private slots:
         QVERIFY(saved.open(QIODevice::ReadOnly));
         QCOMPARE(saved.readAll(), QByteArray("edited\n"));
         closeAllEditorTabs(mw_);
+    }
+
+    // Opening a document themes only that document; the application style
+    // sheet is not re-applied (which would repolish every widget).
+    void openingTabDoesNotRestyleApplication() {
+        closeAllEditorTabs(mw_);
+        const QString path = tmpDir_.filePath(QStringLiteral("no-restyle.txt"));
+        {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write("no restyle\n");
+        }
+        struct StyleChangeCounter final : QObject {
+            int count = 0;
+            bool eventFilter(QObject *, QEvent *event) override {
+                if (event->type() == QEvent::StyleChange) ++count;
+                return false;
+            }
+        } counter;
+        mw_->statusBar()->installEventFilter(&counter);
+        mw_->openFilesFromExternal({path});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
+        QApplication::processEvents();
+        mw_->statusBar()->removeEventFilter(&counter);
+        QCOMPARE(counter.count, 0);
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab);
+        const QColor paper = tab->editor()->paper();
+        QVERIFY(paper == ThemeTokens::light().paper || paper == ThemeTokens::dark().paper
+                || qApp->styleSheet().isEmpty());
+        closeAllEditorTabs(mw_);
+    }
+
+    // The title bar lives in the central widget; a dock above it would take
+    // the window's top edge, so the search dock may not use the top area.
+    void searchDockStaysBelowTitleBar() {
+        auto *dock = mw_->findChild<QDockWidget *>(QStringLiteral("SearchResultsDock"));
+        QVERIFY(dock);
+        QVERIFY(!dock->isAreaAllowed(Qt::TopDockWidgetArea));
+        QVERIFY(dock->isAreaAllowed(Qt::BottomDockWidgetArea));
+        QVERIFY(mw_->dockWidgetArea(dock) != Qt::TopDockWidgetArea);
     }
 
     void tc_system_high_contrast_keeps_platform_palette() {

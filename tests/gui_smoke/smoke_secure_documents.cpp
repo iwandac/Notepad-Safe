@@ -8,6 +8,7 @@
 #include "SecuritySessionService.h"
 #include "SessionManager.h"
 #include "StartupCoordinator.h"
+#include "TitleBar.h"
 #include "VaultDock.h"
 #include "VirtualFileView.h"
 
@@ -1982,9 +1983,15 @@ private slots:
         QTRY_COMPARE(QApplication::clipboard()->text(), secret);
         const QString externalReplacement = QStringLiteral("external clipboard value");
         QApplication::clipboard()->setText(externalReplacement);
+        // An open command palette lists the document by title; locking must
+        // close it so the title does not stay on screen.
+        emit window->titleBar()->commandPaletteRequested();
+        auto *palette = window->findChild<QFrame *>(QStringLiteral("commandPalette"));
+        QTRY_VERIFY(palette && palette->isVisible());
         QAction *lockAction = actionWithText(window.get(), QStringLiteral("立即锁定"));
         QVERIFY(lockAction);
         lockAction->trigger();
+        QVERIFY(!palette->isVisible());
         QVERIFY2(tab->isSecureDocumentMasked(),
                  qPrintable(QStringLiteral("manual lock did not mask; enabled=%1 status=%2")
                                 .arg(lockAction->isEnabled())

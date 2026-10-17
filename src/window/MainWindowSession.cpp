@@ -3,6 +3,7 @@
 #include "AsyncSerialQueue.h"
 #include "EditorTab.h"
 #include "EditorPreferences.h"
+#include "SearchResultsDock.h"
 #include "FileTierPolicy.h"
 #include "SessionManager.h"
 #include "VaultDock.h"
@@ -210,6 +211,8 @@ void MainWindow::loadSettings()
     QByteArray state = settings->value("windowState").toByteArray();
     if (!state.isEmpty())
         restoreState(state);
+    if (m_searchDock && dockWidgetArea(m_searchDock) == Qt::TopDockWidgetArea)
+        addDockWidget(Qt::BottomDockWidgetArea, m_searchDock);
 
     const bool statusVisible = settings->value("statusBarVisible", true).toBool();
     if (m_statusVisibilityAction)

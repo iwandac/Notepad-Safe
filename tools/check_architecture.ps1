@@ -217,6 +217,22 @@ foreach ($domainFile in $domainFiles) {
     }
 }
 
+# The shell (theme, chrome, menus, palette) re-hosts commands; it may use Qt
+# and src/app command types but never editor, window or vault internals.
+$shellFiles = Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src/shell') -File |
+    Where-Object Extension -in '.cpp', '.h'
+foreach ($shellFile in $shellFiles) {
+    $shellContent = Remove-CodeComments (
+        Get-Content -LiteralPath $shellFile.FullName -Raw)
+    foreach ($token in @('"EditorTab', '"MainWindow', '"VirtualFileView',
+                         '"WindowedReadOnlyProvider', '"SecuritySession',
+                         '"SecureDocument', '"VaultDock', 'KeePass')) {
+        if ($shellContent.Contains($token)) {
+            Add-Failure "shell depends on editor/window/vault token '$token': $($shellFile.Name)"
+        }
+    }
+}
+
 $domainTargetText = [regex]::Match(
     ($cmakeLines -join "`n"),
     '(?s)add_library\(notepadsafe_domain\s+STATIC.*?\n\)').Value

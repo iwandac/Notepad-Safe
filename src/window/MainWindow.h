@@ -23,6 +23,9 @@ class QPoint;
 class EditorTab;
 struct ThemeTokens;
 class TitleBar;
+// Applies the current appearance to one new tab's editors without
+// re-applying the application style sheet.
+void themeNewEditorTab(EditorTab *tab, bool highContrast, bool dark);
 class StatusSegment;
 class NoticeBar;
 class CommandPalette;

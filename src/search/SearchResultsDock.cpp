@@ -27,9 +27,9 @@ SearchResultsDock::SearchResultsDock(SearchResultsController &controller,
 {
     // ⚠️ 关键修复：禁用浮动和移动，防止双击 / 拖动后嵌入错位
     //  - Fixed: 允许用户关闭/显示，不允许脱离位置
-    //  - setAllowedAreas: 仅允许底部和顶部（底部初始）
+    //  - setAllowedAreas: 仅允许底部。标题栏在中央区域顶部，停靠在顶部会占据窗口上沿。
     //  - MainWindow::addDockWidget(Qt::BottomDockWidgetArea) 已在 MainWindow 里设置，这里再次约束
-    setAllowedAreas(Qt::BottomDockWidgetArea | Qt::TopDockWidgetArea);
+    setAllowedAreas(Qt::BottomDockWidgetArea);
     setFeatures(QDockWidget::DockWidgetClosable);
 
     auto *container = new QWidget(this);

@@ -356,7 +356,7 @@ EditorTab *MainWindow::addNewTab(OpenPresentationPolicy presentation, int recove
     applyEditorPreferences(tab);
     // QScintilla keeps its own colors outside the QWidget palette. Apply the
     // resolved appearance to newly created/restored tabs as well as existing ones.
-    applyDarkMode(m_darkMode);
+    themeNewEditorTab(tab, m_highContrastMode, m_darkMode);
 
     if (auto *bar = qobject_cast<DocumentTabBar *>(m_tabs->tabBar()))
         connect(tab, &EditorTab::modificationChanged, bar, &DocumentTabBar::refresh);

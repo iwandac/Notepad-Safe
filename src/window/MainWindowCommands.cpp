@@ -688,6 +688,16 @@ TabVisualState tabVisualState(QWidget *page)
     return {kind, tab->isModified(), tab->isSecureDocumentMasked()};
 }
 
+void themeTabEditors(EditorTab *tab, bool highContrast, const ThemeTokens &t)
+{
+    for (QsciScintilla *surface : tab->themedEditors()) {
+        if (highContrast)
+            applyEditorSurfacePalette(surface, qApp->palette());
+        else
+            applyEditorTheme(surface, t, tab->isSecureDocument());
+    }
+}
+
 void themeTabBar(QTabWidget *tabs, const ThemeTokens &t)
 {
     auto *bar = qobject_cast<DocumentTabBar *>(tabs ? tabs->tabBar() : nullptr);
@@ -697,6 +707,12 @@ void themeTabBar(QTabWidget *tabs, const ThemeTokens &t)
     bar->setTokens(t);
 }
 } // namespace
+
+void themeNewEditorTab(EditorTab *tab, bool highContrast, bool dark)
+{
+    if (tab)
+        themeTabEditors(tab, highContrast, dark ? ThemeTokens::dark() : ThemeTokens::light());
+}
 
 void MainWindow::applyDarkMode(bool dark)
 {
@@ -717,8 +733,7 @@ void MainWindow::applyDarkMode(bool dark)
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
         if (!tab)
             continue;
-        for (QsciScintilla *surface : tab->themedEditors())
-            applyEditorSurfacePalette(surface, pal);
+        themeTabEditors(tab, true, ThemeTokens::light());
     }
 }
 
@@ -776,8 +791,7 @@ void MainWindow::applyTheme(const ThemeTokens &t)
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
         if (!tab)
             continue;
-        for (QsciScintilla *surface : tab->themedEditors())
-            applyEditorTheme(surface, t, tab->isSecureDocument());
+        themeTabEditors(tab, false, t);
     }
 }
 
