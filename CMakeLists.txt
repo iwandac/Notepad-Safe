@@ -425,6 +425,8 @@ add_library(notepadsafe_app STATIC
     src/vault/VaultDockSupport.cpp
     src/shell/ThemeTokens.cpp
     src/shell/ThemeStyle.cpp
+    src/shell/WindowChrome.cpp
+    src/shell/TitleBar.cpp
 )
 target_include_directories(notepadsafe_app PUBLIC
     ${APP_INCLUDE_DIRS}
@@ -708,6 +710,9 @@ target_link_libraries(test_document_open_routing PRIVATE notepadsafe_app Qt6::Te
 add_executable(test_theme_tokens tests/test_theme_tokens.cpp)
 target_include_directories(test_theme_tokens PRIVATE ${APP_INCLUDE_DIRS})
 target_link_libraries(test_theme_tokens PRIVATE notepadsafe_app Qt6::Test)
+add_executable(test_shell_logic tests/test_shell_logic.cpp)
+target_include_directories(test_shell_logic PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(test_shell_logic PRIVATE notepadsafe_app Qt6::Test)
 
 add_executable(test_tail_command_contracts tests/test_tail_command_contracts.cpp)
 target_include_directories(test_tail_command_contracts PRIVATE ${APP_INCLUDE_DIRS})
@@ -859,6 +864,7 @@ set(NOTEPADSAFE_NON_GUI_TEST_TARGETS
     test_tail_command_contracts
     test_document_open_routing
     test_theme_tokens
+    test_shell_logic
     test_startup_composition
     test_startup_trace
     test_vault_contract
@@ -942,6 +948,7 @@ set_tests_properties(architecture_contracts PROPERTIES
 add_test(NAME tail_command_contracts COMMAND test_tail_command_contracts)
 add_test(NAME document_open_routing COMMAND test_document_open_routing)
 add_test(NAME theme_tokens COMMAND test_theme_tokens)
+add_test(NAME shell_logic COMMAND test_shell_logic)
 set_tests_properties(tail_command_contracts PROPERTIES
     LABELS "quick;architecture;NSP-LARGEFILE" TIMEOUT 30)
 add_test(NAME startup_composition COMMAND test_startup_composition)

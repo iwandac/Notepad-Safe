@@ -21,6 +21,8 @@
 #include "SensitiveText.h"
 #include "CommandRegistry.h"
 #include "DocumentOpenWorkflow.h"
+#include "TitleBar.h"
+#include "WindowChrome.h"
 #include "EditorPreferences.h"
 
 #include <QTabWidget>
@@ -115,7 +117,16 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
     m_workspaceStack = new QStackedWidget(this);
     m_workspaceStack->setObjectName(QStringLiteral("WorkspaceStack"));
     m_workspaceStack->addWidget(m_tabs);
-    setCentralWidget(m_workspaceStack);
+    // The frameless window's title bar sits above every workspace page.
+    auto *shell = new QWidget(this);
+    shell->setObjectName(QStringLiteral("ShellRoot"));
+    auto *shellLayout = new QVBoxLayout(shell);
+    shellLayout->setContentsMargins(0, 0, 0, 0);
+    shellLayout->setSpacing(0);
+    m_titleBar = new TitleBar(this, shell);
+    shellLayout->addWidget(m_titleBar);
+    shellLayout->addWidget(m_workspaceStack, 1);
+    setCentralWidget(shell);
     // 把 m_tabs 也加入 drag 转发（防止 QTabBar 吞事件）
     registerDropProxy(m_tabs);
 
@@ -222,6 +233,32 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
             m_secureAutosaveTimer.start(30000);
     });
 
+    // The title bar's security pill follows the device session. Polling
+    // never creates the security backend; it stays hidden until one exists.
+    auto *pillTimer = new QTimer(this);
+    pillTimer->setInterval(5000);
+    const auto refreshPill = [this]() {
+        if (!m_titleBar || AsyncSerialQueue::security().busy())
+            return;
+        const bool identity = m_securitySession && m_securitySession->available()
+            && m_securitySession->hasIdentity();
+        const bool active = identity && m_securitySession->hasActiveSession();
+        m_titleBar->setSecurityPill(securityPillView(
+            identity, active,
+            active ? m_securitySession->expiresAtUtc().toLocalTime() : QDateTime(),
+            QDateTime::currentDateTime()));
+    };
+    connect(pillTimer, &QTimer::timeout, this, refreshPill);
+    pillTimer->start();
+    connect(m_titleBar, &TitleBar::securityPillClicked, this, [this, refreshPill]() {
+        const bool active = m_securitySession && m_securitySession->hasActiveSession();
+        if (auto *action = findChild<QAction *>(active ? QStringLiteral("tools.lockNow")
+                                                       : QStringLiteral("tools.securityCenter")))
+            action->trigger();
+        refreshPill();
+    });
+    WindowChrome::install(this);
+
     m_securityExpiryTimer.setInterval(60 * 1000);
     connect(&m_securityExpiryTimer, &QTimer::timeout, this, [this]() {
         if (AsyncSerialQueue::security().busy())
@@ -277,6 +314,10 @@ bool MainWindow::nativeEvent(const QByteArray &eventType, void *message,
 {
 #ifdef Q_OS_WIN
     Q_UNUSED(eventType)
+    if (m_titleBar && WindowChrome::handleNativeEvent(
+            this, message, result, 6, m_titleBar->captionRect(),
+            m_titleBar->maxButtonRect(), m_titleBar->interactiveRects()))
+        return true;
     auto *nativeMessage = static_cast<MSG *>(message);
     if (nativeMessage) {
         if (nativeMessage->message == WM_WTSSESSION_CHANGE) {

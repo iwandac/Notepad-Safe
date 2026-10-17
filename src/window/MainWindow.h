@@ -22,6 +22,7 @@ class QUuid;
 class QPoint;
 class EditorTab;
 struct ThemeTokens;
+class TitleBar;
 class FindReplaceDialog;
 class SearchResultsDock;
 class SearchResultsController;
@@ -208,6 +209,7 @@ private:
     QAction *m_tasksAction = nullptr;
     QLabel *m_securityIdentityStatus = nullptr;
     QLabel *m_securitySessionStatus = nullptr;
+    TitleBar *m_titleBar = nullptr;
     QLabel *m_securityRecoveryStatus = nullptr;
     QActionGroup *m_edgeColGroup = nullptr;   // 长行标尺列数组，遍历其 action 同步勾选
     QActionGroup *m_tabWidthGroup = nullptr;

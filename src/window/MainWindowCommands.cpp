@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "ThemeStyle.h"
+#include "TitleBar.h"
 #include "RecoveryIssuePage.h"
 #include "EditorTab.h"
 #include "FileContentProbe.h"
@@ -671,6 +672,8 @@ void MainWindow::applyDarkMode(bool dark)
     const QPalette pal = QApplication::style()->standardPalette();
     qApp->setPalette(pal);
     qApp->setStyleSheet(QString());
+    if (m_titleBar)
+        m_titleBar->setTokens(ThemeTokens::light(), false);
     searchHitColor() = pal.color(QPalette::Highlight);
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
@@ -685,6 +688,8 @@ void MainWindow::applyTheme(const ThemeTokens &t)
 {
     qApp->setPalette(applicationPalette(t));
     qApp->setStyleSheet(applicationStyleSheet(t));
+    if (m_titleBar)
+        m_titleBar->setTokens(t);
     searchHitColor() = t.hit;
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
