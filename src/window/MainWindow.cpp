@@ -21,6 +21,7 @@
 #include "SensitiveText.h"
 #include "CommandRegistry.h"
 #include "DocumentOpenWorkflow.h"
+#include "DocumentTabBar.h"
 #include "MainMenu.h"
 #include "TitleBar.h"
 #include "WindowChrome.h"
@@ -110,7 +111,7 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
     setAcceptDrops(true);
 
     // 标签页
-    m_tabs = new QTabWidget(this);
+    m_tabs = new DocumentTabWidget(this);
     m_tabs->setTabsClosable(true);
     m_tabs->setMovable(true);
     m_tabs->setDocumentMode(true);
@@ -251,6 +252,8 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
             QDateTime::currentDateTime()));
     };
     connect(pillTimer, &QTimer::timeout, this, refreshPill);
+    // Lock state changes the secure tab spine; repaint with the pill.
+    connect(pillTimer, &QTimer::timeout, m_tabs->tabBar(), qOverload<>(&QWidget::update));
     pillTimer->start();
     connect(m_titleBar, &TitleBar::securityPillClicked, this, [this, refreshPill]() {
         const bool active = m_securitySession && m_securitySession->hasActiveSession();

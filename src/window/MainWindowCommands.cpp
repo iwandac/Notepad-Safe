@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "DocumentTabBar.h"
 #include "ThemeStyle.h"
 #include "TitleBar.h"
 #include "RecoveryIssuePage.h"
@@ -661,6 +662,29 @@ void MainWindow::displayEncodingFromAction()
 }
 
 
+namespace {
+TabVisualState tabVisualState(QWidget *page)
+{
+    auto *tab = qobject_cast<EditorTab *>(page);
+    if (!tab)
+        return {TabVisualState::Kind::Recovery, false, false};
+    const TabVisualState::Kind kind = tab->isSecureDocument()
+        ? TabVisualState::Kind::Secure
+        : tab->isReadOnlyByPolicy() ? TabVisualState::Kind::ReadOnly
+                                    : TabVisualState::Kind::Plain;
+    return {kind, tab->isModified(), tab->isSecureDocumentMasked()};
+}
+
+void themeTabBar(QTabWidget *tabs, const ThemeTokens &t)
+{
+    auto *bar = qobject_cast<DocumentTabBar *>(tabs ? tabs->tabBar() : nullptr);
+    if (!bar)
+        return;
+    bar->setStateProvider([tabs](int index) { return tabVisualState(tabs->widget(index)); });
+    bar->setTokens(t);
+}
+} // namespace
+
 void MainWindow::applyDarkMode(bool dark)
 {
     if (!m_highContrastMode) {
@@ -674,6 +698,7 @@ void MainWindow::applyDarkMode(bool dark)
     qApp->setStyleSheet(QString());
     if (m_titleBar)
         m_titleBar->setTokens(ThemeTokens::light(), false);
+    themeTabBar(m_tabs, tokensFromPalette(pal));
     searchHitColor() = pal.color(QPalette::Highlight);
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
@@ -690,6 +715,7 @@ void MainWindow::applyTheme(const ThemeTokens &t)
     qApp->setStyleSheet(applicationStyleSheet(t));
     if (m_titleBar)
         m_titleBar->setTokens(t);
+    themeTabBar(m_tabs, t);
     searchHitColor() = t.hit;
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));

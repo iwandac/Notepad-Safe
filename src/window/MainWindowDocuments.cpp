@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "DocumentTabBar.h"
 #include "EditorTab.h"
 #include "FileContentProbe.h"
 #include "FindReplaceDialog.h"
@@ -356,6 +357,8 @@ EditorTab *MainWindow::addNewTab(OpenPresentationPolicy presentation, int recove
     // resolved appearance to newly created/restored tabs as well as existing ones.
     applyDarkMode(m_darkMode);
 
+    if (auto *bar = qobject_cast<DocumentTabBar *>(m_tabs->tabBar()))
+        connect(tab, &EditorTab::modificationChanged, bar, &DocumentTabBar::refresh);
     connect(tab, &EditorTab::modificationChanged, this, [this, tab](bool m) {
         if (m && tab->isSecureDocument() && !tab->isSecureDocumentTransitioning()) {
             tab->setSecureDocumentTitle(secureTitleFrom(tab));

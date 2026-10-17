@@ -10,6 +10,10 @@ class QsciScintilla;
 // Application-wide style sheet built only from tokens.
 QString applicationStyleSheet(const ThemeTokens &t);
 
+// Tokens taken from a platform palette, for Windows high contrast: painted
+// shell parts then use the user's colors instead of ours.
+ThemeTokens tokensFromPalette(const QPalette &palette);
+
 // Palette for widgets the style sheet does not reach.
 QPalette applicationPalette(const ThemeTokens &t);
 

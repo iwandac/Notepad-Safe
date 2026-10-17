@@ -57,6 +57,32 @@ QString applicationStyleSheet(const ThemeTokens &t)
         .arg(t.radiusControl).arg(t.radiusOverlay).arg(t.control);
 }
 
+ThemeTokens tokensFromPalette(const QPalette &palette)
+{
+    ThemeTokens t;
+    t.paper = palette.color(QPalette::Base);
+    t.raised = t.paper;
+    t.ink = palette.color(QPalette::Text);
+    t.muted = t.ink;
+    t.faint = t.ink;
+    t.chrome = palette.color(QPalette::Window);
+    t.ground = t.chrome;
+    t.line = palette.color(QPalette::WindowText);
+    t.lineSoft = t.line;
+    t.hover = palette.color(QPalette::Highlight);
+    t.selection = t.hover;
+    t.focus = t.hover;
+    t.seal = t.hover;
+    t.exposed = t.hover;
+    t.sealSoft = t.paper;
+    t.exposedSoft = t.paper;
+    t.hit = t.hover;
+    t.hitCurrent = t.hover;
+    t.danger = t.ink;
+    t.dangerSoft = t.paper;
+    return t;
+}
+
 QPalette applicationPalette(const ThemeTokens &t)
 {
     QPalette p;

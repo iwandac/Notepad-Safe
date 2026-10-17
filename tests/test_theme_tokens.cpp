@@ -10,6 +10,7 @@ private slots:
     void tokenValuesMatchSpec();
     void textContrastMeetsAA();
     void styleSheetUsesTokens();
+    void highContrastTokensFollowPalette();
 };
 
 namespace {
@@ -104,6 +105,24 @@ void TestThemeTokens::styleSheetUsesTokens()
     const QString dark = applicationStyleSheet(ThemeTokens::dark()).toUpper();
     QVERIFY(dark.contains(QStringLiteral("#1A2029")));
     QVERIFY(!dark.contains(QStringLiteral("#2D2D30")));
+}
+
+void TestThemeTokens::highContrastTokensFollowPalette()
+{
+    QPalette palette;
+    palette.setColor(QPalette::Base, QColor("#000000"));
+    palette.setColor(QPalette::Text, QColor("#FFFF00"));
+    palette.setColor(QPalette::Window, QColor("#101010"));
+    palette.setColor(QPalette::WindowText, QColor("#FFFFFF"));
+    palette.setColor(QPalette::Highlight, QColor("#00FFFF"));
+    const ThemeTokens t = tokensFromPalette(palette);
+    QCOMPARE(t.paper, QColor("#000000"));
+    QCOMPARE(t.ink, QColor("#FFFF00"));
+    QCOMPARE(t.muted, QColor("#FFFF00"));
+    QCOMPARE(t.chrome, QColor("#101010"));
+    QCOMPARE(t.seal, QColor("#00FFFF"));
+    QCOMPARE(t.exposed, QColor("#00FFFF"));
+    QCOMPARE(t.tab, 34);
 }
 
 QTEST_GUILESS_MAIN(TestThemeTokens)

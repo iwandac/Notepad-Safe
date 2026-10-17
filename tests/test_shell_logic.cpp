@@ -1,4 +1,5 @@
 #include "AltMenuTracker.h"
+#include "DocumentTabBar.h"
 #include "TitleBar.h"
 #include "WindowChrome.h"
 
@@ -16,6 +17,7 @@ private slots:
     void altTapOpensMainMenu();
     void altLetterOpensSubmenu();
     void altCombinationsDoNothing();
+    void tabPaintSpecRules();
 };
 
 namespace {
@@ -141,6 +143,54 @@ void TestShellLogic::altCombinationsDoNothing()
     tracker.reset();  // e.g. a mouse click while Alt is down
     QCOMPARE(tracker.keyRelease(Qt::Key_Alt, Qt::NoModifier).result,
              AltMenuTracker::Result::None);
+}
+
+void TestShellLogic::tabPaintSpecRules()
+{
+    using Kind = TabVisualState::Kind;
+    const ThemeTokens t = ThemeTokens::light();
+    const QColor none(Qt::transparent);
+
+    // Active plain tab: paper, ink, semibold, close shown, no spine.
+    TabPaintSpec spec = tabPaintSpec({Kind::Plain, false, false}, true, false, t);
+    QCOMPARE(spec.background, t.paper);
+    QCOMPARE(spec.text, t.ink);
+    QCOMPARE(spec.fontWeight, 600);
+    QCOMPARE(spec.spine, none);
+    QVERIFY(spec.showClose && !spec.showDirtyDot);
+
+    // Inactive plain tab: transparent, muted, regular.
+    spec = tabPaintSpec({Kind::Plain, false, false}, false, false, t);
+    QCOMPARE(spec.background, none);
+    QCOMPARE(spec.text, t.muted);
+    QCOMPARE(spec.fontWeight, 400);
+
+    // Active secure tab: exposed spine when unlocked, seal when locked; the
+    // lock icon follows the spine.
+    spec = tabPaintSpec({Kind::Secure, false, false}, true, false, t);
+    QCOMPARE(spec.spine, t.exposed);
+    QCOMPARE(spec.icon, t.exposed);
+    spec = tabPaintSpec({Kind::Secure, false, true}, true, false, t);
+    QCOMPARE(spec.spine, t.seal);
+    QCOMPARE(spec.icon, t.seal);
+
+    // Inactive secure tab: no spine, icon keeps the security color.
+    spec = tabPaintSpec({Kind::Secure, false, false}, false, false, t);
+    QCOMPARE(spec.spine, none);
+    QCOMPARE(spec.icon, t.exposed);
+
+    // Dirty: dot instead of close, until hovered.
+    spec = tabPaintSpec({Kind::Plain, true, false}, true, false, t);
+    QVERIFY(spec.showDirtyDot && !spec.showClose);
+    spec = tabPaintSpec({Kind::Plain, true, false}, false, true, t);
+    QVERIFY(!spec.showDirtyDot && spec.showClose);
+
+    // Read-only and recovery tabs carry an icon, no spine.
+    spec = tabPaintSpec({Kind::ReadOnly, false, false}, true, false, t);
+    QCOMPARE(spec.spine, none);
+    QCOMPARE(spec.icon, t.muted);
+    spec = tabPaintSpec({Kind::Recovery, false, false}, true, false, t);
+    QCOMPARE(spec.icon, t.danger);
 }
 
 QTEST_GUILESS_MAIN(TestShellLogic)
