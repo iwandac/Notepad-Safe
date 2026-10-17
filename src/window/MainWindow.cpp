@@ -167,6 +167,7 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
     createMenus();         // 菜单项用默认值创建，action 指针存在 m_act* / m_edgeColGroup
     createStatusBar();
     m_mainMenu = installMainMenu(this, menuBar(), m_titleBar);
+    connect(m_titleBar, &TitleBar::commandPaletteRequested, this, &MainWindow::showCommandPalette);
     m_commandRegistry = std::make_unique<CommandRegistry>();
     m_commandRegistry->bind(this);
     if (!m_commandRegistry->unboundCommandIds().isEmpty())

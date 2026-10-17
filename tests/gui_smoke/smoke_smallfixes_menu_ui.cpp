@@ -3738,6 +3738,35 @@ private slots:
         closeAllEditorTabs(mw_);
     }
 
+    // Ctrl+K opens the palette; typing 查找 and Enter runs the find command.
+    void commandPaletteRunsFind() {
+        closeAllEditorTabs(mw_);
+        const QString path = tmpDir_.filePath(QStringLiteral("palette.txt"));
+        {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write("palette\n");
+        }
+        mw_->openFilesFromExternal({path});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab);
+        mw_->activateWindow();
+        tab->editor()->setFocus();
+        QTest::keyClick(tab->editor(), Qt::Key_K, Qt::ControlModifier);
+        auto *palette = mw_->findChild<QFrame *>(QStringLiteral("commandPalette"));
+        QTRY_VERIFY_WITH_TIMEOUT(palette && palette->isVisible(), 2000);
+        auto *query = palette->findChild<QLineEdit *>(QStringLiteral("commandPaletteQuery"));
+        QVERIFY(query);
+        QTest::keyClicks(query, QStringLiteral("查找"));
+        QTest::keyClick(query, Qt::Key_Return);
+        QTRY_VERIFY(!palette->isVisible());
+        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+        QTRY_VERIFY_WITH_TIMEOUT(dialog && dialog->isVisible(), 2000);
+        dialog->close();
+        closeAllEditorTabs(mw_);
+    }
+
     void tc_system_high_contrast_keeps_platform_palette() {
         const QString dataDir = tmpDir_.filePath(QStringLiteral("high-contrast-settings"));
         QDir().mkpath(dataDir);

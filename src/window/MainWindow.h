@@ -24,6 +24,7 @@ class EditorTab;
 struct ThemeTokens;
 class TitleBar;
 class StatusSegment;
+class CommandPalette;
 class FindReplaceDialog;
 class SearchResultsDock;
 class SearchResultsController;
@@ -217,6 +218,7 @@ private:
     QLabel *m_securityIdentityStatus = nullptr;
     QLabel *m_securitySessionStatus = nullptr;
     TitleBar *m_titleBar = nullptr;
+    CommandPalette *m_commandPalette = nullptr;
     QMenu *m_mainMenu = nullptr;
     QLabel *m_securityRecoveryStatus = nullptr;
     QActionGroup *m_edgeColGroup = nullptr;   // 长行标尺列数组，遍历其 action 同步勾选
@@ -310,6 +312,7 @@ private:
     void rebuildRecentFilesMenu();
     void applyDarkMode(bool dark);
     void applyTheme(const ThemeTokens &t);
+    void showCommandPalette();
     void applyAppearanceMode();
     // 将当前 m_darkMode/m_wordWrap/m_edgeVisible/m_edgeColumn 同步到视图菜单的勾选状态
     // 必须在 createMenus 之后、loadSettings 之后调用，避免"设置恢复了但菜单勾选没变"

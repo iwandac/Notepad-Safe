@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "CommandPalette.h"
 #include "DocumentTabBar.h"
 #include "StatusSegments.h"
 #include "ThemeStyle.h"
@@ -718,6 +719,46 @@ void MainWindow::applyDarkMode(bool dark)
         for (QsciScintilla *surface : tab->themedEditors())
             applyEditorSurfacePalette(surface, pal);
     }
+}
+
+void MainWindow::showCommandPalette()
+{
+    if (!m_commandPalette)
+        m_commandPalette = new CommandPalette(this);
+    m_commandPalette->setTokens(m_highContrastMode ? tokensFromPalette(qApp->palette())
+                                : m_darkMode ? ThemeTokens::dark() : ThemeTokens::light());
+    QVector<PaletteEntry> entries;
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        QPointer<QWidget> page = m_tabs->widget(i);
+        auto *tab = qobject_cast<EditorTab *>(page.data());
+        // A locked secure document must not reveal its title or path.
+        const bool locked = tab && tab->isSecureDocumentMasked();
+        entries.push_back({PaletteEntry::Group::OpenDocument,
+                           locked ? QStringLiteral("已锁定文档") : m_tabs->tabText(i),
+                           locked || !tab ? QString() : tab->filePath(), {}, true,
+                           [this, page] { if (page) m_tabs->setCurrentWidget(page); }});
+    }
+    QSet<QString> seen;
+    for (QAction *action : findChildren<QAction *>()) {
+        const QString id = action->objectName();
+        if (id.isEmpty() || action->menu() || action->isSeparator() || seen.contains(id)
+            || id.startsWith(QLatin1String("tabContext.")) || id == QLatin1String("view.commandPalette"))
+            continue;
+        seen.insert(id);
+        QPointer<QAction> target = action;
+        entries.push_back({PaletteEntry::Group::Command, action->text(), {},
+                           action->shortcut().toString(QKeySequence::NativeText),
+                           action->isEnabled(), [target] { if (target) target->trigger(); }});
+    }
+    for (QAction *action : m_recentMenu ? m_recentMenu->actions() : QList<QAction *>()) {
+        const QString path = action->data().toString();
+        if (path.isEmpty())
+            continue;
+        QPointer<QAction> target = action;
+        entries.push_back({PaletteEntry::Group::Recent, QFileInfo(path).fileName(), path, {},
+                           true, [target] { if (target) target->trigger(); }});
+    }
+    m_commandPalette->open(std::move(entries));
 }
 
 void MainWindow::applyTheme(const ThemeTokens &t)
