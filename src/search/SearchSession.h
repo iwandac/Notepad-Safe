@@ -27,7 +27,6 @@ public:
         query_ = std::move(query);
         ++generation_;
         pendingTargets_ = 0;
-        skippedTextTargets_ = 0;
         skippedLockedTargets_ = 0;
         dispatchComplete_ = false;
         cancelRequested_ = false;
@@ -39,7 +38,6 @@ public:
         clearQuery();
         ++generation_;
         pendingTargets_ = 0;
-        skippedTextTargets_ = 0;
         skippedLockedTargets_ = 0;
         dispatchComplete_ = true;
         cancelRequested_ = false;
@@ -66,9 +64,7 @@ public:
             --pendingTargets_;
     }
     int pendingTargets() const noexcept { return pendingTargets_; }
-    void skipTextTarget() noexcept { ++skippedTextTargets_; }
     void skipLockedTarget() noexcept { ++skippedLockedTargets_; }
-    int skippedTextTargets() const noexcept { return skippedTextTargets_; }
     int skippedLockedTargets() const noexcept { return skippedLockedTargets_; }
     void clearQuery()
     {
@@ -81,7 +77,6 @@ private:
     SearchQuery query_;
     int generation_ = 0;
     int pendingTargets_ = 0;
-    int skippedTextTargets_ = 0;
     int skippedLockedTargets_ = 0;
     bool dispatchComplete_ = true;
     bool cancelRequested_ = false;

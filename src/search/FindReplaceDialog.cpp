@@ -432,15 +432,6 @@ void FindReplaceDialog::notifyTabOpened(DocumentSearchSurface *tab)
         }
         return;
     }
-    if (m_searchSession.query().hexBytes && !tab->isHexPresentation()) {
-        m_searchSession.skipTextTarget();
-        if (m_statusLabel) {
-            m_statusLabel->setText(
-                QStringLiteral("新打开的文本文件不属于当前字节搜索；已跳过 %1 个文本文件。")
-                    .arg(m_searchSession.skippedTextTargets()));
-        }
-        return;
-    }
 
     const bool needsRestart = m_searchSession.dispatchComplete();
     m_multiTabs.push_back(tab);
@@ -610,16 +601,9 @@ void FindReplaceDialog::updateQueryUi()
         && m_tab->isHexPresentation();
     bool hasSearchableTarget = isSearchableDocument(m_tab);
     if (allOpenScope()) {
+        // All-open search is text-only; byte search stays on the current file.
         hasBinaryTarget = false;
-        hasSearchableTarget = false;
-        for (DocumentSearchSurface *tab : openTabs()) {
-            if (!isSearchableDocument(tab))
-                continue;
-            hasSearchableTarget = true;
-            if (tab->isHexPresentation()) {
-                hasBinaryTarget = true;
-            }
-        }
+        hasSearchableTarget = searchableTargetCount > 0;
     }
     // Keep one stable interpretation state. Programmatic callers can still
     // set disabled QCheckBoxes, so normalize here as a defensive domain gate;
@@ -676,27 +660,18 @@ void FindReplaceDialog::updateQueryUi()
     const bool currentTargetReplaceable = replaceableTextTarget(m_tab);
     const bool currentReplaceAllowed = !busy && hasQuery && !allOpenScope() && !hex
                                        && currentTargetReplaceable;
-    // Single-step Replace remains a current-document operation. Replace All
-    // follows the selected scope and can transact across editable open tabs.
+    // Replace and Replace All act on the current file only; the all-open
+    // scope only finds.
     m_replaceBtn->setEnabled(currentReplaceAllowed);
-    // The replacement value remains editable for an empty query, but only
-    // where the selected scope contains a policy-writable Text target.
-    bool scopeHasReplaceableTarget = currentTargetReplaceable;
-    if (allOpenScope()) {
-        const auto targets = openTabs();
-        scopeHasReplaceableTarget = std::any_of(
-            targets.cbegin(), targets.cend(), replaceableTextTarget);
-    }
-    const bool replacementValueAllowed = !busy && !hex
-        && scopeHasReplaceableTarget;
-    m_replaceAllBtn->setEnabled(currentReplaceAllowed
-        || (replacementValueAllowed && hasQuery && allOpenScope()));
-    m_replaceEdit->setEnabled(replacementValueAllowed);
+    m_replaceAllBtn->setEnabled(currentReplaceAllowed);
+    // The replacement value remains editable for an empty query.
+    m_replaceEdit->setEnabled(!busy && !hex && !allOpenScope()
+                              && currentTargetReplaceable);
     if (!busy && m_statusLabel) {
         const QString byteModeNotice = QStringLiteral(
             "字节模式仅查找；编辑请回到十六进制视图。");
         const QString allOpenReplaceNotice = QStringLiteral(
-            "全部替换只修改可编辑文本；执行前列出跳过项。");
+            "全部打开文件范围只查找；替换只作用于当前文件。");
         if (hex && m_replaceMode)
             m_statusLabel->setText(byteModeNotice);
         else if (allOpenScope() && m_replaceMode)
@@ -819,132 +794,9 @@ void FindReplaceDialog::onReplaceAll()
     if (pattern.isEmpty()) return;
     emitFindParameters();
 
-    if (allOpenScope()) {
-        struct PlannedTarget {
-            QPointer<DocumentSearchSurface> tab;
-            quint64 revision = 0;
-            int matches = 0;
-        };
-        QVector<PlannedTarget> plan;
-        qint64 totalMatches = 0;
-        int skippedReadOnly = 0;
-        int skippedBinary = 0;
-        int skippedLocked = 0;
-
-        // Freeze and preflight the complete manifest before touching any tab.
-        // A query/preflight error aborts the whole transaction; policy-
-        // incompatible targets are explicitly summarized as skips.
-        for (DocumentSearchSurface *tab : openTabs()) {
-            if (!tab)
-                continue;
-            if (tab->isSecureDocumentMasked() || tab->isSecureDocumentTransitioning()) {
-                ++skippedLocked;
-                continue;
-            }
-            if (tab->isBinaryDocument()) {
-                ++skippedBinary;
-                continue;
-            }
-            if (tab->isReadOnlyByPolicy()) {
-                ++skippedReadOnly;
-                continue;
-            }
-            const QVector<SearchMatch> matches = tab->findAll(
-                pattern, m_regexCheck->isChecked(),
-                m_caseCheck->isChecked(), m_wordCheck->isChecked());
-            if (!tab->lastSearchError().isEmpty() || tab->lastFindAllWasTruncated()) {
-                const QString reason = !tab->lastSearchError().isEmpty()
-                    ? tab->lastSearchError()
-                    : QStringLiteral("匹配数量超过安全结果上限");
-                if (m_statusLabel)
-                    m_statusLabel->setText(QStringLiteral("预检失败：%1：%2")
-                                               .arg(tab->fileName(), reason));
-                QMessageBox::warning(this, QStringLiteral("无法执行全部替换"),
-                    QStringLiteral("尚未修改任何文件。\n%1：%2")
-                        .arg(tab->fileName(), reason));
-                return;
-            }
-            if (matches.isEmpty())
-                continue;
-            plan.push_back({tab, tab->contentRevision(), int(matches.size())});
-            totalMatches += matches.size();
-        }
-
-        const QString skipSummary = QStringLiteral(
-            "跳过：只读大文件 %1 个，二进制文档 %2 个，锁定文档 %3 个。")
-                .arg(skippedReadOnly).arg(skippedBinary).arg(skippedLocked);
-        if (plan.isEmpty()) {
-            const QString message = QStringLiteral("没有可替换的匹配。%1").arg(skipSummary);
-            if (m_statusLabel) m_statusLabel->setText(message);
-            QMessageBox::information(this, QStringLiteral("全部替换"), message);
-            return;
-        }
-
-        const QString confirmation = QStringLiteral(
-            "将在 %1 个可编辑文本文件中替换 %2 处匹配。\n%3\n\n"
-            "每个文件形成一个撤销步骤；不会自动保存。是否继续？")
-                .arg(plan.size()).arg(totalMatches).arg(skipSummary);
-        if (QMessageBox::question(this, QStringLiteral("确认全部打开文件替换"),
-                                  confirmation,
-                                  QMessageBox::Yes | QMessageBox::No,
-                                  QMessageBox::No) != QMessageBox::Yes) {
-            if (m_statusLabel) m_statusLabel->setText(QStringLiteral("已取消，未修改任何文件。"));
-            return;
-        }
-
-        QVector<QPointer<DocumentSearchSurface>> changed;
-        qint64 replacedTotal = 0;
-        QString failure;
-        for (const PlannedTarget &target : std::as_const(plan)) {
-            DocumentSearchSurface *tab = target.tab.data();
-            if (!tab || tab->contentRevision() != target.revision) {
-                failure = tab
-                    ? QStringLiteral("“%1”在确认后发生变化").arg(tab->fileName())
-                    : QStringLiteral("一个目标标签已关闭");
-                break;
-            }
-            const int replaced = tab->replaceAll(
-                pattern, currentReplaceText(), m_regexCheck->isChecked(),
-                m_caseCheck->isChecked(), m_wordCheck->isChecked());
-            if (!tab->lastSearchError().isEmpty() || replaced != target.matches) {
-                failure = !tab->lastSearchError().isEmpty()
-                    ? QStringLiteral("%1：%2").arg(tab->fileName(), tab->lastSearchError())
-                    : QStringLiteral("%1：预期 %2 处，实际替换 %3 处")
-                          .arg(tab->fileName()).arg(target.matches).arg(replaced);
-                break;
-            }
-            if (replaced > 0) {
-                changed.push_back(tab);
-                replacedTotal += replaced;
-            }
-        }
-
-        if (!failure.isEmpty()) {
-            for (auto it = changed.crbegin(); it != changed.crend(); ++it) {
-                if (*it)
-                    (*it)->undo();
-            }
-            const QString message = QStringLiteral(
-                "替换未完成，已撤销本批次中先前修改的文件。\n%1").arg(failure);
-            if (m_statusLabel) m_statusLabel->setText(message);
-            QMessageBox::warning(this, QStringLiteral("全部替换已回滚"), message);
-            return;
-        }
-
-        if (m_resultsDock) {
-            for (const auto &tab : std::as_const(changed)) {
-                if (tab)
-                    m_resultsDock->invalidateResultsFor(
-                        tab->documentState().id);
-            }
-        }
-        const QString completed = QStringLiteral(
-            "已在 %1 个文件中替换 %2 处；文件尚未保存。%3")
-                .arg(changed.size()).arg(replacedTotal).arg(skipSummary);
-        if (m_statusLabel) m_statusLabel->setText(completed);
-        QMessageBox::information(this, QStringLiteral("全部替换完成"), completed);
+    // Replacement only acts on the current file; all-open scope only finds.
+    if (allOpenScope())
         return;
-    }
 
     int count = m_tab->replaceAll(pattern, currentReplaceText(),
                                   m_regexCheck->isChecked(),
@@ -1108,7 +960,6 @@ void FindReplaceDialog::startAllOpenFindAll()
         return;
     const QString pattern = currentFindText();
     const QList<DocumentSearchSurface *> rawTabs = openTabs();
-    const bool hex = hexBytesMode();
 
     SearchQuery query;
     query.pattern = pattern;
@@ -1116,7 +967,8 @@ void FindReplaceDialog::startAllOpenFindAll()
     query.regex = m_regexCheck->isChecked();
     query.caseSensitive = m_caseCheck->isChecked();
     query.wholeWord = m_wordCheck->isChecked();
-    query.hexBytes = hex;
+    // All-open search is text-only; byte search stays on the current file.
+    query.hexBytes = false;
     const int generation = m_searchSession.begin(std::move(query));
     disconnectSingleSearch();
     for (const auto &connection : std::as_const(m_multiConnections))
@@ -1129,18 +981,13 @@ void FindReplaceDialog::startAllOpenFindAll()
             m_searchSession.skipLockedTarget();
             continue;
         }
-        if (hex && (!tab || !tab->isHexPresentation())) {
-            m_searchSession.skipTextTarget();
-            continue;
-        }
         m_multiTabs.push_back(tab);
     }
     m_multiNextIndex = 0;
     m_resultsDock->beginMultiFileResults(pattern, m_multiTabs.size());
     const QString startStatus = QStringLiteral(
-        "正在搜索 %1 个打开文件；已跳过文本 %2 个、锁定 %3 个…")
-        .arg(m_multiTabs.size()).arg(m_searchSession.skippedTextTargets())
-        .arg(m_searchSession.skippedLockedTargets());
+        "正在搜索 %1 个打开文件；已跳过锁定文档 %2 个…")
+        .arg(m_multiTabs.size()).arg(m_searchSession.skippedLockedTargets());
     setL2SearchUiBusy(true, startStatus);
     QTimer::singleShot(0, this, [this, generation]() {
         dispatchNextMultiTarget(generation);
@@ -1292,12 +1139,9 @@ void FindReplaceDialog::finishMultiSearchIfReady(int generation)
     setL2SearchUiBusy(false);
     if (cancelled && m_statusLabel)
         m_statusLabel->setText(QStringLiteral("搜索已取消，已保留完成的结果。"));
-    else if ((m_searchSession.skippedTextTargets() > 0
-              || m_searchSession.skippedLockedTargets() > 0)
-             && m_statusLabel)
+    else if (m_searchSession.skippedLockedTargets() > 0 && m_statusLabel)
         m_statusLabel->setText(
-            QStringLiteral("搜索完成：跳过文本 %1 个、锁定文档 %2 个。")
-                .arg(m_searchSession.skippedTextTargets())
+            QStringLiteral("搜索完成：跳过锁定文档 %1 个。")
                 .arg(m_searchSession.skippedLockedTargets()));
     m_searchSession.clearCancelRequest();
 }
