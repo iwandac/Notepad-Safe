@@ -110,7 +110,8 @@ QStringList FeatureRegistry::requiredStartupCommandIds()
         QStringLiteral("view.zoom.reset"), QStringLiteral("view.panels"),
         QStringLiteral("view.panel.searchResults"),
         QStringLiteral("view.statusBar"),
-        QStringLiteral("menu.encoding"), QStringLiteral("encoding.eol"),
+        QStringLiteral("view.commandPalette"), QStringLiteral("view.settings"),
+        QStringLiteral("menu.main"), QStringLiteral("menu.encoding"), QStringLiteral("encoding.eol"),
         QStringLiteral("encoding.convert"), QStringLiteral("menu.tools"),
         QStringLiteral("tools.accounts"),
         QStringLiteral("tools.securityCenter"),
@@ -183,7 +184,8 @@ QString FeatureRegistry::featureIdForCommand(const QString &commandId)
             "view.folding.toggleCurrent", "view.folding.collapseAll",
             "view.folding.expandAll", "view.edge", "view.edge.visible",
             "view.zoom", "view.zoom.in", "view.zoom.out", "view.zoom.reset",
-            "view.panels", "view.panel.searchResults", "view.statusBar"})
+            "view.panels", "view.panel.searchResults", "view.statusBar",
+            "view.commandPalette", "view.settings"})
         || hasWhitelistedSuffix(commandId, "view.edge.column.",
                                 {"80", "100", "120"}))
         return QStringLiteral("NSP-VIEW");
@@ -205,7 +207,7 @@ QString FeatureRegistry::featureIdForCommand(const QString &commandId)
     if (commandId == QLatin1String("help.about"))
         return QStringLiteral("NSP-HELP");
     if (containsCommand(commandId, {
-            "menu.file", "menu.edit", "menu.search", "menu.language",
+            "menu.main", "menu.file", "menu.edit", "menu.search", "menu.language",
             "menu.view", "menu.encoding", "menu.tools", "menu.help",
             "tabContext.save", "tabContext.saveAs", "tabContext.close",
             "tabContext.closeOthers", "tabContext.closeAll",

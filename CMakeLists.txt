@@ -427,6 +427,8 @@ add_library(notepadsafe_app STATIC
     src/shell/ThemeStyle.cpp
     src/shell/WindowChrome.cpp
     src/shell/TitleBar.cpp
+    src/shell/AltMenuTracker.cpp
+    src/shell/MainMenu.cpp
 )
 target_include_directories(notepadsafe_app PUBLIC
     ${APP_INCLUDE_DIRS}

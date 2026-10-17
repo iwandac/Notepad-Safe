@@ -47,6 +47,9 @@ public:
 
     // 从命令行/拖放等外部传入打开文件（支持多个）
     Q_INVOKABLE void openFilesFromExternal(const QStringList &paths);
+    // The menus behind the title bar's main menu button (the menu bar is hidden).
+    QMenu *mainMenu() const { return m_mainMenu; }
+    TitleBar *titleBar() const { return m_titleBar; }
 
 protected:
     void closeEvent(QCloseEvent *event) override;
@@ -210,6 +213,7 @@ private:
     QLabel *m_securityIdentityStatus = nullptr;
     QLabel *m_securitySessionStatus = nullptr;
     TitleBar *m_titleBar = nullptr;
+    QMenu *m_mainMenu = nullptr;
     QLabel *m_securityRecoveryStatus = nullptr;
     QActionGroup *m_edgeColGroup = nullptr;   // 长行标尺列数组，遍历其 action 同步勾选
     QActionGroup *m_tabWidthGroup = nullptr;

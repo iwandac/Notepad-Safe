@@ -1,3 +1,4 @@
+#include "AltMenuTracker.h"
 #include "TitleBar.h"
 #include "WindowChrome.h"
 
@@ -12,6 +13,9 @@ private slots:
     void hitTestRegions_data();
     void hitTestRegions();
     void securityPillShowsSessionState();
+    void altTapOpensMainMenu();
+    void altLetterOpensSubmenu();
+    void altCombinationsDoNothing();
 };
 
 namespace {
@@ -82,6 +86,61 @@ void TestShellLogic::securityPillShowsSessionState()
     QCOMPARE(today.state, SecurityPillState::ExpiringToday);
     QCOMPARE(today.text, QStringLiteral("今天 21:15 到期"));
     QCOMPARE(today.toolTip, QStringLiteral("本设备会话有效至 10-17 21:15，点击立即锁定"));
+}
+
+void TestShellLogic::altTapOpensMainMenu()
+{
+    AltMenuTracker tracker;
+    QCOMPARE(tracker.keyPress(Qt::Key_Alt, Qt::AltModifier).result,
+             AltMenuTracker::Result::None);
+    QCOMPARE(tracker.keyRelease(Qt::Key_Alt, Qt::NoModifier).result,
+             AltMenuTracker::Result::OpenMainMenu);
+    // A second release without a press does nothing.
+    QCOMPARE(tracker.keyRelease(Qt::Key_Alt, Qt::NoModifier).result,
+             AltMenuTracker::Result::None);
+}
+
+void TestShellLogic::altLetterOpensSubmenu()
+{
+    AltMenuTracker tracker;
+    tracker.keyPress(Qt::Key_Alt, Qt::AltModifier);
+    const AltMenuTracker::Outcome outcome = tracker.keyPress(Qt::Key_F, Qt::AltModifier);
+    QCOMPARE(outcome.result, AltMenuTracker::Result::OpenSubmenu);
+    QCOMPARE(outcome.mnemonic, QChar(u'F'));
+    // Releasing Alt after the letter must not also open the main menu.
+    QCOMPARE(tracker.keyRelease(Qt::Key_Alt, Qt::NoModifier).result,
+             AltMenuTracker::Result::None);
+    // A letter with Alt held but no fresh Alt press still opens the submenu.
+    QCOMPARE(tracker.keyPress(Qt::Key_S, Qt::AltModifier).result,
+             AltMenuTracker::Result::OpenSubmenu);
+}
+
+void TestShellLogic::altCombinationsDoNothing()
+{
+    AltMenuTracker tracker;
+    tracker.keyPress(Qt::Key_Alt, Qt::AltModifier);
+    QCOMPARE(tracker.keyPress(Qt::Key_Tab, Qt::AltModifier).result,
+             AltMenuTracker::Result::None);
+    QCOMPARE(tracker.keyRelease(Qt::Key_Alt, Qt::NoModifier).result,
+             AltMenuTracker::Result::None);
+
+    tracker.keyPress(Qt::Key_Alt, Qt::AltModifier);
+    QCOMPARE(tracker.keyPress(Qt::Key_Up, Qt::AltModifier).result,
+             AltMenuTracker::Result::None);
+    QCOMPARE(tracker.keyRelease(Qt::Key_Alt, Qt::NoModifier).result,
+             AltMenuTracker::Result::None);
+
+    tracker.keyPress(Qt::Key_Control, Qt::ControlModifier);
+    tracker.keyPress(Qt::Key_Alt, Qt::ControlModifier | Qt::AltModifier);
+    QCOMPARE(tracker.keyPress(Qt::Key_D, Qt::ControlModifier | Qt::AltModifier).result,
+             AltMenuTracker::Result::None);
+    QCOMPARE(tracker.keyRelease(Qt::Key_Alt, Qt::ControlModifier).result,
+             AltMenuTracker::Result::None);
+
+    tracker.keyPress(Qt::Key_Alt, Qt::AltModifier);
+    tracker.reset();  // e.g. a mouse click while Alt is down
+    QCOMPARE(tracker.keyRelease(Qt::Key_Alt, Qt::NoModifier).result,
+             AltMenuTracker::Result::None);
 }
 
 QTEST_GUILESS_MAIN(TestShellLogic)

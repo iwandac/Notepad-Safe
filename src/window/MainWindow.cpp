@@ -21,6 +21,7 @@
 #include "SensitiveText.h"
 #include "CommandRegistry.h"
 #include "DocumentOpenWorkflow.h"
+#include "MainMenu.h"
 #include "TitleBar.h"
 #include "WindowChrome.h"
 #include "EditorPreferences.h"
@@ -164,6 +165,7 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
     createActions();
     createMenus();         // 菜单项用默认值创建，action 指针存在 m_act* / m_edgeColGroup
     createStatusBar();
+    m_mainMenu = installMainMenu(this, menuBar(), m_titleBar);
     m_commandRegistry = std::make_unique<CommandRegistry>();
     m_commandRegistry->bind(this);
     if (!m_commandRegistry->unboundCommandIds().isEmpty())

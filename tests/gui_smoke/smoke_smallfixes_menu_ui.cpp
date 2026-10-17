@@ -92,6 +92,7 @@
 #include "AppComposition.h"
 #include "EditorTab.h"
 #include "ThemeTokens.h"
+#include "TitleBar.h"
 #include "WindowedReadOnlyProvider.h"
 #include "ByteClipboard.h"
 #include "VirtualFileView.h"
@@ -3600,6 +3601,71 @@ private slots:
             QCOMPARE(hit, tokens.hit);
             text->clearSearchHighlights();
         }
+        closeAllEditorTabs(mw_);
+    }
+
+    // The menu bar is hidden behind the title bar's main menu button; every
+    // shortcut, Alt and Alt+letter still work.
+    void shortcutsWorkWithHiddenMenuBar() {
+        closeAllEditorTabs(mw_);
+        QVERIFY(!mw_->menuBar()->isVisible());
+        QVERIFY(mw_->mainMenu());
+        const QString path = tmpDir_.filePath(QStringLiteral("hidden-menu.txt"));
+        {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write("alpha\n");
+        }
+        mw_->openFilesFromExternal({path});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab);
+        mw_->activateWindow();
+        tab->editor()->setFocus();
+        QTest::keyClicks(tab->editor(), QStringLiteral("beta "));
+        QVERIFY(tab->isModified());
+        QTest::keyClick(tab->editor(), Qt::Key_S, Qt::ControlModifier);
+        QTRY_VERIFY_WITH_TIMEOUT(!tab->isModified(), 3000);
+        {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            QVERIFY(file.readAll().startsWith("beta "));
+        }
+
+        QAction *next = mw_->findChild<QAction *>(QStringLiteral("search.next"));
+        QVERIFY(next);
+        QSignalSpy nextSpy(next, &QAction::triggered);
+        QTest::keyClick(tab->editor(), Qt::Key_F3);
+        QCOMPARE(nextSpy.count(), 1);
+
+        QTest::keyClick(tab->editor(), Qt::Key_R, Qt::ControlModifier);
+        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+        QTRY_VERIFY_WITH_TIMEOUT(dialog && dialog->isVisible(), 2000);
+        auto *replaceEdit = dialog->findChild<QLineEdit *>(QStringLiteral("replaceTextEdit"));
+        QVERIFY(replaceEdit && replaceEdit->isVisible());
+        dialog->close();
+
+        tab->editor()->setFocus();
+        QTest::keyPress(tab->editor(), Qt::Key_Alt, Qt::AltModifier);
+        QTest::keyRelease(tab->editor(), Qt::Key_Alt, Qt::NoModifier);
+        QTRY_VERIFY_WITH_TIMEOUT(mw_->mainMenu()->isVisible(), 1000);
+        mw_->mainMenu()->close();
+        QTRY_VERIFY(!mw_->mainMenu()->isVisible());
+
+        tab->editor()->setFocus();
+        QTest::keyPress(tab->editor(), Qt::Key_Alt, Qt::AltModifier);
+        QTest::keyClick(tab->editor(), Qt::Key_F, Qt::AltModifier);
+        QTest::keyRelease(tab->editor(), Qt::Key_Alt, Qt::NoModifier);
+        auto *fileMenu = mw_->findChild<QMenu *>(QStringLiteral("menu.file"));
+        QVERIFY(fileMenu);
+        QTRY_VERIFY_WITH_TIMEOUT(fileMenu->isVisible(), 1000);
+        QVERIFY(!mw_->mainMenu()->isVisible());
+        fileMenu->close();
+
+        QSignalSpy paletteSpy(mw_->titleBar(), &TitleBar::commandPaletteRequested);
+        tab->editor()->setFocus();
+        QTest::keyClick(tab->editor(), Qt::Key_K, Qt::ControlModifier);
+        QCOMPARE(paletteSpy.count(), 1);
         closeAllEditorTabs(mw_);
     }
 
