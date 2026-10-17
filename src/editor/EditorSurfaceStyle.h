@@ -14,6 +14,19 @@
 #include <QTextCursor>
 #include <QtMath>
 
+// Search hit fill. The shell theme sets it; the default keeps the legacy amber.
+inline QColor &searchHitColor()
+{
+    static QColor color(0xFF, 0xB7, 0x00);
+    return color;
+}
+
+// Scintilla takes colors as 0xBBGGRR.
+inline long scintillaColor(const QColor &color)
+{
+    return long(color.red()) | (long(color.green()) << 8) | (long(color.blue()) << 16);
+}
+
 inline void applyEditorSurfacePalette(QsciScintilla *editor, const QPalette &palette)
 {
     if (!editor)

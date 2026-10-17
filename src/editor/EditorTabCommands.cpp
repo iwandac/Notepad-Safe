@@ -521,7 +521,8 @@ void EditorTab::setSearchHighlights(const QVector<SearchMatch> &matches)
     m_editor->SendScintilla(QsciScintillaBase::SCI_SETINDICATORCURRENT, indicator);
     m_editor->SendScintilla(QsciScintillaBase::SCI_INDICSETSTYLE, indicator,
                             QsciScintillaBase::INDIC_ROUNDBOX);
-    m_editor->SendScintilla(QsciScintillaBase::SCI_INDICSETFORE, indicator, 0x00B7FF);
+    m_editor->SendScintilla(QsciScintillaBase::SCI_INDICSETFORE, indicator,
+                            scintillaColor(searchHitColor()));
     m_editor->SendScintilla(QsciScintillaBase::SCI_INDICSETALPHA, indicator, 90);
     m_editor->SendScintilla(QsciScintillaBase::SCI_INDICATORCLEARRANGE,
                             0, m_editor->length());

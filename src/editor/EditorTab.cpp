@@ -1225,6 +1225,16 @@ QWidget *EditorTab::l1Page() const
     return m_editor;
 }
 
+QList<QsciScintilla *> EditorTab::themedEditors() const
+{
+    QList<QsciScintilla *> surfaces;
+    if (m_editor)
+        surfaces.push_back(m_editor);
+    if (m_windowedReadOnlyProvider && m_windowedReadOnlyProvider->editor())
+        surfaces.push_back(m_windowedReadOnlyProvider->editor());
+    return surfaces;
+}
+
 bool EditorTab::canSwitchWindowedPresentation() const
 {
     return windowedReadOnlyActive() && !isBinaryDocument();

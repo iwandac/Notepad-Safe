@@ -91,6 +91,8 @@
 #include "MainWindow.h"
 #include "AppComposition.h"
 #include "EditorTab.h"
+#include "ThemeTokens.h"
+#include "WindowedReadOnlyProvider.h"
 #include "ByteClipboard.h"
 #include "VirtualFileView.h"
 #include "WindowedReadOnlyProvider.h"
@@ -3529,6 +3531,76 @@ private slots:
                 break;
             }
         }
+    }
+
+    // Every editor surface follows the theme tokens: editable text, windowed
+    // read-only text and hex. Search hits use the token hit color.
+    void appearanceRepaintsEverySurface() {
+        closeAllEditorTabs(mw_);
+        const QString textPath = tmpDir_.filePath(QStringLiteral("theme-text.txt"));
+        const QString largePath = tmpDir_.filePath(QStringLiteral("theme-large.log"));
+        const QString binaryPath = tmpDir_.filePath(QStringLiteral("theme-small.bin"));
+        {
+            QFile text(textPath);
+            QVERIFY(text.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            text.write("theme marker line\n");
+            QFile large(largePath);
+            QVERIFY(large.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            const QByteArray line(1023, 'x');
+            for (int i = 0; i < 40 * 1024; ++i) {
+                large.write(line);
+                large.write("\n");
+            }
+            QFile binary(binaryPath);
+            QVERIFY(binary.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            binary.write(QByteArray(64, '\0'));
+        }
+        mw_->openFilesFromExternal({textPath, largePath, binaryPath});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 3, 5000);
+        auto *tabs = mw_->findChild<QTabWidget *>();
+        QVERIFY(tabs);
+        QList<EditorTab *> opened;
+        for (int i = 0; i < tabs->count(); ++i) {
+            if (auto *tab = qobject_cast<EditorTab *>(tabs->widget(i)))
+                opened.push_back(tab);
+        }
+        QCOMPARE(opened.size(), 3);
+        const auto surfacesOf = [](EditorTab *tab) {
+            QList<QsciScintilla *> surfaces{tab->editor()};
+            if (auto *provider = tab->windowedReadOnlyProvider())
+                surfaces.push_back(provider->editor());
+            return surfaces;
+        };
+        QAction *dark = mw_->findChild<QAction *>(QStringLiteral("view.appearance.dark"));
+        QAction *light = mw_->findChild<QAction *>(QStringLiteral("view.appearance.light"));
+        QVERIFY(dark && light);
+
+        for (const bool useDark : {true, false}) {
+            (useDark ? dark : light)->trigger();
+            const ThemeTokens tokens = useDark ? ThemeTokens::dark() : ThemeTokens::light();
+            QApplication::processEvents();
+            QVERIFY(qApp->styleSheet().contains(tokens.paper.name(QColor::HexRgb),
+                                                Qt::CaseInsensitive));
+            for (EditorTab *tab : std::as_const(opened)) {
+                for (QsciScintilla *surface : surfacesOf(tab)) {
+                    QVERIFY2(surface && surface->paper() == tokens.paper,
+                             qPrintable(tab->fileName()));
+                }
+            }
+            EditorTab *text = opened.front();
+            SearchMatch match;
+            match.line = 0;
+            match.index = 0;
+            match.length = 5;
+            text->setSearchHighlights({match});
+            const long fore = text->editor()->SendScintilla(
+                QsciScintillaBase::SCI_INDICGETFORE, 8UL);
+            const QColor hit(int(fore & 0xff), int((fore >> 8) & 0xff),
+                             int((fore >> 16) & 0xff));
+            QCOMPARE(hit, tokens.hit);
+            text->clearSearchHighlights();
+        }
+        closeAllEditorTabs(mw_);
     }
 
     void tc_system_high_contrast_keeps_platform_palette() {

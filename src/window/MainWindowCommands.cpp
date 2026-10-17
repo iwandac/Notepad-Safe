@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "ThemeStyle.h"
 #include "RecoveryIssuePage.h"
 #include "EditorTab.h"
 #include "FileContentProbe.h"
@@ -661,72 +662,36 @@ void MainWindow::displayEncodingFromAction()
 
 void MainWindow::applyDarkMode(bool dark)
 {
-    QPalette pal;
-    if (m_highContrastMode) {
-        // Let the platform own every color in accessibility mode. In
-        // particular, do not put our dark menu stylesheet on top of a user's
-        // custom Windows contrast scheme.
-        pal = QApplication::style()->standardPalette();
-
-    } else if (dark) {
-        pal.setColor(QPalette::Window, QColor(45, 45, 48));
-        pal.setColor(QPalette::WindowText, QColor(208, 208, 208));
-        pal.setColor(QPalette::Base, QColor(30, 30, 30));
-        pal.setColor(QPalette::AlternateBase, QColor(45, 45, 48));
-        pal.setColor(QPalette::Text, QColor(208, 208, 208));
-        pal.setColor(QPalette::Button, QColor(60, 60, 64));
-        pal.setColor(QPalette::ButtonText, QColor(208, 208, 208));
-        pal.setColor(QPalette::Highlight, QColor(0, 120, 215));
-        pal.setColor(QPalette::HighlightedText, QColor(255, 255, 255));
-        pal.setColor(QPalette::ToolTipBase, QColor(60, 60, 64));
-        pal.setColor(QPalette::ToolTipText, QColor(208, 208, 208));
-        pal.setColor(QPalette::Disabled, QPalette::WindowText, QColor(125, 125, 125));
-        pal.setColor(QPalette::Disabled, QPalette::Text, QColor(125, 125, 125));
-        pal.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(125, 125, 125));
-    } else {
-        // The platform standard palette may itself be dark when Windows is in
-        // dark mode.  "Light" is an explicit user choice, so restoring that
-        // palette must not depend on the current OS theme (or on the custom
-        // palette previously installed by this application).
-        pal = QApplication::style()->standardPalette();
-        pal.setColor(QPalette::Window, QColor(240, 240, 240));
-        pal.setColor(QPalette::WindowText, QColor(0, 0, 0));
-        pal.setColor(QPalette::Base, QColor(255, 255, 255));
-        pal.setColor(QPalette::AlternateBase, QColor(245, 245, 245));
-        pal.setColor(QPalette::Text, QColor(0, 0, 0));
-        pal.setColor(QPalette::Button, QColor(240, 240, 240));
-        pal.setColor(QPalette::ButtonText, QColor(0, 0, 0));
-        pal.setColor(QPalette::Highlight, QColor(0, 120, 215));
-        pal.setColor(QPalette::HighlightedText, QColor(255, 255, 255));
-        pal.setColor(QPalette::ToolTipBase, QColor(255, 255, 220));
-        pal.setColor(QPalette::ToolTipText, QColor(0, 0, 0));
+    if (!m_highContrastMode) {
+        applyTheme(dark ? ThemeTokens::dark() : ThemeTokens::light());
+        return;
     }
+    // Let the platform own every color in accessibility mode; never put the
+    // token style sheet on top of a user's custom Windows contrast scheme.
+    const QPalette pal = QApplication::style()->standardPalette();
     qApp->setPalette(pal);
-    // Native Windows painting can ignore dark palette roles. Keep paired
-    // colors scoped to menus, the main toolbar and Find dialog inputs;
-    // account/editor controls retain their own styles. Light/high contrast
-    // remove every override below and keep the platform style intact.
-    qApp->setStyleSheet(!m_highContrastMode && dark ? QStringLiteral(
-        "QMenuBar { background-color:#2d2d30; color:#d0d0d0; }"
-        "QMenuBar::item:selected { background-color:#3c3c40; color:#ffffff; }"
-        "QMenuBar::item:pressed { background-color:#3c3c40; color:#ffffff; }"
-        "QMenu { background-color:#2d2d30; color:#d0d0d0; border:1px solid #55555a; }"
-        "QMenu::item:selected { background-color:#0078d7; color:#ffffff; }"
-        "QMenu::item:disabled { color:#7d7d7d; }"
-        "QMenu::separator { height:1px; background:#505055; margin:4px 8px; }"
-        "FindReplaceDialog QLineEdit { color:#d0d0d0; background-color:#1e1e1e; border:1px solid #66666a;"
-        " selection-color:#ffffff; selection-background-color:#0078d7; }"
-        "FindReplaceDialog QLineEdit:enabled:focus { border-color:#7ab8ef; }"
-        "FindReplaceDialog QLineEdit:disabled { color:#9a9a9a; background-color:#2d2d30; border-color:#55555a; }"
-        "QToolTip { color:#d0d0d0; background-color:#3c3c40; border:1px solid #66666a; }")
-        : QString());
-
-    // 更新所有 EditorTab 的编辑器配色
+    qApp->setStyleSheet(QString());
+    searchHitColor() = pal.color(QPalette::Highlight);
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
         if (!tab)
             continue;
-        applyEditorSurfacePalette(tab->editor(), pal);
+        for (QsciScintilla *surface : tab->themedEditors())
+            applyEditorSurfacePalette(surface, pal);
+    }
+}
+
+void MainWindow::applyTheme(const ThemeTokens &t)
+{
+    qApp->setPalette(applicationPalette(t));
+    qApp->setStyleSheet(applicationStyleSheet(t));
+    searchHitColor() = t.hit;
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        auto *tab = qobject_cast<EditorTab *>(m_tabs->widget(i));
+        if (!tab)
+            continue;
+        for (QsciScintilla *surface : tab->themedEditors())
+            applyEditorTheme(surface, t, tab->isSecureDocument());
     }
 }
 

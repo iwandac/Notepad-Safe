@@ -21,6 +21,7 @@ class QAction;
 class QUuid;
 class QPoint;
 class EditorTab;
+struct ThemeTokens;
 class FindReplaceDialog;
 class SearchResultsDock;
 class SearchResultsController;
@@ -298,6 +299,7 @@ private:
     void applyEditorPreferences(EditorTab *tab);
     void rebuildRecentFilesMenu();
     void applyDarkMode(bool dark);
+    void applyTheme(const ThemeTokens &t);
     void applyAppearanceMode();
     // 将当前 m_darkMode/m_wordWrap/m_edgeVisible/m_edgeColumn 同步到视图菜单的勾选状态
     // 必须在 createMenus 之后、loadSettings 之后调用，避免"设置恢复了但菜单勾选没变"

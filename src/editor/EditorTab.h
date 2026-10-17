@@ -213,6 +213,8 @@ public:
     // 编辑器访问（L2 模式下仍返回有效 QsciScintilla 指针，但内容为空；
     // 优先使用下方统一分流的 selectAll/copy/paste/... 等接口，避免直接调 editor 方法）
     QsciScintilla *editor() const;
+    // Every editor surface this tab owns, for theming.
+    QList<QsciScintilla *> themedEditors() const;
     qint64 currentByteOffset() const;
 
     // 语法
