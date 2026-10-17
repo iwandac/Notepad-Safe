@@ -150,6 +150,38 @@ struct ReadingPosition {
             && selectionEnd == current.selectionEnd && sourceStart == current.sourceStart
             && sourceEnd == current.sourceEnd && topByte == current.topByte;
     }
+    // A source change can refresh the view in two steps (remap, then the
+    // end-of-file scroll clamp); read the position once it stops moving.
+    static ReadingPosition settled(WindowedReadOnlyProvider *provider)
+    {
+        ReadingPosition last = capture(provider);
+        QElapsedTimer elapsed;
+        elapsed.start();
+        while (elapsed.elapsed() < 3000) {
+            QTest::qWait(250);
+            if (last.equals(provider))
+                return last;
+            last = capture(provider);
+        }
+        return last;
+    }
+    // Names every field that moved, for failure messages.
+    QString differenceFrom(WindowedReadOnlyProvider *provider) const
+    {
+        const auto now = capture(provider);
+        QStringList moved;
+        if (text != now.text) moved << QStringLiteral("text(%1->%2 chars)").arg(text.size()).arg(now.text.size());
+        if (firstLine != now.firstLine) moved << QStringLiteral("firstLine %1->%2").arg(firstLine).arg(now.firstLine);
+        if (xOffset != now.xOffset) moved << QStringLiteral("xOffset %1->%2").arg(xOffset).arg(now.xOffset);
+        if (selectionStart != now.selectionStart || selectionEnd != now.selectionEnd)
+            moved << QStringLiteral("selection %1-%2->%3-%4").arg(selectionStart).arg(selectionEnd)
+                         .arg(now.selectionStart).arg(now.selectionEnd);
+        if (sourceStart != now.sourceStart || sourceEnd != now.sourceEnd)
+            moved << QStringLiteral("source %1-%2->%3-%4").arg(sourceStart).arg(sourceEnd)
+                         .arg(now.sourceStart).arg(now.sourceEnd);
+        if (topByte != now.topByte) moved << QStringLiteral("topByte %1->%2").arg(topByte).arg(now.topByte);
+        return moved.join(QStringLiteral("; "));
+    }
 };
 
 class TailDocument final {
@@ -1162,11 +1194,12 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(document.tab->contentRevision() > revision, ObserveTimeout);
         QVERIFY(document.stopped());
         QVERIFY(!document.following());
-        const auto recoveredPosition = ReadingPosition::capture(document.provider);
+        const auto recoveredPosition = ReadingPosition::settled(document.provider);
         document.resume->trigger();
         QCoreApplication::processEvents();
         QVERIFY(document.stopped());
-        QVERIFY(recoveredPosition.equals(document.provider));
+        QVERIFY2(recoveredPosition.equals(document.provider),
+                 qPrintable(recoveredPosition.differenceFrom(document.provider)));
         QVERIFY2(document.guards().isEmpty(), qPrintable(document.guards()));
 
         // Only explicit off/on may establish a fresh, admitted ordinary source
