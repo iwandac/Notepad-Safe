@@ -4350,10 +4350,9 @@ private slots:
         auto *useTabs = action("edit.indentation.useTabs");
         auto *tabWidth8 = action("edit.indentation.tabWidth.8");
         auto *completion = action("edit.completion.words");
-        auto *split = action("view.split.horizontal");
         QVERIFY(whitespace && eolVisible && toLf && upper && selectAllSame
                 && javascript && foldAll && useTabs && tabWidth8
-                && completion && split);
+                && completion);
 
         whitespace->setChecked(true);
         eolVisible->setChecked(true);
@@ -4407,90 +4406,7 @@ private slots:
         mw_->openFilesFromExternal({binaryPath});
         QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 1, 2000);
         QTRY_VERIFY_WITH_TIMEOUT(!upper->isEnabled() && !toLf->isEnabled()
-                                 && !foldAll->isEnabled() && !split->isEnabled(), 2000);
-        closeAllEditorTabs(mw_);
-    }
-
-    void tc_s1_split_view_shares_document_and_keeps_independent_viewports() {
-        closeAllEditorTabs(mw_);
-        const QString path = tmpDir_.filePath(QStringLiteral("split-view.txt"));
-        QFile file(path);
-        QVERIFY(file.open(QIODevice::WriteOnly));
-        QByteArray content;
-        for (int line = 0; line < 240; ++line)
-            content += QByteArray("line-") + QByteArray::number(line) + '\n';
-        QCOMPARE(file.write(content), qint64(content.size()));
-        file.close();
-
-        mw_->openFilesFromExternal({path});
-        auto *tabs = mw_->findChild<QTabWidget *>();
-        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 1, 2000);
-        auto *tab = qobject_cast<EditorTab *>(tabs->currentWidget());
-        QVERIFY(tab != nullptr);
-        auto *horizontal = mw_->findChild<QAction *>(
-            QStringLiteral("view.split.horizontal"));
-        auto *vertical = mw_->findChild<QAction *>(
-            QStringLiteral("view.split.vertical"));
-        QVERIFY(horizontal && vertical);
-        QVERIFY(horizontal->isEnabled() && vertical->isEnabled());
-
-        horizontal->setChecked(true);
-        QTRY_VERIFY_WITH_TIMEOUT(tab->splitViewEnabled(), 1500);
-        auto *splitter = tab->findChild<QSplitter *>(QStringLiteral("editorSplitView"));
-        auto *secondary = tab->findChild<QsciScintilla *>(
-            QStringLiteral("secondaryScintillaEditor"));
-        QVERIFY(splitter && secondary);
-        QCOMPARE(splitter->orientation(), Qt::Horizontal);
-        secondary->setCursorPosition(0, 0);
-        secondary->insert(QStringLiteral("shared-"));
-        QTRY_VERIFY_WITH_TIMEOUT(tab->editor()->text().startsWith(QStringLiteral("shared-line-0")),
-                                 1500);
-        tab->editor()->SendScintilla(QsciScintillaBase::SCI_SETFIRSTVISIBLELINE, 0UL);
-        secondary->SendScintilla(QsciScintillaBase::SCI_SETFIRSTVISIBLELINE, 180UL);
-        QApplication::processEvents(QEventLoop::AllEvents, 100);
-        QCOMPARE(tab->editor()->SendScintilla(
-                     QsciScintillaBase::SCI_GETFIRSTVISIBLELINE), 0L);
-        QVERIFY(secondary->SendScintilla(
-                    QsciScintillaBase::SCI_GETFIRSTVISIBLELINE) >= 170L);
-
-        vertical->setChecked(true);
-        QTRY_COMPARE_WITH_TIMEOUT(splitter->orientation(), Qt::Vertical, 1000);
-        QVERIFY(!horizontal->isChecked() && vertical->isChecked());
-        QTRY_VERIFY2_WITH_TIMEOUT(
-            tab->editor()->height() > 200 && secondary->height() > 200,
-            qPrintable(QStringLiteral("splitter=%1x%2 sizes=%3 primary=%4 secondary=%5")
-                .arg(splitter->width()).arg(splitter->height())
-                .arg([&]() {
-                    QStringList values;
-                    for (int value : splitter->sizes())
-                        values.append(QString::number(value));
-                    return values.join(QLatin1Char(','));
-                }())
-                .arg(tab->editor()->height()).arg(secondary->height())),
-            1000);
-        tab->editor()->setModified(false);
-        const QString sessionDir = tmpDir_.filePath(QStringLiteral("split-session"));
-        QVERIFY(QDir().mkpath(sessionDir));
-        SessionManager splitSession(sessionDir);
-        QVERIFY(splitSession.saveSession({tab}, 0, false));
-        const SessionData splitState = splitSession.loadSession();
-        QCOMPARE(splitState.tabs.size(), 1);
-        QVERIFY(splitState.tabs.constFirst().splitView);
-        QCOMPARE(splitState.tabs.constFirst().splitOrientation,
-                 QStringLiteral("vertical"));
-        if (auto *searchDock = mw_->findChild<QDockWidget *>(
-                QStringLiteral("SearchResultsDock"))) {
-            searchDock->hide();
-        }
-        QApplication::processEvents(QEventLoop::AllEvents, 100);
-        const QString screenshot = QCoreApplication::applicationDirPath()
-                                   + QStringLiteral("/gui-s1-shared-split-view.png");
-        QVERIFY2(mw_->grab().save(screenshot), qPrintable(screenshot));
-
-        vertical->setChecked(false);
-        QTRY_VERIFY_WITH_TIMEOUT(!tab->splitViewEnabled(), 1500);
-        QVERIFY(tab->findChild<QsciScintilla *>(
-                    QStringLiteral("secondaryScintillaEditor")) == nullptr);
+                                 && !foldAll->isEnabled(), 2000);
         closeAllEditorTabs(mw_);
     }
 

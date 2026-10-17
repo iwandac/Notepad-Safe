@@ -442,6 +442,11 @@ int main(int argc, char **argv)
               && FeatureRegistry::featureIdForCommand(
                      QStringLiteral("language.unregistered")).isEmpty(),
           "known command namespaces reject typo and unregistered suffixes");
+    for (const char *removed : {"view.split", "view.split.horizontal", "view.split.vertical"}) {
+        check(FeatureRegistry::featureIdForCommand(QString::fromLatin1(removed)).isEmpty(),
+              qPrintable(QStringLiteral("removed command is no longer registered: %1")
+                             .arg(QString::fromLatin1(removed))));
+    }
 
     InferenceProviderRegistry inferenceProviders;
     check(inferenceProviders.manifests().isEmpty()

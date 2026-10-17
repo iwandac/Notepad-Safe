@@ -99,8 +99,7 @@ QStringList FeatureRegistry::requiredStartupCommandIds()
         QStringLiteral("view.appearance.light"),
         QStringLiteral("view.appearance.dark"), QStringLiteral("view.wordWrap"),
         QStringLiteral("view.tail.toggle"), QStringLiteral("view.tail.resume"),
-        QStringLiteral("view.split"), QStringLiteral("view.split.horizontal"),
-        QStringLiteral("view.split.vertical"), QStringLiteral("view.symbols"),
+        QStringLiteral("view.symbols"),
         QStringLiteral("view.symbols.whitespace"),
         QStringLiteral("view.symbols.eol"), QStringLiteral("view.folding"),
         QStringLiteral("view.folding.toggleCurrent"),
@@ -183,8 +182,7 @@ QString FeatureRegistry::featureIdForCommand(const QString &commandId)
         return QStringLiteral("NSP-LANGUAGE");
     if (containsCommand(commandId, {
             "view.appearance", "view.appearance.system", "view.appearance.light",
-            "view.appearance.dark", "view.wordWrap", "view.split",
-            "view.split.horizontal", "view.split.vertical", "view.symbols",
+            "view.appearance.dark", "view.wordWrap", "view.symbols",
             "view.symbols.whitespace", "view.symbols.eol", "view.folding",
             "view.folding.toggleCurrent", "view.folding.collapseAll",
             "view.folding.expandAll", "view.presentation",

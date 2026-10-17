@@ -44,7 +44,7 @@ void DocumentTailActions::install(QObject *uiOwner, CommandRegistry &registry)
     resume_->setObjectName(QStringLiteral("view.tail.resume"));
     resume_->setEnabled(false);
     resume_->setStatusTip(tr("清除阅读选区，回到当前文件末尾并继续跟随。"));
-    QAction *before = uiOwner->findChild<QAction *>(QStringLiteral("view.split"));
+    QAction *before = uiOwner->findChild<QAction *>(QStringLiteral("view.symbols"));
     menu->insertAction(before, toggle_);
     menu->insertAction(before, resume_);
     connect(toggle_, &QAction::triggered, this, [this](bool checked) { execute(false, checked); });

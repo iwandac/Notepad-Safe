@@ -1358,43 +1358,6 @@ void MainWindow::createMenus()
     m_actWordWrap->setChecked(m_wordWrap);
     connect(m_actWordWrap, &QAction::triggered, this, &MainWindow::toggleWordWrap);
 
-    auto *splitMenu = viewMenu->addMenu(QStringLiteral("分屏"));
-    assignMenuId(splitMenu, QStringLiteral("view.split"));
-    m_actSplitHorizontal = splitMenu->addAction(QStringLiteral("左右分屏"));
-    m_actSplitHorizontal->setObjectName(QStringLiteral("view.split.horizontal"));
-    m_actSplitHorizontal->setCheckable(true);
-    m_actSplitVertical = splitMenu->addAction(QStringLiteral("上下分屏"));
-    m_actSplitVertical->setObjectName(QStringLiteral("view.split.vertical"));
-    m_actSplitVertical->setCheckable(true);
-    connect(m_actSplitHorizontal, &QAction::toggled, this, [this](bool enabled) {
-        EditorTab *tab = currentTab();
-        if (!tab)
-            return;
-        if (enabled) {
-            QSignalBlocker blocker(m_actSplitVertical);
-            m_actSplitVertical->setChecked(false);
-            tab->setSplitView(true, Qt::Horizontal);
-        } else if (tab->splitViewEnabled()
-                   && tab->splitOrientation() == Qt::Horizontal) {
-            tab->setSplitView(false);
-        }
-        syncCommandStates(tab);
-    });
-    connect(m_actSplitVertical, &QAction::toggled, this, [this](bool enabled) {
-        EditorTab *tab = currentTab();
-        if (!tab)
-            return;
-        if (enabled) {
-            QSignalBlocker blocker(m_actSplitHorizontal);
-            m_actSplitHorizontal->setChecked(false);
-            tab->setSplitView(true, Qt::Vertical);
-        } else if (tab->splitViewEnabled()
-                   && tab->splitOrientation() == Qt::Vertical) {
-            tab->setSplitView(false);
-        }
-        syncCommandStates(tab);
-    });
-
     auto *symbolsMenu = viewMenu->addMenu(QStringLiteral("显示符号"));
     assignMenuId(symbolsMenu, QStringLiteral("view.symbols"));
     m_actWhitespaceVisible = symbolsMenu->addAction(QStringLiteral("显示空格与制表符"));

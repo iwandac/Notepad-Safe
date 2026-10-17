@@ -31,10 +31,4 @@ void restoreDocumentSessionView(EditorTab *tab, const SessionTab &state)
     } else {
         tab->setCursorPosition(state.cursorLine, state.cursorIndex);
     }
-    if (state.splitView && tab->canSplitView()) {
-        tab->setSplitView(
-            true, state.splitOrientation == QLatin1String("vertical")
-                      ? Qt::Vertical : Qt::Horizontal,
-            EditorTab::SplitViewFocusPolicy::PreserveCurrentFocus);
-    }
 }

@@ -552,8 +552,6 @@ std::shared_ptr<SessionManager::AsyncSaveResult> SessionManager::writeAsyncSave(
         obj["documentId"] = item.state.documentId;
         obj["presentation"] = item.state.presentation;
         obj["hexInsertMode"] = item.state.hexInsertMode;
-        obj["splitView"] = item.state.splitView;
-        obj["splitOrientation"] = item.state.splitOrientation;
         tabsArray.append(obj);
     }
 
@@ -716,8 +714,6 @@ SessionData SessionManager::loadSession() const
         st.secureDocument = obj["secureDocument"].toBool(false);
         if (!st.secureDocument && !isManagedAutosavePath(st.autosavePath))
             st.autosavePath.clear();
-        st.splitView = obj["splitView"].toBool(false);
-        st.splitOrientation = obj["splitOrientation"].toString();
         st.documentId = obj["documentId"].toString();
         st.presentation = obj["presentation"].toString();
         st.hexInsertMode = obj["hexInsertMode"].toBool(false);

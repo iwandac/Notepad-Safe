@@ -69,7 +69,6 @@ void CommandRegistry::applyContext(const CommandContext &context) const
             || id.startsWith(QLatin1String("search.brace."))
             || id == QLatin1String("search.bookmarks")
             || id == QLatin1String("view.wordWrap")
-            || id.startsWith(QLatin1String("view.split"))
             || id.startsWith(QLatin1String("view.symbols"))
             || id.startsWith(QLatin1String("view.folding"))
             || id.startsWith(QLatin1String("view.presentation"))
@@ -161,13 +160,6 @@ void CommandRegistry::applyContext(const CommandContext &context) const
                document && context.canModify && !context.dualPresentation);
     setEnabled(QStringLiteral("edit.lines.sortDescending"),
                document && context.canModify && !context.dualPresentation);
-    setEnabled(QStringLiteral("view.split"), context.splitAvailable);
-    setEnabled(QStringLiteral("view.split.horizontal"), context.splitAvailable);
-    setEnabled(QStringLiteral("view.split.vertical"), context.splitAvailable);
-    setChecked(QStringLiteral("view.split.horizontal"),
-               context.splitEnabled && !context.splitVertical);
-    setChecked(QStringLiteral("view.split.vertical"),
-               context.splitEnabled && context.splitVertical);
     setEnabled(QStringLiteral("view.presentation.text"),
                context.dualPresentation);
     setEnabled(QStringLiteral("view.presentation.hex"),

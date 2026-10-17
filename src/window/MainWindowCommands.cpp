@@ -892,10 +892,6 @@ void MainWindow::syncCommandStates(EditorTab *tab)
         context.editableHex = hasDocument && canModify && tab->isL2Active()
             && tab->viewModeL2() == ViewMode::Hex;
         context.hexInsertMode = context.editableHex && !tab->hexOverwriteMode();
-        context.splitAvailable = hasDocument && tab->canSplitView();
-        context.splitEnabled = hasDocument && tab->splitViewEnabled();
-        context.splitVertical = context.splitEnabled
-            && tab->splitOrientation() == Qt::Vertical;
         context.displayEncodingAvailable = hasDocument
             && !tab->isSecureDocument() && !tab->isUntitled();
         context.conversionAvailable = context.displayEncodingAvailable

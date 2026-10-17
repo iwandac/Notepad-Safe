@@ -181,8 +181,6 @@ private:
     QAction *m_actAppearanceSystem = nullptr;
     QAction *m_actAppearanceLight = nullptr;
     QAction *m_actWordWrap = nullptr;
-    QAction *m_actSplitHorizontal = nullptr;
-    QAction *m_actSplitVertical = nullptr;
     QAction *m_actWhitespaceVisible = nullptr;
     QAction *m_actEolVisible = nullptr;
     QAction *m_actUseTabs = nullptr;

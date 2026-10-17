@@ -117,11 +117,6 @@ SessionTab captureEditorSessionTab(const EditorTab *tab)
         state.presentation = QStringLiteral("text");
     }
     state.modified = tab->isModified();
-    state.splitView = tab->splitViewEnabled();
-    if (state.splitView) {
-        state.splitOrientation = tab->splitOrientation() == Qt::Vertical
-            ? QStringLiteral("vertical") : QStringLiteral("horizontal");
-    }
     state.secureDocument = tab->isSecureDocument();
     if (state.secureDocument)
         state.documentId = tab->secureDocumentId().toString(QUuid::WithoutBraces);
@@ -205,7 +200,6 @@ bool EditorTab::openLargeFileL2(const QString &path, QString *errMsg,
                                 bool requireReadOnly)
 {
     if (!m_searchSource->closeAndOwnerAlive()) return false;
-    setSplitView(false);
     const bool inheritedWordWrap = m_editor
         && m_editor->wrapMode() != QsciScintilla::WrapNone;
     QFileInfo fi(path);

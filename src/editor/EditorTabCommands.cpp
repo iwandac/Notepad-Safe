@@ -625,7 +625,7 @@ void EditorTab::setCursorPosition(int line, int index)
 
 void EditorTab::applyEdgeSettings()
 {
-    for (QsciScintilla *view : {m_editor, m_splitEditor}) {
+    for (QsciScintilla *view : {m_editor}) {
         if (!view)
             continue;
         view->setEdgeColumn(m_edgeColumn);

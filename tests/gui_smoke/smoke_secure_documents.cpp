@@ -993,18 +993,15 @@ private slots:
     {
         QTest::addColumn<bool>("missingSecure");
         QTest::addColumn<bool>("enterAccounts");
-        QTest::addColumn<bool>("splitSecure");
-        QTest::newRow("success") << false << false << false;
-        QTest::newRow("missing-secure") << true << false << false;
-        QTest::newRow("enter-accounts") << false << true << false;
-        QTest::newRow("enter-accounts-split") << false << true << true;
+        QTest::newRow("success") << false << false;
+        QTest::newRow("missing-secure") << true << false;
+        QTest::newRow("enter-accounts") << false << true;
     }
 
     void laterSecureRestoreKeepsOrdinaryCurrentDocument()
     {
         QFETCH(bool, missingSecure);
         QFETCH(bool, enterAccounts);
-        QFETCH(bool, splitSecure);
         QTemporaryDir dataDirectory;
         QVERIFY(dataDirectory.isValid());
         const bool hadProfile = qEnvironmentVariableIsSet("NOTEPADSAFE_DATADIR");
@@ -1064,16 +1061,6 @@ private slots:
             QTRY_VERIFY_WITH_TIMEOUT(!secure->autosavePath().isEmpty()
                                          && QFileInfo::exists(secure->autosavePath()), 5000);
             securePath = secure->autosavePath();
-            if (splitSecure) {
-                QVERIFY(secure->canSplitView());
-                secure->setSplitView(true, Qt::Vertical);
-                QVERIFY(secure->splitViewEnabled());
-                QCOMPARE(secure->splitOrientation(), Qt::Vertical);
-                auto *secondary = secure->findChild<QsciScintilla *>(QStringLiteral("secondaryScintillaEditor"));
-                QVERIFY(secondary && secondary != secure->editor());
-                QCOMPARE(QApplication::focusWidget(), static_cast<QWidget *>(secondary));
-                QCOMPARE(secondary->text(), secureBody);
-            }
             auto *tabs = seed->findChild<QTabWidget *>();
             QVERIFY(tabs);
             QCOMPARE(tabs->count(), 3);
@@ -1097,8 +1084,6 @@ private slots:
         QVERIFY(before.tabs[2].secureDocument);
         QCOMPARE(before.tabs[2].documentId, secureDocumentId);
         QCOMPARE(before.tabs[2].autosavePath, securePath);
-        QCOMPARE(before.tabs[2].splitView, splitSecure);
-        if (splitSecure) QCOMPARE(before.tabs[2].splitOrientation, QStringLiteral("vertical"));
         const QByteArray ciphertext = readBytes(securePath);
         QCOMPARE(ciphertext.left(8).toHex().toUpper(), QByteArray("03D9A29A67FB4BB5"));
         QVERIFY(!ciphertext.contains(secureBody.toUtf8()));
@@ -1304,22 +1289,6 @@ private slots:
             QVERIFY(secure->documentState().id != ordinaryId);
             QVERIFY(secure->documentState().id != second->documentState().id);
             QCOMPARE(hash(readBytes(securePath)), secureHash);
-            QCOMPARE(secure->splitViewEnabled(), splitSecure);
-            if (splitSecure) {
-                QCOMPARE(secure->splitOrientation(), Qt::Vertical);
-                auto *splitter = secure->findChild<QSplitter *>(QStringLiteral("editorSplitView"));
-                auto *secondary = secure->findChild<QsciScintilla *>(QStringLiteral("secondaryScintillaEditor"));
-                QVERIFY(splitter && secondary && secondary != secure->editor());
-                QCOMPARE(splitter->count(), 2);
-                QCOMPARE(splitter->orientation(), Qt::Vertical);
-                QCOMPARE(splitter->widget(0), secure->editor());
-                QCOMPARE(splitter->widget(1), secondary);
-                QVERIFY(secure->editor()->isVisibleTo(secure) && secondary->isVisibleTo(secure));
-                QCOMPARE(secondary->text(), secureBody);
-                void *const sharedDocument = secure->editor()->SendScintillaPtrResult(QsciScintillaBase::SCI_GETDOCPOINTER);
-                QVERIFY(sharedDocument);
-                QCOMPARE(secondary->SendScintillaPtrResult(QsciScintillaBase::SCI_GETDOCPOINTER), sharedDocument);
-            }
         }
         QCOMPARE(ordinary->documentState().id, ordinaryId);
         QCOMPARE(ordinary->contentRevision(), ordinaryRevision);
@@ -1341,8 +1310,6 @@ private slots:
         QVERIFY(after.tabs[2].secureDocument);
         QCOMPARE(after.tabs[2].documentId, secureDocumentId);
         QCOMPARE(after.tabs[2].autosavePath, securePath);
-        QCOMPARE(after.tabs[2].splitView, splitSecure);
-        if (splitSecure) QCOMPARE(after.tabs[2].splitOrientation, QStringLiteral("vertical"));
         QVERIFY(!unexpectedPrompt);
         QVERIFY(QApplication::activeModalWidget() == nullptr);
         if (enterAccounts) {
@@ -1354,7 +1321,7 @@ private slots:
                 << "enterAccounts" << enterAccounts << "completed" << completed.count()
                 << "visibleDocuments" << tabs->count() << "workspaceDepartures" << workspaceDepartures
                 << "accountsOpen" << (accountsVault && accountsVault->isSecureStoreOpen())
-                << "documentFocusTransfers" << documentFocusTransfers << "splitSecure" << splitSecure;
+                << "documentFocusTransfers" << documentFocusTransfers;
         if (enterAccounts) {
             QVERIFY(workspace && accountsPage && accountsVault);
             QCOMPARE(workspace->currentWidget(), accountsPage.data());
@@ -1390,18 +1357,13 @@ private slots:
             QCOMPARE(documents[0]->editor()->text().toUtf8(), ordinaryBody);
             QCOMPARE(documents[1]->editor()->text().toUtf8(), secondBody);
             QCOMPARE(documents[2]->editor()->text(), secureBody);
-            if (splitSecure) {
-                auto *secondary = documents[2]->findChild<QsciScintilla *>(QStringLiteral("secondaryScintillaEditor"));
-                QVERIFY(secondary);
-                QCOMPARE(secondary->text(), secureBody);
-            }
             QCOMPARE(hash(readBytes(ordinaryPath)), ordinaryHash);
             QCOMPARE(hash(readBytes(secondPath)), secondHash);
             QCOMPARE(hash(readBytes(securePath)), secureHash);
             QCOMPARE(hash(readBytes(accountsPath)), accountsHash);
             QCOMPARE(documentFocusTransfers, 0);
-            const QString screenshot = QDir::current().filePath(splitSecure
-                ? QStringLiteral("3a-accounts-focus-split.png") : QStringLiteral("3a-accounts-focus-text.png"));
+            const QString screenshot = QDir::current().filePath(
+                QStringLiteral("3a-accounts-focus-text.png"));
             QVERIFY2(restarted->grab().save(screenshot), qPrintable(screenshot));
         } else {
             QCOMPARE(tabs->currentWidget(), ordinary.data());

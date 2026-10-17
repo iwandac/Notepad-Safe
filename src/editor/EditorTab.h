@@ -339,12 +339,6 @@ public:
     bool backspaceUnindents() const { return m_backspaceUnindents; }
     void setWordCompletionEnabled(bool enabled);
     bool wordCompletionEnabled() const { return m_wordCompletionEnabled; }
-    enum class SplitViewFocusPolicy { FocusNewView, PreserveCurrentFocus };
-    bool canSplitView() const;
-    bool splitViewEnabled() const { return m_splitEditor != nullptr; }
-    Qt::Orientation splitOrientation() const;
-    void setSplitView(bool enabled, Qt::Orientation orientation = Qt::Horizontal,
-                      SplitViewFocusPolicy focusPolicy = SplitViewFocusPolicy::FocusNewView);
 
     // 以指定编码显示（Notepad++ 风格：不修改文件内容，仅改变显示解码方式）
     // L1 模式：重新以指定编码解码并加载到 QsciScintilla
@@ -492,8 +486,6 @@ private:
                                     bool allowSecureTransition) const;
 
     QsciScintilla *m_editor;
-    QsciScintilla *m_splitEditor = nullptr;
-    QSplitter *m_l1Splitter = nullptr;
     QStackedWidget *m_stack = nullptr;  // 0: m_editor (L1), 1: m_l2View (L2)
     QWidget *m_secureLockingPage = nullptr;
     QUuid m_sessionInstanceId = QUuid::createUuid();

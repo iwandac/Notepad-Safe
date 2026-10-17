@@ -22,8 +22,6 @@ struct SessionTab {
     QString documentId;
     QString presentation;
     bool hexInsertMode = false;
-    bool splitView = false;
-    QString splitOrientation;
 };
 
 enum class SessionRecoveryKind {

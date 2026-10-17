@@ -193,10 +193,6 @@ EditorTab::~EditorTab() {
     //
     //  此处析构体里仅做 dtor-safe 兜底：如果 MainWindow 路径没执行到（如异常析构），
     //  手动调 closeFile(false)—— 禁止 processEvents，保守等待 500ms 让 worker 自退出。
-    {
-        QSignalBlocker blocker(this);
-        setSplitView(false);
-    }
     bridgeReparentEditorToStack();
     clearL2BridgeBaseline();
     if (m_windowedReadOnlyProvider)
@@ -768,7 +764,6 @@ void EditorTab::maskSecureDocument()
 {
     if (!isSecureDocument() || m_documentSession.secureMasked())
         return;
-    setSplitView(false);
     m_documentSession.setSecureTransitioning(true);
     m_documentSession.setSecureMasked(true);
     // A note title is commonly derived from its first plaintext line. Do not
@@ -999,12 +994,6 @@ void EditorTab::applySyntax(Syntax syntax)
         lexer->setDefaultFont(font);
     }
     m_editor->setLexer(lexer);
-    if (m_splitEditor) {
-        QsciLexer *splitLexer = createLexer(syntax, m_splitEditor);
-        if (splitLexer)
-            splitLexer->setDefaultFont(m_splitEditor->font());
-        m_splitEditor->setLexer(splitLexer);
-    }
     // setLexer 接管 ownership，旧 lexer 自动删除
 
     // 大文件启用 idle styling：只对可见区域着色，剩余部分在空闲时逐步完成，
@@ -1152,12 +1141,6 @@ void EditorTab::setWordWrap(bool on)
     } else {
         m_editor->setWrapMode(QsciScintilla::WrapNone);
     }
-    if (m_splitEditor) {
-        m_splitEditor->setWrapMode(on ? QsciScintilla::WrapWord
-                                      : QsciScintilla::WrapNone);
-        m_splitEditor->setWrapVisualFlags(QsciScintilla::WrapFlagByText);
-        m_splitEditor->setWrapIndentMode(QsciScintilla::WrapIndentSame);
-    }
 }
 
 bool EditorTab::wordWrap() const
@@ -1174,9 +1157,6 @@ void EditorTab::setWhitespaceVisible(bool on)
         m_editor->setWhitespaceVisibility(on ? QsciScintilla::WsVisible
                                              : QsciScintilla::WsInvisible);
     }
-    if (m_splitEditor)
-        m_splitEditor->setWhitespaceVisibility(on ? QsciScintilla::WsVisible
-                                                   : QsciScintilla::WsInvisible);
     if (m_windowedReadOnlyProvider && m_windowedReadOnlyProvider->editor())
         m_windowedReadOnlyProvider->editor()->setWhitespaceVisibility(
             on ? QsciScintilla::WsVisible : QsciScintilla::WsInvisible);
@@ -1187,8 +1167,6 @@ void EditorTab::setEolVisible(bool on)
     m_eolVisible = on;
     if (m_editor)
         m_editor->setEolVisibility(on);
-    if (m_splitEditor)
-        m_splitEditor->setEolVisibility(on);
     if (m_windowedReadOnlyProvider && m_windowedReadOnlyProvider->editor())
         m_windowedReadOnlyProvider->editor()->setEolVisibility(on);
 }
@@ -1210,8 +1188,6 @@ void EditorTab::setUseTabs(bool on)
     m_useTabs = on;
     if (m_editor)
         m_editor->setIndentationsUseTabs(on);
-    if (m_splitEditor)
-        m_splitEditor->setIndentationsUseTabs(on);
 }
 
 void EditorTab::setTabWidth(int columns)
@@ -1219,8 +1195,6 @@ void EditorTab::setTabWidth(int columns)
     m_tabWidth = qBound(1, columns, 16);
     if (m_editor)
         m_editor->setTabWidth(m_tabWidth);
-    if (m_splitEditor)
-        m_splitEditor->setTabWidth(m_tabWidth);
 }
 
 void EditorTab::setBackspaceUnindents(bool on)
@@ -1228,8 +1202,6 @@ void EditorTab::setBackspaceUnindents(bool on)
     m_backspaceUnindents = on;
     if (m_editor)
         m_editor->setBackspaceUnindents(on);
-    if (m_splitEditor)
-        m_splitEditor->setBackspaceUnindents(on);
 }
 
 void EditorTab::setWordCompletionEnabled(bool on)
@@ -1240,152 +1212,16 @@ void EditorTab::setWordCompletionEnabled(bool on)
     m_editor->setAutoCompletionSource(on ? QsciScintilla::AcsAll
                                          : QsciScintilla::AcsNone);
     m_editor->setAutoCompletionThreshold(on ? 3 : -1);
-    if (m_splitEditor) {
-        m_splitEditor->setAutoCompletionSource(on ? QsciScintilla::AcsAll
-                                                   : QsciScintilla::AcsNone);
-        m_splitEditor->setAutoCompletionThreshold(on ? 3 : -1);
-    }
 }
 
 QsciScintilla *EditorTab::activeTextEditor() const
 {
-    if (m_splitEditor && (m_splitEditor->hasFocus()
-                          || (m_splitEditor->viewport()
-                              && m_splitEditor->viewport()->hasFocus()))) {
-        return m_splitEditor;
-    }
     return m_editor;
 }
 
 QWidget *EditorTab::l1Page() const
 {
-    return m_l1Splitter ? static_cast<QWidget *>(m_l1Splitter)
-                        : static_cast<QWidget *>(m_editor);
-}
-
-bool EditorTab::canSplitView() const
-{
-    return m_editor && !isL2Mode() && !isBinaryDocument()
-           && !isSecureDocumentMasked() && !isSecureDocumentTransitioning();
-}
-
-Qt::Orientation EditorTab::splitOrientation() const
-{
-    return m_l1Splitter ? m_l1Splitter->orientation() : Qt::Horizontal;
-}
-
-void EditorTab::setSplitView(bool enabled, Qt::Orientation orientation,
-                             SplitViewFocusPolicy focusPolicy)
-{
-    if (enabled && !canSplitView())
-        return;
-    if (!enabled) {
-        if (!m_l1Splitter)
-            return;
-        const bool wasCurrent = m_stack && m_stack->currentWidget() == m_l1Splitter;
-        if (m_splitEditor) {
-            m_splitEditor->setDocument(QsciDocument());
-            delete m_splitEditor;
-            m_splitEditor = nullptr;
-        }
-        QSplitter *splitter = m_l1Splitter;
-        m_l1Splitter = nullptr;
-        if (m_stack)
-            m_stack->removeWidget(splitter);
-        m_editor->setParent(m_stack);
-        if (m_stack && m_stack->indexOf(m_editor) < 0)
-            m_stack->insertWidget(0, m_editor);
-        if (wasCurrent && m_stack)
-            m_stack->setCurrentWidget(m_editor);
-        delete splitter;
-        emit commandCapabilitiesChanged();
-        return;
-    }
-
-    if (m_l1Splitter) {
-        m_l1Splitter->setOrientation(orientation);
-        m_editor->show();
-        if (m_splitEditor)
-            m_splitEditor->show();
-        // QSplitter preserves pixel sizes when its orientation changes.  A
-        // width that was valid for a side-by-side split can become a zero
-        // height after switching to a stacked split, leaving the second view
-        // logically alive but invisible.  Rebalance both visible views.
-        const int extent = orientation == Qt::Horizontal
-            ? m_l1Splitter->width() : m_l1Splitter->height();
-        const int half = qMax(1, extent / 2);
-        m_l1Splitter->setSizes({half, half});
-        emit commandCapabilitiesChanged();
-        return;
-    }
-
-    const bool wasCurrent = m_stack && m_stack->currentWidget() == m_editor;
-    const int oldIndex = m_stack ? m_stack->indexOf(m_editor) : 0;
-    m_l1Splitter = new QSplitter(orientation, m_stack);
-    m_l1Splitter->setObjectName(QStringLiteral("editorSplitView"));
-    m_l1Splitter->setChildrenCollapsible(false);
-    m_l1Splitter->addWidget(m_editor);
-    if (m_stack)
-        m_stack->insertWidget(qMax(0, oldIndex), m_l1Splitter);
-
-    m_splitEditor = new QsciScintilla(m_l1Splitter);
-    m_splitEditor->setObjectName(QStringLiteral("secondaryScintillaEditor"));
-    applySharedEditorSurfaceStyle(m_splitEditor);
-    m_splitEditor->setDocument(m_editor->document());
-    m_splitEditor->setMarginType(0, QsciScintilla::NumberMargin);
-    m_splitEditor->setMarginLineNumbers(0, true);
-    m_splitEditor->setMarginWidth(0, "99999");
-    m_splitEditor->setMarginWidth(1, 0);
-    m_splitEditor->setFolding(QsciScintilla::BoxedTreeFoldStyle);
-    m_splitEditor->setEolMode(m_editor->eolMode());
-    m_splitEditor->setReadOnly(m_editor->isReadOnly());
-    m_splitEditor->setScrollWidth(1);
-    m_splitEditor->setScrollWidthTracking(true);
-    m_splitEditor->setIndentationsUseTabs(m_useTabs);
-    m_splitEditor->setTabWidth(m_tabWidth);
-    m_splitEditor->setBackspaceUnindents(m_backspaceUnindents);
-    m_splitEditor->setWhitespaceVisibility(m_whitespaceVisible
-                                               ? QsciScintilla::WsVisible
-                                               : QsciScintilla::WsInvisible);
-    m_splitEditor->setEolVisibility(m_eolVisible);
-    m_splitEditor->setWrapMode(wordWrap() ? QsciScintilla::WrapWord
-                                           : QsciScintilla::WrapNone);
-    m_splitEditor->setWrapVisualFlags(QsciScintilla::WrapFlagByText);
-    m_splitEditor->setWrapIndentMode(QsciScintilla::WrapIndentSame);
-    m_splitEditor->setAutoCompletionSource(m_wordCompletionEnabled
-                                               ? QsciScintilla::AcsAll
-                                               : QsciScintilla::AcsNone);
-    m_splitEditor->setAutoCompletionThreshold(m_wordCompletionEnabled ? 3 : -1);
-    m_splitEditor->SendScintilla(QsciScintillaBase::SCI_SETMULTIPLESELECTION, 1UL);
-    m_splitEditor->SendScintilla(QsciScintillaBase::SCI_SETADDITIONALSELECTIONTYPING, 1UL);
-    m_splitEditor->SendScintilla(QsciScintillaBase::SCI_SETMULTIPASTE,
-                                 QsciScintillaBase::SC_MULTIPASTE_EACH);
-    QsciLexer *lexer = createLexer(m_syntax, m_splitEditor);
-    if (lexer)
-        lexer->setDefaultFont(m_splitEditor->font());
-    m_splitEditor->setLexer(lexer);
-    applyEdgeSettings();
-    m_l1Splitter->addWidget(m_splitEditor);
-    // Reparenting the current page out of QStackedWidget can preserve its
-    // hidden state.  Both editor surfaces must become visible members of the
-    // splitter; otherwise one logical view consumes zero pixels.
-    m_editor->show();
-    m_splitEditor->show();
-    const int extent = orientation == Qt::Horizontal
-        ? m_l1Splitter->width() : m_l1Splitter->height();
-    const int half = qMax(1, extent / 2);
-    m_l1Splitter->setSizes({half, half});
-    connect(m_splitEditor, &QsciScintilla::cursorPositionChanged,
-            this, &EditorTab::cursorPositionChanged);
-    connect(m_splitEditor, &QsciScintilla::selectionChanged,
-            this, &EditorTab::commandCapabilitiesChanged);
-    connect(m_splitEditor, &QsciScintilla::textChanged,
-            this, &EditorTab::commandCapabilitiesChanged);
-    if (wasCurrent && m_stack)
-        m_stack->setCurrentWidget(m_l1Splitter);
-    if (focusPolicy == SplitViewFocusPolicy::FocusNewView)
-        m_splitEditor->setFocus();
-    emit commandCapabilitiesChanged();
+    return m_editor;
 }
 
 void EditorTab::setDisplayEncoding(TextEncoding enc)

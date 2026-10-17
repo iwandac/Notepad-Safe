@@ -29,9 +29,6 @@ struct CommandContext {
     bool lexerSupported = false;
     bool editableHex = false;
     bool hexInsertMode = false;
-    bool splitAvailable = false;
-    bool splitEnabled = false;
-    bool splitVertical = false;
     bool displayEncodingAvailable = false;
     bool conversionAvailable = false;
     bool dualPresentation = false;

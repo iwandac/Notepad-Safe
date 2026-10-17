@@ -10,6 +10,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTemporaryDir>
@@ -51,8 +52,7 @@ QJsonObject recordFields(const SessionTab &s)
             {"selectionEndByte", QString::number(s.selectionEndByte)},
             {"modified", s.modified}, {"autosavePath", s.autosavePath},
             {"secureDocument", s.secureDocument}, {"documentId", s.documentId},
-            {"presentation", s.presentation}, {"hexInsertMode", s.hexInsertMode},
-            {"splitView", s.splitView}, {"splitOrientation", s.splitOrientation}};
+            {"presentation", s.presentation}, {"hexInsertMode", s.hexInsertMode}};
 }
 
 SessionTab retainedRecord(const QString &source, const QString &draft)
@@ -71,8 +71,6 @@ SessionTab retainedRecord(const QString &source, const QString &draft)
     s.documentId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     s.presentation = QStringLiteral("hex");
     s.hexInsertMode = true;
-    s.splitView = true;
-    s.splitOrientation = QStringLiteral("vertical");
     return s;
 }
 
@@ -137,7 +135,49 @@ private slots:
     void invalidRetainedPathRejectsPublication();
     void manifestCommitFailureDoesNotApplyOrRememberRevision();
     void legacyMigrationKeepsPreviousDraftUntilManifestCommit();
+    void legacySplitFieldsAreIgnoredAndNotRewritten();
 };
+
+void TestSessionPreservation::legacySplitFieldsAreIgnoredAndNotRewritten()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    SessionManager manager(dir.filePath(QStringLiteral("profile")));
+    SessionTab seed;
+    seed.filePath = dir.filePath(QStringLiteral("notes.txt"));
+    seed.encoding = QStringLiteral("UTF-8");
+    seed.cursorLine = 12;
+    QVERIFY(manager.asyncSaveSucceeded(
+        manager.writeAsyncSave(manager.captureAsyncSaveEntries({seed}, 0))));
+
+    // An older build wrote split-view state into each tab record.
+    QJsonDocument manifest = QJsonDocument::fromJson(fileBytes(manager.sessionFilePath()));
+    QJsonObject root = manifest.object();
+    QJsonArray tabs = root.value(QStringLiteral("tabs")).toArray();
+    QCOMPARE(tabs.size(), 1);
+    QJsonObject legacy = tabs.first().toObject();
+    legacy.insert(QStringLiteral("splitView"), true);
+    legacy.insert(QStringLiteral("splitOrientation"), QStringLiteral("vertical"));
+    tabs[0] = legacy;
+    root.insert(QStringLiteral("tabs"), tabs);
+    QVERIFY(writeBytes(manager.sessionFilePath(), QJsonDocument(root).toJson()));
+
+    const SessionData loaded = manager.loadSession();
+    QCOMPARE(loaded.loadStatus, SessionData::LoadStatus::Loaded);
+    QCOMPARE(loaded.tabs.size(), 1);
+    QCOMPARE(loaded.tabs.first().filePath, seed.filePath);
+    QCOMPARE(loaded.tabs.first().cursorLine, 12);
+
+    QVERIFY(manager.asyncSaveSucceeded(
+        manager.writeAsyncSave(manager.captureAsyncSaveEntries({loaded.tabs.first()}, 0))));
+    const QJsonObject rewritten = QJsonDocument::fromJson(fileBytes(manager.sessionFilePath()))
+                                      .object().value(QStringLiteral("tabs")).toArray()
+                                      .first().toObject();
+    QVERIFY(!rewritten.contains(QStringLiteral("splitView")));
+    QVERIFY(!rewritten.contains(QStringLiteral("splitOrientation")));
+    QCOMPARE(rewritten.value(QStringLiteral("filePath")).toString(), seed.filePath);
+    QCOMPARE(rewritten.value(QStringLiteral("cursorLine")).toInt(), 12);
+}
 
 void TestSessionPreservation::retainedEntriesKeepOrderAndOpaqueMetadata()
 {
