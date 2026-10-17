@@ -85,6 +85,12 @@ bool writeFixture(const QString &path, const QByteArray &contents)
            && file.write(contents) == contents.size();
 }
 
+QByteArray readFileBytes(const QString &path)
+{
+    QFile file(path);
+    return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+}
+
 bool isOwnedByWindow(const QObject *object, const MainWindow *window)
 {
     if (!window) return false;
@@ -406,6 +412,147 @@ private slots:
         QFile encrypted(normalizedSecureName);
         QVERIFY(encrypted.open(QIODevice::ReadOnly));
         QCOMPARE(encrypted.read(8).toHex().toUpper(), QByteArray("03D9A29A67FB4BB5"));
+
+        window->close();
+        window.reset();
+        qunsetenv("NOTEPADSAFE_DATADIR");
+    }
+
+    void plainBinarySaveAsOffersNoSecureType()
+    {
+        QTemporaryDir dataDirectory;
+        QVERIFY(dataDirectory.isValid());
+        qputenv("NOTEPADSAFE_DATADIR", dataDirectory.path().toUtf8());
+        const QString binaryPath = dataDirectory.filePath(QStringLiteral("plain.bin"));
+        QByteArray payload(64, '\0');
+        payload[3] = char(0x7f);
+        QVERIFY(writeFixture(binaryPath, payload));
+
+        auto window = std::make_unique<MainWindow>();
+        window->resize(980, 680);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window.get()));
+        window->openFilesFromExternal({binaryPath});
+        EditorTab *tab = currentEditor(window.get());
+        QVERIFY(tab && tab->isBinaryDocument() && !tab->isSecureDocument());
+
+        QStringList filters;
+        bool inspected = false;
+        QTimer::singleShot(80, window.get(), [&]() {
+            auto *dialog = window->findChild<QDialog *>(QStringLiteral("saveAsDialog"));
+            auto *fileDialog = dialog ? dialog->findChild<QFileDialog *>(
+                QStringLiteral("saveAsFileDialog")) : nullptr;
+            if (fileDialog) {
+                filters = fileDialog->nameFilters();
+                inspected = true;
+            }
+            if (dialog)
+                dialog->reject();
+        });
+        QAction *saveAsAction = window->findChild<QAction *>(QStringLiteral("file.saveAs"));
+        QVERIFY(saveAsAction);
+        saveAsAction->trigger();
+
+        QVERIFY(inspected);
+        QCOMPARE(filters, QStringList{QStringLiteral("未加密文件 (*)")});
+        QVERIFY(!tab->isSecureDocument());
+        QCOMPARE(readFileBytes(binaryPath), payload);
+
+        window->close();
+        window.reset();
+        qunsetenv("NOTEPADSAFE_DATADIR");
+    }
+
+    void existingSecureBinaryStillSavesAndExports()
+    {
+        QTemporaryDir dataDirectory;
+        QVERIFY(dataDirectory.isValid());
+        qputenv("NOTEPADSAFE_DATADIR", dataDirectory.path().toUtf8());
+        const QString securePath = dataDirectory.filePath(QStringLiteral("payload.nsafe"));
+        const QString exportPath = dataDirectory.filePath(QStringLiteral("payload-export.bin"));
+        QByteArray payload(64, '\0');
+        for (int i = 0; i < payload.size(); ++i)
+            payload[i] = char(i * 7 + 1);
+        {
+            const QByteArray passwordBytes("correct horse battery staple");
+            SecureBuffer password(passwordBytes.constData(), passwordBytes.size());
+            QString recoveryKey;
+            SecuritySessionService session(dataDirectory.path());
+            VaultError error = session.createIdentity(password, &recoveryKey);
+            QVERIFY2(!error.isError(), qPrintable(error.userMessage));
+            SecureDocumentService documents(&session, dataDirectory.path());
+            SecureDocumentSnapshot snapshot;
+            error = documents.saveAsSecureBinary(
+                payload, QStringLiteral("payload"), securePath, &snapshot);
+            QVERIFY2(!error.isError(), qPrintable(error.userMessage));
+            password.clear();
+        }
+        QVERIFY(!readFileBytes(securePath).contains(payload));
+
+        QByteArray edited = payload;
+        edited[0] = char(0xAB);
+        {
+            auto window = std::make_unique<MainWindow>();
+            window->resize(980, 680);
+            window->show();
+            QVERIFY(QTest::qWaitForWindowExposed(window.get()));
+            window->openFilesFromExternal({securePath});
+            EditorTab *tab = currentEditor(window.get());
+            QVERIFY(tab && tab->isSecureDocument() && tab->isBinaryDocument());
+            QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(0, payload.size()),
+                                      payload, 3000);
+            tab->gotoByteOffset(0);
+            tab->editor()->setFocus(Qt::OtherFocusReason);
+            QTest::keyClicks(tab->editor(), QStringLiteral("AB"));
+            QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(0, payload.size()),
+                                      edited, 1000);
+            QVERIFY(QMetaObject::invokeMethod(window.get(), "saveFile",
+                                              Qt::DirectConnection));
+            QTRY_VERIFY_WITH_TIMEOUT(!tab->isModified(), 3000);
+            window->close();
+        }
+        QVERIFY(!readFileBytes(securePath).contains(edited));
+
+        auto window = std::make_unique<MainWindow>();
+        window->resize(980, 680);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window.get()));
+        window->openFilesFromExternal({securePath});
+        EditorTab *tab = currentEditor(window.get());
+        QVERIFY(tab && tab->isSecureDocument() && tab->isBinaryDocument());
+        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(0, edited.size()),
+                                  edited, 3000);
+
+        QStringList filters;
+        bool accepted = false;
+        QTimer::singleShot(80, window.get(), [&]() {
+            auto *dialog = window->findChild<QDialog *>(QStringLiteral("saveAsDialog"));
+            auto *fileDialog = dialog ? dialog->findChild<QFileDialog *>(
+                QStringLiteral("saveAsFileDialog")) : nullptr;
+            if (!fileDialog) {
+                if (dialog)
+                    dialog->reject();
+                return;
+            }
+            filters = fileDialog->nameFilters();
+            fileDialog->selectNameFilter(QStringLiteral("未加密文件 (*)"));
+            fileDialog->selectFile(exportPath);
+            accepted = QMetaObject::invokeMethod(fileDialog, "accept",
+                                                 Qt::DirectConnection);
+        });
+        QTimer::singleShot(5000, window.get(), [window = window.get()]() {
+            if (auto *dialog = window->findChild<QDialog *>(
+                    QStringLiteral("saveAsDialog")); dialog && dialog->isVisible()) {
+                dialog->reject();
+            }
+        });
+        QAction *saveAsAction = window->findChild<QAction *>(QStringLiteral("file.saveAs"));
+        QVERIFY(saveAsAction);
+        saveAsAction->trigger();
+
+        QVERIFY(accepted);
+        QCOMPARE(filters.size(), 2);
+        QCOMPARE(readFileBytes(exportPath), edited);
 
         window->close();
         window.reset();

@@ -8,12 +8,14 @@
 
 std::optional<SaveAsSelection> SaveAsDialog::choose(
     QWidget *parent, const QString &suggestion,
-    DocumentPersistence currentPersistence, bool binaryDocument)
+    DocumentPersistence currentPersistence, bool binaryDocument,
+    bool allowSecure)
 {
     const QString secureFilter = QStringLiteral(
         "Notepad Safe 安全文档 (*.nsafe)");
     const QString plainFilter = QStringLiteral("未加密文件 (*)");
-    QString selectedFilter = currentPersistence == DocumentPersistence::SecureFile
+    QString selectedFilter = allowSecure
+            && currentPersistence == DocumentPersistence::SecureFile
         ? secureFilter : plainFilter;
 
     QDialog dialog(parent);
@@ -26,7 +28,8 @@ std::optional<SaveAsSelection> SaveAsDialog::choose(
 
     auto *fileDialog = new QFileDialog(
         &dialog, QString(), suggestion,
-        secureFilter + QStringLiteral(";;") + plainFilter);
+        allowSecure ? secureFilter + QStringLiteral(";;") + plainFilter
+                    : plainFilter);
     fileDialog->setObjectName(QStringLiteral("saveAsFileDialog"));
     fileDialog->setWindowFlags(Qt::Widget);
     fileDialog->setAcceptMode(QFileDialog::AcceptSave);
@@ -97,7 +100,8 @@ std::optional<SaveAsSelection> SaveAsDialog::choose(
     }
     QString path = fileDialog->selectedFiles().constFirst();
     selectedFilter = fileDialog->selectedNameFilter();
-    const DocumentPersistence persistence = selectedFilter == secureFilter
+    const DocumentPersistence persistence = allowSecure
+            && selectedFilter == secureFilter
         ? DocumentPersistence::SecureFile : DocumentPersistence::PlainFile;
     if (persistence == DocumentPersistence::PlainFile
         && path.endsWith(QStringLiteral(".nsafe"), Qt::CaseInsensitive)) {

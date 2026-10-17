@@ -1345,7 +1345,8 @@ bool MainWindow::saveAsFile()
         this, suggestion,
         tab->isSecureDocument() ? DocumentPersistence::SecureFile
                                 : DocumentPersistence::PlainFile,
-        tab->isBinaryDocument());
+        tab->isBinaryDocument(),
+        !tab->isBinaryDocument() || tab->isSecureDocument());
     if (!selection)
         return false;
     QString fileName = selection->path;
@@ -1353,6 +1354,14 @@ bool MainWindow::saveAsFile()
         == DocumentPersistence::SecureFile;
     if (saveSecure) {
         const bool binaryPayload = tab->isBinaryDocument();
+        // New secure documents are text-only; an existing secure binary
+        // may still be saved as a secure document.
+        if (binaryPayload && !tab->isSecureDocument()) {
+            QMessageBox::information(
+                this, QStringLiteral("不能转换为安全文档"),
+                QStringLiteral("安全文档只保存文本。二进制文件请另存为普通文件。"));
+            return false;
+        }
         if (tab->isLargeDocument() && !binaryPayload) {
             QMessageBox::information(
                 this, QStringLiteral("不能转换为安全文档"),
