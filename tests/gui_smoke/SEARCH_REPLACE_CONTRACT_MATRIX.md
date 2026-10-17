@@ -2,6 +2,8 @@
 
 > 2026-10-02 范围校准：这是既有测试 ID 与语义索引，历史通过记录只适用于当时版本；当前规则见 [回归方法](../../docs/TARGET_EXPERIENCE.md) 和 [正则专项](../../docs/REGEX_ENGINE_EXPLORATION.md)。S2/S3 同为只读，2 GiB 不是功能门槛；下文 ADR-022 是历史方案编号，现行语义以正则专项和源码为准。
 
+> 2026-10-17 功能删除（见 [功能取舍](../../docs/FEATURE_DECISIONS.md)）：全部打开文件范围只查找，不再有跨文件全部替换和字节搜索；二进制没有文本呈现。已删除的用例：`tc_fr_015_all_open_replace_transaction_and_skip_summary`、`tc_fr_012_hex_byte_all_open_filters_text_targets`、`tc_fr_034_real_smalltestfile_text_directional_search_progress`、`tc_fr_038_real_tinytestfile_replacement_literal_user_flow`（依赖已删除的二进制文本呈现）、整个 `gui_smoke_search_malformed_encoding` 套件。新增 `tc_fr_all_open_scope_is_find_only`；`tc_fr_019` 的 all-open-mixed 上下文改为无字节模式、无全部替换。
+
 本文件是搜索/替换专项的可执行边界，不是抽样用户旅程。每次修复必须选择对应 `SR-*`
 契约，以判别语料、明确 byte range 和真实 GUI 操作验证；不能只证明函数返回值。
 
@@ -13,7 +15,7 @@
 
 | 模式 | 合法可选项 | 必须禁用且清空 | 目标约束 |
 |---|---|---|---|
-| Literal 普通文本 | 区分大小写 × 整词 × 循环 × 当前/全部 | 无 | 所有可搜索 Text/Secure Text；Binary 的文本呈现按当前编码解释 |
+| Literal 普通文本 | 区分大小写 × 整词 × 循环 × 当前/全部 | 无 | 所有可搜索 Text/Secure Text |
 | Regex 正则 | 区分大小写 × 循环 × 当前/全部 | 整词、十六进制字节 | PCRE2 产品方言；非 UTF-8 原始 subject 仅启用明确日志子集 |
 | Hex bytes 原始字节 | 循环 × 当前/全部 | 正则、区分大小写、整词 | 当前范围至少有一个 Binary/Hex；全部文件只调度 Binary/Hex |
 

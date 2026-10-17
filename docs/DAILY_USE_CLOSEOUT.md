@@ -12,6 +12,27 @@
 
 ## 当前执行证据
 
+### 2026-10-17：功能删除验证（分支 `feat/simplify-and-shell`）
+
+构建 `build-final/notepad-safe.exe`，33,105,920 字节，SHA-256 `76BC7A5580FE4CF5758E7F6E5B32B3211626AA76C2249747CC2FCBA9FEA58A0B`，基于 `d89ba7c`，Release / KDBX ON / Qt 6.11.1 静态链接。删除了分支起点之后所有比最新改动头文件旧的项目目标文件（180/238）后全量重编：中文编译器提示使 CMake 漏掉间接包含的头文件依赖，此前的增量构建里有布局不一致的旧目标文件，两个恢复类套件的崩溃即由此造成。
+
+核心测试 14 组全部通过（含新增 `test_document_open_routing` 7/7 与 `test_settings_ui`）。GUI 套件使用真实 Windows 平台插件串行执行；为区分原有问题，另在分支起点 `2de41ad` 建对照构建复跑了失败项。
+
+| 套件 | 结果 | 说明 |
+|---|---|---|
+| findreplace | 40/41 | `tc_fr_024` 在分支起点同样失败，原有问题 |
+| secure_documents | 14/14 | 含新增两项加密二进制用例 |
+| smallfixes | 64/68 | `tc_external_open_preserves_dirty_and_active_search`、`tc_gui_large_conversion_rejects_unsampled_invalid_source_byte` 为原有问题；两项十六进制契约用例本次因桌面焦点被占用失败，前两轮在本分支通过 |
+| large_readonly | 25/25 | 含新增 `windowedTextReopensAsHexAndRestoresAcrossSession`；它发现了只读大文本以十六进制恢复时缺少提供器的问题，已在 `d89ba7c` 修复 |
+| tail_follow | 20/21 | `sourceFaultStopsAndNeverAutoResumes(truncate)` 在本分支三次运行均失败、分支起点通过，**未解决**，交最终审查 |
+| document_product_language | 22/24 | `realLargeSearchCancellationKeepsStoppedReason` 两行在分支起点同样失败 |
+| recovery_issue | 14/16 | `tc_2b1_modified_without_draft_does_not_load_original` 两行在分支起点同样失败 |
+| readonly_search_source、windowed_hex_mouse | 全部通过 | |
+| hex_readonly_search、tail_presentation | 各 1 项失败 | 焦点/主题相关，前两轮在本分支通过，本次运行时桌面在使用中 |
+
+已删除或改写的用例见三份测试矩阵顶部的 2026-10-17 说明。
+
+
 ### 2026-10-02：单副本保留定向验证
 
 中间验证构建基于 HEAD `988b097` 加当前未提交工作树，`build-final` Release / KDBX ON / Qt 6.11.1。`notepad-safe` 和两份测试程序重新构建成功，架构边界检查、`git diff --check`通过。源码、夹具与程序SHA-256见本机生成的 [证据清单](../build-final/backup-retention-evidence.json)，构建输出见 [构建日志](../build-final/backup-retention-build.log)。

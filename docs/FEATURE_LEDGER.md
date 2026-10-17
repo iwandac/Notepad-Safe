@@ -13,10 +13,10 @@
 | 模式 | 内容与表示 | 实际能力 | 限制与源码 |
 |---|---|---|---|
 | 空工作区 | 没有文档 | 打开、新建、工作区切换、设置、任务等应用操作 | 启动不隐式创建文档或安全身份；见 [`StartupCoordinator`](../src/app/StartupCoordinator.cpp)、[`MainWindow`](../src/window/MainWindow.cpp) |
-| 普通小文本 | QScintilla 完整文本 | 编辑、搜索替换、撤销、语法、分屏、普通/安全另存 | 编辑过程中增长到保存快照上限附近需单独回归，不能只测打开时大小；见 [`EditorTabPersistence`](../src/editor/EditorTabPersistence.cpp) |
-| 普通小二进制，Hex 表示 | VirtualFileView + PatchList + Hex/字符区投影 | 字节输入、插入/覆盖、删除、剪贴板、撤销、搜索、保存 | 不提供普通文本行操作、语法、分屏、搜索替换；见 [`EditorTabHex`](../src/editor/EditorTabHex.cpp) |
+| 普通小文本 | QScintilla 完整文本 | 编辑、搜索替换、撤销、语法、普通/安全另存 | 编辑过程中增长到保存快照上限附近需单独回归，不能只测打开时大小；见 [`EditorTabPersistence`](../src/editor/EditorTabPersistence.cpp) |
+| 普通小二进制，Hex 表示 | VirtualFileView + PatchList + Hex/字符区投影 | 字节输入、插入/覆盖、删除、剪贴板、撤销、搜索、保存 | 不提供普通文本行操作、语法、搜索替换，不能新建为安全文档；见 [`EditorTabHex`](../src/editor/EditorTabHex.cpp) |
 | 普通小二进制，Text 表示 | 原始字节的解码投影 | 浏览、复制、搜索、切回 Hex；仍可保存既有字节模型 | **Text 投影只读**，不能把解码后的替代字符当作可逆字节编辑；见 [`bridgePopulateScintilla`](../src/editor/EditorTabLargeDocument.cpp) |
-| 普通只读文件 | WindowedReadOnlyProvider 的 Text 或 Hex 表示 | 窗口化浏览、全局字节定位、跨窗口选区、复制、查找、统计、Tail | 无编辑、普通保存/另存、分屏、自动换行、语法呈现；只读 **Text** 仍有“转换编码并另存新文件”；见 [`openLargeFileL2`](../src/editor/EditorTabLargeDocumentPersistence.cpp) |
+| 普通只读文件 | WindowedReadOnlyProvider 的 Text 或 Hex 表示（Binary 只用 Hex；Text 可在标签右键切到 Hex 查看） | 窗口化浏览、全局字节定位、跨窗口选区、复制、查找、统计、Tail | 无编辑、普通保存/另存、自动换行、语法呈现；只读 **Text** 仍有“转换编码并另存新文件”；见 [`openLargeFileL2`](../src/editor/EditorTabLargeDocumentPersistence.cpp) |
 | 安全文本/安全二进制 | 解锁后的文本编辑或字节模型 | 编辑、搜索、加密保存、加密恢复、显式另存转换 | 有效载荷必须 **小于 32 MiB**，不会降级为普通只读安全大文件；见 [`SecureDocumentService`](../src/vault/SecureDocumentService.cpp) |
 | 安全文档已锁定/切换中 | 遮蔽或切换状态 | 显式解锁、关闭等生命周期操作 | `documentState()` 返回空内容能力；不允许把缓存正文继续用于搜索、复制或工具；见 [`EditorTab::documentState`](../src/editor/EditorTab.cpp) |
 | Accounts 工作区 | 独立 KDBX 账号条目 | 账号编辑、搜索、取用、锁定等 | 不作为普通文档参与全标签搜索、文本替换或文档工具；见 [`VaultDock`](../src/vault/VaultDock.cpp) |
@@ -42,14 +42,13 @@
 | NSP-SHELL：异常清单保全 | [`WorkspaceRecoveryCoordinator`](../src/window/WorkspaceRecoveryCoordinator.cpp)、[`SessionManager`](../src/session/SessionManager.cpp) | 损坏/未知版本/不可读清单；默认取消；显式保全选择、复制校验失败、重试、保全后当前会话写入失败；不能把错误当空会话 |
 | NSP-EDIT：文本输入与历史 | [`EditorTab`](../src/editor/EditorTab.cpp)、[`EditorTabCommands`](../src/editor/EditorTabCommands.cpp) | 输入、删除、选区覆盖、Unicode/IME、多行粘贴、撤销/重做分组、保存点、活动分屏；适用普通/解锁安全文本 |
 | NSP-EDIT：剪贴板 | [`DocumentClipboardCommands`](../src/editor/DocumentClipboardCommands.cpp)、[`ByteClipboard`](../src/editor/ByteClipboard.h)、[`MainWindowCommands`](../src/window/MainWindowCommands.cpp) | 文本与 Hex/字符区焦点、反向/跨窗口选区、内部原始字节 MIME 和对外文本、重复复制、64 MiB 字节载荷边界、安全剪贴板清理 |
-| NSP-EDIT：行操作 | [`EditorTabCommands`](../src/editor/EditorTabCommands.cpp) | 复制、删除、上移/下移、转置、合并、按窗口宽度拆分；首末行、无末尾换行、CR/LF/CRLF、多行选区及一次撤销 |
+| NSP-EDIT：行操作 | [`EditorTabCommands`](../src/editor/EditorTabCommands.cpp) | 复制、删除、上移/下移、合并；首末行、无末尾换行、CR/LF/CRLF、多行选区及一次撤销 |
 | NSP-EDIT：排序与大小写 | [`EditorTabCommands`](../src/editor/EditorTabCommands.cpp) | 升/降序、Unicode 大小写、空行、重复行、选区端点、换行保真、活动分屏；排序实现须重点复核，见第 4 节 |
 | NSP-EDIT：多选 | [`EditorTabCommands`](../src/editor/EditorTabCommands.cpp) | 选择下一个/所有相同内容、空选区、重叠匹配、循环末端、修改与撤销；仅原生可编辑文本 |
 | NSP-EDIT：缩进与补全 | [`MainWindow`](../src/window/MainWindow.cpp)、[`EditorTab`](../src/editor/EditorTab.cpp) | Tab/空格、宽度 2/4/8、Backspace 回退缩进、文档词语补全；设置在新标签/分屏/只读模式中的应用 |
 | NSP-EDIT：Hex 输入 | [`EditorTabHex`](../src/editor/EditorTabHex.cpp)、[`PatchList`](../src/editor/PatchList.cpp) | 高/低半字节输入、字符区输入、插入/覆盖、EOF 追加、Delete/Backspace、完整选区替换、无效输入、IME 不破坏字节网格 |
 | NSP-VIEW：Text/Hex 表示 | [`EditorTabLargeDocument`](../src/editor/EditorTabLargeDocument.cpp)、[`WindowedReadOnlyProvider`](../src/editor/WindowedReadOnlyProvider.cpp) | 小二进制及窗口化文件双表示、切换前补丁同步、光标/选区源字节一致、解码错误；小文本直接编辑界面没有完整双表示路径 |
-| NSP-VIEW：分屏 | [`EditorTab::setSplitView`](../src/editor/EditorTab.cpp) | 水平/垂直、共享内容和撤销、独立滚动与选区、焦点命令归属、关闭分屏；仅原生文本，非 Binary/窗口化/锁定状态 |
-| NSP-VIEW：阅读设置 | [`MainWindow`](../src/window/MainWindow.cpp)、[`EditorTab`](../src/editor/EditorTab.cpp) | 自动换行、空白/行尾符号、标尺及 72/80/100/120/150/200 列、缩放/重置、工具栏/状态栏/结果面板；窗口化只读强制不换行 |
+| NSP-VIEW：阅读设置 | [`MainWindow`](../src/window/MainWindow.cpp)、[`EditorTab`](../src/editor/EditorTab.cpp) | 自动换行、空白/行尾符号、标尺及 80/100/120 列、缩放/重置、状态栏/结果面板；窗口化只读强制不换行 |
 | NSP-LANGUAGE：语法与折叠 | [`FeatureRegistry`](../src/domain/FeatureRegistry.cpp)、[`EditorTab`](../src/editor/EditorTab.cpp)、[`EditorTabCommands`](../src/editor/EditorTabCommands.cpp) | 扩展名猜测、手选语言、恢复保留、当前/全部折叠、匹配括号跳转/选择；不把 lexer 当代码解析器 |
 | NSP-SEARCH：当前/全部打开文件查找 | [`FindReplaceDialog`](../src/search/FindReplaceDialog.cpp)、[`SearchNavigationRequest`](../src/search/SearchNavigationRequest.cpp) | 前后方向、循环开关、标签顺序、普通文本/二进制/只读混合、锁定跳过、无匹配、空查询、查询变更；没有目录搜索入口 |
 | NSP-SEARCH：解释选项 | [`FindReplaceDialog`](../src/search/FindReplaceDialog.cpp)、[`EditableTextSearch`](../src/search/EditableTextSearch.cpp)、[`LargeFileSearch`](../src/search/LargeFileSearch.cpp) | 字面量/正则/大小写/整词的合法组合；正则与整词互斥，字节模式与正则/大小写/整词互斥；非法程序化状态也有归一化 |
@@ -58,7 +57,7 @@
 | NSP-SEARCH：替换 | [`FindReplaceDialog::onReplaceAll`](../src/search/FindReplaceDialog.cpp)、[`EditableTextSearch`](../src/search/EditableTextSearch.cpp) | 当前单次/全部替换、捕获展开、空替换、不可表示输出、一次撤销；只修改可编辑 Text，不修改 Binary/只读/锁定文档 |
 | NSP-SEARCH：跨标签全部替换 | [`FindReplaceDialog::onReplaceAll`](../src/search/FindReplaceDialog.cpp) | 全体预检、跳过清单、默认取消、确认后 revision 变化/关闭、异常回滚、每文件一个撤销步骤、不自动保存 |
 | NSP-SEARCH：结果与异步生命周期 | [`SearchResultsController`](../src/search/SearchResultsController.cpp)、[`SearchResultsModel`](../src/search/SearchResultsModel.cpp)、[`LargeFileSearchTasks`](../src/search/LargeFileSearchTasks.cpp) | 增量/容量/部分结果、结果行紧凑、重复导航、取消与重跑、旧结果失效、编辑/编码切换/关闭/外部替换时禁止错误跳转 |
-| NSP-SEARCH：书签 | [`EditorTabCommands`](../src/editor/EditorTabCommands.cpp) | 标记/下一处/上一处/清除、首末端循环、编辑后位置、分屏焦点；当前实现绑定原生编辑器，窗口化全局书签不作为已交付能力 |
+| NSP-SEARCH：书签 | [`EditorTabCommands`](../src/editor/EditorTabCommands.cpp) | 标记/下一处/上一处/清除、首末端循环、编辑后位置；当前实现绑定原生编辑器，窗口化全局书签不作为已交付能力 |
 | NSP-LARGEFILE：只读浏览 | [`WindowedReadOnlyProvider`](../src/editor/WindowedReadOnlyProvider.cpp)、[`ReadOnlyTextAnalysis`](../src/file_runtime/ReadOnlyTextAnalysis.cpp) | 32 MiB 前后、超长行、多字节跨窗口、首尾定位、大偏移、全局滚动、Text/Hex 选区、统计未知/进行中/完成；只读限制不能被快捷键绕过 |
 | NSP-LARGEFILE：普通读取准入 | [`OrdinaryReadSource`](../src/file_runtime/OrdinaryReadSource.cpp)、[`ReadOnlySearchSource`](../src/search/ReadOnlySearchSource.cpp) | 同句柄身份、删除/替换/截断、原普通文件变成安全文件、读取失败、映射回收；打开时只读判定不能被后续较小替换文件放宽 |
 | NSP-LARGEFILE：跟随末尾 | [`ReadOnlyTailController`](../src/editor/ReadOnlyTailController.cpp)、[`DocumentTailActions`](../src/window/DocumentTailActions.cpp) | 默认关闭；普通只读 Text/Hex；追加跟随，浏览/选区/导航暂停，显式恢复到末尾；异常源变化停止；搜索与统计不可抢回阅读位置 |
@@ -98,7 +97,7 @@
 
 1. **内容与模式**：普通 Text、Binary Hex、Binary Text、只读 Text/Hex、安全 Text/Binary、锁定/切换中、Accounts、空工作区；不适用组合写出原因。
 2. **内容边界**：空/单字节、32 MiB 前后及编码膨胀、超长行、无末尾换行、混合 EOL、BOM、非 BMP 字符、非法字节、首尾/跨窗口选区。超过 2 GiB 只用于偏移与资源压力验证。
-3. **编辑序列**：操作 → 撤销 → 重做 → 保存 → 重开；分屏改变焦点后重复；Text/Hex 切换前后字节一致；普通文本增长到保存快照上限时不丢内容。
+3. **编辑序列**：操作 → 撤销 → 重做 → 保存 → 重开；只读文本大文件 Text/Hex 查看切换前后字节一致；普通文本增长到保存快照上限时不丢内容。
 4. **搜索序列**：查找 → 编辑/切编码/换表示/关闭 → 点击旧结果；取消 → 重跑；跨标签替换确认前后内容变化；搜索容量耗尽后禁止以不完整匹配集合替换。
 5. **持久化序列**：两个以上 dirty 文档中一个快照失败、清单提交失败、外部写入、路径替换、目标被占用、恢复途中关闭取消/重试；核对全部旧稿和当前正文责任。
 6. **安全序列**：正在搜索/编辑/复制 → 主动锁定或到期 → 再解锁；分别注入安全保存失败、恢复快照失败、二者均失败；正文、账号秘密与恢复材料不得跨入普通会话和普通搜索。
@@ -111,8 +110,8 @@
 - **大文件已经降级**：后台升级为可编辑大文件的能力关闭；旧大文件编辑恢复日志入口明确拒绝。2 GiB 残留分类不是产品分档，文档和测试解释不能继续把它当成功能边界。
 - **只读仍有转换输出**：普通只读 Text 的编码转换会写到新文件；普通 `Save/Save As` 被持久化层拒绝。两者要分别验证，不能概括成“大文件不能产生任何新文件”。
 - **菜单状态与执行权限尚非一处权威**：`CommandRegistry::applyContext` 对 `file.saveAs` 主要使用“有文档”，而 `PlainFilePersistence::save` 检查 `Save` capability 后拒绝只读。当前可能出现入口可点击、到执行阶段才拒绝的情况；这是界面一致性待复核点，不能写成“所有入口均已正确禁用”。
-- **书签和排序需要重点复核**：`EditorTabCommands` 中书签、排序直接使用 `m_editor`；窗口化可见编辑器和活动分屏可能不是这个对象。排序还把 `text(line)` 结果重新用换行拼接。需以分屏焦点、CR/LF/CRLF 和末行用例验证，当前只记静态风险，不记已复现缺陷。
-- **共同显示设置需要动态差分**：`setTabWidth` 和 `applyEdgeSettings` 当前只更新原生/分屏对象，未同步给窗口化只读 Provider。默认样式相等不能证明运行中修改Tab宽、标尺、主题和缩放仍一致；具体执行PAR-03至07。
+- **书签和排序需要重点复核**：`EditorTabCommands` 中书签、排序直接使用 `m_editor`；窗口化可见编辑器可能不是这个对象。排序还把 `text(line)` 结果重新用换行拼接。需以 CR/LF/CRLF 和末行用例验证，当前只记静态风险，不记已复现缺陷。
+- **共同显示设置需要动态差分**：`setTabWidth` 和 `applyEdgeSettings` 当前只更新原生编辑器，未同步给窗口化只读 Provider。默认样式相等不能证明运行中修改Tab宽、标尺、主题和缩放仍一致；具体执行PAR-03至07。
 - **编辑增长与会话输出有容量边界**：普通快照以大于32MiB拒绝，DraftStore以大于等于32MiB拒绝；已有普通文档编辑增长须验证保存/恢复闭环。Session读取限制256项/4MiB，写端是否会发布自身无法重读的清单需验证。执行EDIT-11、REC-09，静态风险尚非已复现Bug。
 - **普通保存仍有竞争窗口**：新代码在写候选并释放底层句柄后再次比较磁盘版本，但最后比较与 `QSaveFile::commit` 之间没有文件系统条件提交。不能宣称已经消除所有并发覆盖风险。
 - **保存错误不一定表示磁盘未变**：普通保存提交成功后，版本验证或底层重开仍可能失败并返回 Error；回归必须区分提交前失败与提交后失败，核对磁盘文件、内容基线和错误提示。

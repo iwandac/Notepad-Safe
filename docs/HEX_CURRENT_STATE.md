@@ -1,20 +1,22 @@
 # 十六进制现状
 
-更新：2026-10-16。按当前源码记录二进制文档与十六进制视图的实际行为。来源：[`EditorTabHex.cpp`](../src/editor/EditorTabHex.cpp)、[`EditorTabLargeDocument.cpp`](../src/editor/EditorTabLargeDocument.cpp)、[`ByteClipboard.h`](../src/editor/ByteClipboard.h)、[`HexProjection.cpp`](../src/editor/HexProjection.cpp)、[`PatchList.cpp`](../src/editor/PatchList.cpp)、[`FileContentProbe.cpp`](../src/editor/FileContentProbe.cpp)、[`MainWindow.cpp`](../src/window/MainWindow.cpp) 的编辑/视图菜单；契约见 [十六进制契约矩阵](../tests/gui_smoke/HEX_EDITOR_CONTRACT_MATRIX.md)。
+更新：2026-10-17。按当前源码记录二进制文档与十六进制视图的实际行为。来源：[`EditorTabHex.cpp`](../src/editor/EditorTabHex.cpp)、[`EditorTabLargeDocument.cpp`](../src/editor/EditorTabLargeDocument.cpp)、[`ByteClipboard.h`](../src/editor/ByteClipboard.h)、[`HexProjection.cpp`](../src/editor/HexProjection.cpp)、[`PatchList.cpp`](../src/editor/PatchList.cpp)、[`FileContentProbe.cpp`](../src/editor/FileContentProbe.cpp)、[`MainWindow.cpp`](../src/window/MainWindow.cpp) 的编辑/视图菜单；契约见 [十六进制契约矩阵](../tests/gui_smoke/HEX_EDITOR_CONTRACT_MATRIX.md)。
 
 ## 1. 哪些文档有十六进制
 
-| 文档 | 默认呈现 | 可否编辑字节 | 可否切到文本 |
+内容决定视图：二进制只用十六进制，文本用文本视图。
+
+| 文档 | 呈现 | 可否编辑字节 | 可否换一种方式查看 |
 |---|---|---|---|
-| 小于 32 MiB 的二进制 | 十六进制 | 可以 | 可以，文本呈现只读 |
-| 32 MiB 及以上的二进制 | 十六进制 | 不可以 | 可以，只读 |
-| 32 MiB 及以上的文本（只读大文件） | 文本 | 不可以 | 可以切到十六进制，只读 |
-| 小于 32 MiB 的文本 | 文本（QScintilla） | — | **不能切到十六进制** |
-| 加密二进制 | 十六进制 | 可以（加密正文须小于 32 MiB） | 可以，文本呈现只读 |
+| 小于 32 MiB 的二进制 | 十六进制 | 可以 | 不可以 |
+| 32 MiB 及以上的二进制 | 十六进制 | 不可以 | 不可以 |
+| 32 MiB 及以上的文本（只读大文件） | 文本 | 不可以 | 可以，标签右键“以十六进制查看 / 以文本查看”，只读 |
+| 小于 32 MiB 的文本 | 文本（QScintilla） | — | 不可以 |
+| 已有的加密二进制 | 十六进制 | 可以（加密正文须小于 32 MiB） | 不可以 |
 
 二进制判定见 [编码现状](ENCODING_CURRENT_STATE.md)：前 64 KiB 有 `00` 字节或控制字符超过 3%。
 
-切换：视图 › 呈现方式 › 文本 / 十六进制，或 Ctrl+Shift+H 双向切换；只在上表“可以切换”的文档可用。切换不改字节、不保存。
+只读大文件的查看方式切换在标签右键菜单，保持当前位置，不改字节；会话恢复时按上次的查看方式打开。没有“视图 › 呈现方式”菜单和 Ctrl+Shift+H。旧会话里记为文本呈现的二进制恢复为十六进制。
 
 ## 2. 布局
 
@@ -22,7 +24,6 @@
 - 地址为十六进制，位数至少 8 位，按文件大小增加。
 - 每行字节数按窗口宽度自适应：在 64 到 8 之间以 4 为步长取能放下的最大值；窗口缩放时重排，不改数据、光标和选区。
 - 字符栏按当前显示编码解码：多字节字符显示在其第一个字节的格子里，后续字节格留空；非法字节显示 `�`。可通过编码菜单“以 … 编码显示”切换。
-- 二进制切到文本呈现后，行号栏改为十进制全局字节偏移，不建立全文行索引。
 
 ## 3. 光标与选择（十六进制网格）
 
@@ -74,6 +75,7 @@
 - 按字节模型原样保存，不经过文本编码；字符栏的 `�` 不会触发“编码需要确认”。
 - 未修改时保存为空操作。
 - 崩溃恢复保存字节补丁、修改状态与位置（细节见保存与恢复现状）。
+- 二进制另存为时只提供“未加密文件”类型，不能新建加密二进制。已有加密二进制仍按加密文档保存，也可另存为普通文件。
 
 ## 8. 状态栏
 
@@ -84,14 +86,6 @@
 | # | 差异 | 现状 | 处理 |
 |---:|---|---|---|
 | 1 | 十六进制画面 | 原型没有画 | 待设计：地址 / 网格 / 字符栏三栏、INS/OVR、只读状态 |
-| 2 | 呈现方式切换入口 | 菜单与 Ctrl+Shift+H | 新界面放状态栏；小文本不能切十六进制，需显示为不可用 |
+| 2 | 查看方式切换入口 | 只读大文件的标签右键菜单 | 新界面沿用；其他文档不显示此入口 |
 | 3 | 字符栏输入规则 | 按显示编码编码，不是 Latin-1 | 设计说明应以现状为准 |
 | 4 | 状态栏 INS/OVR | 只在可编辑十六进制出现 | 原型的弹出层画板把 INS 画在普通文本上，需改 |
-
-## 已确认的变更（尚未实现）
-
-2026-10-17 按 [功能取舍](FEATURE_DECISIONS.md) 确认，代码尚未修改；实现后把本页正文改为新行为并删除此节。
-
-- 删除同一标签内的文本/十六进制实时切换（视图 › 呈现方式、Ctrl+Shift+H）。二进制只用十六进制视图，二进制的文本呈现与十进制偏移行号一并去掉；保留标签右键“以十六进制重新打开 / 以文本重新打开”，按另一种方式重新打开。
-- 不再允许把二进制另存为加密文档；已有加密二进制仍可打开、编辑、另存为普通文件。
-- 可编辑十六进制（含插入模式）保留不变。

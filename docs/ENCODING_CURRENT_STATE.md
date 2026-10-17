@@ -1,6 +1,6 @@
 # 编码与换行现状
 
-更新：2026-10-16。按当前源码记录文本/二进制判定、编码识别、重新显示、转换另存、换行符和保存时的编码行为。来源：[`FileContentProbe.cpp`](../src/editor/FileContentProbe.cpp)、[`FileTierPolicy.cpp`](../src/domain/FileTierPolicy.cpp)、[`TextEncoding.h`](../src/editor/TextEncoding.h) / [`.cpp`](../src/editor/TextEncoding.cpp)、[`EditorTab.cpp`](../src/editor/EditorTab.cpp) 的 `loadFile` 与 `detectLineEndingMode`、[`EditorTabPersistence.cpp`](../src/editor/EditorTabPersistence.cpp)、[`PlainFilePersistence.cpp`](../src/app/PlainFilePersistence.cpp)、[`MainWindowCommands.cpp`](../src/window/MainWindowCommands.cpp) 的编码菜单处理、[`MainWindowDocuments.cpp`](../src/window/MainWindowDocuments.cpp) 的 `saveFile`。
+更新：2026-10-17。按当前源码记录文本/二进制判定、编码识别、重新显示、转换另存、换行符和保存时的编码行为。来源：[`FileContentProbe.cpp`](../src/editor/FileContentProbe.cpp)、[`FileTierPolicy.cpp`](../src/domain/FileTierPolicy.cpp)、[`TextEncoding.h`](../src/editor/TextEncoding.h) / [`.cpp`](../src/editor/TextEncoding.cpp)、[`EditorTab.cpp`](../src/editor/EditorTab.cpp) 的 `loadFile` 与 `detectLineEndingMode`、[`EditorTabPersistence.cpp`](../src/editor/EditorTabPersistence.cpp)、[`PlainFilePersistence.cpp`](../src/app/PlainFilePersistence.cpp)、[`MainWindowCommands.cpp`](../src/window/MainWindowCommands.cpp) 的编码菜单处理、[`MainWindowDocuments.cpp`](../src/window/MainWindowDocuments.cpp) 的 `saveFile`。
 
 ## 1. 打开时的判定
 
@@ -13,7 +13,7 @@
 3. 除换行、回车、Tab、换页以外的控制字符超过 3% → 二进制。
 4. 其余 → 文本。
 
-二进制文件默认以十六进制打开；明确指定编码打开（例如会话恢复带编码、转换后打开）时跳过二进制判定。
+二进制文件总是以十六进制打开；明确指定编码打开（例如转换后打开）时跳过二进制判定。会话恢复仍按内容判定，二进制即使带有保存的编码也以十六进制恢复。
 
 ## 2. 编码识别
 
@@ -36,9 +36,9 @@
 编码菜单顶部 9 项“以 … 编码显示”，勾选项跟随当前标签：
 
 - 加密文档和未命名文档不可用（点了也不改变）。
-- 只读大文件和二进制的文本呈现：立即按新编码重新解释原字节，不改文件。
+- 只读大文件：立即按新编码重新解释原字节，不改文件。
 - 普通可编辑文本：会从磁盘重新读取字节再解码。如有未保存修改，先问“要先保存再以 X 编码显示吗？”（保存 / 取消，默认取消）；保存失败则不切换。
-- 二进制文档切换显示编码只影响文本呈现和十六进制右侧字符栏，不改字节。
+- 二进制文档切换显示编码只影响十六进制右侧字符栏，不改字节。
 
 ## 5. 转换编码并另存
 

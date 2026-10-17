@@ -2,6 +2,8 @@
 
 > 2026-10-02 范围校准：这是既有专项契约索引，列出用例不代表本轮已执行；本版规则见 [回归方法](../../docs/TARGET_EXPERIENCE.md)。B2/B3 都是同一窗口化只读能力，2 GiB 样本验证偏移/资源，不是另一功能档位。
 
+> 2026-10-17 功能删除（见 [功能取舍](../../docs/FEATURE_DECISIONS.md)）：二进制只用十六进制视图，同一标签内的文本/十六进制切换、二进制的文本呈现（HX-O02）和全部打开文件的字节搜索已删除，主工具栏也已删除。已删除的用例：`windowedBinaryTextPresentationUsesByteOffsetGutterWithoutGlobalScans`、`binaryTextEncodingRegexAndWindowedGlobalLinesUserFlow`、`tc_binary_text_presentation_survives_session_restore`、`tc_fr_012_hex_byte_all_open_filters_text_targets`。只读文本大文件可在标签右键切到十六进制查看，由 `windowedTextReopensAsHexAndRestoresAcrossSession` 覆盖。
+
 本文件定义 Hex 模块的有限测试边界。执行器根据维度自动生成 pairwise、三元或穷举案例；
 它不是用户旅程。每个失败必须输出稳定 case ID，并同时检查 byte model、Hex/ASCII 投影、
 caret/selection、状态栏、dirty/Undo 和磁盘结果中适用的部分。

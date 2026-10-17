@@ -1,6 +1,6 @@
 # 加密与锁定现状
 
-更新：2026-10-16。按当前源码记录本地安全身份、会话、加密文档、锁定、剪贴板和安全中心。账号库界面见账号库现状。来源：[`MainWindowDocuments.cpp`](../src/window/MainWindowDocuments.cpp)（`ensureSecuritySessionInteractive`、`newFile`、`saveSecureTab`、`lockSecureDocumentsImpl`、`protectForSystemLock`、`restoreAfterSystemUnlock`）、[`MainWindow.cpp`](../src/window/MainWindow.cpp)（计时器、`nativeEvent`、安全中心页、`showAccountsWorkspace`）、[`EditorTab.cpp`](../src/editor/EditorTab.cpp) 的 `maskSecureDocument`、[`SecureDocumentService.cpp`](../src/vault/SecureDocumentService.cpp)、[`SecurityIdentity.cpp`](../src/vault/SecurityIdentity.cpp)、[`SecuritySessionService.cpp`](../src/vault/SecuritySessionService.cpp)、[`FileCredentialDialog.cpp`](../src/window/FileCredentialDialog.cpp)；边界说明见 [源码架构](DESIGN.md)。
+更新：2026-10-17。按当前源码记录本地安全身份、会话、加密文档、锁定、剪贴板和安全中心。账号库界面见账号库现状。来源：[`MainWindowDocuments.cpp`](../src/window/MainWindowDocuments.cpp)（`ensureSecuritySessionInteractive`、`newFile`、`saveSecureTab`、`lockSecureDocumentsImpl`、`protectForSystemLock`、`restoreAfterSystemUnlock`）、[`MainWindow.cpp`](../src/window/MainWindow.cpp)（计时器、`nativeEvent`、安全中心页、`showAccountsWorkspace`）、[`EditorTab.cpp`](../src/editor/EditorTab.cpp) 的 `maskSecureDocument`、[`SecureDocumentService.cpp`](../src/vault/SecureDocumentService.cpp)、[`SecurityIdentity.cpp`](../src/vault/SecurityIdentity.cpp)、[`SecuritySessionService.cpp`](../src/vault/SecuritySessionService.cpp)、[`FileCredentialDialog.cpp`](../src/window/FileCredentialDialog.cpp)；边界说明见 [源码架构](DESIGN.md)。
 
 ## 1. 安全模型一句话
 
@@ -26,9 +26,9 @@
 - **新建**（Ctrl+N）：直接建立加密草稿，数据目录下 `drafts/<ID>.nsafe-draft`，不问位置。
 - **标题**取正文前 8 行中第一行非空文字（去掉开头 `#`，最多 80 字）。
 - **保存**：静默写回自己的加密文件；修改后 5 秒自动写回；关闭标签时自动写回，失败则阻止关闭。
-- **另存为**：可以选“Notepad Safe 安全文档 (*.nsafe)”放到任意位置，或转为未加密文件；普通文件也可经另存为转为安全文档（内容须小于 32 MiB）。
+- **另存为**：可以选“Notepad Safe 安全文档 (*.nsafe)”放到任意位置，或转为未加密文件；普通文本文件也可经另存为转为安全文档（内容须小于 32 MiB）；普通二进制的另存为只提供“未加密文件”。
 - **大小**：加密正文严格小于 32 MiB；编辑中达到上限会停止编辑或撤销这次修改，提示另存为普通文件。
-- **内容类型**：文本或二进制（二进制以十六进制编辑）。
+- **内容类型**：新建或转换出的安全文档只有文本。已有的加密二进制仍可打开、以十六进制编辑、保存，也可另存为普通文件。
 - **外部修改**：保存前发现密文在磁盘上变了，暂停保存，可“重新解密并加载磁盘版本”或另存为新的安全文档；最新内容写入本机加密恢复点。
 - **写回失败**：建立本机加密恢复点；两者都失败时提示立即手动保存。
 - **打开别人的或旧身份的文件**：当前会话解不开时弹“打开受其他密码保护的文件”，解锁方式选“文件密码”或“恢复密钥”，可“显示输入”；成功后本次会话内不再询问。
@@ -74,8 +74,7 @@
 
 ## 已确认的变更（尚未实现）
 
-2026-10-17 按 [功能取舍](FEATURE_DECISIONS.md) 确认，代码尚未修改；实现后把本页正文改为新行为并删除此节。
+2026-10-17 按 [功能取舍](FEATURE_DECISIONS.md) 确认。不再新建加密二进制已实现并写入正文；以下尚未实现。
 
 - 新增锁定标签内直接解锁（复用现有登录流程）。
-- 不再新建或转换出加密二进制文档；已有的仍可打开和导出为普通文件。
 - 不做：登录框改用恢复密钥。暂缓：闲置自动锁定。
