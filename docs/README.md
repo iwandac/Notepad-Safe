@@ -9,6 +9,9 @@
 | 文档 | 职责 |
 |---|---|
 | [产品目标与核心旅程](PRODUCT_GOALS.md) | 一句话目标、不变边界、12 条核心旅程及其状态、完成标准 |
+| [架构评估与建议](ARCHITECTURE_ASSESSMENT.md) | 现状架构问题、故障隔离思路、目标结构与迁移顺序 |
+| 功能现状：[搜索](SEARCH_CURRENT_STATE.md)、[编辑](EDIT_CURRENT_STATE.md)、[编码](ENCODING_CURRENT_STATE.md)、[十六进制](HEX_CURRENT_STATE.md)、[大文件](LARGE_FILE_CURRENT_STATE.md)、[保存恢复](SAVE_RECOVERY_CURRENT_STATE.md)、[加密锁定](SECURITY_CURRENT_STATE.md)、[账号库](ACCOUNTS_CURRENT_STATE.md) | 按源码逐项记录的当前行为，及与新界面原型的差异 |
+| [新界面功能核对](UI_FEATURE_MAP.md) | 现有功能在新界面中的位置 |
 | [项目入口](../README.md) | 产品范围、构建入口、数据位置 |
 | [功能清单](FEATURE_LEDGER.md) | 现有功能、模式适用性、能力限制 |
 | [源码架构](DESIGN.md) | 真实依赖、状态所有权、持久化、安全及复杂度 |
