@@ -3,6 +3,8 @@
 #include <Qsci/qsciscintilla.h>
 #include <Qsci/qscilexer.h>
 
+#include <utility>
+
 namespace {
 QString c(const QColor &color)
 {
@@ -12,53 +14,61 @@ QString c(const QColor &color)
 
 QString applicationStyleSheet(const ThemeTokens &t)
 {
-    // %1 ground  %2 chrome  %3 paper  %4 raised  %5 ink  %6 muted  %7 line
-    // %8 hover  %9 selection  %10 focus  %11 faint
-    // %12 radiusControl  %13 radiusOverlay  %14 control
-    return QStringLiteral(
-        "QMainWindow, QDialog { background:%2; color:%5; }"
-        "QMenuBar { background:%2; color:%5; }"
-        "QMenuBar::item:selected, QMenuBar::item:pressed { background:%8; color:%5; }"
-        "QMenu { background:%4; color:%5; border:1px solid %7; border-radius:%13px; padding:4px; }"
-        "QMenu::item { padding:5px 24px 5px 12px; border-radius:%12px; }"
-        "QMenu::item:selected { background:%8; color:%5; }"
-        "QMenu::item:disabled { color:%11; }"
-        "QMenu::separator { height:1px; background:%7; margin:4px 8px; }"
-        "QStatusBar { background:%2; color:%6; border-top:1px solid %7; }"
-        "QStatusBar QLabel { color:%6; }"
-        "StatusSegment { color:%6; background:transparent; border:0; border-radius:0;"
+    // Named placeholders: a numbered arg() chain shifts every color when one
+    // number goes unused.
+    QString sheet = QStringLiteral(
+        "QMainWindow, QDialog { background:@chrome; color:@ink; }"
+        "QMenuBar { background:@chrome; color:@ink; }"
+        "QMenuBar::item:selected, QMenuBar::item:pressed { background:@hover; color:@ink; }"
+        "QMenu { background:@raised; color:@ink; border:1px solid @line; border-radius:@radiusOverlaypx; padding:4px; }"
+        "QMenu::item { padding:5px 24px 5px 12px; border-radius:@radiusControlpx; }"
+        "QMenu::item:selected { background:@hover; color:@ink; }"
+        "QMenu::item:disabled { color:@faint; }"
+        "QMenu::separator { height:1px; background:@line; margin:4px 8px; }"
+        "QStatusBar { background:@chrome; color:@muted; border-top:1px solid @line; }"
+        "QStatusBar::item { border:0; }"
+        "QStatusBar QLabel { color:@muted; }"
+        "StatusSegment { color:@muted; background:transparent; border:0; border-radius:0;"
         " padding:0 8px; }"
-        "StatusSegment:hover { background:%8; color:%5; }"
+        "StatusSegment:hover { background:@hover; color:@ink; }"
         "StatusSegment::menu-indicator { image:none; width:0; }"
-        "QTabWidget::pane { border:0; background:%3; }"
+        "QTabWidget::pane { border:0; background:@paper; }"
         "QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QSpinBox {"
-        " background:%3; color:%5; border:1px solid %7; border-radius:%12px;"
-        " selection-background-color:%9; selection-color:%5; }"
-        "QLineEdit, QComboBox, QSpinBox { min-height:%14px; padding:0 8px; }"
-        "QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QComboBox:focus { border-color:%10; }"
-        "QLineEdit:disabled, QComboBox:disabled { color:%11; background:%2; }"
-        "QPushButton { background:%4; color:%5; border:1px solid %7; border-radius:%12px;"
-        " min-height:%14px; padding:0 12px; }"
-        "QPushButton:hover { background:%8; }"
-        "QPushButton:focus { border-color:%10; }"
-        "QPushButton:disabled { color:%11; }"
-        "QCheckBox, QRadioButton, QLabel { color:%5; }"
-        "QCheckBox:disabled, QRadioButton:disabled, QLabel:disabled { color:%11; }"
-        "QTreeView, QListView, QTableView { background:%3; color:%5; border:1px solid %7;"
-        " selection-background-color:%9; selection-color:%5; }"
-        "QHeaderView::section { background:%2; color:%6; border:0; border-bottom:1px solid %7; padding:4px 8px; }"
-        "QDockWidget { color:%5; }"
-        "QToolTip { background:%4; color:%5; border:1px solid %7; padding:4px 6px; }"
+        " background:@paper; color:@ink; border:1px solid @line; border-radius:@radiusControlpx;"
+        " selection-background-color:@selection; selection-color:@ink; }"
+        "QLineEdit, QComboBox, QSpinBox { min-height:@controlpx; padding:0 8px; }"
+        "QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QComboBox:focus { border-color:@focus; }"
+        "QLineEdit:disabled, QComboBox:disabled { color:@faint; background:@chrome; }"
+        "QPushButton { background:@raised; color:@ink; border:1px solid @line; border-radius:@radiusControlpx;"
+        " min-height:@controlpx; padding:0 12px; }"
+        "QPushButton:hover { background:@hover; }"
+        "QPushButton:focus { border-color:@focus; }"
+        "QPushButton:disabled { color:@faint; }"
+        "QCheckBox, QRadioButton, QLabel { color:@ink; }"
+        "QCheckBox:disabled, QRadioButton:disabled, QLabel:disabled { color:@faint; }"
+        "QTreeView, QListView, QTableView { background:@paper; color:@ink; border:1px solid @line;"
+        " selection-background-color:@selection; selection-color:@ink; }"
+        "QHeaderView::section { background:@chrome; color:@muted; border:0; border-bottom:1px solid @line; padding:4px 8px; }"
+        "QDockWidget { color:@ink; }"
+        "QToolTip { background:@raised; color:@ink; border:1px solid @line; padding:4px 6px; }"
         "QScrollBar:vertical { background:transparent; width:12px; margin:0; }"
         "QScrollBar:horizontal { background:transparent; height:12px; margin:0; }"
-        "QScrollBar::handle { background:%7; border-radius:4px; min-height:24px; min-width:24px; margin:2px; }"
-        "QScrollBar::handle:hover { background:%11; }"
+        "QScrollBar::handle { background:@line; border-radius:4px; min-height:24px; min-width:24px; margin:2px; }"
+        "QScrollBar::handle:hover { background:@faint; }"
         "QScrollBar::add-line, QScrollBar::sub-line { width:0; height:0; }"
-        "QScrollBar::add-page, QScrollBar::sub-page { background:transparent; }")
-        .arg(c(t.ground), c(t.chrome), c(t.paper), c(t.raised), c(t.ink),
-             c(t.muted), c(t.line), c(t.hover), c(t.selection))
-        .arg(c(t.focus), c(t.faint))
-        .arg(t.radiusControl).arg(t.radiusOverlay).arg(t.control);
+        "QScrollBar::add-page, QScrollBar::sub-page { background:transparent; }");
+    const std::pair<const char *, QString> values[] = {
+        {"@ground", c(t.ground)}, {"@chrome", c(t.chrome)}, {"@paper", c(t.paper)},
+        {"@raised", c(t.raised)}, {"@ink", c(t.ink)}, {"@muted", c(t.muted)},
+        {"@line", c(t.line)}, {"@hover", c(t.hover)}, {"@selection", c(t.selection)},
+        {"@focus", c(t.focus)}, {"@faint", c(t.faint)},
+        {"@radiusControl", QString::number(t.radiusControl)},
+        {"@radiusOverlay", QString::number(t.radiusOverlay)},
+        {"@control", QString::number(t.control)},
+    };
+    for (const auto &[name, value] : values)
+        sheet.replace(QLatin1String(name), value);
+    return sheet;
 }
 
 ThemeTokens tokensFromPalette(const QPalette &palette)

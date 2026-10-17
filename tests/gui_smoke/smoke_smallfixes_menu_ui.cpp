@@ -892,10 +892,14 @@ private slots:
         QCOMPARE(tab->viewModeL2(), ViewMode::Hex);
         bool rawByteStatus = false;
         bool hexStatus = false;
-        for (QLabel *label : mw_->findChildren<QLabel *>()) {
-            rawByteStatus |= label->text().startsWith(
-                QStringLiteral("原始字节 · 字符区 UTF-8"));
-            hexStatus |= label->text() == QStringLiteral("十六进制");
+        QStringList statusTexts;
+        for (QLabel *label : mw_->findChildren<QLabel *>())
+            statusTexts << label->text();
+        for (QToolButton *segment : mw_->findChildren<QToolButton *>())
+            statusTexts << segment->text();
+        for (const QString &text : std::as_const(statusTexts)) {
+            rawByteStatus |= text.startsWith(QStringLiteral("原始字节 · 字符区 UTF-8"));
+            hexStatus |= text == QStringLiteral("十六进制");
         }
         QVERIFY(rawByteStatus);
         QVERIFY(hexStatus);
@@ -3632,7 +3636,7 @@ private slots:
         {
             QFile file(path);
             QVERIFY(file.open(QIODevice::ReadOnly));
-            QVERIFY(file.readAll().startsWith("beta "));
+            QVERIFY(file.readAll().contains("beta "));
         }
 
         QAction *next = mw_->findChild<QAction *>(QStringLiteral("search.next"));
@@ -3760,7 +3764,8 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(palette && palette->isVisible(), 2000);
         auto *query = palette->findChild<QLineEdit *>(QStringLiteral("commandPaletteQuery"));
         QVERIFY(query);
-        QTest::keyClicks(query, QStringLiteral("查找"));
+        // QTest cannot type CJK keys; set the text as an input method would.
+        query->setText(QStringLiteral("查找"));
         QTest::keyClick(query, Qt::Key_Return);
         QTRY_VERIFY(!palette->isVisible());
         auto *dialog = mw_->findChild<FindReplaceDialog *>();

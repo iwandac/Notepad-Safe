@@ -1,3 +1,5 @@
+#include <QToolButton>
+#include "TitleBar.h"
 #include <QAction>
 #include <QApplication>
 #include <QCryptographicHash>
@@ -140,12 +142,14 @@ public:
 
     bool openFileMenu()
     {
+        // The menu bar is hidden; menus open from the title bar's main menu button.
         auto *action = window->findChild<QAction *>(QStringLiteral("file.new"));
-        auto *bar = window->menuBar();
-        if (!action || !action->isEnabled() || !bar || !bar->isVisible())
-            return fail(QStringLiteral("real File/New action or menu bar unavailable"));
+        QMenu *mainMenu = window->mainMenu();
+        QToolButton *menuButton = window->titleBar() ? window->titleBar()->menuButton() : nullptr;
+        if (!action || !action->isEnabled() || !mainMenu || !menuButton || !menuButton->isVisible())
+            return fail(QStringLiteral("real File/New action or main menu button unavailable"));
         fileMenu = nullptr;
-        for (QAction *top : bar->actions()) {
+        for (QAction *top : mainMenu->actions()) {
             if (top->menu() && top->menu()->actions().contains(action)) {
                 fileMenu = top->menu();
                 fileMenuAction = top;
@@ -155,11 +159,14 @@ public:
         if (!fileMenu) return fail(QStringLiteral("New is not in a top-level production menu"));
         if (!QTest::qWaitForWindowActive(window.get(), 2000))
             return fail(QStringLiteral("owned native main window could not become active"));
-        const QRect area = bar->actionGeometry(fileMenuAction);
-        if (area.isEmpty() || !bar->rect().contains(area.center()))
+        QTest::mouseClick(menuButton, Qt::LeftButton);
+        if (!QTest::qWaitFor([mainMenu] { return mainMenu->isVisible(); }, 2000))
+            return fail(QStringLiteral("main menu button did not open the main menu"));
+        const QRect area = mainMenu->actionGeometry(fileMenuAction);
+        if (area.isEmpty() || !mainMenu->rect().contains(area.center()))
             return fail(QStringLiteral("File menu has no real clickable geometry"));
         menuPaintCount = menuPaintTailCount = 0;
-        QTest::mouseClick(bar, Qt::LeftButton, Qt::NoModifier, area.center());
+        QTest::mouseClick(mainMenu, Qt::LeftButton, Qt::NoModifier, area.center());
         if (!QTest::qWaitFor([this] {
                 return fileMenu && fileMenu->isVisible() && menuPaintCount > 0 && menuPaintTailCount > 0;
             }, 2000)) return fail(QStringLiteral("real menu input did not produce a visible menu and Paint delivery"));

@@ -102,6 +102,17 @@ void TestThemeTokens::styleSheetUsesTokens()
     QVERIFY(light.contains(QStringLiteral("#FCFDFE")));
     QVERIFY(light.contains(QStringLiteral("#2F6FEB")));
     QVERIFY(!light.contains(QStringLiteral("#2D2D30")));
+    // Each rule must get its own token, not a neighbour's.
+    QVERIFY2(light.contains(QStringLiteral("QMENU { BACKGROUND:#FFFFFF; COLOR:#18212C;")),
+             "menu uses raised + ink");
+    QVERIFY2(light.contains(QStringLiteral("QMENU::ITEM:DISABLED { COLOR:#7F8A98; }")),
+             "disabled menu items use faint");
+    QVERIFY2(light.contains(QStringLiteral("QSTATUSBAR { BACKGROUND:#F1F3F6; COLOR:#556171;")),
+             "status bar uses chrome + muted");
+    QVERIFY2(light.contains(QStringLiteral("BORDER-COLOR:#2F6FEB")), "focus border uses focus");
+    QVERIFY2(!light.contains(QLatin1Char('%')), "every placeholder is filled");
+    QVERIFY2(light.contains(QStringLiteral("QSTATUSBAR::ITEM { BORDER:0; }")),
+             "no native separators between status segments");
     const QString dark = applicationStyleSheet(ThemeTokens::dark()).toUpper();
     QVERIFY(dark.contains(QStringLiteral("#1A2029")));
     QVERIFY(!dark.contains(QStringLiteral("#2D2D30")));
