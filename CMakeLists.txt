@@ -433,6 +433,7 @@ add_library(notepadsafe_app STATIC
     src/shell/StatusSegments.cpp
     src/shell/CommandPaletteModel.cpp
     src/shell/CommandPalette.cpp
+    src/shell/NoticeBar.cpp
 )
 target_include_directories(notepadsafe_app PUBLIC
     ${APP_INCLUDE_DIRS}

@@ -1,3 +1,4 @@
+#include "NoticeBar.h"
 #include "WorkspaceRecoveryCoordinator.h"
 
 #include "AppComposition.h"
@@ -468,12 +469,14 @@ void WorkspaceRecoveryCoordinator::finish()
             showEmptyWorkspaceHint(window_->statusBar(), window_->m_tabs,
                 window_->m_workspaceStack, summary);
         } else {
-            window_->statusBar()->showMessage(summary, hasUnsaved_ ? 5000 : 3000);
+            window_->m_noticeBar->showNotice(NoticeKind::Info, summary, {},
+                                             hasUnsaved_ ? 5000 : 3000);
         }
     } else {
-        window_->statusBar()->showMessage(
+        window_->m_noticeBar->showNotice(
+            NoticeKind::Info,
             QObject::tr("已恢复 %1 个标签页，%2 项尚未完成。原文件未被本次恢复修改；请在待处理标签页重试，或用文件→打开。")
-                .arg(restoredDocuments.size()).arg(unresolvedCount), 0);
+                .arg(restoredDocuments.size()).arg(unresolvedCount));
     }
 
     if (!guarded || closing_)

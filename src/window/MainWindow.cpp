@@ -23,6 +23,7 @@
 #include "DocumentOpenWorkflow.h"
 #include "DocumentTabBar.h"
 #include "MainMenu.h"
+#include "NoticeBar.h"
 #include "TitleBar.h"
 #include "WindowChrome.h"
 #include "EditorPreferences.h"
@@ -127,6 +128,8 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
     shellLayout->setSpacing(0);
     m_titleBar = new TitleBar(this, shell);
     shellLayout->addWidget(m_titleBar);
+    m_noticeBar = new NoticeBar(shell);
+    shellLayout->addWidget(m_noticeBar);
     shellLayout->addWidget(m_workspaceStack, 1);
     setCentralWidget(shell);
     // 把 m_tabs 也加入 drag 转发（防止 QTabBar 吞事件）

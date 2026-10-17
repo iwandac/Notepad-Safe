@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 #include "CommandPalette.h"
 #include "DocumentTabBar.h"
+#include "NoticeBar.h"
 #include "StatusSegments.h"
 #include "ThemeStyle.h"
 #include "TitleBar.h"
@@ -767,6 +768,8 @@ void MainWindow::applyTheme(const ThemeTokens &t)
     qApp->setStyleSheet(applicationStyleSheet(t));
     if (m_titleBar)
         m_titleBar->setTokens(t);
+    if (m_noticeBar)
+        m_noticeBar->setTokens(t);
     themeTabBar(m_tabs, t);
     searchHitColor() = t.hit;
     for (int i = 0; i < m_tabs->count(); ++i) {

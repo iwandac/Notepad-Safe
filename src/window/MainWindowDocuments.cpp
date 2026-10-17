@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "DocumentTabBar.h"
+#include "NoticeBar.h"
 #include "EditorTab.h"
 #include "FileContentProbe.h"
 #include "FindReplaceDialog.h"
@@ -1135,10 +1136,23 @@ bool MainWindow::saveFile()
     const PersistenceResult result = m_composition->persistenceAdapters().saveFor(
         DocumentPersistence::PlainFile, tab, request);
     if (!result.succeeded()) {
-        const QString err = result.error;
-        QString detail = err.isEmpty() ? tab->filePath() : QStringLiteral("%1\n\n详细信息：%2").arg(tab->filePath(), err);
-        QMessageBox::warning(this, QStringLiteral("错误"),
-                             QStringLiteral("无法保存文件：\n%1").arg(detail));
+        // Non-blocking: the edit stays in the tab and the user can retry.
+        QString reason = result.error.trimmed();
+        while (reason.endsWith(QChar(0x3002)) || reason.endsWith(QLatin1Char('.')))
+            reason.chop(1);
+        if (reason.isEmpty())
+            reason = QStringLiteral("无法写入 %1").arg(QFileInfo(tab->filePath()).fileName());
+        const QPointer<EditorTab> target(tab);
+        const auto focusTarget = [this, target] {
+            if (target)
+                m_tabs->setCurrentWidget(target);
+            return bool(target);
+        };
+        m_noticeBar->showNotice(
+            NoticeKind::Error,
+            QStringLiteral("没有保存：%1。修改仍在，原文件未更改。").arg(reason),
+            {{QStringLiteral("重试"), [this, focusTarget] { if (focusTarget()) saveFile(); }},
+             {QStringLiteral("另存为…"), [this, focusTarget] { if (focusTarget()) saveAsFile(); }}});
         return false;
     }
     m_session->discardRecovery(tab);

@@ -24,6 +24,7 @@ class EditorTab;
 struct ThemeTokens;
 class TitleBar;
 class StatusSegment;
+class NoticeBar;
 class CommandPalette;
 class FindReplaceDialog;
 class SearchResultsDock;
@@ -218,6 +219,7 @@ private:
     QLabel *m_securityIdentityStatus = nullptr;
     QLabel *m_securitySessionStatus = nullptr;
     TitleBar *m_titleBar = nullptr;
+    NoticeBar *m_noticeBar = nullptr;
     CommandPalette *m_commandPalette = nullptr;
     QMenu *m_mainMenu = nullptr;
     QLabel *m_securityRecoveryStatus = nullptr;

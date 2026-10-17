@@ -2843,8 +2843,10 @@ private slots:
         QCOMPARE(restored->l2View()->selectionStart(), qint64(20));
         QCOMPARE(restored->l2View()->selectionEnd(), qint64(21));
         QVERIFY(restored->isModified());
-        QTRY_VERIFY_WITH_TIMEOUT(restoredWindow->statusBar()->currentMessage().contains(
-            QStringLiteral("含未保存修改")), 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            restoredWindow->findChild<QLabel *>(QStringLiteral("noticeText"))
+                && restoredWindow->findChild<QLabel *>(QStringLiteral("noticeText"))
+                       ->text().contains(QStringLiteral("含未保存修改")), 2000);
         QFile unchanged(sourcePath);
         QVERIFY(unchanged.open(QIODevice::ReadOnly));
         QCOMPARE(unchanged.readAll(), original);
@@ -3764,6 +3766,70 @@ private slots:
         auto *dialog = mw_->findChild<FindReplaceDialog *>();
         QTRY_VERIFY_WITH_TIMEOUT(dialog && dialog->isVisible(), 2000);
         dialog->close();
+        closeAllEditorTabs(mw_);
+    }
+
+    // A plain save failure is a notice, not a modal box: the edit stays, and
+    // 重试 saves once the cause is gone.
+    void saveFailureShowsNoticeAndRetries() {
+        closeAllEditorTabs(mw_);
+        const QString path = tmpDir_.filePath(QStringLiteral("notice-readonly.txt"));
+        {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write("original\n");
+        }
+        mw_->openFilesFromExternal({path});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab);
+        tab->editor()->setText(QStringLiteral("edited\n"));
+        QVERIFY(tab->isModified());
+        QVERIFY(QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::ReadUser));
+        const auto restoreWritable = qScopeGuard([&path] {
+            QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                                            | QFileDevice::ReadUser | QFileDevice::WriteUser);
+        });
+
+        bool modalSeen = false;
+        QTimer modalPoll;
+        modalPoll.setInterval(20);
+        connect(&modalPoll, &QTimer::timeout, this, [&]() {
+            if (auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget())) {
+                modalSeen = true;
+                box->reject();
+            }
+        });
+        modalPoll.start();
+        QVERIFY(QMetaObject::invokeMethod(mw_, "saveFile", Qt::DirectConnection));
+        QApplication::processEvents(QEventLoop::AllEvents, 100);
+        modalPoll.stop();
+        QVERIFY(!modalSeen);
+        QVERIFY(tab->isModified());
+
+        auto *notice = mw_->findChild<QWidget *>(QStringLiteral("noticeBar"));
+        QVERIFY(notice);
+        QTRY_VERIFY(notice->isVisible());
+        auto *text = notice->findChild<QLabel *>(QStringLiteral("noticeText"));
+        QVERIFY(text);
+        QVERIFY2(text->text().startsWith(QStringLiteral("没有保存：")), qPrintable(text->text()));
+        QVERIFY(text->text().endsWith(QStringLiteral("修改仍在，原文件未更改。")));
+        QPushButton *retry = nullptr;
+        QPushButton *saveAs = nullptr;
+        for (QPushButton *button : notice->findChildren<QPushButton *>()) {
+            if (button->text() == QStringLiteral("重试")) retry = button;
+            if (button->text() == QStringLiteral("另存为…")) saveAs = button;
+        }
+        QVERIFY(retry && saveAs && retry->isVisible() && saveAs->isVisible());
+
+        QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                                        | QFileDevice::ReadUser | QFileDevice::WriteUser);
+        QTest::mouseClick(retry, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!tab->isModified(), 3000);
+        QTRY_VERIFY(!notice->isVisible());
+        QFile saved(path);
+        QVERIFY(saved.open(QIODevice::ReadOnly));
+        QCOMPARE(saved.readAll(), QByteArray("edited\n"));
         closeAllEditorTabs(mw_);
     }
 
@@ -4982,23 +5048,11 @@ private slots:
         QApplication::sendEvent(tab->editor(), &emojiCommit);
         QVERIFY(tab->isModified());
 
-        bool warningSeen = false;
-        QString warningText;
-        QTimer warningPoll;
-        warningPoll.setInterval(20);
-        connect(&warningPoll, &QTimer::timeout, this, [&]() {
-            for (QMessageBox *box : mw_->findChildren<QMessageBox *>()) {
-                if (!box->isVisible()) continue;
-                warningSeen = true;
-                warningText = box->text() + QLatin1Char(' ') + box->informativeText();
-                box->accept();
-            }
-        });
-        warningPoll.start();
         QVERIFY(QMetaObject::invokeMethod(mw_, "saveFile", Qt::DirectConnection));
-        warningPoll.stop();
-        QVERIFY(warningSeen);
-        QVERIFY(warningText.contains(QStringLiteral("无法保存文件")));
+        auto *notice = mw_->findChild<QWidget *>(QStringLiteral("noticeBar"));
+        QTRY_VERIFY(notice && notice->isVisible());
+        auto *noticeText = notice->findChild<QLabel *>(QStringLiteral("noticeText"));
+        QVERIFY(noticeText && noticeText->text().startsWith(QStringLiteral("没有保存：")));
         QFile unchanged(path);
         QVERIFY(unchanged.open(QIODevice::ReadOnly));
         QCOMPARE(unchanged.readAll(), originalBytes);
