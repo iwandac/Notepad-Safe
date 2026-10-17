@@ -12,6 +12,15 @@
 
 ## 当前执行证据
 
+### 2026-10-17：新外壳验证（分支 `feat/simplify-and-shell`）
+
+构建 `build-final/notepad-safe.exe`，33,209,344 字节，SHA-256 `14064B38C4EBE92C34E773DA3D3022A717651C55A6A8691D67EE1913061F2F62`，基于 `4b116a9`，Release / KDBX ON / Qt 6.11.1 静态链接。依赖（Botan、QScintilla）在本轮用 `prepare_dependencies.bat` 离线重建后重新链接。
+
+- **核心测试** 17 组全部通过，新增 `test_theme_tokens`、`test_shell_logic`、`test_command_palette_model`；架构检查通过（MainWindow 方法数 112/112，已到上限）。
+- **GUI 套件**（真实 Windows 平台插件、串行）：smallfixes 71/73（两项为已登记的原有问题；新增的外观、隐藏菜单栏快捷键、状态栏分段、命令面板、保存失败提示条用例全部通过），startup_shell 7/7，secure_documents 14/14，large_readonly 25/25，hex_readonly_search、tail_presentation、windowed_hex_mouse 全部通过；recovery_issue 14/16、document_product_language 22/24、findreplace 40/41 的失败均为分支起点即有的问题；tail_follow 20/21 为功能删除阶段遗留的未解决项；hex_accessibility 4/5 因未设置 `NOTEPADSAFE_EXPECTED_DPR` 环境变量（受阻，不是产品结果）。
+- **桌面检查**：截图确认标题栏、主菜单、绘制标签、状态栏分段、命令面板、深色外观；双击标题栏最大化正常且不溢出屏幕。检查中发现应用样式表占位符错位（菜单文字为白色、禁用项为蓝色）及状态栏原生分隔框，均已修复（`4b116a9`）。拖动、贴靠布局浮层、边缘缩放、Win+方向键未逐项人工验证（受阻）。
+- **启动时间（J1）**：正式启动探针 30 次冷启动，从进程创建到窗口可见（含观察器开销）中位 537 ms、P95 793 ms、最大 966 ms，未达到 500 ms 目标。探针仍查找已隐藏的菜单栏，后续“打开文件菜单”阶段无法完成，需要按新外壳更新；与历史 693 ms P95 的测量点不同，不能直接比较。
+
 ### 2026-10-17：功能删除验证（分支 `feat/simplify-and-shell`）
 
 构建 `build-final/notepad-safe.exe`，33,105,920 字节，SHA-256 `76BC7A5580FE4CF5758E7F6E5B32B3211626AA76C2249747CC2FCBA9FEA58A0B`，基于 `d89ba7c`，Release / KDBX ON / Qt 6.11.1 静态链接。删除了分支起点之后所有比最新改动头文件旧的项目目标文件（180/238）后全量重编：中文编译器提示使 CMake 漏掉间接包含的头文件依赖，此前的增量构建里有布局不一致的旧目标文件，两个恢复类套件的崩溃即由此造成。
