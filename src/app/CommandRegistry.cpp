@@ -71,7 +71,6 @@ void CommandRegistry::applyContext(const CommandContext &context) const
             || id == QLatin1String("view.wordWrap")
             || id.startsWith(QLatin1String("view.symbols"))
             || id.startsWith(QLatin1String("view.folding"))
-            || id.startsWith(QLatin1String("view.presentation"))
             || id.startsWith(QLatin1String("view.edge"))
             || id.startsWith(QLatin1String("view.zoom"))
             || id.startsWith(QLatin1String("encoding."));
@@ -157,15 +156,9 @@ void CommandRegistry::applyContext(const CommandContext &context) const
     }
 
     setEnabled(QStringLiteral("edit.lines.sortAscending"),
-               document && context.canModify && !context.dualPresentation);
+               document && context.textMutationSupported);
     setEnabled(QStringLiteral("edit.lines.sortDescending"),
-               document && context.canModify && !context.dualPresentation);
-    setEnabled(QStringLiteral("view.presentation.text"),
-               context.dualPresentation);
-    setEnabled(QStringLiteral("view.presentation.hex"),
-               context.dualPresentation);
-    setEnabled(QStringLiteral("view.presentation.toggle"), document);
-    setEnabled(QStringLiteral("view.presentation"), document);
+               document && context.textMutationSupported);
     setEnabled(QStringLiteral("menu.encoding"),
                context.displayEncodingAvailable || context.conversionAvailable);
 }

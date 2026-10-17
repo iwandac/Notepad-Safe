@@ -699,6 +699,10 @@ if(WIN32)
     target_link_libraries(test_architecture_contracts PRIVATE ${WIN_SYSTEM_LIBS})
 endif()
 
+add_executable(test_document_open_routing tests/test_document_open_routing.cpp)
+target_include_directories(test_document_open_routing PRIVATE ${APP_INCLUDE_DIRS})
+target_link_libraries(test_document_open_routing PRIVATE notepadsafe_app Qt6::Test)
+
 add_executable(test_tail_command_contracts tests/test_tail_command_contracts.cpp)
 target_include_directories(test_tail_command_contracts PRIVATE ${APP_INCLUDE_DIRS})
 target_link_libraries(test_tail_command_contracts PRIVATE notepadsafe_app Qt6::Test)
@@ -847,6 +851,7 @@ set(NOTEPADSAFE_NON_GUI_TEST_TARGETS
     test_filetierpolicy
     test_architecture_contracts
     test_tail_command_contracts
+    test_document_open_routing
     test_startup_composition
     test_startup_trace
     test_vault_contract
@@ -928,6 +933,7 @@ add_test(NAME architecture_contracts COMMAND test_architecture_contracts)
 set_tests_properties(architecture_contracts PROPERTIES
     LABELS "quick;architecture;tools;providers" TIMEOUT 30)
 add_test(NAME tail_command_contracts COMMAND test_tail_command_contracts)
+add_test(NAME document_open_routing COMMAND test_document_open_routing)
 set_tests_properties(tail_command_contracts PROPERTIES
     LABELS "quick;architecture;NSP-LARGEFILE" TIMEOUT 30)
 add_test(NAME startup_composition COMMAND test_startup_composition)
@@ -1161,10 +1167,6 @@ add_executable(gui_smoke_search_external_changes
     tests/gui_smoke/smoke_search_external_changes.cpp
     ${APP_QRC_FILE}
 )
-add_executable(gui_smoke_search_malformed_encoding
-    tests/gui_smoke/smoke_search_malformed_encoding.cpp
-    ${APP_QRC_FILE}
-)
 add_executable(gui_smoke_readonly_search_source
     tests/gui_smoke/smoke_readonly_search_source.cpp
     ${APP_QRC_FILE}
@@ -1184,7 +1186,7 @@ add_executable(gui_smoke_tail_presentation
 foreach(search_lifecycle_target IN ITEMS
         gui_smoke_search_lifecycle gui_smoke_l2_queued_cancel_process
         gui_smoke_search_real_failure gui_smoke_search_capacity
-        gui_smoke_search_external_changes gui_smoke_search_malformed_encoding
+        gui_smoke_search_external_changes
         gui_smoke_readonly_search_source gui_smoke_read_admission_open
         gui_smoke_tail_follow gui_smoke_tail_presentation)
     target_include_directories(${search_lifecycle_target} PRIVATE
@@ -1562,7 +1564,6 @@ set(NOTEPADSAFE_GUI_SMOKE_TARGETS
     gui_smoke_search_real_failure
     gui_smoke_search_capacity
     gui_smoke_search_external_changes
-    gui_smoke_search_malformed_encoding
     gui_smoke_readonly_search_source
     gui_smoke_read_admission_open
     gui_smoke_tail_follow
@@ -1767,15 +1768,6 @@ foreach(recovery_test IN LISTS recovery_registered_tests)
         set_property(TEST "${recovery_test}" APPEND PROPERTY LABELS
             NSP-FILE NSP-SHELL NSP-ENCODING NSP-LANGUAGE NSP-VIEW)
     endif()
-endforeach()
-foreach(search_malformed_row IN ITEMS utf16le-malformed utf16be-malformed gbk-orphan-tail)
-    set(search_malformed_test
-        "gui_smoke_search_malformed_encoding.malformedLiteralSearchPreservesSourceByteRanges.${search_malformed_row}")
-    add_test(NAME ${search_malformed_test}
-        COMMAND gui_smoke_search_malformed_encoding
-            "malformedLiteralSearchPreservesSourceByteRanges:${search_malformed_row}")
-    set_tests_properties(${search_malformed_test}
-        PROPERTIES LABELS "gui;smoke;adjacent;NSP-SEARCH;NSP-ENCODING" RUN_SERIAL TRUE TIMEOUT 60)
 endforeach()
 notepadsafe_register_qt_cases(gui_smoke_hex_accessibility
     tests/gui_smoke/smoke_hex_accessibility.cpp adjacent 180 NSP-ACCESSIBILITY)

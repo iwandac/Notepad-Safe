@@ -358,41 +358,6 @@ private slots:
         QVERIFY(saveDocumentEvidence(*fixture.window, QStringLiteral("editable-byte-status")));
     }
 
-    void binaryTextReadonlyExplainsCapabilitiesAndNoCharacterTotal()
-    {
-        WindowFixture fixture;
-        QVERIFY(QTest::qWaitForWindowExposed(fixture.window.get()));
-        const QString path = fixture.directory.filePath(QStringLiteral("readonly.bin"));
-        QFile file(path);
-        QVERIFY(file.open(QIODevice::WriteOnly));
-        QVERIFY(file.resize(33LL * 1024 * 1024));
-        file.close();
-        const auto hash = fileHash(path);
-        fixture.window->openFilesFromExternal({path});
-        auto *tab = fixture.current();
-        QVERIFY(tab);
-        QTRY_VERIFY_WITH_TIMEOUT(tab->isReadOnlyByPolicy(), 5000);
-        auto *textView = fixture.window->findChild<QAction *>(QStringLiteral("view.presentation.text"));
-        QVERIFY(textView && textView->isEnabled());
-        textView->trigger();
-        QTRY_VERIFY_WITH_TIMEOUT(!tab->isHexPresentation(), 5000);
-        QCOMPARE(tab->contentSizeBytes(), 33LL * 1024 * 1024);
-        QCOMPARE(tab->contentCharacterCount(), qint64(-1));
-        QVERIFY(tab->isBinaryDocument() && tab->isReadOnlyByPolicy());
-        QVERIFY(!tab->documentState().capabilities.testFlag(DocumentCapability::Edit));
-        QCOMPARE(fileHash(path), hash);
-        auto *size = fixture.window->findChild<QLabel *>(QStringLiteral("status.size"));
-        auto *count = fixture.window->findChild<QLabel *>(QStringLiteral("status.characters"));
-        QVERIFY(size && count);
-        const QString fields = fieldText(size) + fieldText(count);
-        QVERIFY2(!hasEngineeringWords(fields), qPrintable(fields));
-        QVERIFY(fields.contains(QStringLiteral("只读")) && fields.contains(QStringLiteral("浏览"))
-                && fields.contains(QStringLiteral("查找")) && fields.contains(QStringLiteral("复制")));
-        QVERIFY(count->text().contains(QStringLiteral("不")) && count->text().contains(QStringLiteral("统计")));
-        QVERIFY(size->toolTip().contains(QStringLiteral("视图")) && size->toolTip().contains(QStringLiteral("源")));
-        QVERIFY(saveDocumentEvidence(*fixture.window, QStringLiteral("readonly-text-status")));
-    }
-
     void inMemoryTextSizeIsExplicitlyUtf8_data()
     {
         QTest::addColumn<bool>("secure");

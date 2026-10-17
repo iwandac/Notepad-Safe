@@ -54,22 +54,22 @@ bool openSessionDocument(const DocumentProviderRegistry &providers,
         return false;
     const std::optional<TextEncoding> restoredEncoding =
         encodingFromName(state.encoding);
-    const bool restoreHex = state.presentation == QLatin1String("hex");
-    // Freeze current classification even for a restored Hex presentation;
-    // a later path replacement may add restrictions, never remove them.
+    // Content decides the view: Binary is always Hex. Only a windowed
+    // read-only Text document may be restored in its Hex presentation.
     const FileContentProbeResult probe = probeFileContent(state.filePath);
-    if (restoreHex || probe.contentKind == DocumentContentKind::Binary) {
+    const bool binary = probe.contentKind == DocumentContentKind::Binary;
+    const bool windowedTextAsHex = !binary && probe.tier.usesMappedPreview()
+        && state.presentation == QLatin1String("hex");
+    if (binary || windowedTextAsHex) {
         QString error;
         // A stored display encoding must not bypass Binary classification in
-        // openDocumentByPolicy. Keep its byte-backed provider for either view;
-        // the surface still derives read-only capability from current size.
-        const DocumentPresentationKind presentation =
-            state.presentation == QLatin1String("text")
-                ? DocumentPresentationKind::Text
-                : DocumentPresentationKind::Hex;
+        // openDocumentByPolicy; the surface still derives read-only
+        // capability from current size.
         const DocumentSurfaceOpenRequest request{
-            state.filePath, DocumentContentKind::Binary, true,
-            presentation, restoredEncoding, {}, probe.tier.isReadOnlyByPolicy()};
+            state.filePath,
+            binary ? DocumentContentKind::Binary : DocumentContentKind::Text, true,
+            DocumentPresentationKind::Hex, restoredEncoding, {},
+            probe.tier.isReadOnlyByPolicy()};
         if (!providers.openBest(surface, request, &error)) {
             qWarning("[session] Binary restore failed: path='%s', error='%s'",
                      qUtf8Printable(state.filePath), qUtf8Printable(error));

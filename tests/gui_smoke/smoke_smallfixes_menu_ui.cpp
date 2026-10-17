@@ -706,28 +706,10 @@ private slots:
                 .arg(failConvert.join("、"))));
         for (QAction *action : encs.display)
             QVERIFY(action->isEnabled());
-        QAction *textPresentation = mw_->findChild<QAction *>(
-            QStringLiteral("view.presentation.text"));
-        QAction *hexPresentation = mw_->findChild<QAction *>(
-            QStringLiteral("view.presentation.hex"));
-        QAction *presentationToggle = mw_->findChild<QAction *>(
-            QStringLiteral("view.presentation.toggle"));
-        QVERIFY(textPresentation && hexPresentation && presentationToggle);
-        QVERIFY(textPresentation->isEnabled() && hexPresentation->isEnabled());
-        QVERIFY(hexPresentation->isChecked() && !textPresentation->isChecked());
-        textPresentation->trigger();
-        QApplication::processEvents(QEventLoop::AllEvents, 100);
-        QCOMPARE(et->viewModeL2(), ViewMode::Text);
-        QVERIFY(textPresentation->isChecked() && !hexPresentation->isChecked());
-        const EncodingActions textEncodings = collectEncodingActions(mw_);
-        for (QAction *action : textEncodings.convert)
-            QVERIFY(!action->isEnabled());
-        for (QAction *action : textEncodings.display)
-            QVERIFY(action->isEnabled());
-        presentationToggle->trigger();
-        QApplication::processEvents(QEventLoop::AllEvents, 100);
+        // Content decides the view: no in-tab presentation commands remain.
+        QVERIFY(mw_->findChild<QAction *>(QStringLiteral("view.presentation.text")) == nullptr);
+        QVERIFY(mw_->findChild<QAction *>(QStringLiteral("view.presentation.toggle")) == nullptr);
         QCOMPARE(et->viewModeL2(), ViewMode::Hex);
-        QVERIFY(hexPresentation->isChecked() && !textPresentation->isChecked());
         // 自清理：D003 结束不残留 tab，避免影响 D007（D007 阶段 0 自己也会清，但这里保持独立）
         closeAllEditorTabs(mw_);
         QCOMPARE(tabCount(mw_), 0);
@@ -904,9 +886,7 @@ private slots:
         QVERIFY(asciiPreview->toPlainText().startsWith(
             decodeByteGridText(expected.left(16), TextEncoding::Utf8, 16)));
 
-        QAction *hexAction = mw_->findChild<QAction *>(
-            QStringLiteral("view.presentation.hex"));
-        QVERIFY(hexAction && hexAction->isEnabled() && hexAction->isChecked());
+        QCOMPARE(tab->viewModeL2(), ViewMode::Hex);
         bool rawByteStatus = false;
         bool hexStatus = false;
         for (QLabel *label : mw_->findChildren<QLabel *>()) {
@@ -2470,13 +2450,8 @@ private slots:
             }
 
             // The byte-editor policy must not leak into ordinary text mode;
-            // Chinese IME remains available when the same Scintilla instance
-            // is reused as a text editor.
-            tab->setViewModeL2(ViewMode::Text);
-            QVERIFY(tab->editor()->testAttribute(Qt::WA_InputMethodEnabled));
             QTRY_COMPARE_WITH_TIMEOUT(
                 tab->l2View()->readByteRange(0, expected.size()), expected, 1000);
-            tab->setViewModeL2(ViewMode::Hex);
             QVERIFY(!tab->editor()->testAttribute(Qt::WA_InputMethodEnabled));
 
             QString saveError;
@@ -2880,75 +2855,6 @@ private slots:
         qputenv("NOTEPADSAFE_DATADIR", primaryTestDataDir_.toUtf8());
     }
 
-    void tc_binary_text_presentation_survives_session_restore() {
-        const QString dataDir = tmpDir_.filePath(QStringLiteral("binary-text-session-data"));
-        QDir().mkpath(dataDir);
-        qputenv("NOTEPADSAFE_DATADIR", dataDir.toUtf8());
-        const QString sourcePath = tmpDir_.filePath(
-            QStringLiteral("binary-presented-as-text.dat"));
-        QByteArray bytes("BINARY-AS-TEXT\n", 15);
-        bytes.append('\0');
-        bytes.append("tail\n", 5);
-        {
-            QFile source(sourcePath);
-            QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
-            QCOMPARE(source.write(bytes), qint64(bytes.size()));
-        }
-
-        auto *first = new MainWindow;
-        first->resize(1050, 680);
-        first->show();
-        QVERIFY(QTest::qWaitForWindowExposed(first));
-        first->openFilesFromExternal({sourcePath});
-        QVERIFY(waitForTabCountAndL2(first, 1, true, 5000));
-        EditorTab *source = currentEditorTab(first);
-        QVERIFY(source && source->viewModeL2() == ViewMode::Hex);
-        source->setViewModeL2(ViewMode::Text);
-        QTRY_COMPARE_WITH_TIMEOUT(source->viewModeL2(), ViewMode::Text, 2000);
-        QVERIFY(source->isBinaryDocument());
-        QTRY_COMPARE_WITH_TIMEOUT(source->editor()->marginType(0),
-                                  QsciScintilla::TextMargin, 2000);
-
-        SessionManager session(dataDir);
-        QVERIFY(session.saveSession({source}, 0, false));
-        const SessionData stored = session.loadSession();
-        QCOMPARE(stored.tabs.size(), 1);
-        QCOMPARE(stored.tabs.first().presentation, QStringLiteral("text"));
-
-        source->shutdownL2BeforeClose();
-        delete first;
-        QApplication::processEvents(QEventLoop::AllEvents, 80);
-
-        auto *restoredWindow = new MainWindow;
-        restoredWindow->resize(1050, 680);
-        restoredWindow->show();
-        QVERIFY(QTest::qWaitForWindowExposed(restoredWindow));
-        restoredWindow->deferredRestoreSession();
-        QTRY_COMPARE_WITH_TIMEOUT(tabCount(restoredWindow), 1, 5000);
-        EditorTab *restored = currentEditorTab(restoredWindow);
-        QTRY_VERIFY_WITH_TIMEOUT(restored && restored->l2View()
-                                 && restored->l2View()->isOpen(), 5000);
-        QCOMPARE(restored->viewModeL2(), ViewMode::Text);
-        QVERIFY(restored->isBinaryDocument());
-        QCOMPARE(restored->editor()->marginType(0), QsciScintilla::TextMargin);
-        QVERIFY(restored->editor()->text().startsWith(
-            QStringLiteral("BINARY-AS-TEXT")));
-        QVERIFY(!restored->editor()->text().startsWith(
-            QStringLiteral("42 49 4E")));
-
-        const QString screenshot = QCoreApplication::applicationDirPath()
-                                   + QStringLiteral("/gui-binary-text-session.png");
-        QVERIFY2(restoredWindow->grab().save(screenshot), qPrintable(screenshot));
-        restored->shutdownL2BeforeClose();
-        // This case verifies session presentation, not the application-wide
-        // close transaction (accounts workspace, autosave and security-session
-        // shutdown). Let the owning MainWindow destroy its tab hierarchy once;
-        // deleting the page separately would run a second L2 teardown while
-        // deferred session restoration still owns queued callbacks.
-        delete restoredWindow;
-        qputenv("NOTEPADSAFE_DATADIR", primaryTestDataDir_.toUtf8());
-    }
-
     void tc_unified_open_focuses_existing_document() {
         closeAllEditorTabs(mw_);
         QCOMPARE(tabCount(mw_), 0);
@@ -3172,10 +3078,8 @@ private slots:
         QVERIFY(menuAction(menu, QStringLiteral("tabContext.closeAll")));
         QVERIFY(menuAction(menu, QStringLiteral("tabContext.copyPath")));
         QVERIFY(menuAction(menu, QStringLiteral("tabContext.reveal")));
-        QVERIFY(menuAction(menu, QStringLiteral("tabContext.presentText")));
-        QVERIFY(menuAction(menu, QStringLiteral("tabContext.presentHex")));
-        QVERIFY(!menuAction(menu, QStringLiteral("tabContext.presentText"))->isEnabled());
-        QVERIFY(!menuAction(menu, QStringLiteral("tabContext.presentHex"))->isEnabled());
+        // Content decides the view; small text has no presentation switch.
+        QVERIFY(!menuAction(menu, QStringLiteral("tabContext.switchPresentation")));
         QTest::qWait(80);
         const QString textMenuShot = QCoreApplication::applicationDirPath()
                                      + QStringLiteral("/gui-tab-context-text.png");
@@ -3193,42 +3097,23 @@ private slots:
         openTabMenu(binaryIndex);
         QTRY_VERIFY_WITH_TIMEOUT(visibleTabMenu() != nullptr, 2000);
         menu = visibleTabMenu();
-        QAction *presentText = menuAction(menu, QStringLiteral("tabContext.presentText"));
-        QAction *presentHex = menuAction(menu, QStringLiteral("tabContext.presentHex"));
-        QVERIFY(presentText && presentText->isEnabled());
-        QVERIFY(presentHex && !presentHex->isEnabled());
-        QPointer<QMenu> binaryHexMenuGuard(menu);
-        QTest::mouseClick(menu, Qt::LeftButton, Qt::NoModifier,
-                          menu->actionGeometry(presentText).center());
-        QTRY_VERIFY_WITH_TIMEOUT(binaryHexMenuGuard.isNull()
-                                 || !binaryHexMenuGuard->isVisible(), 1000);
-        EditorTab *binaryTab = qobject_cast<EditorTab *>(tabs->currentWidget());
+        // A small binary stays in Hex; there is no switch to a text view.
+        QVERIFY(!menuAction(menu, QStringLiteral("tabContext.switchPresentation")));
+        EditorTab *binaryTab = qobject_cast<EditorTab *>(tabs->widget(binaryIndex));
         QVERIFY(binaryTab && binaryTab->isBinaryDocument());
-        QTRY_COMPARE_WITH_TIMEOUT(binaryTab->viewModeL2(), ViewMode::Text, 2000);
-        // Let the previous popup's native close animation finish before
-        // measuring the next popup; otherwise Windows can expose only the
-        // final scroll strip during a zero-delay reopen.
-        QTest::qWait(180);
-
-        openTabMenu(tabs->currentIndex());
-        QTRY_VERIFY_WITH_TIMEOUT(visibleTabMenu() != nullptr, 2000);
-        menu = visibleTabMenu();
-        presentText = menuAction(menu, QStringLiteral("tabContext.presentText"));
-        presentHex = menuAction(menu, QStringLiteral("tabContext.presentHex"));
-        QVERIFY(presentText && !presentText->isEnabled());
-        QVERIFY(presentHex && presentHex->isEnabled());
+        QCOMPARE(binaryTab->viewModeL2(), ViewMode::Hex);
         QAction *closeOthers = menuAction(menu, QStringLiteral("tabContext.closeOthers"));
         QVERIFY(closeOthers && closeOthers->isEnabled());
         QTest::qWait(80);
         const QString binaryMenuShot = QCoreApplication::applicationDirPath()
-                                       + QStringLiteral("/gui-tab-context-binary-text.png");
+                                       + QStringLiteral("/gui-tab-context-binary.png");
         QVERIFY2(menu->grab().save(binaryMenuShot), qPrintable(binaryMenuShot));
         QTest::mouseClick(menu, Qt::LeftButton, Qt::NoModifier,
                           menu->actionGeometry(closeOthers).center());
         QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
         QCOMPARE(currentEditorTab(mw_), binaryTab);
         QVERIFY(binaryTab->isBinaryDocument());
-        QVERIFY(binaryTab->viewModeL2() == ViewMode::Text);
+        QVERIFY(binaryTab->viewModeL2() == ViewMode::Hex);
 
         closeAllEditorTabs(mw_);
     }
@@ -3521,16 +3406,10 @@ private slots:
         QVERIFY(tab);
         QVERIFY(tab->editor()->paper().lightness() < 128);
 
-        QMenu *presentation = window->findChild<QMenu *>(
-            QStringLiteral("view.presentation"));
         QMenu *edge = window->findChild<QMenu *>(QStringLiteral("view.edge"));
         QMenu *zoom = window->findChild<QMenu *>(QStringLiteral("view.zoom"));
-        QAction *textPresentation = window->findChild<QAction *>(
-            QStringLiteral("view.presentation.text"));
-        QAction *hexPresentation = window->findChild<QAction *>(
-            QStringLiteral("view.presentation.hex"));
-        QVERIFY(presentation && edge && zoom && textPresentation && hexPresentation);
-        QVERIFY(!textPresentation->isEnabled() && !hexPresentation->isEnabled());
+        QVERIFY(edge && zoom);
+        QVERIFY(window->findChild<QMenu *>(QStringLiteral("view.presentation")) == nullptr);
 
         QMenu *viewMenu = nullptr;
         for (QAction *topAction : window->menuBar()->actions()) {
@@ -3541,7 +3420,6 @@ private slots:
             }
         }
         QVERIFY(viewMenu);
-        QVERIFY(viewMenu->actions().contains(presentation->menuAction()));
         QVERIFY(viewMenu->actions().contains(edge->menuAction()));
         QVERIFY(viewMenu->actions().contains(zoom->menuAction()));
         viewMenu->popup(window->mapToGlobal(QPoint(160, 90)));

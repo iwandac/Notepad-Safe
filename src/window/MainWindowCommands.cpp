@@ -442,25 +442,7 @@ void MainWindow::toggleWordWrap()
     saveSettings();
 }
 
-// ============================================================================
-//  16 进制视图模式切换（仅对当前 L2 VirtualFileView tab 生效；L1/QScintilla tab 忽略）
-// ============================================================================
-void MainWindow::toggleHexViewMode()
-{
-    auto *tab = currentTab();
-    if (!tab || !tab->isL2Active()) {
-        syncGlobalMenuCheckStates();
-        return;
-    }
-    ViewMode now = tab->viewModeL2();
-    ViewMode next = (now == ViewMode::Hex) ? ViewMode::Text : ViewMode::Hex;
-    tab->setViewModeL2(next);
-    syncCommandStates(tab);
-    syncGlobalMenuCheckStates();
-    updateStatusBar();
-}
-
-// 统一把外观/换行/标尺/呈现方式同步到视图菜单。
+// 统一把外观/换行/标尺同步到视图菜单。
 // 这是解决"恢复设置后菜单勾选未同步显示"的核心函数
 void MainWindow::syncGlobalMenuCheckStates()
 {
@@ -486,19 +468,6 @@ void MainWindow::syncGlobalMenuCheckStates()
     if (m_actWordCompletion)
         m_actWordCompletion->setChecked(m_wordCompletion);
     if (m_actEdgeVisible) m_actEdgeVisible->setChecked(m_edgeVisible);
-    if (m_actTextViewMode || m_actHexViewMode) {
-        auto *tab = currentTab();
-        const bool dualPresentation = tab && tab->isL2Active();
-        const bool hex = dualPresentation && tab->viewModeL2() == ViewMode::Hex;
-        if (m_actTextViewMode) {
-            m_actTextViewMode->setEnabled(dualPresentation);
-            m_actTextViewMode->setChecked(dualPresentation && !hex);
-        }
-        if (m_actHexViewMode) {
-            m_actHexViewMode->setEnabled(dualPresentation);
-            m_actHexViewMode->setChecked(hex);
-        }
-    }
     if (m_edgeColGroup) {
         for (QAction *a : m_edgeColGroup->actions()) {
             a->setChecked(a->data().toInt() == m_edgeColumn);
@@ -896,7 +865,6 @@ void MainWindow::syncCommandStates(EditorTab *tab)
             && !tab->isSecureDocument() && !tab->isUntitled();
         context.conversionAvailable = context.displayEncodingAvailable
             && !tab->isBinaryDocument();
-        context.dualPresentation = hasDocument && tab->isL2Active();
         DocumentTailActions::installAndPopulate(m_tailActions, this, *m_commandRegistry, tab, context,
             [this] { return currentTab(); }, [this] { syncCommandStates(currentTab()); });
         m_commandRegistry->applyContext(context);
@@ -1020,37 +988,24 @@ void MainWindow::showTabContextMenu(const QPoint &position)
     }
 
     menu->addSeparator();
-    QAction *asText = menu->addAction(QStringLiteral("以文本重新打开"));
-    asText->setObjectName(QStringLiteral("tabContext.presentText"));
-    QAction *asHex = menu->addAction(QStringLiteral("以十六进制重新打开"));
-    asHex->setObjectName(QStringLiteral("tabContext.presentHex"));
-    const bool presentationSwitchAvailable = tab->isL2Active();
-    asText->setEnabled(presentationSwitchAvailable
-                       && tab->viewModeL2() != ViewMode::Text);
-    asHex->setEnabled(presentationSwitchAvailable
-                      && tab->viewModeL2() != ViewMode::Hex);
-    if (!presentationSwitchAvailable) {
-        const QString reason = QStringLiteral(
-            "当前直接编辑视图尚不需要重新装载；二进制和大文件视图可在文本与十六进制间切换。");
-        asText->setStatusTip(reason);
-        asHex->setStatusTip(reason);
+    if (tab->canSwitchWindowedPresentation()) {
+        const bool showingHex = tab->viewModeL2() == ViewMode::Hex;
+        QAction *switchView = menu->addAction(showingHex
+            ? QStringLiteral("以文本查看") : QStringLiteral("以十六进制查看"));
+        switchView->setObjectName(QStringLiteral("tabContext.switchPresentation"));
+        connect(switchView, &QAction::triggered, this, [this, tab, showingHex]() {
+            if (!tab || !tab->canSwitchWindowedPresentation())
+                return;
+            QString error;
+            if (!tab->reopenWindowedPresentation(showingHex
+                    ? ViewMode::Text : ViewMode::Hex, &error)
+                && !error.isEmpty()) {
+                statusBar()->showMessage(error, 6000);
+            }
+            syncCommandStates(tab);
+            updateStatusBar();
+        });
     }
-    connect(asText, &QAction::triggered, this, [this, tab]() {
-        if (!tab || !tab->isL2Active())
-            return;
-        tab->setViewModeL2(ViewMode::Text);
-        syncCommandStates(tab);
-        syncGlobalMenuCheckStates();
-        updateStatusBar();
-    });
-    connect(asHex, &QAction::triggered, this, [this, tab]() {
-        if (!tab || !tab->isL2Active())
-            return;
-        tab->setViewModeL2(ViewMode::Hex);
-        syncCommandStates(tab);
-        syncGlobalMenuCheckStates();
-        updateStatusBar();
-    });
 
     menu->popup(popupPosition);
 }

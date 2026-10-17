@@ -346,9 +346,11 @@ public:
     void setDisplayEncoding(TextEncoding enc);
     TextEncoding displayEncoding() const;
 
-    // L2 视图模式：文本 / 16 进制（仅 L2 生效）
-    void setViewModeL2(ViewMode mode);
+    // 内容决定视图：二进制固定为十六进制；只有窗口化只读文本可以在
+    // 文本与十六进制查看之间切换，切换后保持当前位置并关闭跟随。
     ViewMode viewModeL2() const;
+    bool canSwitchWindowedPresentation() const;
+    bool reopenWindowedPresentation(ViewMode target, QString *error = nullptr);
     // 当前 tab 是否正在显示 L2 VirtualFileView（大文件视图），非 L1/QScintilla
     bool isL2Active() const;
 
@@ -479,6 +481,7 @@ signals:
                                           const QString &reason);
 
 private:
+    void setViewModeL2(ViewMode mode);
     friend class HexMouseSelectionController;
     bool createDocumentSnapshotImpl(qint64 maximumBytes,
                                     DocumentSnapshot *snapshot,

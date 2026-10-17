@@ -99,7 +99,6 @@ private slots:
     void toggleEdgeLine();
     void setEdgeColumnFromAction();
     void toggleWordWrap();
-    void toggleHexViewMode();
 
     // 编码
     void setEncodingFromAction();
@@ -187,8 +186,6 @@ private:
     QAction *m_actBackspaceUnindents = nullptr;
     QAction *m_actWordCompletion = nullptr;
     QAction *m_actEdgeVisible = nullptr;
-    QAction *m_actTextViewMode = nullptr;
-    QAction *m_actHexViewMode = nullptr;
     QAction *m_searchPanelAction = nullptr;
     QAction *m_toolbarVisibilityAction = nullptr;
     QAction *m_statusVisibilityAction = nullptr;

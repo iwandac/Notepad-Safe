@@ -1407,46 +1407,6 @@ void MainWindow::createMenus()
 
     viewMenu->addSeparator();
 
-    auto *presentationMenu = viewMenu->addMenu(QStringLiteral("呈现方式"));
-    assignMenuId(presentationMenu, QStringLiteral("view.presentation"));
-    auto *presentationGroup = new QActionGroup(this);
-    presentationGroup->setExclusive(true);
-    m_actTextViewMode = presentationMenu->addAction(QStringLiteral("文本"));
-    m_actTextViewMode->setObjectName(QStringLiteral("view.presentation.text"));
-    m_actTextViewMode->setCheckable(true);
-    presentationGroup->addAction(m_actTextViewMode);
-    m_actHexViewMode = presentationMenu->addAction(QStringLiteral("十六进制"));
-    m_actHexViewMode->setObjectName(QStringLiteral("view.presentation.hex"));
-    m_actHexViewMode->setCheckable(true);
-    presentationGroup->addAction(m_actHexViewMode);
-    connect(m_actTextViewMode, &QAction::triggered, this, [this]() {
-        auto *tab = currentTab();
-        if (!tab || !tab->isL2Active())
-            return;
-        tab->setViewModeL2(ViewMode::Text);
-        syncCommandStates(tab);
-        syncGlobalMenuCheckStates();
-        updateStatusBar();
-    });
-    connect(m_actHexViewMode, &QAction::triggered, this, [this]() {
-        auto *tab = currentTab();
-        if (!tab || !tab->isL2Active())
-            return;
-        tab->setViewModeL2(ViewMode::Hex);
-        syncCommandStates(tab);
-        syncGlobalMenuCheckStates();
-        updateStatusBar();
-    });
-    // The menu entries select a concrete presentation; the established
-    // shortcut remains a true two-way toggle.
-    auto *togglePresentation = new QAction(this);
-    togglePresentation->setObjectName(QStringLiteral("view.presentation.toggle"));
-    togglePresentation->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+H")));
-    togglePresentation->setShortcutContext(Qt::WindowShortcut);
-    addAction(togglePresentation);
-    connect(togglePresentation, &QAction::triggered,
-            this, &MainWindow::toggleHexViewMode);
-
     auto *edgeMenu = viewMenu->addMenu(QStringLiteral("长行标尺"));
     assignMenuId(edgeMenu, QStringLiteral("view.edge"));
     m_actEdgeVisible = edgeMenu->addAction(QStringLiteral("显示标尺"));

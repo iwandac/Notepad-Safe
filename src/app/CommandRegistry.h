@@ -31,7 +31,6 @@ struct CommandContext {
     bool hexInsertMode = false;
     bool displayEncodingAvailable = false;
     bool conversionAvailable = false;
-    bool dualPresentation = false;
     bool tailAvailable = false;
     bool tailEnabled = false;
     bool tailCanResume = false;

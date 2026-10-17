@@ -30,6 +30,9 @@
 #include <QWidget>
 
 #include "EditorTab.h"
+#include "AppComposition.h"
+#include "DocumentOpenWorkflow.h"
+#include "SessionDocumentPort.h"
 #include "PlainFilePersistence.h"
 #include "ByteClipboard.h"
 #include "FindReplaceDialog.h"
@@ -463,39 +466,6 @@ private slots:
             QDir(QCoreApplication::applicationDirPath()).filePath(
                 QStringLiteral("gui-tiny-hex-raw-byte-search.png"))));
 
-        // Switch at a non-zero projected window. Binary CR/LF bytes are not a
-        // trustworthy line model: the gutter must keep authoritative source
-        // byte offsets and switching presentation must not launch a global
-        // line/character scan.
-        const qint64 textTarget = QFileInfo(path).size() * 3 / 4;
-        tab->gotoByteOffset(textTarget, 0);
-        const qint64 windowStart = tab->l2View()->activeWindowByteStart();
-        QSignalSpy taskAdded(&AsyncTaskManager::instance(),
-                             &AsyncTaskManager::taskAdded);
-        tab->setViewModeL2(ViewMode::Text);
-        QTRY_COMPARE_WITH_TIMEOUT(tab->viewModeL2(), ViewMode::Text, 3000);
-        QTest::qWait(200);
-        for (const QList<QVariant> &arguments : taskAdded) {
-            const AsyncTask task = AsyncTaskManager::instance().taskById(
-                arguments.constFirst().toLongLong());
-            QVERIFY2(task.categoryTag != QStringLiteral("LineNumberIndex")
-                         && task.categoryTag != QStringLiteral("CharacterCount"),
-                     qPrintable(task.title));
-        }
-        const int digits = qMax(
-            8, QString::number(QFileInfo(path).size() - 1, 16).size());
-        const QString expectedFirstMargin = QString::number(windowStart, 16)
-            .rightJustified(digits, QLatin1Char('0')).toUpper();
-        QTRY_COMPARE_WITH_TIMEOUT(marginText(tab->editor(), 0),
-                                  expectedFirstMargin, 3000);
-        bool hexOk = false;
-        const qint64 secondOffset = marginText(tab->editor(), 1)
-            .toLongLong(&hexOk, 16);
-        QVERIFY(hexOk);
-        QVERIFY(secondOffset > windowStart);
-        QVERIFY(window.grab().save(
-            QDir(QCoreApplication::applicationDirPath()).filePath(
-                QStringLiteral("gui-tiny-binary-text-byte-offsets.png"))));
         window.close();
     }
 
@@ -675,82 +645,6 @@ private slots:
         QVERIFY(!tab->l2View()->patches().isModified());
         QCOMPARE(tab->l2View()->virtualFileSize(), sourceInfo.size());
 
-        tab->setViewModeL2(ViewMode::Text);
-        QTRY_COMPARE_WITH_TIMEOUT(tab->viewModeL2(), ViewMode::Text, 3000);
-        QTRY_COMPARE_WITH_TIMEOUT(visibleVerticalScrollBars(tab), 1, 3000);
-        QCOMPARE(tab->editor()->SendScintilla(
-                     QsciScintillaBase::SCI_GETVSCROLLBAR), 0L);
-        QCOMPARE(tab->editor()->SendScintilla(
-                     QsciScintillaBase::SCI_GETHSCROLLBAR), 0L);
-        QScrollBar *global = tab->l2View()->verticalScrollBar();
-        QVERIFY(global && global->maximum() > 0);
-
-        QSignalSpy projectionChanges(tab->l2View(),
-                                     &VirtualFileView::activeWindowChanged);
-        dragScrollBarContinuously(global, 0.75);
-        QTRY_VERIFY_WITH_TIMEOUT(
-            tab->l2View()->activeWindowByteStart() > sourceInfo.size() / 2, 5000);
-        const int settledAt75 = global->value();
-        QVERIFY(settledAt75 > global->maximum() / 2);
-        const qint64 settledWindowStart = tab->l2View()->activeWindowByteStart();
-        const int projectionsAfterRelease = projectionChanges.count();
-        QTest::qWait(3000);
-        QCOMPARE(global->value(), settledAt75); // no delayed feedback-loop snap-back
-        QCOMPARE(tab->l2View()->activeWindowByteStart(), settledWindowStart);
-        QVERIFY2(projectionChanges.count() <= projectionsAfterRelease + 1,
-                 "an idle viewport kept rebuilding projections after drag release");
-
-        const qint64 sizeBeforeWrap = tab->l2View()->virtualFileSize();
-        QCOMPARE(sizeBeforeWrap, sourceInfo.size());
-        const int logicalLinesBeforeWrap = tab->editor()->lines();
-        const QString projectedTextBeforeWrap = tab->editor()->text();
-        const QByteArray projectedBytesBeforeWrap = scintillaBytes(tab->editor());
-        QCOMPARE(projectedBytesBeforeWrap,
-                 tab->l2View()->readByteRange(
-                     tab->l2View()->activeWindowByteStart(),
-                     tab->l2View()->activeWindowByteEnd()));
-        QVERIFY(!tab->l2View()->patches().isModified());
-        tab->setWordWrap(true);
-        QTRY_VERIFY_WITH_TIMEOUT(tab->wordWrap(), 1000);
-        QCOMPARE(tab->editor()->wrapMode(), QsciScintilla::WrapWord);
-        QTRY_COMPARE_WITH_TIMEOUT(visibleHorizontalScrollBars(tab), 0, 1000);
-        QCOMPARE(tab->editor()->lines(), logicalLinesBeforeWrap);
-        QCOMPARE(tab->editor()->text(), projectedTextBeforeWrap);
-        QCOMPARE(scintillaBytes(tab->editor()), projectedBytesBeforeWrap);
-        QCOMPARE(tab->l2View()->virtualFileSize(), sizeBeforeWrap);
-        QVERIFY(!tab->l2View()->patches().isModified());
-
-        // The persisted application setting may enable wrapping before the
-        // user opens/switches this file. Exercise a non-terminal continuous
-        // thumb drag while wrap layout notifications are active; EOF-only
-        // coverage cannot expose a midpoint feedback loop.
-        dragScrollBarContinuously(global, 0.42);
-        QTRY_VERIFY_WITH_TIMEOUT(global->value() > global->maximum() / 3, 5000);
-        const int wrappedSettledValue = global->value();
-        const qint64 wrappedSettledStart = tab->l2View()->activeWindowByteStart();
-        const int wrappedProjectionCount = projectionChanges.count();
-        QTest::qWait(3000);
-        QCOMPARE(global->value(), wrappedSettledValue);
-        QCOMPARE(tab->l2View()->activeWindowByteStart(), wrappedSettledStart);
-        QVERIFY2(projectionChanges.count() <= wrappedProjectionCount + 1,
-                 "wrapped idle viewport kept rebuilding after midpoint drag");
-
-        dragScrollBar(global, 1.0);
-        QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->activeWindowByteEnd(),
-                                  tab->l2View()->virtualFileSize(), 5000);
-        QTest::qWait(500);
-        QVERIFY(global->value() >= global->maximum() - global->pageStep());
-        QVERIFY(!tab->l2View()->patches().isModified());
-        QCOMPARE(tab->l2View()->virtualFileSize(), sizeBeforeWrap);
-
-        QVERIFY(window.grab().save(
-            QDir(QCoreApplication::applicationDirPath()).filePath(
-                QStringLiteral("gui-tiny-binary-text-wrap-eof.png"))));
-        tab->setWordWrap(false);
-        QTRY_VERIFY_WITH_TIMEOUT(!tab->wordWrap(), 1000);
-        QVERIFY(!tab->l2View()->patches().isModified());
-        window.close();
-        QCOMPARE(fileSha256(path), diskHashBefore);
     }
 
     void windowedHexUsesUnifiedThreeColumnByteContract()
@@ -976,55 +870,61 @@ private slots:
         window.close();
     }
 
-    void windowedBinaryTextPresentationUsesByteOffsetGutterWithoutGlobalScans()
+    void windowedTextReopensAsHexAndRestoresAcrossSession()
     {
         QTemporaryDir temporary;
         QVERIFY(temporary.isValid());
-        const QString path = temporary.filePath(QStringLiteral("binary-as-text.bin"));
-        QFile source(path);
-        QVERIFY(source.open(QIODevice::WriteOnly | QIODevice::Truncate));
-        QCOMPARE(source.write(QByteArrayLiteral("alpha\nbeta\ngamma\n")), qint64(17));
-        source.close();
+        const QString path = temporary.filePath(QStringLiteral("reopen-as-hex.log"));
+        QSaveFile source(path);
+        QVERIFY(source.open(QIODevice::WriteOnly));
+        QByteArray block;
+        while (block.size() < 1024 * 1024)
+            block += QByteArrayLiteral("2026-10-17 INFO reopen marker payload\n");
+        block.truncate(1024 * 1024);
+        for (int i = 0; i < 40; ++i)
+            QCOMPARE(source.write(block), qint64(block.size()));
+        QVERIFY(source.commit());
+        const QByteArray sourceHash = QCryptographicHash::hash(
+            [&] { QFile f(path); f.open(QIODevice::ReadOnly); return f.readAll(); }(),
+            QCryptographicHash::Sha256);
 
         QWidget window;
-        window.resize(800, 500);
+        window.resize(1100, 700);
         auto *layout = new QVBoxLayout(&window);
-        auto *provider = new WindowedReadOnlyProvider(&window);
-        provider->setBinaryContent(true);
-        layout->addWidget(provider);
+        auto *tab = new EditorTab(&window);
+        layout->addWidget(tab);
         window.show();
         QVERIFY(QTest::qWaitForWindowExposed(&window));
-        QSignalSpy taskAdded(&AsyncTaskManager::instance(),
-                             &AsyncTaskManager::taskAdded);
         QString error;
-        QVERIFY2(provider->openFile(path,
-                                    WindowedReadOnlyProvider::Presentation::Hex,
-                                    registeredReadFixturePolicy(),
-                                    &error), qPrintable(error));
-        QCOMPARE(provider->editor()->marginType(0), QsciScintilla::TextMargin);
-        QVERIFY(provider->asciiPreview()->isVisibleTo(provider));
+        QVERIFY2(openWindowedFixture(tab, path, &error), qPrintable(error));
+        QVERIFY(tab->canSwitchWindowedPresentation());
+        auto *provider = tab->windowedReadOnlyProvider();
+        QVERIFY(provider);
+        const qint64 target = 20LL * 1024 * 1024;
+        provider->goToOffset(target);
+        QTRY_VERIFY_WITH_TIMEOUT(qAbs(provider->visibleTopOffset() - target) < 4096, 3000);
 
-        provider->setPresentation(WindowedReadOnlyProvider::Presentation::Text);
-        QCoreApplication::processEvents();
-        QCOMPARE(provider->editor()->marginType(0), QsciScintilla::TextMargin);
-        QVERIFY(!provider->asciiPreview()->isVisibleTo(provider));
-        QVERIFY(provider->editor()->marginWidth(0) > 0);
-        QCOMPARE(marginText(provider->editor(), 0), QStringLiteral("00000000"));
-        QCOMPARE(marginText(provider->editor(), 1), QStringLiteral("00000006"));
-        QVERIFY(!provider->characterCountPending());
-        QTest::qWait(100);
-        for (const QList<QVariant> &arguments : taskAdded) {
-            const AsyncTask task = AsyncTaskManager::instance().taskById(
-                arguments.constFirst().toLongLong());
-            QVERIFY2(task.categoryTag != QStringLiteral("LineNumberIndex")
-                         && task.categoryTag != QStringLiteral("CharacterCount"),
-                     qPrintable(task.title));
-        }
+        QVERIFY2(tab->reopenWindowedPresentation(ViewMode::Hex, &error), qPrintable(error));
+        QCOMPARE(tab->viewModeL2(), ViewMode::Hex);
+        QVERIFY(!tab->isBinaryDocument());
+        QTRY_VERIFY_WITH_TIMEOUT(qAbs(provider->visibleTopOffset() - target) < 4096, 3000);
 
-        provider->setPresentation(WindowedReadOnlyProvider::Presentation::Hex);
-        QCoreApplication::processEvents();
-        QCOMPARE(provider->editor()->marginType(0), QsciScintilla::TextMargin);
-        QVERIFY(provider->asciiPreview()->isVisibleTo(provider));
+        const SessionTab state = tab->captureSessionTab();
+        QCOMPARE(state.presentation, QStringLiteral("hex"));
+        tab->shutdownL2BeforeClose();
+
+        AppComposition composition;
+        auto *restored = new EditorTab(&window);
+        layout->addWidget(restored);
+        QVERIFY(openSessionDocument(composition.documentProviders(), restored, state));
+        QTRY_VERIFY_WITH_TIMEOUT(restored->windowedReadOnlyProvider(), 5000);
+        QCOMPARE(restored->viewModeL2(), ViewMode::Hex);
+        QVERIFY(!restored->isBinaryDocument());
+        QVERIFY(restored->canSwitchWindowedPresentation());
+        restored->shutdownL2BeforeClose();
+        QFile reread(path);
+        QVERIFY(reread.open(QIODevice::ReadOnly));
+        QCOMPARE(QCryptographicHash::hash(reread.readAll(), QCryptographicHash::Sha256), sourceHash);
         window.close();
     }
 
@@ -1896,86 +1796,6 @@ private slots:
         QVERIFY(!tab.exportRecoveryCheckpoint(&checkpoint, &error));
         QCOMPARE(checkpoint.size(), qint64(0));
         QVERIFY(error.contains(QStringLiteral("只读分析")));
-    }
-
-    void binaryTextEncodingRegexAndWindowedGlobalLinesUserFlow()
-    {
-        const QString tinyPath = portableTinyBinaryPath();
-        QVERIFY2(QFileInfo::exists(tinyPath), qPrintable(tinyPath));
-
-        QWidget tinyWindow;
-        tinyWindow.resize(1100, 720);
-        auto *tinyLayout = new QVBoxLayout(&tinyWindow);
-        auto *tab = new EditorTab(&tinyWindow);
-        tinyLayout->addWidget(tab);
-        tinyWindow.show();
-        QVERIFY(QTest::qWaitForWindowExposed(&tinyWindow));
-
-        QString error;
-        QVERIFY2(openWindowedFixture(tab, tinyPath, &error,
-                                      L2Presentation::Hex,
-                                      L2ContentKind::Binary), qPrintable(error));
-        QTRY_VERIFY_WITH_TIMEOUT(tab->l2View() && tab->l2View()->isOpen(), 5000);
-        tab->setViewModeL2(ViewMode::Text);
-        QTRY_COMPARE_WITH_TIMEOUT(tab->viewModeL2(), ViewMode::Text, 3000);
-        QVERIFY(tab->editor()->isReadOnly());
-
-        tab->setDisplayEncoding(TextEncoding::Utf8);
-        QCoreApplication::processEvents();
-        const QString utf8Projection = tab->editor()->text().left(512);
-        QVERIFY(utf8Projection.contains(QChar::ReplacementCharacter));
-        tab->setDisplayEncoding(TextEncoding::Windows1252);
-        QCoreApplication::processEvents();
-        const QString cp1252Projection = tab->editor()->text().left(512);
-        QVERIFY(cp1252Projection != utf8Projection);
-        QVERIFY(cp1252Projection.contains(QChar(0x201c))); // byte 0x93 in PE header
-
-        tab->setDisplayEncoding(TextEncoding::Utf8);
-        QCoreApplication::processEvents();
-        QVERIFY2(tab->findNext(QStringLiteral("This\\s+program\\s+cannot"),
-                               true, true, false, true, true, false),
-                 qPrintable(tab->lastSearchError()));
-        QCOMPARE(tab->l2View()->selectionStart(), qint64(0x4e));
-        QCOMPARE(tab->l2View()->selectionEnd(), qint64(0x61));
-        QVERIFY(tinyWindow.grab().save(
-            QDir(QCoreApplication::applicationDirPath()).filePath(
-                QStringLiteral("gui-binary-text-decoded-regex.png"))));
-        tinyWindow.close();
-
-        QTemporaryDir temporary;
-        QVERIFY(temporary.isValid());
-        const QString linesPath = temporary.filePath(QStringLiteral("global-lines.log"));
-        QSaveFile output(linesPath);
-        QVERIFY(output.open(QIODevice::WriteOnly));
-        const QByteArray line("row-data\n", 9);
-        for (int i = 0; i < 600000; ++i)
-            QCOMPARE(output.write(line), qint64(line.size()));
-        QVERIFY(output.commit());
-
-        QWidget lineWindow;
-        lineWindow.resize(900, 620);
-        auto *lineLayout = new QVBoxLayout(&lineWindow);
-        auto *provider = new WindowedReadOnlyProvider(&lineWindow);
-        lineLayout->addWidget(provider);
-        lineWindow.show();
-        QVERIFY(QTest::qWaitForWindowExposed(&lineWindow));
-        QVERIFY2(provider->openFile(linesPath,
-                                    WindowedReadOnlyProvider::Presentation::Text,
-                                    registeredReadFixturePolicy(),
-                                    &error), qPrintable(error));
-        QTRY_VERIFY_WITH_TIMEOUT(!provider->characterCountPending(), 15000);
-        provider->goToOffset(4LL * 1024 * 1024);
-        QTRY_VERIFY_WITH_TIMEOUT(provider->windowStart() > 0, 3000);
-        const qint64 expectedFirstLine = provider->windowStart() / line.size() + 1;
-        QTRY_COMPARE_WITH_TIMEOUT(marginText(provider->editor(), 0),
-                                  QString::number(expectedFirstLine), 3000);
-        QCOMPARE(marginText(provider->editor(), 1),
-                 QString::number(expectedFirstLine + 1));
-        QVERIFY(expectedFirstLine > 1);
-        QVERIFY(lineWindow.grab().save(
-            QDir(QCoreApplication::applicationDirPath()).filePath(
-                QStringLiteral("gui-windowed-global-line-numbers.png"))));
-        lineWindow.close();
     }
 
     void bigFileLineNumbersAndCharacterCountShareOneScan()

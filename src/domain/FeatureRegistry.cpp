@@ -105,10 +105,7 @@ QStringList FeatureRegistry::requiredStartupCommandIds()
         QStringLiteral("view.folding.toggleCurrent"),
         QStringLiteral("view.folding.collapseAll"),
         QStringLiteral("view.folding.expandAll"),
-        QStringLiteral("view.presentation"),
-        QStringLiteral("view.presentation.text"),
-        QStringLiteral("view.presentation.hex"),
-        QStringLiteral("view.presentation.toggle"), QStringLiteral("view.edge"),
+        QStringLiteral("view.edge"),
         QStringLiteral("view.edge.visible"), QStringLiteral("view.zoom"),
         QStringLiteral("view.zoom.in"), QStringLiteral("view.zoom.out"),
         QStringLiteral("view.zoom.reset"), QStringLiteral("view.panels"),
@@ -185,9 +182,7 @@ QString FeatureRegistry::featureIdForCommand(const QString &commandId)
             "view.appearance.dark", "view.wordWrap", "view.symbols",
             "view.symbols.whitespace", "view.symbols.eol", "view.folding",
             "view.folding.toggleCurrent", "view.folding.collapseAll",
-            "view.folding.expandAll", "view.presentation",
-            "view.presentation.text", "view.presentation.hex",
-            "view.presentation.toggle", "view.edge", "view.edge.visible",
+            "view.folding.expandAll", "view.edge", "view.edge.visible",
             "view.zoom", "view.zoom.in", "view.zoom.out", "view.zoom.reset",
             "view.panels", "view.panel.searchResults", "view.toolbar",
             "view.statusBar"})
@@ -217,7 +212,7 @@ QString FeatureRegistry::featureIdForCommand(const QString &commandId)
             "tabContext.save", "tabContext.saveAs", "tabContext.close",
             "tabContext.closeOthers", "tabContext.closeAll",
             "tabContext.copyPath", "tabContext.reveal",
-            "tabContext.presentText", "tabContext.presentHex"}))
+            "tabContext.switchPresentation"}))
         return QStringLiteral("NSP-SHELL");
     return {};
 }

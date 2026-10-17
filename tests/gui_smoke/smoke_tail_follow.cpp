@@ -40,6 +40,7 @@
 #include "AsyncTaskManager.h"
 #include "DiskFileVersion.h"
 #include "EditorTab.h"
+#include "VirtualFileView.h"
 #include "FindReplaceDialog.h"
 #include "MainWindow.h"
 #include "OrdinaryReadSource.h"
@@ -488,8 +489,9 @@ private slots:
         QVERIFY2(document.guards().isEmpty(), qPrintable(document.guards()));
         QVERIFY2(document.findTailUi(), qPrintable(document.error));
         if (hex) {
-            auto *action = document.window->findChild<QAction *>(QStringLiteral("view.presentation.hex"));
-            QVERIFY2(document.clickMenu(action), qPrintable(document.error));
+            QString switchError;
+            QVERIFY2(document.tab->reopenWindowedPresentation(ViewMode::Hex, &switchError),
+                     qPrintable(switchError));
             QVERIFY(document.tab->isHexPresentation());
         }
         document.provider->goToOffset(document.expected.size());

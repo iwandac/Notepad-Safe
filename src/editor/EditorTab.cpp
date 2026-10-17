@@ -4,6 +4,7 @@
 // Hex character rows use the shared measured Scintilla-authoritative grid.
 #include "ByteClipboard.h"
 #include "VirtualFileView.h"
+#include "ReadOnlyTailController.h"
 #include "WindowedReadOnlyProvider.h"
 #include "EditorSearchSource.h"
 #include "FileTierPolicy.h"
@@ -1222,6 +1223,30 @@ QsciScintilla *EditorTab::activeTextEditor() const
 QWidget *EditorTab::l1Page() const
 {
     return m_editor;
+}
+
+bool EditorTab::canSwitchWindowedPresentation() const
+{
+    return windowedReadOnlyActive() && !isBinaryDocument();
+}
+
+bool EditorTab::reopenWindowedPresentation(ViewMode target, QString *error)
+{
+    if (!canSwitchWindowedPresentation()) {
+        if (error)
+            *error = QObject::tr("只有只读大文本文件可以在文本与十六进制查看之间切换。");
+        return false;
+    }
+    const QPointer<EditorTab> owner(this);
+    if (auto *tail = m_windowedReadOnlyProvider->tailController())
+        tail->setTailEnabled(false);
+    if (!owner || !m_windowedReadOnlyProvider || viewModeL2() == target)
+        return owner && viewModeL2() == target;
+    const qint64 top = m_windowedReadOnlyProvider->visibleTopOffset();
+    setViewModeL2(target);
+    if (owner && m_windowedReadOnlyProvider)
+        m_windowedReadOnlyProvider->goToOffset(top);
+    return owner && viewModeL2() == target;
 }
 
 void EditorTab::setDisplayEncoding(TextEncoding enc)
