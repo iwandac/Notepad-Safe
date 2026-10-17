@@ -430,6 +430,7 @@ add_library(notepadsafe_app STATIC
     src/shell/AltMenuTracker.cpp
     src/shell/MainMenu.cpp
     src/shell/DocumentTabBar.cpp
+    src/shell/StatusSegments.cpp
 )
 target_include_directories(notepadsafe_app PUBLIC
     ${APP_INCLUDE_DIRS}

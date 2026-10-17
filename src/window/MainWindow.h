@@ -23,6 +23,7 @@ class QPoint;
 class EditorTab;
 struct ThemeTokens;
 class TitleBar;
+class StatusSegment;
 class FindReplaceDialog;
 class SearchResultsDock;
 class SearchResultsController;
@@ -160,12 +161,15 @@ private:
 
     // 状态栏
     QLabel *m_statusPos = nullptr;
-    QLabel *m_statusEncoding = nullptr;
+    StatusSegment *m_statusEncoding = nullptr;
+    StatusSegment *m_statusEol = nullptr;
+    StatusSegment *m_statusZoom = nullptr;
+    StatusSegment *m_statusSecurity = nullptr;
     QLabel *m_statusSize = nullptr;
     QLabel *m_statusCharacters = nullptr;
-    QLabel *m_statusSyntax = nullptr;
+    StatusSegment *m_statusSyntax = nullptr;
     QLabel *m_statusModified = nullptr;
-    QToolButton *m_hexEditModeButton = nullptr;
+    StatusSegment *m_hexEditModeButton = nullptr;
     QToolButton *m_externalOpenFailuresButton = nullptr;
     QStringList m_externalOpenFailures;
     StatusBarTaskWidget *m_taskWidget = nullptr;

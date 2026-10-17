@@ -3212,9 +3212,9 @@ private slots:
         EditorTab *tab = currentEditorTab(mw_);
         QVERIFY(tab && !tab->isL2Active());
         QCOMPARE(tab->lineEndingName(), QStringLiteral("CRLF"));
-        auto *encodingStatus = mw_->findChild<QLabel *>(QStringLiteral("status.encoding"));
-        QVERIFY(encodingStatus);
-        QVERIFY(encodingStatus->text().contains(QStringLiteral("CRLF")));
+        auto *eolStatus = mw_->findChild<QToolButton *>(QStringLiteral("status.eol"));
+        QVERIFY(eolStatus);
+        QVERIFY(eolStatus->text().contains(QStringLiteral("CRLF")));
 
         tab->editor()->setFocus();
         tab->editor()->setCursorPosition(1, 4);
@@ -3279,8 +3279,9 @@ private slots:
         QCOMPARE(decoded.encoding, TextEncoding::Utf16LE);
         QVERIFY(decoded.text.contains(QStringLiteral("beta\r\ngamma")));
         QCOMPARE(convertedTab->lineEndingName(), QStringLiteral("CRLF"));
-        QVERIFY(encodingStatus->text().contains(QStringLiteral("UTF-16LE")));
-        QVERIFY(encodingStatus->text().contains(QStringLiteral("CRLF")));
+        auto *encodingStatus = mw_->findChild<QToolButton *>(QStringLiteral("status.encoding"));
+        QVERIFY(encodingStatus && encodingStatus->text().contains(QStringLiteral("UTF-16LE")));
+        QVERIFY(eolStatus->text().contains(QStringLiteral("CRLF")));
         closeAllEditorTabs(mw_);
     }
 
@@ -3513,8 +3514,8 @@ private slots:
         QApplication::processEvents(QEventLoop::AllEvents, 100);
         QVERIFY(!searchResults->isEnabled());
         QVERIFY(!window->findChild<QLabel *>(QStringLiteral("status.position"))->isVisible());
-        QVERIFY(!window->findChild<QLabel *>(QStringLiteral("status.encoding"))->isVisible());
-        QVERIFY(!window->findChild<QLabel *>(QStringLiteral("status.context"))->isVisible());
+        QVERIFY(!window->findChild<QToolButton *>(QStringLiteral("status.encoding"))->isVisible());
+        QVERIFY(!window->findChild<QToolButton *>(QStringLiteral("status.context"))->isVisible());
         QVERIFY(!window->findChild<QLabel *>(QStringLiteral("status.size"))->isVisible());
         QVERIFY(!window->findChild<QLabel *>(QStringLiteral("status.modified"))->isVisible());
         window->close();
@@ -3666,6 +3667,74 @@ private slots:
         tab->editor()->setFocus();
         QTest::keyClick(tab->editor(), Qt::Key_K, Qt::ControlModifier);
         QCOMPARE(paletteSpy.count(), 1);
+        closeAllEditorTabs(mw_);
+    }
+
+    // Status segments open menus made of the existing command actions, so
+    // the status bar and the main menu always agree.
+    void statusSegmentsReuseCommandActions() {
+        closeAllEditorTabs(mw_);
+        auto *encoding = mw_->findChild<QToolButton *>(QStringLiteral("status.encoding"));
+        QVERIFY(encoding && encoding->menu());
+        QSet<QAction *> displayActions;
+        for (QAction *action : mw_->findChildren<QAction *>()) {
+            if (action->objectName().startsWith(QStringLiteral("encoding.display.")))
+                displayActions.insert(action);
+        }
+        QVERIFY(!displayActions.isEmpty());
+        QSet<QAction *> segmentActions;
+        QMenu *convert = nullptr;
+        for (QAction *action : encoding->menu()->actions()) {
+            if (action->menu())
+                convert = action->menu();
+            else if (!action->isSeparator())
+                segmentActions.insert(action);
+        }
+        QCOMPARE(segmentActions, displayActions);
+        QVERIFY(convert);
+        QCOMPARE(convert->title(), QStringLiteral("转换编码另存"));
+        for (QAction *action : convert->actions())
+            QVERIFY(action->objectName().startsWith(QStringLiteral("encoding.convert.")));
+
+        for (const auto &[segment, prefix] : {
+                 std::pair{QStringLiteral("status.eol"), QStringLiteral("encoding.eol.")},
+                 std::pair{QStringLiteral("status.context"), QStringLiteral("language.")},
+                 std::pair{QStringLiteral("status.zoom"), QStringLiteral("view.zoom.")}}) {
+            auto *button = mw_->findChild<QToolButton *>(segment);
+            QVERIFY2(button && button->menu(), qPrintable(segment));
+            for (QAction *action : button->menu()->actions()) {
+                QVERIFY2(action->isSeparator()
+                             || action->objectName().startsWith(prefix),
+                         qPrintable(action->objectName()));
+            }
+        }
+
+        const QString textPath = tmpDir_.filePath(QStringLiteral("segments.txt"));
+        const QString binaryPath = tmpDir_.filePath(QStringLiteral("segments.bin"));
+        {
+            QFile text(textPath);
+            QVERIFY(text.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            text.write("segments\r\n");
+            QFile binary(binaryPath);
+            QVERIFY(binary.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            binary.write(QByteArray(32, '\0'));
+        }
+        auto *hexMode = mw_->findChild<QToolButton *>(QStringLiteral("status.hexEditMode"));
+        auto *eol = mw_->findChild<QToolButton *>(QStringLiteral("status.eol"));
+        QVERIFY(hexMode && eol);
+        mw_->openFilesFromExternal({textPath});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
+        QTRY_VERIFY(!hexMode->isVisible());
+        QTRY_COMPARE(eol->text(), QStringLiteral("CRLF"));
+
+        mw_->openFilesFromExternal({binaryPath});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 2, 3000);
+        EditorTab *binary = currentEditorTab(mw_);
+        QVERIFY(binary && binary->isBinaryDocument());
+        QTRY_VERIFY(hexMode->isVisible());
+        const bool overwrite = binary->hexOverwriteMode();
+        QTest::mouseClick(hexMode, Qt::LeftButton);
+        QCOMPARE(binary->hexOverwriteMode(), !overwrite);
         closeAllEditorTabs(mw_);
     }
 
@@ -4816,7 +4885,7 @@ private slots:
         QCOMPARE(invalidTab->encoding(), TextEncoding::Utf8);
         QCOMPARE(invalidTab->encodingOrigin(), EncodingOrigin::Fallback);
         QVERIFY(invalidTab->encodingHasDecodeErrors());
-        auto *status = mw_->findChild<QLabel *>(QStringLiteral("status.encoding"));
+        auto *status = mw_->findChild<QToolButton *>(QStringLiteral("status.encoding"));
         QVERIFY(status && status->text().contains(QStringLiteral("包含非法字节")));
         closeAllEditorTabs(mw_);
     }

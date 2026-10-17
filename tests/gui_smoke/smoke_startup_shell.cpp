@@ -289,7 +289,7 @@ private slots:
         for (const QString &name : {QStringLiteral("status.position"), QStringLiteral("status.encoding"),
                                    QStringLiteral("status.context"), QStringLiteral("status.size"),
                                    QStringLiteral("status.characters")}) {
-            auto *label = fixture.window->findChild<QLabel *>(name);
+            auto *label = fixture.window->findChild<QWidget *>(name);
             QVERIFY2(label, qPrintable(QStringLiteral("Missing document status label: ") + name));
             if (label->isVisible()) visibleDocumentLabels.append(name);
         }

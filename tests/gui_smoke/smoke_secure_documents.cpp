@@ -11,6 +11,7 @@
 #include "VaultDock.h"
 #include "VirtualFileView.h"
 
+#include <QAbstractButton>
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
@@ -747,9 +748,9 @@ private slots:
         QVERIFY(vault && tree && vault->isSecureStoreOpen());
         auto *statusPosition = window->findChild<QLabel *>(
             QStringLiteral("status.position"));
-        auto *statusEncoding = window->findChild<QLabel *>(
+        auto *statusEncoding = window->findChild<QAbstractButton *>(
             QStringLiteral("status.encoding"));
-        auto *statusContext = window->findChild<QLabel *>(
+        auto *statusContext = window->findChild<QAbstractButton *>(
             QStringLiteral("status.context"));
         auto *statusSize = window->findChild<QLabel *>(QStringLiteral("status.size"));
         QVERIFY(statusPosition && statusEncoding && statusContext && statusSize);

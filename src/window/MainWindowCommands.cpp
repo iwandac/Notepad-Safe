@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "DocumentTabBar.h"
+#include "StatusSegments.h"
 #include "ThemeStyle.h"
 #include "TitleBar.h"
 #include "RecoveryIssuePage.h"
@@ -150,17 +151,28 @@ void MainWindow::createStatusBar()
     m_statusPos->setMinimumWidth(120);
     statusBar()->addPermanentWidget(m_statusPos);
 
-    m_statusEncoding = new QLabel(QStringLiteral("UTF-8"));
-    m_statusEncoding->setObjectName(QStringLiteral("status.encoding"));
-    m_statusEncoding->setAccessibleName(QStringLiteral("编码与换行符"));
-    m_statusEncoding->setMinimumWidth(80);
+    // Clickable segments open menus built from the existing command actions.
+    m_statusSecurity = new StatusSegment(QStringLiteral("status.security"),
+                                         QStringLiteral("文档安全状态"));
+    m_statusSecurity->setPopupMode(QToolButton::DelayedPopup);
+    m_statusSecurity->hide();
+    connect(m_statusSecurity, &QToolButton::clicked,
+            m_titleBar, &TitleBar::securityPillClicked);
+    statusBar()->addPermanentWidget(m_statusSecurity);
+    m_statusEncoding = new StatusSegment(QStringLiteral("status.encoding"),
+                                         QStringLiteral("编码"));
+    m_statusEncoding->setText(QStringLiteral("UTF-8"));
     statusBar()->addPermanentWidget(m_statusEncoding);
-
-    m_statusSyntax = new QLabel(QStringLiteral("纯文本"));
-    m_statusSyntax->setObjectName(QStringLiteral("status.context"));
-    m_statusSyntax->setAccessibleName(QStringLiteral("文档类型或当前工作区"));
-    m_statusSyntax->setMinimumWidth(80);
+    m_statusEol = new StatusSegment(QStringLiteral("status.eol"), QStringLiteral("换行符"));
+    statusBar()->addPermanentWidget(m_statusEol);
+    m_statusSyntax = new StatusSegment(QStringLiteral("status.context"),
+                                       QStringLiteral("文档类型或当前工作区"));
+    m_statusSyntax->setText(QStringLiteral("纯文本"));
     statusBar()->addPermanentWidget(m_statusSyntax);
+    m_statusZoom = new StatusSegment(QStringLiteral("status.zoom"), QStringLiteral("缩放"));
+    statusBar()->addPermanentWidget(m_statusZoom);
+    installStatusMenus(this, m_statusEncoding, m_statusEol, m_statusSyntax, m_statusZoom,
+                       [this] { updateStatusBar(); });
 
     m_statusSize = new QLabel(QStringLiteral("0 B"));
     m_statusSize->setObjectName(QStringLiteral("status.size"));
@@ -179,10 +191,9 @@ void MainWindow::createStatusBar()
     connect(&m_characterStatusTimer, &QTimer::timeout,
             this, &MainWindow::updateStatusBar);
 
-    m_hexEditModeButton = new QToolButton;
-    m_hexEditModeButton->setObjectName(QStringLiteral("status.hexEditMode"));
-    m_hexEditModeButton->setAccessibleName(QStringLiteral("十六进制编辑模式"));
-    m_hexEditModeButton->setAutoRaise(true);
+    m_hexEditModeButton = new StatusSegment(QStringLiteral("status.hexEditMode"),
+                                            QStringLiteral("十六进制编辑模式"));
+    m_hexEditModeButton->setPopupMode(QToolButton::DelayedPopup);
     m_hexEditModeButton->setMinimumWidth(44);
     m_hexEditModeButton->hide();
     statusBar()->addPermanentWidget(m_hexEditModeButton);
@@ -1132,10 +1143,9 @@ void MainWindow::onTabEncodingChanged(TextEncoding encoding)
         ? QStringLiteral(" · 包含非法字节")
         : tab && tab->encodingOrigin() == EncodingOrigin::Fallback
             ? QStringLiteral(" · 默认假设") : QString();
-    m_statusEncoding->setText(tab
-        ? QStringLiteral("%1%2 · %3")
-              .arg(encodingName(encoding), origin, tab->lineEndingName())
-        : encodingName(encoding));
+    m_statusEncoding->setText(encodingName(encoding) + origin);
+    if (tab)
+        m_statusEol->setText(tab->lineEndingName());
     syncEncodingMenuTo(m_encodingMenu, encoding);
 }
 
@@ -1195,6 +1205,9 @@ void MainWindow::updateStatusBar()
         if (m_statusPos) m_statusPos->hide();
         if (m_statusEncoding) m_statusEncoding->hide();
         if (m_statusSyntax) m_statusSyntax->hide();
+        m_statusEol->hide();
+        m_statusZoom->hide();
+        m_statusSecurity->hide();
         if (m_statusSize) m_statusSize->hide();
         if (m_statusCharacters) m_statusCharacters->hide();
         if (m_hexEditModeButton) m_hexEditModeButton->hide();
@@ -1204,6 +1217,7 @@ void MainWindow::updateStatusBar()
     if (m_statusPos) m_statusPos->show();
     if (m_statusEncoding) m_statusEncoding->show();
     if (m_statusSyntax) m_statusSyntax->show();
+    m_statusZoom->show();
     if (m_statusSize) m_statusSize->show();
     if (m_statusCharacters) m_statusCharacters->show();
     if (m_statusModified) m_statusModified->show();
@@ -1239,9 +1253,15 @@ void MainWindow::updateStatusBar()
     m_statusEncoding->setText(hexMode
                                      ? QStringLiteral("原始字节 · 字符区 %1")
                                            .arg(encodingName(tab->displayEncoding()))
-                                     : QStringLiteral("%1%2 · %3")
-                                           .arg(encodingName(tab->encoding()), origin,
-                                                tab->lineEndingName()));
+                                     : encodingName(tab->encoding()) + origin);
+    m_statusEol->setText(tab->lineEndingName());
+    m_statusEol->setVisible(!hexMode);
+    m_statusSecurity->setVisible(tab->isSecureDocument());
+    m_statusSecurity->setText(tab->isSecureDocumentMasked() ? QStringLiteral("已加密 · 已锁定")
+                                                            : QStringLiteral("已加密"));
+    const int zoomPoints = int(tab->editor()->SendScintilla(QsciScintillaBase::SCI_GETZOOM));
+    m_statusZoom->setText(QString::number(qRound(100.0 * (10 + zoomPoints) / 10.0))
+                          + QLatin1Char('%'));
 
     const QStringList syntaxNames = {
         QStringLiteral("纯文本"), QStringLiteral("C/C++"),
@@ -1282,6 +1302,9 @@ void MainWindow::showWorkspaceStatus(const QString &workspaceName)
     if (m_statusCharacters) m_statusCharacters->hide();
     if (m_hexEditModeButton) m_hexEditModeButton->hide();
     if (m_statusModified) m_statusModified->hide();
+    m_statusEol->hide();
+    m_statusZoom->hide();
+    m_statusSecurity->hide();
     if (m_statusSyntax) {
         m_statusSyntax->setText(workspaceName);
         m_statusSyntax->show();
