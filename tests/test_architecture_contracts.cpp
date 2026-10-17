@@ -444,7 +444,8 @@ int main(int argc, char **argv)
           "known command namespaces reject typo and unregistered suffixes");
     for (const char *removed : {"view.split", "view.split.horizontal", "view.split.vertical",
                                 "view.presentation", "view.presentation.text",
-                                "view.presentation.hex", "view.presentation.toggle"}) {
+                                "view.presentation.hex", "view.presentation.toggle",
+                                "edit.line.transpose", "edit.lines.split", "view.toolbar"}) {
         check(FeatureRegistry::featureIdForCommand(QString::fromLatin1(removed)).isEmpty(),
               qPrintable(QStringLiteral("removed command is no longer registered: %1")
                              .arg(QString::fromLatin1(removed))));

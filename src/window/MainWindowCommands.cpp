@@ -37,7 +37,6 @@
 #include <QStatusBar>
 #include <QLabel>
 #include <QToolButton>
-#include <QToolBar>
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QDialog>
@@ -140,47 +139,6 @@ static void syncEncodingMenuTo(QMenu *menu, TextEncoding enc)
 
 
 // Main-window command, menu-state and interaction implementation.
-void MainWindow::createToolBar()
-{
-    auto *toolbar = addToolBar(QStringLiteral("主工具栏"));
-    toolbar->setObjectName(QStringLiteral("MainToolBar"));
-    toolbar->setMovable(false);
-    toolbar->setIconSize(QSize(16, 16));
-
-    toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-    auto *newAction = findChild<QAction *>(QStringLiteral("file.new"));
-    auto *openAction = findChild<QAction *>(QStringLiteral("file.open"));
-    if (newAction) {
-        newAction->setIcon(style()->standardIcon(QStyle::SP_FileIcon));
-        newAction->setIconText(QStringLiteral("新建"));
-        newAction->setToolTip(QStringLiteral("新建（默认安全保存）"));
-        toolbar->addAction(newAction);
-    }
-    if (openAction) {
-        openAction->setIcon(style()->standardIcon(QStyle::SP_DialogOpenButton));
-        openAction->setIconText(QStringLiteral("打开"));
-        openAction->setToolTip(QStringLiteral("打开文件"));
-        toolbar->addAction(openAction);
-    }
-    if (m_saveAction) {
-        m_saveAction->setIcon(style()->standardIcon(QStyle::SP_DialogSaveButton));
-        m_saveAction->setIconText(QStringLiteral("保存"));
-        m_saveAction->setToolTip(QStringLiteral("保存"));
-        toolbar->addAction(m_saveAction);
-    }
-    toolbar->addSeparator();
-    if (m_findAction) {
-        m_findAction->setIcon(style()->standardIcon(QStyle::SP_FileDialogContentsView));
-        m_findAction->setIconText(QStringLiteral("查找"));
-        m_findAction->setToolTip(QStringLiteral("查找 / 查找全部"));
-        toolbar->addAction(m_findAction);
-    }
-    if (m_accountsAction) {
-        m_accountsAction->setIcon(style()->standardIcon(QStyle::SP_DirHomeIcon));
-        toolbar->addAction(m_accountsAction);
-    }
-}
-
 void MainWindow::createStatusBar()
 {
     m_statusPos = new QLabel(QStringLiteral("行: 1, 列: 1"));
@@ -756,11 +714,6 @@ void MainWindow::applyDarkMode(bool dark)
         "QMenu::item:selected { background-color:#0078d7; color:#ffffff; }"
         "QMenu::item:disabled { color:#7d7d7d; }"
         "QMenu::separator { height:1px; background:#505055; margin:4px 8px; }"
-        "QToolBar#MainToolBar QToolButton { color:#d0d0d0; background-color:#2d2d30; border:1px solid transparent; }"
-        "QToolBar#MainToolBar QToolButton:enabled:hover { color:#ffffff; background-color:#3c3c40; }"
-        "QToolBar#MainToolBar QToolButton:enabled:pressed { color:#ffffff; background-color:#0078d7; }"
-        "QToolBar#MainToolBar QToolButton:enabled:focus { border-color:#7ab8ef; }"
-        "QToolBar#MainToolBar QToolButton:disabled { color:#9a9a9a; background-color:#2d2d30; }"
         "FindReplaceDialog QLineEdit { color:#d0d0d0; background-color:#1e1e1e; border:1px solid #66666a;"
         " selection-color:#ffffff; selection-background-color:#0078d7; }"
         "FindReplaceDialog QLineEdit:enabled:focus { border-color:#7ab8ef; }"

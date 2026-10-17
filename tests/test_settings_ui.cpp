@@ -16,6 +16,8 @@
 //       EditorTab::setWordWrap 为单行转发 QsciScintilla::setWrapMode 的封装，
 //       功能正确性在人工验证和运行时保证，此处不做单元化 GUI 创建。
 // ============================================================
+#include "EditorPreferences.h"
+
 #include <QCoreApplication>
 #include <QSettings>
 #include <QVector>
@@ -130,7 +132,7 @@ static void test_syncAlgo_applyTrue_allChecked()
 {
     TEST("同步算法: 默认值→全 true 后菜单勾选");
     FakeAction actDark, actWrap, actEdge; FakeGroup grp;
-    QVector<int> cols = {72,80,100,120,150,200};
+    QVector<int> cols = {80,100,120};
     makeDefaultMenu(actDark, actWrap, actEdge, grp, cols, 80);
 
     simulateSyncAlgo(true, true, true, 80, &actDark, &actWrap, &actEdge, &grp);
@@ -144,7 +146,7 @@ static void test_syncAlgo_applyFalse_allUnchecked()
 {
     TEST("同步算法: 全勾选脏状态→全 false 后取消");
     FakeAction actDark, actWrap, actEdge; FakeGroup grp;
-    QVector<int> cols = {72,80,100,120,150,200};
+    QVector<int> cols = {80,100,120};
     makeDefaultMenu(actDark, actWrap, actEdge, grp, cols, 120);
     actDark.checked = true; actWrap.checked = true; actEdge.checked = true;
 
@@ -157,17 +159,17 @@ static void test_syncAlgo_applyFalse_allUnchecked()
 
 static void test_syncAlgo_edgeColumn_switch()
 {
-    TEST("同步算法: 标尺列号 80→150 切换正确");
+    TEST("同步算法: 标尺列号 80→100 切换正确");
     FakeAction actDark, actWrap, actEdge; FakeGroup grp;
-    QVector<int> cols = {72,80,100,120,150,200};
+    QVector<int> cols = {80,100,120};
     makeDefaultMenu(actDark, actWrap, actEdge, grp, cols, 80);
 
-    simulateSyncAlgo(false, false, true, 150, nullptr, nullptr, nullptr, &grp);
+    simulateSyncAlgo(false, false, true, 100, nullptr, nullptr, nullptr, &grp);
 
-    FakeAction *a150 = findColAction(grp, 150);
-    CHECK(a150 && a150->checked, "150 列应被勾选");
+    FakeAction *a100 = findColAction(grp, 100);
+    CHECK(a100 && a100->checked, "100 列应被勾选");
     for (int c : cols) {
-        if (c == 150) continue;
+        if (c == 100) continue;
         FakeAction *a = findColAction(grp, c);
         CHECK(a && !a->checked, qPrintable(QString("非目标列 %1 不应被勾选").arg(c)));
     }
@@ -190,7 +192,7 @@ static void test_syncAlgo_scenario_all4together()
 
     // Step 2: 创建 action 并按默认值初始化（模拟 MainWindow.createMenus()）
     FakeAction actDark, actWrap, actEdge; FakeGroup grp;
-    QVector<int> cols = {72,80,100,120,150,200};
+    QVector<int> cols = {80,100,120};
     makeDefaultMenu(actDark, actWrap, actEdge, grp, cols, 80);
 
     // 先断言：同步前状态就是 bug 时的"未同步"状态
@@ -228,6 +230,22 @@ static void test_syncAlgo_scenario_all4together()
     }
 }
 
+// 标尺只保留 80/100/120 三档；旧设置值落到最近的一档。
+void test_rulerColumnSnapsToSupportedSet()
+{
+    TEST("rulerColumnSnapsToSupportedSet");
+    const struct { int saved; int expected; } cases[] = {
+        {72, 80}, {80, 80}, {99, 100}, {100, 100}, {150, 120}, {200, 120}, {0, 80},
+    };
+    for (const auto &c : cases) {
+        CHECK(normalizeRulerColumn(c.saved) == c.expected,
+              qPrintable(QString("edgeColumn %1 应规整为 %2").arg(c.saved).arg(c.expected)));
+    }
+    CHECK(std::size(RulerColumns) == 3 && RulerColumns[0] == 80
+              && RulerColumns[1] == 100 && RulerColumns[2] == 120,
+          "RulerColumns 为 80/100/120");
+}
+
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
@@ -250,6 +268,7 @@ int main(int argc, char *argv[])
     test_syncAlgo_applyFalse_allUnchecked();
     test_syncAlgo_edgeColumn_switch();
     test_syncAlgo_scenario_all4together();
+    test_rulerColumnSnapsToSupportedSet();
 
     fprintf(stderr, "\n=== Result: %d/%d passed ===\n\n", test_passed, test_count);
 

@@ -74,12 +74,11 @@ QStringList FeatureRegistry::requiredStartupCommandIds()
         QStringLiteral("edit.selectAll"), QStringLiteral("edit.hexInsertMode"),
         QStringLiteral("edit.line.duplicate"), QStringLiteral("edit.line.delete"),
         QStringLiteral("edit.line.moveUp"), QStringLiteral("edit.line.moveDown"),
-        QStringLiteral("edit.line.transpose"),
         QStringLiteral("edit.multiSelect.next"),
         QStringLiteral("edit.multiSelect.all"),
         QStringLiteral("edit.selection.upper"),
         QStringLiteral("edit.selection.lower"),
-        QStringLiteral("edit.lines.join"), QStringLiteral("edit.lines.split"),
+        QStringLiteral("edit.lines.join"),
         QStringLiteral("edit.lines.sortAscending"),
         QStringLiteral("edit.lines.sortDescending"),
         QStringLiteral("edit.indentation"),
@@ -110,7 +109,7 @@ QStringList FeatureRegistry::requiredStartupCommandIds()
         QStringLiteral("view.zoom.in"), QStringLiteral("view.zoom.out"),
         QStringLiteral("view.zoom.reset"), QStringLiteral("view.panels"),
         QStringLiteral("view.panel.searchResults"),
-        QStringLiteral("view.toolbar"), QStringLiteral("view.statusBar"),
+        QStringLiteral("view.statusBar"),
         QStringLiteral("menu.encoding"), QStringLiteral("encoding.eol"),
         QStringLiteral("encoding.convert"), QStringLiteral("menu.tools"),
         QStringLiteral("tools.accounts"),
@@ -120,7 +119,7 @@ QStringList FeatureRegistry::requiredStartupCommandIds()
     };
     for (const int width : {2, 4, 8})
         result.append(QStringLiteral("edit.indentation.tabWidth.%1").arg(width));
-    for (const int column : {72, 80, 100, 120, 150, 200})
+    for (const int column : {80, 100, 120})
         result.append(QStringLiteral("view.edge.column.%1").arg(column));
     for (const char *syntax : {
              "plain", "cpp", "python", "json", "html", "xml", "sql",
@@ -156,9 +155,9 @@ QString FeatureRegistry::featureIdForCommand(const QString &commandId)
             "edit.undo", "edit.redo", "edit.cut", "edit.copy", "edit.paste",
             "edit.selectAll", "edit.hexInsertMode", "edit.line.duplicate",
             "edit.line.delete", "edit.line.moveUp", "edit.line.moveDown",
-            "edit.line.transpose", "edit.multiSelect.next", "edit.multiSelect.all",
+            "edit.multiSelect.next", "edit.multiSelect.all",
             "edit.selection.upper", "edit.selection.lower", "edit.lines.join",
-            "edit.lines.split", "edit.lines.sortAscending",
+            "edit.lines.sortAscending",
             "edit.lines.sortDescending", "edit.indentation",
             "edit.indentation.useTabs", "edit.indentation.tabWidth",
             "edit.indentation.backspaceUnindents", "edit.completion.words"})
@@ -184,10 +183,9 @@ QString FeatureRegistry::featureIdForCommand(const QString &commandId)
             "view.folding.toggleCurrent", "view.folding.collapseAll",
             "view.folding.expandAll", "view.edge", "view.edge.visible",
             "view.zoom", "view.zoom.in", "view.zoom.out", "view.zoom.reset",
-            "view.panels", "view.panel.searchResults", "view.toolbar",
-            "view.statusBar"})
+            "view.panels", "view.panel.searchResults", "view.statusBar"})
         || hasWhitelistedSuffix(commandId, "view.edge.column.",
-                                {"72", "80", "100", "120", "150", "200"}))
+                                {"80", "100", "120"}))
         return QStringLiteral("NSP-VIEW");
     if (containsCommand(commandId, {"encoding.eol", "encoding.convert"})
         || hasWhitelistedSuffix(commandId, "encoding.eol.", {"crlf", "lf", "cr"})

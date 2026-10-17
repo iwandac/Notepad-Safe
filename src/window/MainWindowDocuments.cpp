@@ -34,7 +34,6 @@
 #include <QStatusBar>
 #include <QLabel>
 #include <QToolButton>
-#include <QToolBar>
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QDialog>

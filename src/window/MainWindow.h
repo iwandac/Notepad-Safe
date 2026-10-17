@@ -187,7 +187,6 @@ private:
     QAction *m_actWordCompletion = nullptr;
     QAction *m_actEdgeVisible = nullptr;
     QAction *m_searchPanelAction = nullptr;
-    QAction *m_toolbarVisibilityAction = nullptr;
     QAction *m_statusVisibilityAction = nullptr;
     QAction *m_actReload = nullptr;
     QAction *m_actCloseTab = nullptr;
@@ -241,7 +240,6 @@ private:
 
     void createActions();
     void createMenus();
-    void createToolBar();
     void createStatusBar();
 
     enum class OpenPresentationPolicy {

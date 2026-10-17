@@ -121,13 +121,6 @@ void EditorTab::moveLineDown()
     activeTextEditor()->SendScintilla(QsciScintillaBase::SCI_MOVESELECTEDLINESDOWN);
 }
 
-void EditorTab::transposeLine()
-{
-    if (!supportsTextMutationCommands())
-        return;
-    activeTextEditor()->SendScintilla(QsciScintillaBase::SCI_LINETRANSPOSE);
-}
-
 void EditorTab::selectionToUpper()
 {
     QsciScintilla *editor = activeTextEditor();
@@ -157,23 +150,6 @@ void EditorTab::joinSelectedLines()
     editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETSTART, start);
     editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETEND, end);
     editor->SendScintilla(QsciScintillaBase::SCI_LINESJOIN);
-    editor->endUndoAction();
-}
-
-void EditorTab::splitSelectedLines()
-{
-    if (!supportsTextMutationCommands())
-        return;
-    QsciScintilla *editor = activeTextEditor();
-    const auto start = editor->SendScintilla(QsciScintillaBase::SCI_GETSELECTIONSTART);
-    const auto end = editor->SendScintilla(QsciScintillaBase::SCI_GETSELECTIONEND);
-    if (end <= start)
-        return;
-    const int pixelWidth = qMax(80, editor->viewport()->width() - 24);
-    editor->beginUndoAction();
-    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETSTART, start);
-    editor->SendScintilla(QsciScintillaBase::SCI_SETTARGETEND, end);
-    editor->SendScintilla(QsciScintillaBase::SCI_LINESSPLIT, pixelWidth);
     editor->endUndoAction();
 }
 

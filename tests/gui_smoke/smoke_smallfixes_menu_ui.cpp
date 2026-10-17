@@ -3354,6 +3354,21 @@ private slots:
         closeAllEditorTabs(mw_);
     }
 
+    void removedCommandsAreAbsent() {
+        for (const char *id : {"edit.line.transpose", "edit.lines.split", "view.toolbar"}) {
+            QVERIFY2(mw_->findChild<QAction *>(QString::fromLatin1(id)) == nullptr, id);
+        }
+        QVERIFY(mw_->findChild<QToolBar *>(QStringLiteral("MainToolBar")) == nullptr);
+        QMenu *edge = mw_->findChild<QMenu *>(QStringLiteral("view.edge"));
+        QVERIFY(edge);
+        QList<int> columns;
+        for (QAction *action : edge->actions()) {
+            if (action->objectName().startsWith(QStringLiteral("view.edge.column.")))
+                columns.push_back(action->data().toInt());
+        }
+        QCOMPARE(columns, (QList<int>{80, 100, 120}));
+    }
+
     void tc_view_appearance_and_panels_are_unified() {
         const QString dataDir = tmpDir_.filePath(QStringLiteral("appearance-settings"));
         QDir().mkpath(dataDir);
@@ -3381,17 +3396,13 @@ private slots:
         QVERIFY(dark->isChecked());
         QVERIFY(!light->isChecked() && !system->isChecked());
         QVERIFY(QApplication::palette().color(QPalette::Window).lightness() < 128);
-        QAction *toolbarVisibility = window->findChild<QAction *>(
-            QStringLiteral("view.toolbar"));
+        // A legacy toolbarVisible value is ignored: there is no toolbar.
         QAction *statusVisibility = window->findChild<QAction *>(
             QStringLiteral("view.statusBar"));
-        QToolBar *toolbar = window->findChild<QToolBar *>(QStringLiteral("MainToolBar"));
-        QVERIFY(toolbarVisibility && statusVisibility && toolbar);
-        QVERIFY(!toolbarVisibility->isChecked() && !toolbar->isVisible());
+        QVERIFY(statusVisibility);
+        QVERIFY(window->findChild<QToolBar *>(QStringLiteral("MainToolBar")) == nullptr);
         QVERIFY(!statusVisibility->isChecked() && !window->statusBar()->isVisible());
-        toolbarVisibility->trigger();
         statusVisibility->trigger();
-        QTRY_VERIFY_WITH_TIMEOUT(toolbar->isVisible(), 1000);
         QTRY_VERIFY_WITH_TIMEOUT(window->statusBar()->isVisible(), 1000);
 
         const QString textPath = tmpDir_.filePath(QStringLiteral("appearance-document.txt"));

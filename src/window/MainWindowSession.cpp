@@ -2,6 +2,7 @@
 #include "AppComposition.h"
 #include "AsyncSerialQueue.h"
 #include "EditorTab.h"
+#include "EditorPreferences.h"
 #include "FileTierPolicy.h"
 #include "SessionManager.h"
 #include "VaultDock.h"
@@ -21,7 +22,6 @@
 #include <QStatusBar>
 #include <QTabWidget>
 #include <QTimer>
-#include <QToolBar>
 
 #include <memory>
 #include <stdexcept>
@@ -189,8 +189,7 @@ void MainWindow::loadSettings()
     rebuildRecentFilesMenu();
 
     m_edgeVisible = settings->value("edgeVisible", true).toBool();
-    m_edgeColumn = settings->value("edgeColumn", 80).toInt();
-    if (m_edgeColumn < 1) m_edgeColumn = 80;
+    m_edgeColumn = normalizeRulerColumn(settings->value("edgeColumn", 80).toInt());
     m_wordWrap = settings->value("wordWrap", false).toBool();
     m_whitespaceVisible = settings->value("editor/showWhitespace", false).toBool();
     m_eolVisible = settings->value("editor/showEol", false).toBool();
@@ -212,12 +211,7 @@ void MainWindow::loadSettings()
     if (!state.isEmpty())
         restoreState(state);
 
-    const bool toolbarVisible = settings->value("toolbarVisible", true).toBool();
     const bool statusVisible = settings->value("statusBarVisible", true).toBool();
-    if (m_toolbarVisibilityAction)
-        m_toolbarVisibilityAction->setChecked(toolbarVisible);
-    if (auto *toolbar = findChild<QToolBar *>(QStringLiteral("MainToolBar")))
-        toolbar->setVisible(toolbarVisible);
     if (m_statusVisibilityAction)
         m_statusVisibilityAction->setChecked(statusVisible);
     statusBar()->setVisible(statusVisible);
@@ -248,8 +242,7 @@ void MainWindow::saveSettings()
     settings->setValue("windowSize", size());
     settings->setValue("windowGeometry", saveGeometry());
     settings->setValue("windowState", saveState());
-    if (auto *toolbar = findChild<QToolBar *>(QStringLiteral("MainToolBar")))
-        settings->setValue("toolbarVisible", toolbar->isVisible());
+    settings->remove("toolbarVisible");
     settings->setValue("statusBarVisible", statusBar()->isVisible());
     settings->remove("vaultDockVisible");
 }

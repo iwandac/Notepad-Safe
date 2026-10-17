@@ -127,7 +127,6 @@ void CommandRegistry::applyContext(const CommandContext &context) const
             || id == QLatin1String("edit.selection.upper")
             || id == QLatin1String("edit.selection.lower")
             || id == QLatin1String("edit.lines.join")
-            || id == QLatin1String("edit.lines.split")
             || id == QLatin1String("encoding.eol")
             || id.startsWith(QLatin1String("encoding.eol."))) {
             override = true;

@@ -226,11 +226,9 @@ public:
     void moveLineDown();
     void sortLinesAsc();
     void sortLinesDesc();
-    void transposeLine();
     void selectionToUpper();
     void selectionToLower();
     void joinSelectedLines();
-    void splitSelectedLines();
 
     // Native Scintilla selection/navigation commands. They are deliberately
     // exposed through EditorTab so callers cannot accidentally apply them to

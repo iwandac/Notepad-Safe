@@ -21,6 +21,7 @@
 #include "SensitiveText.h"
 #include "CommandRegistry.h"
 #include "DocumentOpenWorkflow.h"
+#include "EditorPreferences.h"
 
 #include <QTabWidget>
 #include <QTabBar>
@@ -33,7 +34,6 @@
 #include <QStatusBar>
 #include <QLabel>
 #include <QToolButton>
-#include <QToolBar>
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QDialog>
@@ -152,7 +152,6 @@ MainWindow::MainWindow(QWidget *parent, AppComposition *composition)
     m_session = new SessionManager(this);
     createActions();
     createMenus();         // 菜单项用默认值创建，action 指针存在 m_act* / m_edgeColGroup
-    createToolBar();
     createStatusBar();
     m_commandRegistry = std::make_unique<CommandRegistry>();
     m_commandRegistry->bind(this);
@@ -1110,11 +1109,6 @@ void MainWindow::createMenus()
         return action;
     };
 
-    addNativeTextAction(QStringLiteral("转置当前行"),
-                        QStringLiteral("edit.line.transpose"), {}, [this]() {
-        if (auto *tab = currentTab()) tab->transposeLine();
-    });
-
     editMenu->addSeparator();
     addNativeTextAction(QStringLiteral("选择下一个相同内容"),
                         QStringLiteral("edit.multiSelect.next"),
@@ -1137,10 +1131,6 @@ void MainWindow::createMenus()
     addNativeTextAction(QStringLiteral("合并选中行"),
                         QStringLiteral("edit.lines.join"), {}, [this]() {
         if (auto *tab = currentTab()) tab->joinSelectedLines();
-    });
-    addNativeTextAction(QStringLiteral("按窗口宽度拆分选中行"),
-                        QStringLiteral("edit.lines.split"), {}, [this]() {
-        if (auto *tab = currentTab()) tab->splitSelectedLines();
     });
 
     editMenu->addSeparator();
@@ -1417,8 +1407,7 @@ void MainWindow::createMenus()
 
     edgeMenu->addSeparator();
     m_edgeColGroup = new QActionGroup(this);
-    QList<int> edgeCols = {72, 80, 100, 120, 150, 200};
-    for (int col : edgeCols) {
+    for (int col : RulerColumns) {
         auto *a = edgeMenu->addAction(QStringLiteral("%1 列").arg(col));
         a->setObjectName(QStringLiteral("view.edge.column.%1").arg(col));
         a->setCheckable(true);
@@ -1466,14 +1455,6 @@ void MainWindow::createMenus()
             m_taskWidget->showPanel();
     });
     viewMenu->addSeparator();
-    m_toolbarVisibilityAction = viewMenu->addAction(QStringLiteral("主工具栏"));
-    m_toolbarVisibilityAction->setObjectName(QStringLiteral("view.toolbar"));
-    m_toolbarVisibilityAction->setCheckable(true);
-    m_toolbarVisibilityAction->setChecked(true);
-    connect(m_toolbarVisibilityAction, &QAction::toggled, this, [this](bool visible) {
-        if (auto *toolbar = findChild<QToolBar *>(QStringLiteral("MainToolBar")))
-            toolbar->setVisible(visible);
-    });
     m_statusVisibilityAction = viewMenu->addAction(QStringLiteral("状态栏"));
     m_statusVisibilityAction->setObjectName(QStringLiteral("view.statusBar"));
     m_statusVisibilityAction->setCheckable(true);
