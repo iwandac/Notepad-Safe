@@ -53,8 +53,8 @@ AppComposition::AppComposition()
          DocumentContentKind::Text, true, DocumentPresentationKind::Text, 100},
         {QStringLiteral("binary.windowed"), QStringLiteral("Large hex"),
          DocumentContentKind::Binary, true, DocumentPresentationKind::Hex, 100},
-        {QStringLiteral("binary.text-windowed"), QStringLiteral("Binary text"),
-         DocumentContentKind::Binary, true, DocumentPresentationKind::Text, 100},
+        {QStringLiteral("text.hex-windowed"), QStringLiteral("Large text as hex"),
+         DocumentContentKind::Text, true, DocumentPresentationKind::Hex, 100},
     };
     for (const auto &descriptor : descriptors) {
         documentProviders_.registerProvider(descriptor, [this, descriptor]() {

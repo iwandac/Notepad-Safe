@@ -1,10 +1,12 @@
 // Session restore routing: which provider request each stored presentation
 // produces. Core-only: providers record the request instead of opening widgets.
+#include "AppComposition.h"
 #include "DocumentOpenWorkflow.h"
 #include "DocumentProviderRegistry.h"
 #include "DocumentSurface.h"
 #include "SessionDocumentPort.h"
 
+#include <algorithm>
 #include <QCoreApplication>
 #include <QFile>
 #include <QTemporaryDir>
@@ -86,6 +88,7 @@ private slots:
     void smallBinaryTextSessionRestoresAsHex();
     void windowedTextHexSessionKeepsTextContent();
     void smallTextHexSessionOpensAsText();
+    void productionProvidersCoverEveryRoutedShape();
 };
 
 void TestDocumentOpenRouting::binaryTextSessionRestoresAsHex()
@@ -152,6 +155,28 @@ void TestDocumentOpenRouting::smallTextHexSessionOpensAsText()
     QCOMPARE(g_lastRequest->contentKind, DocumentContentKind::Text);
     QCOMPARE(g_lastRequest->presentation, DocumentPresentationKind::Text);
     QVERIFY(!g_lastRequest->windowed);
+}
+
+// The open workflow routes to exactly these shapes; each needs a real provider.
+void TestDocumentOpenRouting::productionProvidersCoverEveryRoutedShape()
+{
+    AppComposition composition;
+    const QList<DocumentProviderDescriptor> descriptors =
+        composition.documentProviders().descriptors();
+    const auto has = [&descriptors](DocumentContentKind kind, bool windowed,
+                                    DocumentPresentationKind presentation) {
+        return std::any_of(descriptors.cbegin(), descriptors.cend(),
+                           [&](const DocumentProviderDescriptor &d) {
+            return d.contentKind == kind && d.windowed == windowed
+                && d.presentation == presentation;
+        });
+    };
+    QVERIFY(has(DocumentContentKind::Text, false, DocumentPresentationKind::Text));
+    QVERIFY(has(DocumentContentKind::Text, true, DocumentPresentationKind::Text));
+    QVERIFY(has(DocumentContentKind::Text, true, DocumentPresentationKind::Hex));
+    QVERIFY(has(DocumentContentKind::Binary, true, DocumentPresentationKind::Hex));
+    // Binary is never shown as text.
+    QVERIFY(!has(DocumentContentKind::Binary, true, DocumentPresentationKind::Text));
 }
 
 QTEST_GUILESS_MAIN(TestDocumentOpenRouting)

@@ -173,6 +173,64 @@ bool treeContainsText(QTreeWidget *tree, const QString &needle)
     return findTreeItem(tree, needle) != nullptr;
 }
 
+// Answers the 登录 Notepad Safe prompt for an identity created outside the
+// window. The driver stops itself after the first login or after 8 seconds.
+void driveLoginDialog(MainWindow *window)
+{
+    auto *driver = new QTimer(window);
+    auto elapsed = std::make_shared<QElapsedTimer>();
+    elapsed->start();
+    driver->setInterval(25);
+    QObject::connect(driver, &QTimer::timeout, window, [driver, elapsed]() {
+        auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        auto *password = dialog ? dialog->findChild<QLineEdit *>(
+            QStringLiteral("securitySessionPassword")) : nullptr;
+        auto *buttons = dialog ? dialog->findChild<QDialogButtonBox *>() : nullptr;
+        auto *ok = buttons ? buttons->button(QDialogButtonBox::Ok) : nullptr;
+        if (password && ok && !dialog->findChild<QLineEdit *>(
+                QStringLiteral("securitySessionConfirmation"))) {
+            password->setText(QStringLiteral("correct horse battery staple"));
+            driver->stop();
+            driver->deleteLater();
+            ok->click();
+            return;
+        }
+        if (elapsed->elapsed() > 8000) {
+            driver->stop();
+            driver->deleteLater();
+        }
+    });
+    driver->start();
+}
+
+// Waits for the current tab to be a secure binary; on timeout returns what
+// was on screen instead (tab state or the blocking modal's title and text).
+QString waitForSecureBinaryTab(MainWindow *window)
+{
+    QElapsedTimer elapsed;
+    elapsed.start();
+    QString seen;
+    while (elapsed.elapsed() < 5000) {
+        QApplication::processEvents(QEventLoop::AllEvents, 25);
+        EditorTab *tab = currentEditor(window);
+        if (tab && tab->isSecureBinaryDocument())
+            return {};
+        if (auto *modal = qobject_cast<QDialog *>(QApplication::activeModalWidget())) {
+            auto *box = qobject_cast<QMessageBox *>(modal);
+            seen = QStringLiteral("modal '%1': %2").arg(
+                modal->windowTitle(), box ? box->text() : QString());
+        } else if (tab) {
+            seen = QStringLiteral("tab '%1' secure=%2 binary=%3").arg(
+                tab->filePath()).arg(tab->isSecureDocument()).arg(tab->isBinaryDocument());
+        } else {
+            seen = QStringLiteral("no tab");
+        }
+    }
+    if (auto *modal = QApplication::activeModalWidget())
+        modal->close();
+    return seen;
+}
+
 void driveIdentityCreationDialog(MainWindow *window)
 {
     constexpr auto ResultProperty = "notepadsafeTestIdentityDriverResult";
@@ -496,9 +554,17 @@ private slots:
             window->resize(980, 680);
             window->show();
             QVERIFY(QTest::qWaitForWindowExposed(window.get()));
-            window->openFilesFromExternal({securePath});
+            driveLoginDialog(window.get());
+            {
+                // External opens never unlock secure files; use 文件 › 打开.
+                const QString openError = openThroughFileMenu(window.get(), securePath);
+                QVERIFY2(openError.isEmpty(), qPrintable(openError));
+            }
+            {
+                const QString seen = waitForSecureBinaryTab(window.get());
+                QVERIFY2(seen.isEmpty(), qPrintable(seen));
+            }
             EditorTab *tab = currentEditor(window.get());
-            QVERIFY(tab && tab->isSecureDocument() && tab->isBinaryDocument());
             QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(0, payload.size()),
                                       payload, 3000);
             tab->gotoByteOffset(0);
@@ -517,14 +583,23 @@ private slots:
         window->resize(980, 680);
         window->show();
         QVERIFY(QTest::qWaitForWindowExposed(window.get()));
-        window->openFilesFromExternal({securePath});
+        driveLoginDialog(window.get());
+        {
+            // External opens never unlock secure files; use 文件 › 打开.
+            const QString openError = openThroughFileMenu(window.get(), securePath);
+            QVERIFY2(openError.isEmpty(), qPrintable(openError));
+        }
+        {
+            const QString seen = waitForSecureBinaryTab(window.get());
+            QVERIFY2(seen.isEmpty(), qPrintable(seen));
+        }
         EditorTab *tab = currentEditor(window.get());
-        QVERIFY(tab && tab->isSecureDocument() && tab->isBinaryDocument());
         QTRY_COMPARE_WITH_TIMEOUT(tab->l2View()->readByteRange(0, edited.size()),
                                   edited, 3000);
 
         QStringList filters;
         bool accepted = false;
+        QString selectedFilter;
         QTimer::singleShot(80, window.get(), [&]() {
             auto *dialog = window->findChild<QDialog *>(QStringLiteral("saveAsDialog"));
             auto *fileDialog = dialog ? dialog->findChild<QFileDialog *>(
@@ -535,7 +610,18 @@ private slots:
                 return;
             }
             filters = fileDialog->nameFilters();
-            fileDialog->selectNameFilter(QStringLiteral("未加密文件 (*)"));
+            // Choose the plain type the way a user does: through the type combo.
+            for (QComboBox *candidate : fileDialog->findChildren<QComboBox *>()) {
+                if (candidate->count() == filters.size()
+                    && candidate->itemText(0).contains(QStringLiteral("安全文档"))) {
+                    candidate->setCurrentIndex(0);
+                    candidate->setFocus();
+                    QTest::keyClick(candidate, Qt::Key_Down);
+                    break;
+                }
+            }
+            QApplication::processEvents(QEventLoop::AllEvents, 80);
+            selectedFilter = fileDialog->selectedNameFilter();
             fileDialog->selectFile(exportPath);
             accepted = QMetaObject::invokeMethod(fileDialog, "accept",
                                                  Qt::DirectConnection);
@@ -552,6 +638,7 @@ private slots:
 
         QVERIFY(accepted);
         QCOMPARE(filters.size(), 2);
+        QCOMPARE(selectedFilter, QStringLiteral("未加密文件 (*)"));
         QCOMPARE(readFileBytes(exportPath), edited);
 
         window->close();
