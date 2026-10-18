@@ -57,6 +57,7 @@ protected:
 
 private:
     void updateWindowButtons();
+    void updateIcons();
     void applyStyle();
     QRect toWindow(const QWidget *child) const;
 

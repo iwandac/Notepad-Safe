@@ -1,5 +1,7 @@
 #include "DocumentTabBar.h"
 
+#include "ShellGlyphs.h"
+
 #include <QAbstractButton>
 #include <QMouseEvent>
 #include <QPainter>
@@ -42,24 +44,16 @@ constexpr int IconWidth = 18;
 constexpr int SidePadding = 12;
 constexpr int CloseReserve = 26;
 
-QChar iconGlyph(TabVisualState::Kind kind)
+// Painted glyphs, not an icon font (font fallback lookup is slow).
+bool iconGlyph(TabVisualState::Kind kind, ShellGlyph *glyph)
 {
     switch (kind) {
-    case TabVisualState::Kind::Secure: return QChar(0xE72E);    // Lock
-    case TabVisualState::Kind::ReadOnly: return QChar(0xE7B3);  // View
-    case TabVisualState::Kind::Recovery: return QChar(0xE7BA);  // Warning
+    case TabVisualState::Kind::Secure: *glyph = ShellGlyph::Lock; return true;
+    case TabVisualState::Kind::ReadOnly: *glyph = ShellGlyph::Eye; return true;
+    case TabVisualState::Kind::Recovery: *glyph = ShellGlyph::Warning; return true;
     case TabVisualState::Kind::Plain: break;
     }
-    return {};
-}
-
-QFont iconFont(const QFont &base)
-{
-    QFont font(QStringLiteral("Segoe Fluent Icons"));
-    font.setFamilies({QStringLiteral("Segoe Fluent Icons"),
-                      QStringLiteral("Segoe MDL2 Assets")});
-    font.setPointSizeF(base.pointSizeF() > 0 ? base.pointSizeF() : 9.0);
-    return font;
+    return false;
 }
 
 // QTabBar's own close buttons; recovery tabs install none.
@@ -150,12 +144,10 @@ void DocumentTabBar::paintEvent(QPaintEvent *)
         }
 
         int x = tab.left() + SidePadding;
-        const QChar glyph = iconGlyph(state.kind);
-        if (!glyph.isNull()) {
-            painter.setFont(iconFont(font()));
-            painter.setPen(spec.icon);
-            painter.drawText(QRect(x, tab.top() + 2, IconWidth, tab.height()),
-                             Qt::AlignVCenter | Qt::AlignLeft, QString(glyph));
+        ShellGlyph glyph;
+        if (iconGlyph(state.kind, &glyph)) {
+            paintShellGlyph(&painter, glyph,
+                            QRectF(x - 1, tab.center().y() - 6, 14, 14), spec.icon);
             x += IconWidth;
         }
 

@@ -1,5 +1,7 @@
 #include "TitleBar.h"
 
+#include "ShellGlyphs.h"
+
 #include <QEvent>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -26,19 +28,11 @@ SecurityPillView securityPillView(bool hasIdentity, bool active,
 }
 
 namespace {
-// Segoe Fluent Icons (Windows 11) with the MDL2 fallback (Windows 10).
-const QChar GlyphMinimize(0xE921);
-const QChar GlyphMaximize(0xE922);
-const QChar GlyphRestore(0xE923);
-const QChar GlyphClose(0xE8BB);
-const QChar GlyphMenu(0xE700);
-
-QToolButton *windowButton(const QString &objectName, QChar glyph, const QString &tip,
-                          QWidget *parent)
+QToolButton *windowButton(const QString &objectName, const QString &tip, QWidget *parent)
 {
     auto *button = new QToolButton(parent);
     button->setObjectName(objectName);
-    button->setText(glyph);
+    button->setIconSize(QSize(10, 10));
     button->setToolTip(tip);
     button->setAccessibleName(tip);
     button->setFixedSize(46, 40);
@@ -66,7 +60,7 @@ TitleBar::TitleBar(QWidget *window, QWidget *parent)
 
     m_menuButton = new QToolButton(this);
     m_menuButton->setObjectName(QStringLiteral("shellMainMenuButton"));
-    m_menuButton->setText(GlyphMenu);
+    m_menuButton->setIconSize(QSize(14, 14));
     m_menuButton->setToolTip(QStringLiteral("主菜单 (Alt)"));
     m_menuButton->setAccessibleName(QStringLiteral("主菜单"));
     m_menuButton->setFixedSize(m_tokens.control + 4, m_tokens.control);
@@ -101,12 +95,11 @@ TitleBar::TitleBar(QWidget *window, QWidget *parent)
     layout->addWidget(m_securityPill);
     layout->addSpacing(6);
 
-    m_minimize = windowButton(QStringLiteral("shellMinimizeButton"), GlyphMinimize,
+    m_minimize = windowButton(QStringLiteral("shellMinimizeButton"),
                               QStringLiteral("最小化"), this);
-    m_maximize = windowButton(QStringLiteral("shellMaximizeButton"), GlyphMaximize,
+    m_maximize = windowButton(QStringLiteral("shellMaximizeButton"),
                               QStringLiteral("最大化"), this);
-    m_close = windowButton(QStringLiteral("shellCloseButton"), GlyphClose,
-                           QStringLiteral("关闭"), this);
+    m_close = windowButton(QStringLiteral("shellCloseButton"), QStringLiteral("关闭"), this);
     connect(m_minimize, &QToolButton::clicked, this, [this] {
         if (m_window) m_window->showMinimized();
     });
@@ -205,13 +198,29 @@ bool TitleBar::eventFilter(QObject *watched, QEvent *event)
 void TitleBar::updateWindowButtons()
 {
     const bool maximized = m_window && m_window->isMaximized();
-    m_maximize->setText(maximized ? GlyphRestore : GlyphMaximize);
+    updateIcons();
     m_maximize->setToolTip(maximized ? QStringLiteral("向下还原") : QStringLiteral("最大化"));
     m_maximize->setAccessibleName(m_maximize->toolTip());
 }
 
+void TitleBar::updateIcons()
+{
+    // Painted glyphs, not an icon font (font fallback lookup is slow).
+    const bool active = !m_window || m_window->isActiveWindow();
+    const QColor glyph = !m_styled ? palette().color(QPalette::ButtonText)
+        : active ? m_tokens.ink : m_tokens.faint;
+    const bool maximized = m_window && m_window->isMaximized();
+    m_menuButton->setIcon(shellGlyphIcon(ShellGlyph::Menu, glyph, glyph, 14));
+    m_minimize->setIcon(shellGlyphIcon(ShellGlyph::Minimize, glyph, glyph, 10));
+    m_maximize->setIcon(shellGlyphIcon(maximized ? ShellGlyph::Restore : ShellGlyph::Maximize,
+                                       glyph, glyph, 10));
+    m_close->setIcon(shellGlyphIcon(ShellGlyph::Close, glyph,
+                                    m_styled ? QColor(Qt::white) : glyph, 10));
+}
+
 void TitleBar::applyStyle()
 {
+    updateIcons();
     if (!m_styled) {
         setStyleSheet(QString());
         return;
@@ -225,8 +234,7 @@ void TitleBar::applyStyle()
     setStyleSheet(QStringLiteral(
         "#shellTitleBar { background:%1; border-bottom:1px solid %2; }"
         "#shellWindowTitle { color:%3; font-size:9pt; padding-left:6px; }"
-        "#shellMainMenuButton { color:%4; border:0; border-radius:%5px;"
-        " font-family:'Segoe Fluent Icons','Segoe MDL2 Assets'; font-size:10pt; }"
+        "#shellMainMenuButton { color:%4; border:0; border-radius:%5px; }"
         "#shellMainMenuButton:hover { background:%6; }"
         "#shellCommandCenter { color:%7; background:%8; border:1px solid %2;"
         " border-radius:%5px; text-align:left; padding:0 10px; }"
@@ -234,8 +242,7 @@ void TitleBar::applyStyle()
         "#shellSecurityPill { color:%9; background:%10; border:0; border-radius:%11px;"
         " padding:0 12px; font-weight:600; }"
         "#shellMinimizeButton, #shellMaximizeButton, #shellCloseButton { color:%4;"
-        " border:0; border-radius:0; font-family:'Segoe Fluent Icons','Segoe MDL2 Assets';"
-        " font-size:8pt; }"
+        " border:0; border-radius:0; }"
         "#shellMinimizeButton:hover, #shellMaximizeButton:hover { background:%6; }"
         "#shellCloseButton:hover { background:%12; color:#FFFFFF; }")
         .arg(hex(t.chrome), hex(t.lineSoft), hex(active ? t.muted : t.faint),

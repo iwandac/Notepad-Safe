@@ -1,8 +1,11 @@
 #include "AltMenuTracker.h"
 #include "DocumentTabBar.h"
+#include "ShellGlyphs.h"
 #include "TitleBar.h"
 #include "WindowChrome.h"
 
+#include <QImage>
+#include <QPainter>
 #include <QtTest/QTest>
 
 Q_DECLARE_METATYPE(ChromeHit)
@@ -19,6 +22,7 @@ private slots:
     void altCombinationsDoNothing();
     void f10OpensMainMenu();
     void tabPaintSpecRules();
+    void everyGlyphDrawsInItsBox();
 };
 
 namespace {
@@ -202,6 +206,29 @@ void TestShellLogic::f10OpensMainMenu()
     // Shift+F10 is the context-menu key; leave it alone.
     QCOMPARE(tracker.keyPress(Qt::Key_F10, Qt::ShiftModifier).result,
              AltMenuTracker::Result::None);
+}
+
+void TestShellLogic::everyGlyphDrawsInItsBox()
+{
+    for (const ShellGlyph glyph : {ShellGlyph::Menu, ShellGlyph::Minimize, ShellGlyph::Maximize,
+                                   ShellGlyph::Restore, ShellGlyph::Close, ShellGlyph::Lock,
+                                   ShellGlyph::Eye, ShellGlyph::Warning}) {
+        QImage image(32, 32, QImage::Format_ARGB32_Premultiplied);
+        image.fill(Qt::transparent);
+        QPainter painter(&image);
+        paintShellGlyph(&painter, glyph, QRectF(8, 8, 16, 16), Qt::black);
+        painter.end();
+        int inside = 0;
+        int outside = 0;
+        for (int y = 0; y < image.height(); ++y) {
+            for (int x = 0; x < image.width(); ++x) {
+                if (qAlpha(image.pixel(x, y)) == 0) continue;
+                (x >= 7 && x <= 24 && y >= 7 && y <= 24 ? inside : outside) += 1;
+            }
+        }
+        QVERIFY2(inside > 4, qPrintable(QString::number(int(glyph))));
+        QCOMPARE(outside, 0);
+    }
 }
 
 QTEST_GUILESS_MAIN(TestShellLogic)

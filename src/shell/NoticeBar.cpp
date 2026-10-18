@@ -1,5 +1,7 @@
 #include "NoticeBar.h"
 
+#include "ShellGlyphs.h"
+
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
@@ -25,7 +27,7 @@ NoticeBar::NoticeBar(QWidget *parent) : QFrame(parent)
 
     m_dismiss = new QToolButton(this);
     m_dismiss->setObjectName(QStringLiteral("noticeDismiss"));
-    m_dismiss->setText(QStringLiteral("✕"));
+    m_dismiss->setIconSize(QSize(10, 10));
     m_dismiss->setToolTip(QStringLiteral("关闭提示"));
     m_dismiss->setAccessibleName(QStringLiteral("关闭提示"));
     m_dismiss->setAutoRaise(true);
@@ -82,6 +84,8 @@ void NoticeBar::dismiss()
 
 void NoticeBar::applyStyle()
 {
+    const QColor glyph = m_styled ? m_tokens.muted : palette().color(QPalette::ButtonText);
+    m_dismiss->setIcon(shellGlyphIcon(ShellGlyph::Close, glyph, glyph, 10));
     if (!m_styled) {
         setStyleSheet(QString());
         return;
