@@ -1,3 +1,4 @@
+#include <QLabel>
 #include <QtCore/QCryptographicHash>
 #include <QtCore/QDirIterator>
 #include <QtCore/QElapsedTimer>
@@ -136,8 +137,16 @@ struct SaveErrorCapture {
 
 void armSaveErrorCapture(QWidget *owner, SaveErrorCapture *capture)
 {
-    QTimer::singleShot(100, owner, [capture]() {
+    QTimer::singleShot(100, owner, [owner, capture]() {
         auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+        // A plain save failure is a non-blocking notice above the document.
+        auto *notice = owner->findChild<QLabel *>(QStringLiteral("noticeText"));
+        if (!box && capture && notice && notice->isVisible()) {
+            capture->shown = true;
+            capture->text = notice->text();
+            capture->detailedText = notice->toolTip();
+            return;
+        }
         if (!box || !capture)
             return;
         capture->shown = true;
@@ -743,7 +752,7 @@ private slots:
         SaveErrorCapture capture;
         armSaveErrorCapture(window, &capture);
         saveAction->trigger();
-        QVERIFY2(capture.shown, "candidate-create failure was not user-visible");
+        QTRY_VERIFY2_WITH_TIMEOUT(capture.shown, "candidate-create failure was not user-visible", 2000);
         const QString visibleDiagnostic = capture.text + capture.informativeText
             + capture.detailedText;
         QVERIFY2(visibleDiagnostic.contains(
@@ -848,7 +857,7 @@ private slots:
         SaveErrorCapture capture;
         armSaveErrorCapture(window, &capture);
         saveAction->trigger();
-        QVERIFY2(capture.shown, "commit/replace failure was not user-visible");
+        QTRY_VERIFY2_WITH_TIMEOUT(capture.shown, "commit/replace failure was not user-visible", 2000);
         const QString visibleDiagnostic = capture.text + capture.informativeText
             + capture.detailedText;
         QVERIFY2(visibleDiagnostic.contains(QStringLiteral("[plain.save.commit]")),

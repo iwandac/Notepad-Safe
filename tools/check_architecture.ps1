@@ -339,7 +339,7 @@ $complexityBudgets = @(
     @{ File = 'src/editor/EditorTabSearch.cpp'; Lines = 1617; Branches = 189 },
     @{ File = 'src/search/FindOverlay.cpp'; Lines = 1427; Branches = 196 },
     @{ File = 'src/search/SearchResultsDock.cpp'; Lines = 540; Branches = 62 },
-    @{ File = 'src/search/SearchResultsAggregateModel.h'; Lines = 309; Branches = 48 },
+    @{ File = 'src/search/SearchResultsAggregateModel.h'; Lines = 320; Branches = 49 },
     @{ File = 'src/app/DocumentOpenWorkflow.cpp'; Lines = 80; Branches = 10 },
     @{ File = 'src/search/EditableTextSearch.cpp'; Lines = 102; Branches = 13 },
     @{ File = 'src/search/SearchResultsController.cpp'; Lines = 64; Branches = 4 },

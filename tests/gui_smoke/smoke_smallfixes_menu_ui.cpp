@@ -4190,6 +4190,10 @@ private slots:
         QVERIFY(tab);
         FindOverlay *overlay = openOverlay(tab);
         QVERIFY(overlay);
+        // Earlier cases searched in this window; start from an empty history.
+        overlay->clearSensitiveState();
+        overlay = openOverlay(tab);
+        QVERIFY(overlay);
         auto *edit = overlay->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
         auto *findAll = overlay->findChild<QPushButton *>(QStringLiteral("findAllButton"));
         auto *summary = mw_->findChild<QLabel *>(QStringLiteral("searchResultsSummary"));
@@ -4625,6 +4629,10 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(dock->isVisible(), 2000);
         QTRY_VERIFY_WITH_TIMEOUT(tree->model() != nullptr, 2000);
         QTRY_COMPARE_WITH_TIMEOUT(tree->model()->rowCount(), 2, 3000);
+        // Groups exist from the start; wait until both files have finished.
+        auto *cancelSearch = dialog->findChild<QPushButton *>(QStringLiteral("cancelSearchButton"));
+        QVERIFY(cancelSearch);
+        QTRY_VERIFY_WITH_TIMEOUT(!cancelSearch->isVisible(), 5000);
         QCOMPARE(scope->currentData().toInt(), 1);
         QCOMPARE(scope->itemText(scope->currentIndex()),
                  QStringLiteral("全部打开文件 (2)"));

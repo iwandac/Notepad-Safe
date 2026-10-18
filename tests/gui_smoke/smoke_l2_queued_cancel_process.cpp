@@ -1586,7 +1586,9 @@ bool runChild(const QString &kind, const QString &stopAction,
             QSignalSpy bSubmitted(&manager, &AsyncTaskManager::taskAdded);
             QSignalSpy bClicks(findAll, &QPushButton::clicked);
             QTest::mouseClick(findAll, Qt::LeftButton);
-            CHILD_CHECK(bClicks.size() == 1, QStringLiteral("B was not attempted through the real Find All control"));
+            // An invalid regex disables Find All before any click can start work.
+            CHILD_CHECK(bClicks.size() == 1 || (invalidNextQuery && !findAll->isEnabled()),
+                        QStringLiteral("B was not attempted through the real Find All control"));
             qint64 taskB = 0;
             int bSubmissions = 0;
             for (const QList<QVariant> &arguments : bSubmitted) {
@@ -1613,7 +1615,9 @@ bool runChild(const QString &kind, const QString &stopAction,
                                 && summary->text().contains(queryB),
                             QStringLiteral("Accepted B lacks its own real queued task and visible query state"));
             } else if (invalidNextQuery) {
-                CHILD_CHECK(!status->text().isEmpty() && findAll->isEnabled()
+                auto *hint = status->parentWidget()->findChild<QLabel *>(
+                    QStringLiteral("regexQueryHint"));
+                CHILD_CHECK(hint && !hint->text().isEmpty() && !findAll->isEnabled()
                                 && pattern->isEnabled() && !cancelSearch->isVisible(),
                             QStringLiteral("Invalid B did not expose a terminal validation error"));
             } else {
@@ -1662,7 +1666,8 @@ bool runChild(const QString &kind, const QString &stopAction,
             // Reach data guards before the expected stale-completion UI red.
             CHILD_CHECK(sourceGuards() && companionGuards(), QStringLiteral("Late A/B work changed source/identity/body"));
             CHILD_CHECK(pattern->text() == queryB && scope->currentData().toInt() == 0
-                            && findAll->isEnabled() && pattern->isEnabled() && !cancelSearch->isVisible(),
+                            && (findAll->isEnabled() != invalidNextQuery)
+                            && pattern->isEnabled() && !cancelSearch->isVisible(),
                         QStringLiteral("Late A changed B query controls or left them busy"));
             if (acceptedB) {
                 auto *model = qobject_cast<SearchResultsModel *>(tree->model());

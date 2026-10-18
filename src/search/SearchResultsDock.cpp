@@ -269,7 +269,9 @@ void SearchResultsDock::closeResultsFor(const QUuid &documentId)
     if (!m_controller->contains(documentId))
         return;
     if (m_controller->isMultiFile()) {
-        invalidateResultsFor(documentId);
+        if (!m_multiModel
+            || !m_multiModel->removeUnsettled(m_controller->targetId(documentId)))
+            invalidateResultsFor(documentId);
         return;
     }
     SearchResultsModel *oldModel = m_model;

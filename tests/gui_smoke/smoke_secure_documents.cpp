@@ -1667,6 +1667,11 @@ private slots:
         QVERIFY(tree);
         QTRY_VERIFY_WITH_TIMEOUT(tree->model(), 5000);
         QTRY_COMPARE_WITH_TIMEOUT(tree->model()->rowCount(), 3, 5000);
+        // Groups exist from the start; wait until every file has finished.
+        auto *cancelSearch = findDialog->findChild<QPushButton *>(
+            QStringLiteral("cancelSearchButton"));
+        QVERIFY(cancelSearch);
+        QTRY_VERIFY_WITH_TIMEOUT(!cancelSearch->isVisible(), 5000);
 
         bool keywordHighlightedInDock = false;
         QModelIndex secondFileMatch;

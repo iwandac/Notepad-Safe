@@ -1040,7 +1040,13 @@ void SmokeFindReplace::tc_fr_010_all_open_cancel_and_rerun()
     QTRY_VERIFY_WITH_TIMEOUT(!cancel->isVisible(), 3000);
     QTRY_VERIFY_WITH_TIMEOUT(summary->text().contains(QStringLiteral("已取消")), 3000);
     QVERIFY(tree->model());
-    QVERIFY(tree->model()->rowCount() < TargetCount);
+    // Every file has a group from the start; only a prefix may hold results.
+    int finishedGroups = 0;
+    for (int row = 0; row < tree->model()->rowCount(); ++row) {
+        if (tree->model()->index(row, SearchResultsModel::COL_MATCHCOUNT).data().isValid())
+            ++finishedGroups;
+    }
+    QVERIFY(finishedGroups < TargetCount);
     QVERIFY(findAll->isEnabled());
     const QString outputDir = QCoreApplication::applicationDirPath();
     QVERIFY(dialog.grab().save(
@@ -1765,8 +1771,10 @@ void SmokeFindReplace::tc_fr_018_regex_contract_model_runs_gui_variants()
         QTest::mouseClick(findAll, Qt::LeftButton);
 
         if (variant.invalidRegex) {
-            QTRY_VERIFY_WITH_TIMEOUT(
-                status->text().contains(QStringLiteral("正则无效")), 2000);
+            // An invalid regex blocks Find All; the reason is in the hint line.
+            auto *hint = dialog.findChild<QLabel *>(QStringLiteral("regexQueryHint"));
+            QVERIFY2(hint && !hint->text().isEmpty(), variant.id);
+            QVERIFY2(!findAll->isEnabled(), variant.id);
             QVERIFY2(!tree->model() || tree->model()->rowCount() == 0, variant.id);
             QTest::mouseClick(findNext, Qt::LeftButton);
             QTRY_VERIFY_WITH_TIMEOUT(

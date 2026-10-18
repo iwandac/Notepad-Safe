@@ -179,6 +179,19 @@ public:
         endInsertRows();
     }
 
+    // A document closed before its search finished leaves nothing to show.
+    bool removeUnsettled(const QString &targetId)
+    {
+        Group *group = findGroup(targetId);
+        if (!group || group->state.isEmpty()) return false;
+        const int row = groups_.indexOf(group);
+        beginRemoveRows({}, row, row);
+        if (group->results) group->results->deleteLater();
+        delete groups_.takeAt(row);
+        endRemoveRows();
+        return true;
+    }
+
     bool setState(const QString &targetId, const QString &state)
     {
         Group *group = findGroup(targetId);
