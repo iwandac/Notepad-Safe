@@ -179,6 +179,14 @@ public:
         endInsertRows();
     }
 
+    void settleWaiting(const QString &state)
+    {
+        for (Group *group : std::as_const(groups_)) {
+            if (!group->results && !group->state.isEmpty() && !group->state.startsWith(QStringLiteral("已跳过")))
+                setState(group->target.key(), state);
+        }
+    }
+
     // A document closed before its search finished leaves nothing to show.
     bool removeUnsettled(const QString &targetId)
     {
@@ -277,7 +285,8 @@ public:
     {
         for (int row = 0; row < groups_.size(); ++row) {
             Group *group = groups_.at(row);
-            if (group->target.key() != targetId || group->stale) continue;
+            // A file still waiting is searched later on its current text.
+            if (group->target.key() != targetId || group->stale || !group->results) continue;
             const QModelIndex groupIndex = index(row, 0);
             const int count = childCount(group);
             if (count > 0)

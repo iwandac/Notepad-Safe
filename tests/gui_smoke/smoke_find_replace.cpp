@@ -204,6 +204,7 @@ private slots:
     // QTreeView 的隐式自动换行在不同搜索模式下撑满整个 Dock。
     void tc_fr_041_search_dock_rows_remain_compact_across_modes();
     void tc_fr_042_all_open_groups_keep_tab_order_and_state();
+    void tc_fr_043_waiting_groups_survive_edits_and_cancel();
 
     // Real MainWindow queues the result jump. An edit after the request but
     // before that queued turn must invalidate it without applying old offsets.
@@ -3842,6 +3843,37 @@ void SmokeFindReplace::tc_fr_042_all_open_groups_keep_tab_order_and_state()
     QCOMPARE(name(0), QStringLiteral("big.log"));
     QCOMPARE(state(0), QString());
     QVERIFY2(summary->text().contains(QStringLiteral("找到 2 处")), qPrintable(summary->text()));
+}
+
+// Editing a file that is still waiting must not mark its later, fresh
+// results stale; cancelling leaves undispatched files marked as cancelled.
+void SmokeFindReplace::tc_fr_043_waiting_groups_survive_edits_and_cancel()
+{
+    SearchResultsController resultsController;
+    SearchResultsDock dock(resultsController);
+    auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+    QVERIFY(tree);
+    const SearchResultTarget edited{QUuid::createUuid(), 1, QStringLiteral("edited.txt")};
+    const SearchResultTarget never{QUuid::createUuid(), 1, QStringLiteral("never.txt")};
+    dock.beginMultiFileResults(QStringLiteral("hit"), 2);
+    dock.reserveMultiFileTargets({edited, never}, {});
+    dock.invalidateResultsFor(edited.documentId);
+
+    SearchMatch hit;
+    hit.length = 3;
+    hit.text = QStringLiteral("hit");
+    hit.context = QStringLiteral("hit");
+    hit.byteOffset = 0;
+    hit.byteLength = 3;
+    dock.appendMultiFileResults(edited, QVector<SearchMatch>{hit});
+    QAbstractItemModel *model = tree->model();
+    QVERIFY(model);
+    QCOMPARE(model->rowCount(model->index(0, 0)), 1);
+    QCOMPARE(model->index(0, SearchResultsModel::COL_CONTEXT).data().toString(), QString());
+
+    dock.finishMultiFileResults(true);
+    QCOMPARE(model->index(1, SearchResultsModel::COL_CONTEXT).data().toString(),
+             QStringLiteral("已取消"));
 }
 
 QTEST_MAIN(SmokeFindReplace)

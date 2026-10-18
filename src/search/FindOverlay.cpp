@@ -97,6 +97,7 @@ FindOverlay::FindOverlay(QWidget *parent)
     setFrameShape(QFrame::NoFrame);
     setAttribute(Qt::WA_StyledBackground, true);
     m_live = new FindLiveSearch(this);
+    m_live->setFocusOwner(this);
     buildUi();
     connect(m_live, &FindLiveSearch::updated, this, &FindOverlay::updateQueryUi);
     if (parentWidget())
@@ -580,13 +581,29 @@ void FindOverlay::rerunRecentQuery(int index)
     if (index < 0 || index >= m_recentQueries.size() || m_l2SearchInProgress)
         return;
     const SearchQuery query = m_recentQueries.at(index);
-    m_hexBytesCheck->setChecked(query.hexBytes);
-    m_regexCheck->setChecked(query.regex);
-    m_caseCheck->setChecked(query.caseSensitive);
-    m_wordCheck->setChecked(query.wholeWord);
-    m_scopeCombo->setCurrentIndex(m_scopeCombo->findData(
-        query.scope == SearchScope::AllOpenDocuments ? 1 : 0));
-    m_findEdit->setText(query.pattern);
+    {
+        // Restore the whole query at once: the toggles' handlers would
+        // otherwise undo each other against the previous scope.
+        const QSignalBlocker blockScope(m_scopeCombo);
+        const QSignalBlocker blockHex(m_hexBytesCheck);
+        const QSignalBlocker blockRegex(m_regexCheck);
+        const QSignalBlocker blockCase(m_caseCheck);
+        const QSignalBlocker blockWord(m_wordCheck);
+        const QSignalBlocker blockEdit(m_findEdit);
+        m_scopeCombo->setCurrentIndex(m_scopeCombo->findData(
+            query.scope == SearchScope::AllOpenDocuments ? 1 : 0));
+        m_hexBytesCheck->setChecked(query.hexBytes);
+        m_regexCheck->setChecked(query.regex);
+        m_caseCheck->setChecked(query.caseSensitive);
+        m_wordCheck->setChecked(query.wholeWord);
+        m_findEdit->setText(query.pattern);
+    }
+    updateQueryUi();
+    if (hexBytesMode() != query.hexBytes) {
+        m_statusLabel->setText(QStringLiteral("字节搜索只适用于处于十六进制视图的当前文件。"));
+        return;
+    }
+    emitFindParameters();
     onFindAll();
 }
 
@@ -1028,8 +1045,7 @@ void FindOverlay::onFindAll()
 {
     if (!m_tab || !m_resultsDock) return;
     // Find All owns the document's one background search and its highlights.
-    m_live->cancel();
-    m_live->releaseHighlights();
+    m_live->reset();
     const QPointer<FindOverlay> owner(this);
     const QPointer<DocumentSearchSurface> target(m_tab);
     const SearchQuery query{currentFindText(), allOpenScope()

@@ -4225,6 +4225,25 @@ private slots:
         closeAllEditorTabs(mw_);
     }
 
+    // Live results never select text while the user is typing in the
+    // document: a selected match would be replaced by the next keystroke.
+    void liveSearchDoesNotSelectWhileEditorHasFocus() {
+        EditorTab *tab = openOverlayDocument(QStringLiteral("live-focus.txt"),
+                                             "word one\nword two\n");
+        QVERIFY(tab);
+        tab->editor()->setCursorPosition(1, 8);
+        FindOverlay *overlay = openOverlay(tab);
+        QVERIFY(overlay);
+        auto *edit = overlay->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        auto *hint = overlay->findChild<QLabel *>(QStringLiteral("regexQueryHint"));
+        edit->setText(QStringLiteral("word"));
+        tab->editor()->setFocus();
+        QTRY_VERIFY_WITH_TIMEOUT(hint->text().contains(QStringLiteral("处")), 3000);
+        QVERIFY(!tab->editor()->hasSelectedText());
+        overlay->closeOverlay();
+        closeAllEditorTabs(mw_);
+    }
+
     // 转置当前行 was removed; QScintilla's own Ctrl+T binding must not
     // bring it back.
     void ctrlTDoesNotTransposeLines() {

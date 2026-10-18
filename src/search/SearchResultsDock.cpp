@@ -269,8 +269,9 @@ void SearchResultsDock::closeResultsFor(const QUuid &documentId)
     if (!m_controller->contains(documentId))
         return;
     if (m_controller->isMultiFile()) {
-        if (!m_multiModel
-            || !m_multiModel->removeUnsettled(m_controller->targetId(documentId)))
+        if (m_multiModel && m_multiModel->removeUnsettled(m_controller->targetId(documentId)))
+            m_multiTargetCount = qMax(0, m_multiTargetCount - 1);
+        else
             invalidateResultsFor(documentId);
         return;
     }
@@ -425,6 +426,8 @@ void SearchResultsDock::finishMultiFileResults(bool cancelled)
     if (!m_controller->isMultiFile())
         return;
     if (cancelled) {
+        if (m_multiModel)
+            m_multiModel->settleWaiting(QStringLiteral("已取消"));
         m_feedback->setSummaryText(
             QStringLiteral("已取消在全部打开文件中搜索 “%1”；已保留 %2 处完成结果，可重新查找。")
                 .arg(m_controller->pattern()).arg(m_controller->matchCount()));

@@ -8,6 +8,7 @@
 #include "SearchMatch.h"
 
 class DocumentSearchSurface;
+class QWidget;
 
 // Search-as-you-type for ordinary editable text. A short pause after typing
 // runs one background Find All on the current document, highlights every hit,
@@ -34,9 +35,10 @@ public:
     void cancel();
     // cancel() plus forgetting results and the highlights this object drew.
     void reset();
-    // Find All drew its own highlights; closing the panel must keep them.
-    void releaseHighlights() { m_ownsHighlights = false; }
     void setSuspended(bool suspended) { m_suspended = suspended; }
+    // Matches are selected only while focus is inside this widget; otherwise
+    // the user's next keystroke would replace the selected text.
+    void setFocusOwner(QWidget *owner) { m_focusOwner = owner; }
     // Re-reads the selection after navigation; reruns when the text changed.
     void refreshPosition();
     QString positionText() const;
@@ -48,6 +50,7 @@ signals:
 private:
     QTimer m_timer;
     QPointer<DocumentSearchSurface> m_tab;
+    QPointer<QWidget> m_focusOwner;
     Query m_query;
     QVector<SearchMatch> m_matches;
     QString m_error;

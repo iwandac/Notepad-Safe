@@ -1,6 +1,8 @@
 #include "FindLiveSearch.h"
 #include "DocumentSearchSurface.h"
 
+#include <QApplication>
+
 #include <algorithm>
 #include <utility>
 
@@ -81,9 +83,11 @@ void FindLiveSearch::run()
         [this, generation](QVector<SearchMatch> matches, bool truncated, QString error) {
             finish(generation, std::move(matches), truncated, std::move(error));
         });
-    // Another Find All owns the document; the next pause tries again.
-    if (!started && generation == m_generation)
+    // Another Find All owns the document; try again shortly.
+    if (!started && generation == m_generation) {
         m_inFlight = false;
+        m_timer.start();
+    }
 }
 
 void FindLiveSearch::finish(int generation, QVector<SearchMatch> matches,
@@ -114,7 +118,10 @@ void FindLiveSearch::finish(int generation, QVector<SearchMatch> matches,
             [](const SearchMatch &match, qint64 offset) { return match.byteOffset < offset; });
         m_index = first == m_matches.cend() ? 0 : int(first - m_matches.cbegin());
         const SearchMatch &hit = m_matches.at(m_index);
-        m_tab->selectSearchHit(hit.byteOffset, hit.byteLength);
+        if (m_focusOwner && m_focusOwner->isAncestorOf(QApplication::focusWidget()))
+            m_tab->selectSearchHit(hit.byteOffset, hit.byteLength);
+        else
+            m_index = -1;
     }
     emit updated();
 }
@@ -144,6 +151,8 @@ QString FindLiveSearch::positionText() const
         return {};
     if (!m_error.isEmpty())
         return m_error;
+    if (!m_resultsValid)
+        return {};
     if (m_matches.isEmpty())
         return m_inFlight || m_timer.isActive() ? QString() : QStringLiteral("未找到匹配");
     const QString total = m_truncated ? QStringLiteral("%1+").arg(m_matches.size())
