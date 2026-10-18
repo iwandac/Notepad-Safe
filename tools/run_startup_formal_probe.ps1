@@ -171,6 +171,8 @@ $processClock = $null
 $observedExit = $false
 $frequency = [Diagnostics.Stopwatch]::Frequency
 $fileName = -join @([char]0x6587, [char]0x4ef6)
+# The menu bar is hidden; menus open from the title bar's main menu button.
+$mainMenuName = -join @([char]0x4e3b, [char]0x83dc, [char]0x5355)
 $newName = -join @([char]0x65b0, [char]0x5efa)
 
 function Assert-Budget([string]$Stage) {
@@ -389,16 +391,36 @@ public static class FormalStartupNative {
     Wait-Observed { [TailSoakNative]::GetForegroundWindow() -eq $mainHwnd } 'foreground-owned-mainwindow'
     Wait-Observed {
         $condition = New-Object Windows.Automation.PropertyCondition(
-            [Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::MenuBar)
-        $bar = $mainElement.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)
-        Assert-Budget 'menubar-state'
-        if ($null -eq $bar -or $bar.Current.ProcessId -ne $owned.Id) { return $false }
-        $matches = @(Owned-MenuItems $bar ([Windows.Automation.TreeScope]::Children) | Where-Object {
-            $name = Normalize-MenuName $_.Current.Name
-            $name -ceq $fileName -or $name -ceq 'File'
+            [Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Button)
+        $buttons = @($mainElement.FindAll([Windows.Automation.TreeScope]::Descendants, $condition) | Where-Object {
+            $_.Current.ProcessId -eq $owned.Id -and $_.Current.Name -ceq $mainMenuName
         })
-        if ($matches.Count -gt 1) { throw 'Ambiguous File MenuItem.' }
-        if ($matches.Count -eq 1) { $script:fileItem = $matches[0]; return $true }
+        Assert-Budget 'main-menu-button-state'
+        if ($buttons.Count -gt 1) { throw 'Ambiguous main menu button.' }
+        if ($buttons.Count -eq 1) { $script:menuButton = $buttons[0]; return $true }
+        return $false
+    } 'find-main-menu-button'
+    $buttonState = $menuButton.Current
+    Assert-Budget 'main-menu-button-final-state'
+    if ($buttonState.IsOffscreen -or -not $buttonState.IsEnabled) { throw 'Main menu button is not visible and enabled.' }
+    $buttonBounds = $buttonState.BoundingRectangle
+    if ($buttonBounds.IsEmpty -or $buttonBounds.Width -le 0) { throw 'Main menu button has no clickable geometry.' }
+    $buttonX = [int][Math]::Floor($buttonBounds.X + $buttonBounds.Width / 2)
+    $buttonY = [int][Math]::Floor($buttonBounds.Y + $buttonBounds.Height / 2)
+    [FormalStartupNative]::RequireHit($mainHwnd, $owned.Id, $buttonX, $buttonY)
+    [TailSoakNative]::Click($owned.Id, $buttonX, $buttonY)
+    # The main menu popup lists the classic menus; 文件 opens the file menu.
+    Wait-Observed {
+        foreach ($candidate in [TailSoakNative]::VisibleWindows($owned.Id)) {
+            if ($candidate -eq $mainHwnd) { continue }
+            $element = [Windows.Automation.AutomationElement]::FromHandle($candidate)
+            if ($element.Current.ProcessId -ne $owned.Id -or $element.Current.ClassName -cne 'QMenu') { continue }
+            $matches = @(Owned-MenuItems $element ([Windows.Automation.TreeScope]::Descendants) | Where-Object {
+                $name = Normalize-MenuName $_.Current.Name
+                $name -ceq $fileName -or $name -ceq 'File'
+            })
+            if ($matches.Count -eq 1) { $script:fileItem = $matches[0]; $script:mainMenuHwnd = $candidate; return $true }
+        }
         return $false
     } 'find-real-file-menuitem'
     $itemState = $fileItem.Current
@@ -411,14 +433,14 @@ public static class FormalStartupNative {
     $report.menu_click = @($clickX, $clickY)
     Assert-Owned
     Assert-Budget 'input-before'
-    [FormalStartupNative]::RequireHit($mainHwnd, $owned.Id, $clickX, $clickY)
+    [FormalStartupNative]::RequireHit($mainMenuHwnd, $owned.Id, $clickX, $clickY)
     $report.input_before_qpc = [Diagnostics.Stopwatch]::GetTimestamp().ToString()
     [TailSoakNative]::Click($owned.Id, $clickX, $clickY)
     $report.input_after_qpc = [Diagnostics.Stopwatch]::GetTimestamp().ToString()
     Assert-Budget 'input-after'
     Wait-Observed {
         foreach ($candidate in [TailSoakNative]::VisibleWindows($owned.Id)) {
-            if ($candidate -eq $mainHwnd) { continue }
+            if ($candidate -eq $mainHwnd -or $candidate -eq $mainMenuHwnd) { continue }
             $element = [Windows.Automation.AutomationElement]::FromHandle($candidate)
             $state = $element.Current
             Assert-Budget 'popup-state'
