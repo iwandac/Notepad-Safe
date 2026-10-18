@@ -3,7 +3,7 @@
 #include "NoticeBar.h"
 #include "EditorTab.h"
 #include "FileContentProbe.h"
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
 #include "SearchResultsDock.h"
 #include "SearchResultsController.h"
 #include "SessionManager.h"
@@ -109,16 +109,16 @@ void MainWindow::ensureSecurityServicesCreated()
     m_securitySession = std::move(runtime.session);
     m_securePersistence = runtime.documents;
 }
-void MainWindow::ensureFindDialogCreated()
+void MainWindow::ensureFindOverlayCreated()
 {
-    if (m_findDialog)
+    if (m_findOverlay)
         return;
     m_composition->recordHeavyFactoryCall();
-    m_findDialog = new FindReplaceDialog(this);
-    m_findDialog->setSearchResultsDock(m_searchDock);
-    m_findDialog->setTabWidget(m_tabs);
-    m_findDialog->setActiveTab(currentTab());
-    connect(m_findDialog, &FindReplaceDialog::findParametersChanged,
+    m_findOverlay = new FindOverlay(m_tabs);
+    m_findOverlay->setSearchResultsDock(m_searchDock);
+    m_findOverlay->setTabWidget(m_tabs);
+    m_findOverlay->setActiveTab(currentTab());
+    connect(m_findOverlay, &FindOverlay::findParametersChanged,
             this, [this](const QString &pattern, bool regex, bool cs, bool wo) {
         m_lastFindPattern = pattern;
         m_lastFindRegex = regex;
@@ -500,10 +500,10 @@ EditorTab *MainWindow::addNewTab(OpenPresentationPolicy presentation, int recove
     } else if (previousCurrent && m_tabs->currentWidget() != previousCurrent) {
         m_tabs->setCurrentWidget(previousCurrent);
     }
-    if (m_findDialog) {
+    if (m_findOverlay) {
         if (activateDocumentWorkspace)
-            m_findDialog->setActiveTab(tab);
-        m_findDialog->notifyTabOpened(tab);
+            m_findOverlay->setActiveTab(tab);
+        m_findOverlay->notifyTabOpened(tab);
     }
     // 新建后立刻同步一次 L2 敏感动作（覆盖新 tab 还没收到任何信号的早期空状态）
     syncCommandStates(currentTab());
@@ -806,8 +806,8 @@ void MainWindow::purgeSensitiveSearchState()
     m_lastFindRegex = false;
     m_lastFindCase = false;
     m_lastFindWord = false;
-    if (m_findDialog)
-        m_findDialog->clearSensitiveState();
+    if (m_findOverlay)
+        m_findOverlay->clearSensitiveState();
     if (m_searchDock)
         m_searchDock->clearResults();
 }

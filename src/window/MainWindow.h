@@ -31,7 +31,7 @@ void refreshTabSecurityCue(EditorTab *tab, bool highContrast, bool dark);
 class StatusSegment;
 class NoticeBar;
 class CommandPalette;
-class FindReplaceDialog;
+class FindOverlay;
 class SearchResultsDock;
 class SearchResultsController;
 class SessionManager;
@@ -158,7 +158,7 @@ private:
     QStackedWidget *m_workspaceStack = nullptr;
     QWidget *m_accountsPage = nullptr;
     QWidget *m_securityCenterPage = nullptr;
-    FindReplaceDialog *m_findDialog = nullptr;
+    FindOverlay *m_findOverlay = nullptr;
     SearchResultsDock *m_searchDock = nullptr;
     std::unique_ptr<SearchResultsController> m_searchResultsController;
     VaultDock *m_vaultDock = nullptr;
@@ -304,7 +304,7 @@ private:
     bool reloadTabFromDisk(EditorTab *tab);
     bool reloadSecureTabFromDisk(EditorTab *tab);
     void ensureSecurityServicesCreated();
-    void ensureFindDialogCreated();
+    void ensureFindOverlayCreated();
     void ensureAccountsWorkspaceCreated();
     void ensureSecurityCenterCreated();
     // closingApp=true: 关闭整个应用，未命名文件走 autosave 不提示

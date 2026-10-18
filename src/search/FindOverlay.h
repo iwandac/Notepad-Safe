@@ -1,6 +1,6 @@
 #pragma once
 
-#include <QDialog>
+#include <QFrame>
 #include <QList>
 #include <QPointer>
 #include <QUuid>
@@ -14,16 +14,18 @@ class QPushButton;
 class QComboBox;
 class QTabWidget;
 class QWidget;
+class QKeyEvent;
 class DocumentSearchSurface;
 class SearchResultsDock;
 class SingleFindAllRequest;
 class SearchNavigationRequest;
+class FindLiveSearch;
 
-// 非模态查找/替换对话框
-class FindReplaceDialog : public QDialog {
+// 文档区右上角的查找浮层。目标始终是当前标签；查找全部的结果进底部结果面板。
+class FindOverlay : public QFrame {
     Q_OBJECT
 public:
-    explicit FindReplaceDialog(QWidget *parent = nullptr);
+    explicit FindOverlay(QWidget *parent = nullptr);
 
     void setActiveTab(DocumentSearchSurface *tab);
     void setSearchResultsDock(SearchResultsDock *dock);
@@ -36,6 +38,11 @@ public:
     void showReplaceMode();
     void findNextFromShortcut(bool forward);
     void clearSensitiveState();
+    void closeOverlay();
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
 
 signals:
     // 通知主窗口当前查找参数（供 F3 / Shift+F3 使用）
@@ -57,8 +64,10 @@ private slots:
 private:
     QLineEdit *m_findEdit = nullptr;
     QLineEdit *m_replaceEdit = nullptr;
-    QLabel *m_findLabel = nullptr;
-    QLabel *m_replaceLabel = nullptr;
+    QWidget *m_replaceRow = nullptr;
+    QWidget *m_optionsRow = nullptr;
+    QPushButton *m_replaceToggle = nullptr;
+    QPushButton *m_optionsToggle = nullptr;
     QCheckBox *m_regexCheck = nullptr;
     QCheckBox *m_hexBytesCheck = nullptr;
     QCheckBox *m_caseCheck = nullptr;
@@ -79,6 +88,7 @@ private:
 
     DocumentSearchSurface *m_tab = nullptr;
     SearchResultsDock *m_resultsDock = nullptr;
+    FindLiveSearch *m_live = nullptr;
     QTabWidget *m_tabWidget = nullptr;
 
     QPointer<SingleFindAllRequest> m_singleRequest;
@@ -93,6 +103,10 @@ private:
     int m_multiNextIndex = 0;
 
     void buildUi();
+    void reposition();
+    void prefillFromDocument();
+    void scheduleLive();
+    void setReplaceRowVisible(bool visible);
     void disconnectSingleSearch();
     void finishSingleSearch();
     void onL2FindAllFinished(QPointer<SingleFindAllRequest> request,

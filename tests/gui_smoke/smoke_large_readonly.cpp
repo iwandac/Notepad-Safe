@@ -35,7 +35,7 @@
 #include "SessionDocumentPort.h"
 #include "PlainFilePersistence.h"
 #include "ByteClipboard.h"
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
 #include "WindowedReadOnlyProvider.h"
 #include "VirtualFileView.h"
 #include "AsyncTaskManager.h"
@@ -434,7 +434,7 @@ private slots:
                  expectedBytes);
         QCOMPARE(QGuiApplication::clipboard()->text(), expectedCharacterText);
 
-        FindReplaceDialog dialog(&window);
+        FindOverlay dialog(&window);
         dialog.setActiveTab(tab);
         dialog.showFindMode();
         QVERIFY(QTest::qWaitForWindowExposed(&dialog));

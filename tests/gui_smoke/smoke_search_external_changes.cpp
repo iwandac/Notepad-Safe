@@ -34,7 +34,7 @@
 #include "AsyncTaskManager.h"
 #include "DiskFileVersion.h"
 #include "EditorTab.h"
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
 #include "MainWindow.h"
 #include "LargeFileSearch.h"
 #include "ReadOnlySearchSource.h"
@@ -308,7 +308,7 @@ private slots:
         auto *dock = document.window->findChild<SearchResultsDock *>(QStringLiteral("SearchResultsDock"));
         QVERIFY(findAction && dock);
         findAction->trigger();
-        auto *dialog = document.window->findChild<FindReplaceDialog *>();
+        auto *dialog = document.window->findChild<FindOverlay *>();
         QVERIFY(dialog);
         QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
@@ -577,7 +577,7 @@ private slots:
         auto *dock = document.window->findChild<SearchResultsDock *>(QStringLiteral("SearchResultsDock"));
         QVERIFY(findAction && dock);
         findAction->trigger();
-        auto *dialog = document.window->findChild<FindReplaceDialog *>();
+        auto *dialog = document.window->findChild<FindOverlay *>();
         QVERIFY(dialog);
         QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));

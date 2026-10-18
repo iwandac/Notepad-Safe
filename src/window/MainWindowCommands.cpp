@@ -8,7 +8,7 @@
 #include "RecoveryIssuePage.h"
 #include "EditorTab.h"
 #include "FileContentProbe.h"
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
 #include "SearchResultsDock.h"
 #include "SearchResultsController.h"
 #include "SessionManager.h"
@@ -253,7 +253,7 @@ void MainWindow::sortLinesDesc()
 
 void MainWindow::showFindDialog()
 {
-    ensureFindDialogCreated();
+    ensureFindOverlayCreated();
     if (m_workspaceStack && m_accountsPage
         && m_workspaceStack->currentWidget() == m_accountsPage) {
         if (m_vaultDock)
@@ -265,36 +265,36 @@ void MainWindow::showFindDialog()
     auto *tab = currentTab();
     if (!tab)
         return;
-    m_findDialog->setActiveTab(tab);
-    m_findDialog->showFindMode();
+    m_findOverlay->setActiveTab(tab);
+    m_findOverlay->showFindMode();
 }
 
 void MainWindow::showReplaceDialog()
 {
-    ensureFindDialogCreated();
+    ensureFindOverlayCreated();
     if (!isDocumentWorkspaceActive())
         return;
     auto *tab = currentTab();
     if (!tab)
         return;
-    m_findDialog->setActiveTab(tab);
-    m_findDialog->showReplaceMode();
+    m_findOverlay->setActiveTab(tab);
+    m_findOverlay->showReplaceMode();
 }
 
 void MainWindow::findNext()
 {
-    ensureFindDialogCreated();
+    ensureFindOverlayCreated();
     if (!currentTab() || m_lastFindPattern.isEmpty())
         return;
-    m_findDialog->findNextFromShortcut(true);
+    m_findOverlay->findNextFromShortcut(true);
 }
 
 void MainWindow::findPrev()
 {
-    ensureFindDialogCreated();
+    ensureFindOverlayCreated();
     if (!currentTab() || m_lastFindPattern.isEmpty())
         return;
-    m_findDialog->findNextFromShortcut(false);
+    m_findOverlay->findNextFromShortcut(false);
 }
 
 // ============ 语法 ============
@@ -896,7 +896,7 @@ void MainWindow::onTabChanged(int index)
 {
     EditorTab *tab = nullptr;
     if (index >= 0) tab = qobject_cast<EditorTab *>(m_tabs->widget(index));
-    if (m_findDialog) m_findDialog->setActiveTab(tab);
+    if (m_findOverlay) m_findOverlay->setActiveTab(tab);
     // 统一同步不适配 L2 的菜单项（含 index<0 无 tab → 全部变灰）
     syncCommandStates(tab);
     syncGlobalMenuCheckStates();

@@ -254,7 +254,7 @@ public:
     void prevBookmark();
     void clearBookmarks();
 
-    // 搜索（供 FindReplaceDialog 调用；内部按 isL2Mode 自动分流 L1/L2）
+    // 搜索（供 FindOverlay 调用；内部按 isL2Mode 自动分流 L1/L2）
     // findNext 返回是否找到，并跳转光标
     bool findNext(const QString &pattern, bool regex, bool caseSensitive,
                   bool wholeWord, bool forward, bool wrap,
@@ -296,6 +296,8 @@ public:
     void setSearchHighlights(const QVector<SearchMatch> &matches);
     void clearSearchHighlights();
     void selectSearchMatch(int line, int index, int length);
+    DocumentSearchCursor searchCursor() const override;
+    void selectSearchHit(qint64 byteOffset, qint32 byteLength) override;
     // L2 专用 findAll（同步阻塞版本；搜索本身不等待 LineIndex）
     // 仅用于 L1 层的 findNext/findPrev 内部（需要先同步拿到结果集）及旧调用方
     // 返回 SearchResultsModel 所有权（调用方 delete 或 setParent）

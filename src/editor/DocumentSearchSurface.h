@@ -10,6 +10,15 @@
 
 class SearchResultsModel;
 
+// Where the user is in a document, for the find panel. Byte positions are
+// UTF-8 offsets of editable text; other documents report -1.
+struct DocumentSearchCursor {
+    qint64 selectionStart = -1;
+    qint64 selectionEnd = -1;
+    qint64 documentBytes = -1;
+    QString prefill;   // selected single-line text, else the word at the caret
+};
+
 // UI-facing search port implemented by every document surface.  Application
 // search coordination depends on this contract, never on EditorTab or a
 // concrete text/hex widget.
@@ -60,6 +69,9 @@ public:
     virtual bool lastFindAllWasTruncated() const = 0;
     virtual QString lastSearchError() const = 0;
     virtual void setSearchHighlights(const QVector<SearchMatch> &matches) = 0;
+    virtual DocumentSearchCursor searchCursor() const = 0;
+    // Selects and reveals a match without moving keyboard focus.
+    virtual void selectSearchHit(qint64 byteOffset, qint32 byteLength) = 0;
     virtual bool findAllL2Async(const QString &pattern, bool regex,
                                 bool caseSensitive, bool wholeWord,
                                 QObject *parentForModel = nullptr,

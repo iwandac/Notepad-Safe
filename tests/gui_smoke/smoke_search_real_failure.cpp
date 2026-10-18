@@ -23,7 +23,7 @@
 #include "AsyncTaskPanelDialog.h"
 #include "DynamicThresholds.h"
 #include "EditorTab.h"
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
 #include "LargeFileSearch.h"
 #include "ReadOnlySearchSource.h"
 #include "MainWindow.h"
@@ -119,7 +119,7 @@ private slots:
         auto *findAction = window.findChild<QAction *>(QStringLiteral("search.find"));
         QVERIFY(findAction);
         findAction->trigger();
-        auto *dialog = window.findChild<FindReplaceDialog *>();
+        auto *dialog = window.findChild<FindOverlay *>();
         QVERIFY(dialog);
         QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));

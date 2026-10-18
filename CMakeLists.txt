@@ -410,7 +410,8 @@ add_library(notepadsafe_app STATIC
     src/window/MainWindowSession.cpp
     src/window/RecoveryIssuePage.cpp
     src/window/WorkspaceRecoveryCoordinator.cpp
-    src/search/FindReplaceDialog.cpp
+    src/search/FindOverlay.cpp
+    src/search/FindLiveSearch.cpp
     src/search/SingleFindAllRequest.cpp
     src/search/SingleFindAllRequest.h
     src/search/SearchResultsController.cpp

@@ -1,4 +1,4 @@
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
 #include "DocumentSearchSurface.h"
 #include "SearchResultsDock.h"
 #include "SearchResultsModel.h"
@@ -8,6 +8,8 @@
 #include "LargeFileSearch.h"
 #include "EncodedRegexCompiler.h"
 #include "Pcre2Regex.h"
+#include "TextEncoding.h"
+#include "FindLiveSearch.h"
 #include "ByteClipboard.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -27,6 +29,9 @@
 #include <QScopeGuard>
 #include <QRegularExpression>
 #include <QSizePolicy>
+#include <QKeyEvent>
+#include <QApplication>
+#include <QTabBar>
 #include <memory>
 #include <algorithm>
 #include <utility>
@@ -54,16 +59,9 @@ QString compactSearchMessage(QString message, qsizetype limit = 72)
 }
 }
 
-FindReplaceDialog::FindReplaceDialog(QWidget *parent)
-    : QDialog(parent)
+void FindOverlay::clearSensitiveState()
 {
-    setWindowTitle(QStringLiteral("查找 / 替换"));
-    setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
-    buildUi();
-}
-
-void FindReplaceDialog::clearSensitiveState()
-{
+    m_live->reset();
     if (m_navigationRequest) m_navigationRequest->retire();
     if (m_l2SearchInProgress) {
         m_searchSession.requestCancel();
@@ -89,88 +87,243 @@ void FindReplaceDialog::clearSensitiveState()
     hide();
 }
 
-void FindReplaceDialog::buildUi()
+FindOverlay::FindOverlay(QWidget *parent)
+    : QFrame(parent)
 {
+    setObjectName(QStringLiteral("findOverlay"));
+    setFrameShape(QFrame::NoFrame);
+    setAttribute(Qt::WA_StyledBackground, true);
+    m_live = new FindLiveSearch(this);
+    buildUi();
+    connect(m_live, &FindLiveSearch::updated, this, &FindOverlay::updateQueryUi);
+    if (parentWidget())
+        parentWidget()->installEventFilter(this);
+    hide();
+}
+
+void FindOverlay::scheduleLive()
+{
+    if (!isVisible() || hexBytesMode() || !FindLiveSearch::eligible(m_tab))
+        return;
+    m_live->schedule(m_tab, {currentFindText(), m_regexCheck->isChecked(),
+                             m_caseCheck->isChecked(), m_wordCheck->isChecked()});
+}
+
+void FindOverlay::closeOverlay()
+{
+    m_live->reset();
+    hide();
+    if (m_tab)
+        m_tab->setFocusEditor();
+}
+
+bool FindOverlay::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == parentWidget() && event->type() == QEvent::Resize)
+        reposition();
+    if (watched == m_findEdit && event->type() == QEvent::KeyPress) {
+        auto *key = static_cast<QKeyEvent *>(event);
+        if (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter) {
+            if (key->modifiers() & Qt::AltModifier) {
+                if (m_findAllBtn->isEnabled())
+                    onFindAll();
+            } else if (key->modifiers() & Qt::ShiftModifier) {
+                if (m_findPrevBtn->isEnabled())
+                    onFindPrev();
+            } else if (m_findNextBtn->isEnabled()) {
+                onFindNext();
+            }
+            return true;
+        }
+    }
+    return QFrame::eventFilter(watched, event);
+}
+
+void FindOverlay::keyPressEvent(QKeyEvent *event)
+{
+    if (event->key() == Qt::Key_Escape) {
+        closeOverlay();
+        return;
+    }
+    QFrame::keyPressEvent(event);
+}
+
+void FindOverlay::reposition()
+{
+    QWidget *host = parentWidget();
+    if (!host)
+        return;
+    adjustSize();
+    int top = 8;
+    if (auto *tabs = qobject_cast<QTabWidget *>(host)) {
+        if (tabs->tabBar() && tabs->tabBar()->isVisible())
+            top += tabs->tabBar()->geometry().bottom() + 1;
+    }
+    const int width = qMin(sizeHint().width(), qMax(240, host->width() - 32));
+    resize(width, sizeHint().height());
+    move(qMax(0, host->width() - width - 16), top);
+    raise();
+}
+
+void FindOverlay::setReplaceRowVisible(bool visible)
+{
+    m_replaceRow->setVisible(visible);
+    const QSignalBlocker blocker(m_replaceToggle);
+    m_replaceToggle->setChecked(visible);
+    m_replaceToggle->setText(visible ? QStringLiteral("⌄") : QStringLiteral("›"));
+    reposition();
+}
+
+void FindOverlay::buildUi()
+{
+    const auto toggle = [this](const char *name, const QString &text,
+                               const QString &tip) {
+        auto *box = new QCheckBox(text, this);
+        box->setObjectName(QString::fromLatin1(name));
+        box->setToolTip(tip);
+        box->setAccessibleName(tip);
+        box->setFocusPolicy(Qt::TabFocus);
+        return box;
+    };
+    const auto glyphButton = [this](const char *name, const QString &text,
+                                    const QString &tip) {
+        auto *button = new QPushButton(text, this);
+        button->setObjectName(QString::fromLatin1(name));
+        button->setProperty("glyph", true);
+        button->setFocusPolicy(Qt::NoFocus);
+        button->setToolTip(tip);
+        button->setAccessibleName(tip);
+        return button;
+    };
+
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(8, 8, 8, 8);
     layout->setSpacing(6);
+    layout->setSizeConstraint(QLayout::SetFixedSize);
 
-    // 查找输入
-    auto *findLayout = new QHBoxLayout;
-    m_findLabel = new QLabel(QStringLiteral("查找:"));
-    m_findEdit = new QLineEdit;
+    // 主行：展开替换、查找框、开关、上一个/下一个、更多、关闭
+    auto *findRow = new QHBoxLayout;
+    findRow->setSpacing(4);
+    m_replaceToggle = glyphButton("replaceToggleButton", QStringLiteral("›"),
+                                  QStringLiteral("显示替换"));
+    m_replaceToggle->setCheckable(true);
+    m_findEdit = new QLineEdit(this);
     m_findEdit->setObjectName(QStringLiteral("findPatternEdit"));
+    m_findEdit->setPlaceholderText(QStringLiteral("查找"));
+    m_findEdit->setAccessibleName(QStringLiteral("查找"));
     m_findEdit->setClearButtonEnabled(true);
-    findLayout->addWidget(m_findLabel);
-    findLayout->addWidget(m_findEdit);
-    layout->addLayout(findLayout);
+    m_findEdit->setMinimumWidth(220);
+    m_findEdit->installEventFilter(this);
+    m_caseCheck = toggle("caseSensitiveSearchCheck", QStringLiteral("Aa"),
+                         QStringLiteral("区分大小写"));
+    m_wordCheck = toggle("wholeWordSearchCheck", QStringLiteral("词"),
+                         QStringLiteral("整词匹配：西文按单词边界匹配；中文、日文和韩文按完整短语精确匹配"));
+    m_regexCheck = toggle("regexSearchCheck", QStringLiteral(".*"),
+                          QStringLiteral("正则表达式"));
+    m_hexBytesCheck = toggle("hexBytesCheck", QStringLiteral("01"),
+                             QStringLiteral("十六进制字节"));
+    m_hexBytesCheck->setVisible(false);
+    m_findPrevBtn = glyphButton("findPreviousButton", QStringLiteral("↑"),
+                                QStringLiteral("查找上一个 (Shift+Enter)"));
+    m_findNextBtn = glyphButton("findNextButton", QStringLiteral("↓"),
+                                QStringLiteral("查找下一个 (Enter)"));
+    m_optionsToggle = glyphButton("findOptionsToggle", QStringLiteral("⋯"),
+                                  QStringLiteral("更多选项"));
+    m_optionsToggle->setCheckable(true);
+    m_closeBtn = glyphButton("closeSearchButton", QStringLiteral("✕"),
+                             QStringLiteral("关闭 (Esc)"));
+    findRow->addWidget(m_replaceToggle);
+    findRow->addWidget(m_findEdit, 1);
+    findRow->addWidget(m_caseCheck);
+    findRow->addWidget(m_wordCheck);
+    findRow->addWidget(m_regexCheck);
+    findRow->addWidget(m_hexBytesCheck);
+    findRow->addWidget(m_findPrevBtn);
+    findRow->addWidget(m_findNextBtn);
+    findRow->addWidget(m_optionsToggle);
+    findRow->addWidget(m_closeBtn);
+    layout->addLayout(findRow);
 
-    auto *scopeLayout = new QHBoxLayout;
-    auto *scopeLabel = new QLabel(QStringLiteral("范围:"));
-    m_scopeCombo = new QComboBox;
+    // 第二行：状态提示 + 查找全部 + 范围
+    auto *actionRow = new QHBoxLayout;
+    actionRow->setSpacing(6);
+    actionRow->setContentsMargins(28, 0, 0, 0);
+    m_queryHintLabel = new QLabel(this);
+    m_queryHintLabel->setObjectName(QStringLiteral("regexQueryHint"));
+    m_queryHintLabel->setProperty("muted", true);
+    m_queryHintLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_statusLabel = new QLabel(this);
+    m_statusLabel->setObjectName(QStringLiteral("findStatusLabel"));
+    m_statusLabel->setProperty("muted", true);
+    m_statusLabel->setWordWrap(true);
+    m_statusLabel->setMinimumWidth(0);
+    m_statusLabel->setMaximumWidth(260);
+    m_statusLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    m_findAllBtn = new QPushButton(QStringLiteral("查找全部"), this);
+    m_findAllBtn->setObjectName(QStringLiteral("findAllButton"));
+    m_findAllBtn->setToolTip(QStringLiteral("查找全部 (Alt+Enter)，结果显示在底部面板"));
+    m_cancelSearchBtn = new QPushButton(QStringLiteral("取消"), this);
+    m_cancelSearchBtn->setObjectName(QStringLiteral("cancelSearchButton"));
+    m_cancelSearchBtn->setToolTip(QStringLiteral("取消搜索"));
+    m_cancelSearchBtn->setVisible(false);
+    m_scopeCombo = new QComboBox(this);
     m_scopeCombo->setObjectName(QStringLiteral("searchScopeCombo"));
+    m_scopeCombo->setAccessibleName(QStringLiteral("查找范围"));
     m_scopeCombo->addItem(QStringLiteral("当前文件"), 0);
     m_scopeCombo->addItem(QStringLiteral("全部打开文件"), 1);
-    scopeLayout->addWidget(scopeLabel);
-    scopeLayout->addWidget(m_scopeCombo, 1);
-    layout->addLayout(scopeLayout);
+    actionRow->addWidget(m_queryHintLabel);
+    actionRow->addWidget(m_statusLabel, 1);
+    actionRow->addWidget(m_findAllBtn);
+    actionRow->addWidget(m_cancelSearchBtn);
+    actionRow->addWidget(m_scopeCombo);
+    layout->addLayout(actionRow);
 
-    // 替换输入
-    auto *replaceLayout = new QHBoxLayout;
-    m_replaceLabel = new QLabel(QStringLiteral("替换:"));
-    m_replaceEdit = new QLineEdit;
+    // 替换行（› 展开）
+    m_replaceRow = new QWidget(this);
+    auto *replaceLayout = new QHBoxLayout(m_replaceRow);
+    replaceLayout->setContentsMargins(28, 0, 0, 0);
+    replaceLayout->setSpacing(6);
+    m_replaceEdit = new QLineEdit(m_replaceRow);
     m_replaceEdit->setObjectName(QStringLiteral("replaceTextEdit"));
+    m_replaceEdit->setPlaceholderText(QStringLiteral("替换为"));
+    m_replaceEdit->setAccessibleName(QStringLiteral("替换为"));
     m_replaceEdit->setClearButtonEnabled(true);
-    replaceLayout->addWidget(m_replaceLabel);
-    replaceLayout->addWidget(m_replaceEdit);
-    layout->addLayout(replaceLayout);
+    m_replaceBtn = new QPushButton(QStringLiteral("替换"), m_replaceRow);
+    m_replaceBtn->setObjectName(QStringLiteral("replaceButton"));
+    m_replaceAllBtn = new QPushButton(QStringLiteral("全部替换"), m_replaceRow);
+    m_replaceAllBtn->setObjectName(QStringLiteral("replaceAllButton"));
+    replaceLayout->addWidget(m_replaceEdit, 1);
+    replaceLayout->addWidget(m_replaceBtn);
+    replaceLayout->addWidget(m_replaceAllBtn);
+    m_replaceRow->setVisible(false);
+    layout->addWidget(m_replaceRow);
 
-    // 选项
-    auto *optionsLayout = new QHBoxLayout;
-    m_regexCheck = new QCheckBox(QStringLiteral("正则表达式"));
-    m_regexCheck->setObjectName(QStringLiteral("regexSearchCheck"));
-    m_hexBytesCheck = new QCheckBox(QStringLiteral("十六进制字节"));
-    m_hexBytesCheck->setObjectName(QStringLiteral("hexBytesCheck"));
-    m_caseCheck = new QCheckBox(QStringLiteral("区分大小写"));
-    m_caseCheck->setObjectName(QStringLiteral("caseSensitiveSearchCheck"));
-    m_wordCheck = new QCheckBox(QStringLiteral("整词匹配"));
-    m_wordCheck->setObjectName(QStringLiteral("wholeWordSearchCheck"));
-    m_wordCheck->setToolTip(
-        QStringLiteral("西文按单词边界匹配；中文、日文和韩文按完整短语精确匹配"));
-    m_wrapCheck = new QCheckBox(QStringLiteral("循环查找"));
+    // 选项行（⋯ 展开）：循环查找、正则助手
+    m_optionsRow = new QWidget(this);
+    auto *optionsLayout = new QHBoxLayout(m_optionsRow);
+    optionsLayout->setContentsMargins(28, 0, 0, 0);
+    optionsLayout->setSpacing(6);
+    m_wrapCheck = new QCheckBox(QStringLiteral("循环查找"), m_optionsRow);
     m_wrapCheck->setObjectName(QStringLiteral("wrapSearchCheck"));
+    m_wrapCheck->setProperty("plain", true);
     m_wrapCheck->setChecked(true);
-    optionsLayout->addWidget(m_regexCheck);
-    optionsLayout->addWidget(m_hexBytesCheck);
-    optionsLayout->addWidget(m_caseCheck);
-    optionsLayout->addWidget(m_wordCheck);
+    m_regexAssistantToggle = new QPushButton(QStringLiteral("正则助手"), m_optionsRow);
+    m_regexAssistantToggle->setObjectName(QStringLiteral("regexAssistantToggle"));
+    m_regexAssistantToggle->setCheckable(true);
     optionsLayout->addWidget(m_wrapCheck);
+    optionsLayout->addWidget(m_regexAssistantToggle);
     optionsLayout->addStretch();
-    layout->addLayout(optionsLayout);
+    m_optionsRow->setVisible(false);
+    layout->addWidget(m_optionsRow);
 
     // A deliberately small authoring aid: it edits the same regex string as
     // expert mode instead of introducing a second query language or a lossy
     // visual AST. Selected text is wrapped; an empty selection gets an
     // editable placeholder.
-    auto *assistantHeader = new QHBoxLayout;
-    m_regexAssistantToggle = new QPushButton(QStringLiteral("正则助手"));
-    m_regexAssistantToggle->setObjectName(QStringLiteral("regexAssistantToggle"));
-    m_regexAssistantToggle->setCheckable(true);
-    assistantHeader->addWidget(m_regexAssistantToggle);
-    m_queryHintLabel = new QLabel;
-    m_queryHintLabel->setObjectName(QStringLiteral("regexQueryHint"));
-    m_queryHintLabel->setStyleSheet(QStringLiteral("color:#707070;"));
-    m_queryHintLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    m_queryHintLabel->setWordWrap(true);
-    m_queryHintLabel->setMinimumWidth(0);
-    m_queryHintLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    assistantHeader->addWidget(m_queryHintLabel, 1);
-    layout->addLayout(assistantHeader);
-
-    m_regexAssistant = new QWidget;
+    m_regexAssistant = new QWidget(this);
     m_regexAssistant->setObjectName(QStringLiteral("regexAssistant"));
     auto *assistantLayout = new QHBoxLayout(m_regexAssistant);
-    assistantLayout->setContentsMargins(0, 0, 0, 0);
+    assistantLayout->setContentsMargins(28, 0, 0, 0);
     assistantLayout->setSpacing(4);
     struct AssistantItem {
         const char *label;
@@ -191,7 +344,7 @@ void FindReplaceDialog::buildUi()
         {"行尾", "$", "", "", "只在行尾匹配"},
     };
     for (const AssistantItem &item : items) {
-        auto *button = new QPushButton(QString::fromUtf8(item.label));
+        auto *button = new QPushButton(QString::fromUtf8(item.label), m_regexAssistant);
         // The assistant operates on the current selection in the query edit.
         // Mouse clicks must not move focus and clear that selection before the
         // clicked handler reads it.
@@ -215,52 +368,26 @@ void FindReplaceDialog::buildUi()
     m_regexAssistant->setVisible(false);
     layout->addWidget(m_regexAssistant);
 
-    // 按钮
-    auto *btnLayout = new QHBoxLayout;
-    m_findNextBtn = new QPushButton(QStringLiteral("查找下一个"));
-    m_findNextBtn->setObjectName(QStringLiteral("findNextButton"));
-    m_findPrevBtn = new QPushButton(QStringLiteral("查找上一个"));
-    m_findPrevBtn->setObjectName(QStringLiteral("findPreviousButton"));
-    m_replaceBtn = new QPushButton(QStringLiteral("替换"));
-    m_replaceBtn->setObjectName(QStringLiteral("replaceButton"));
-    m_replaceAllBtn = new QPushButton(QStringLiteral("全部替换"));
-    m_replaceAllBtn->setObjectName(QStringLiteral("replaceAllButton"));
-    m_findAllBtn = new QPushButton(QStringLiteral("查找全部"));
-    m_findAllBtn->setObjectName(QStringLiteral("findAllButton"));
-    m_closeBtn = new QPushButton(QStringLiteral("关闭"));
-    m_closeBtn->setObjectName(QStringLiteral("closeSearchButton"));
-    m_cancelSearchBtn = new QPushButton(QStringLiteral("取消搜索"));
-    m_cancelSearchBtn->setObjectName(QStringLiteral("cancelSearchButton"));
-    m_cancelSearchBtn->setVisible(false);
-    btnLayout->addWidget(m_findNextBtn);
-    btnLayout->addWidget(m_findPrevBtn);
-    btnLayout->addWidget(m_replaceBtn);
-    btnLayout->addWidget(m_replaceAllBtn);
-    btnLayout->addWidget(m_findAllBtn);
-    btnLayout->addWidget(m_cancelSearchBtn);
-    btnLayout->addStretch();
-    btnLayout->addWidget(m_closeBtn);
-    layout->addLayout(btnLayout);
-
-    // 异步搜索状态提示（L2 大文件搜索时显示进度；L1 不显示）
-    m_statusLabel = new QLabel(QStringLiteral(""));
-    m_statusLabel->setObjectName(QStringLiteral("findStatusLabel"));
-    m_statusLabel->setStyleSheet(QStringLiteral("color:#888;"));
-    m_statusLabel->setWordWrap(true);
-    m_statusLabel->setMinimumWidth(0);
-    m_statusLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    layout->addWidget(m_statusLabel);
-
     // 连接
-    connect(m_findNextBtn, &QPushButton::clicked, this, &FindReplaceDialog::onFindNext);
-    connect(m_findPrevBtn, &QPushButton::clicked, this, &FindReplaceDialog::onFindPrev);
-    connect(m_replaceBtn, &QPushButton::clicked, this, &FindReplaceDialog::onReplace);
-    connect(m_replaceAllBtn, &QPushButton::clicked, this, &FindReplaceDialog::onReplaceAll);
-    connect(m_findAllBtn, &QPushButton::clicked, this, &FindReplaceDialog::onFindAll);
+    connect(m_findNextBtn, &QPushButton::clicked, this, &FindOverlay::onFindNext);
+    connect(m_findPrevBtn, &QPushButton::clicked, this, &FindOverlay::onFindPrev);
+    connect(m_replaceBtn, &QPushButton::clicked, this, &FindOverlay::onReplace);
+    connect(m_replaceAllBtn, &QPushButton::clicked, this, &FindOverlay::onReplaceAll);
+    connect(m_findAllBtn, &QPushButton::clicked, this, &FindOverlay::onFindAll);
     connect(m_cancelSearchBtn, &QPushButton::clicked,
-            this, &FindReplaceDialog::cancelActiveSearch);
-    connect(m_closeBtn, &QPushButton::clicked, this, &QDialog::close);
-    connect(m_findEdit, &QLineEdit::returnPressed, this, &FindReplaceDialog::onFindNext);
+            this, &FindOverlay::cancelActiveSearch);
+    connect(m_closeBtn, &QPushButton::clicked, this, &FindOverlay::closeOverlay);
+    connect(m_replaceToggle, &QPushButton::toggled, this, [this](bool visible) {
+        setReplaceRowVisible(visible);
+        m_replaceMode = visible;
+        updateQueryUi();
+    });
+    connect(m_optionsToggle, &QPushButton::toggled, this, [this](bool visible) {
+        m_optionsRow->setVisible(visible);
+        if (!visible && m_regexAssistantToggle->isChecked())
+            m_regexAssistantToggle->setChecked(false);
+        reposition();
+    });
     // 查找参数变化时通知主窗口
     connect(m_findEdit, &QLineEdit::textChanged, this, [this](const QString &text) {
         QByteArray rawBytes;
@@ -286,6 +413,7 @@ void FindReplaceDialog::buildUi()
                 "已识别字符栏中的原始字节，按精确字节搜索。"));
         }
         emitFindParameters();
+        scheduleLive();
     });
     connect(m_regexCheck, &QCheckBox::toggled, this, [this](bool checked) {
         if (checked) {
@@ -296,13 +424,14 @@ void FindReplaceDialog::buildUi()
         }
         updateQueryUi();
         emitFindParameters();
+        scheduleLive();
     });
     connect(m_regexAssistantToggle, &QPushButton::toggled,
             this, [this](bool visible) {
                 if (visible && !m_regexCheck->isChecked())
                     m_regexCheck->setChecked(true);
                 m_regexAssistant->setVisible(visible);
-                adjustSize();
+                reposition();
             });
     connect(m_hexBytesCheck, &QCheckBox::toggled, this, [this](bool checked) {
         if (checked) {
@@ -315,25 +444,30 @@ void FindReplaceDialog::buildUi()
         }
         updateQueryUi();
         emitFindParameters();
+        scheduleLive();
     });
     connect(m_caseCheck, &QCheckBox::toggled, this, [this]() {
         updateQueryUi();
         emitFindParameters();
+        scheduleLive();
     });
     connect(m_wordCheck, &QCheckBox::toggled, this, [this]() {
         updateQueryUi();
         emitFindParameters();
+        scheduleLive();
     });
     connect(m_scopeCombo, &QComboBox::currentIndexChanged, this, [this]() {
         updateQueryUi();
     });
 }
 
-void FindReplaceDialog::setActiveTab(DocumentSearchSurface *tab)
+void FindOverlay::setActiveTab(DocumentSearchSurface *tab)
 {
     const bool retireSingle = m_tab != tab
         && m_searchSession.query().scope == SearchScope::CurrentDocument;
     const bool targetChanged = m_tab != tab;
+    if (targetChanged)
+        m_live->reset();
     m_tab = tab;
     if (targetChanged && m_navigationRequest
         && m_navigationRequest->scope() == SearchScope::CurrentDocument)
@@ -344,9 +478,11 @@ void FindReplaceDialog::setActiveTab(DocumentSearchSurface *tab)
         setL2SearchUiBusy(false);
     }
     updateQueryUi();
+    if (targetChanged)
+        scheduleLive();
 }
 
-void FindReplaceDialog::disconnectSingleSearch()
+void FindOverlay::disconnectSingleSearch()
 {
     if (m_singleRequest) {
         m_singleRequest->retire();
@@ -355,25 +491,25 @@ void FindReplaceDialog::disconnectSingleSearch()
     }
 }
 
-void FindReplaceDialog::finishSingleSearch()
+void FindOverlay::finishSingleSearch()
 {
     m_searchSession.settleTarget();
     disconnectSingleSearch();
     setL2SearchUiBusy(false);
 }
 
-void FindReplaceDialog::setSearchResultsDock(SearchResultsDock *dock)
+void FindOverlay::setSearchResultsDock(SearchResultsDock *dock)
 {
     QObject::disconnect(m_rerunConnection);
     m_resultsDock = dock;
     if (m_resultsDock) {
         m_rerunConnection = connect(
             m_resultsDock, &SearchResultsDock::rerunRequested,
-            this, &FindReplaceDialog::rerunInvalidatedSearch);
+            this, &FindOverlay::rerunInvalidatedSearch);
     }
 }
 
-void FindReplaceDialog::rerunInvalidatedSearch(
+void FindOverlay::rerunInvalidatedSearch(
     const QUuid &preferredDocumentId, quint64 expectedRevision)
 {
     Q_UNUSED(expectedRevision);
@@ -407,12 +543,12 @@ void FindReplaceDialog::rerunInvalidatedSearch(
     onFindAll();
 }
 
-void FindReplaceDialog::setTabWidget(QTabWidget *tabs)
+void FindOverlay::setTabWidget(QTabWidget *tabs)
 {
     m_tabWidget = tabs;
 }
 
-void FindReplaceDialog::notifyTabOpened(DocumentSearchSurface *tab)
+void FindOverlay::notifyTabOpened(DocumentSearchSurface *tab)
 {
     if (!tab || !m_l2SearchInProgress || !allOpenScope()
         || m_searchSession.cancelRequested()
@@ -449,49 +585,57 @@ void FindReplaceDialog::notifyTabOpened(DocumentSearchSurface *tab)
     }
 }
 
-void FindReplaceDialog::setReplaceMode(bool replace)
+void FindOverlay::setReplaceMode(bool replace)
 {
     m_replaceMode = replace;
-    m_replaceLabel->setVisible(replace);
-    m_replaceEdit->setVisible(replace);
-    m_replaceBtn->setVisible(replace);
-    m_replaceAllBtn->setVisible(replace);
+    setReplaceRowVisible(replace);
     updateQueryUi();
 }
 
-void FindReplaceDialog::showFindMode()
+void FindOverlay::prefillFromDocument()
 {
+    const QString prefill = m_tab ? m_tab->searchCursor().prefill : QString();
+    if (!prefill.isEmpty() && !m_l2SearchInProgress)
+        m_findEdit->setText(prefill);
+}
+
+void FindOverlay::showFindMode()
+{
+    prefillFromDocument();
     setReplaceMode(false);
-    setWindowTitle(QStringLiteral("查找"));
     show();
-    raise();
-    activateWindow();
+    reposition();
+    if (isWindow())
+        activateWindow();
     m_findEdit->setFocus();
     m_findEdit->selectAll();
+    scheduleLive();
 }
 
-void FindReplaceDialog::showReplaceMode()
+void FindOverlay::showReplaceMode()
 {
+    prefillFromDocument();
     setReplaceMode(true);
-    setWindowTitle(QStringLiteral("替换"));
     show();
-    raise();
-    activateWindow();
+    reposition();
+    if (isWindow())
+        activateWindow();
     m_findEdit->setFocus();
     m_findEdit->selectAll();
+    scheduleLive();
 }
 
-QString FindReplaceDialog::currentFindText() const
+QString FindOverlay::currentFindText() const
 {
     return m_findEdit->text();
 }
 
-QString FindReplaceDialog::currentReplaceText() const
+QString FindOverlay::currentReplaceText() const
 {
     return m_replaceEdit->text();
 }
 
-void FindReplaceDialog::insertRegexTemplate(const QString &prefix,
+void FindOverlay::insertRegexTemplate(const QString &prefix,
                                             const QString &suffix,
                                             const QString &placeholder)
 {
@@ -509,38 +653,38 @@ void FindReplaceDialog::insertRegexTemplate(const QString &prefix,
     m_findEdit->setFocus();
 }
 
-void FindReplaceDialog::emitFindParameters()
+void FindOverlay::emitFindParameters()
 {
     emit findParametersChanged(m_findEdit->text(), m_regexCheck->isChecked(),
                                m_caseCheck->isChecked(), m_wordCheck->isChecked());
 }
 
-void FindReplaceDialog::onFindNext()
+void FindOverlay::onFindNext()
 {
     findAcrossTabs(true);
 }
 
-void FindReplaceDialog::onFindPrev()
+void FindOverlay::onFindPrev()
 {
     findAcrossTabs(false);
 }
 
-void FindReplaceDialog::findNextFromShortcut(bool forward)
+void FindOverlay::findNextFromShortcut(bool forward)
 {
     findAcrossTabs(forward);
 }
 
-bool FindReplaceDialog::allOpenScope() const
+bool FindOverlay::allOpenScope() const
 {
     return m_scopeCombo && m_scopeCombo->currentData().toInt() == 1;
 }
 
-bool FindReplaceDialog::hexBytesMode() const
+bool FindOverlay::hexBytesMode() const
 {
     return m_hexBytesCheck && m_hexBytesCheck->isChecked();
 }
 
-void FindReplaceDialog::updateQueryUi()
+void FindOverlay::updateQueryUi()
 {
     if (!m_hexBytesCheck)
         return;
@@ -548,6 +692,7 @@ void FindReplaceDialog::updateQueryUi()
     const bool busy = m_l2SearchInProgress;
     if (m_regexAssistantToggle)
         m_regexAssistantToggle->setEnabled(!busy && !hexBytesMode());
+    bool regexInvalid = false;
     if (m_queryHintLabel && !busy) {
         if (m_regexCheck->isChecked() && !m_findEdit->text().isEmpty()) {
             QString error;
@@ -567,21 +712,28 @@ void FindReplaceDialog::updateQueryUi()
                                           m_caseCheck->isChecked(), false,
                                           &error);
             }
-            if (valid) {
-                m_queryHintLabel->setText(QStringLiteral("正则有效"));
-                m_queryHintLabel->setToolTip(QString());
-                m_queryHintLabel->setStyleSheet(QStringLiteral("color:#39734a;"));
-            } else {
-                m_queryHintLabel->setText(compactSearchMessage(error));
-                m_queryHintLabel->setToolTip(error);
-                m_queryHintLabel->setStyleSheet(QStringLiteral("color:#a33a3a;"));
+            // Quiet hints: a working downgrade is one muted line with the
+            // reason in the tooltip; an error is its reason, never a box.
+            QString hint = compactSearchMessage(error);
+            QString tip = error;
+            if (valid && encodedTarget) {
+                hint = QStringLiteral("按 %1 子集匹配 ⓘ")
+                    .arg(encodingName(m_tab->displayEncoding()));
+                tip = QStringLiteral("此文件按 %1 编码搜索，正则只支持该编码可表达的子集；"
+                                     "详见正则语义说明。")
+                    .arg(encodingName(m_tab->displayEncoding()));
+            } else if (valid) {
+                const QString position = m_live->positionText();
+                hint = position.isEmpty() ? QStringLiteral("正则有效") : position;
+                tip.clear();
             }
+            regexInvalid = !valid;
+            m_queryHintLabel->setText(hint);
+            m_queryHintLabel->setToolTip(tip);
         } else if (hexBytesMode()) {
             m_queryHintLabel->setText(QStringLiteral("原始字节搜索"));
-            m_queryHintLabel->setStyleSheet(QStringLiteral("color:#707070;"));
         } else {
-            m_queryHintLabel->setText(QStringLiteral("普通查找"));
-            m_queryHintLabel->setStyleSheet(QStringLiteral("color:#707070;"));
+            m_queryHintLabel->setText(m_live->positionText());
         }
     }
     int searchableTargetCount = 0;
@@ -633,6 +785,7 @@ void FindReplaceDialog::updateQueryUi()
     const bool queryExecutable = hasQuery && hasSearchableTarget
         && (!hex || hasBinaryTarget);
 
+    m_hexBytesCheck->setVisible(hasBinaryTarget);
     m_hexBytesCheck->setEnabled(!busy && hasBinaryTarget && !regex
                                 && !caseSensitive && !wholeWord);
     m_hexBytesCheck->setToolTip(hasBinaryTarget
@@ -650,7 +803,7 @@ void FindReplaceDialog::updateQueryUi()
         && (!busy || m_allowNavigationDuringBusy);
     m_findNextBtn->setEnabled(navigationAllowed && queryExecutable);
     m_findPrevBtn->setEnabled(navigationAllowed && queryExecutable);
-    m_findAllBtn->setEnabled(!busy && queryExecutable);
+    m_findAllBtn->setEnabled(!busy && queryExecutable && !regexInvalid);
 
     const auto replaceableTextTarget = [](DocumentSearchSurface *tab) {
         return tab && !tab->isReadOnlyByPolicy() && !tab->isBinaryDocument()
@@ -682,7 +835,7 @@ void FindReplaceDialog::updateQueryUi()
     }
 }
 
-QList<DocumentSearchSurface *> FindReplaceDialog::openTabs() const
+QList<DocumentSearchSurface *> FindOverlay::openTabs() const
 {
     QList<DocumentSearchSurface *> result;
     if (!m_tabWidget)
@@ -694,7 +847,7 @@ QList<DocumentSearchSurface *> FindReplaceDialog::openTabs() const
     return result;
 }
 
-void FindReplaceDialog::findAcrossTabs(bool forward)
+void FindOverlay::findAcrossTabs(bool forward)
 {
     if (!m_tab || (m_navigationRequest && m_navigationRequest->active())) return;
     const QString pattern = currentFindText();
@@ -718,7 +871,7 @@ void FindReplaceDialog::findAcrossTabs(bool forward)
         query, openTabs(), m_tab, forward, m_wrapCheck->isChecked(), this);
     m_navigationRequest = created;
     QPointer<SearchNavigationRequest> request(created);
-    QPointer<FindReplaceDialog> owner(this);
+    QPointer<FindOverlay> owner(this);
     connect(created, &SearchNavigationRequest::targetClosed, this,
         [this, request](DocumentSearchSurface *identity) {
             if (m_tab == identity) m_tab = nullptr;
@@ -739,11 +892,16 @@ void FindReplaceDialog::findAcrossTabs(bool forward)
                     ? QStringLiteral("未找到更多匹配") : compactSearchMessage(error)));
                 m_statusLabel->setToolTip(error);
             }
+            if (found)
+                m_live->refreshPosition();
             if (!found || !targetGuard) return;
             if (allOpen && m_tabWidget) m_tabWidget->setCurrentWidget(targetGuard);
             if (!owner || !targetGuard || m_navigationRequest != request) return;
             if (allOpen && m_tab != targetGuard) setActiveTab(targetGuard);
-            if (owner && targetGuard && m_navigationRequest == request)
+            // Navigation started from the panel keeps typing in the panel;
+            // F3 from the text keeps focus in the text.
+            if (owner && targetGuard && m_navigationRequest == request
+                && !(isVisible() && isAncestorOf(QApplication::focusWidget())))
                 targetGuard->setFocusEditor();
         });
     updateNavigationUi(forward ? QObject::tr("查找下一个…")
@@ -751,7 +909,7 @@ void FindReplaceDialog::findAcrossTabs(bool forward)
     if (owner && request && m_navigationRequest == request) request->start();
 }
 
-void FindReplaceDialog::onReplace()
+void FindOverlay::onReplace()
 {
     if (!m_tab) return;
     QString pattern = currentFindText();
@@ -789,7 +947,7 @@ void FindReplaceDialog::onReplace()
     }
 }
 
-void FindReplaceDialog::onReplaceAll()
+void FindOverlay::onReplaceAll()
 {
     if (!m_tab) return;
     QString pattern = currentFindText();
@@ -819,10 +977,13 @@ void FindReplaceDialog::onReplaceAll()
     }
 }
 
-void FindReplaceDialog::onFindAll()
+void FindOverlay::onFindAll()
 {
     if (!m_tab || !m_resultsDock) return;
-    const QPointer<FindReplaceDialog> owner(this);
+    // Find All owns the document's one background search and its highlights.
+    m_live->cancel();
+    m_live->releaseHighlights();
+    const QPointer<FindOverlay> owner(this);
     const QPointer<DocumentSearchSurface> target(m_tab);
     const SearchQuery query{currentFindText(), allOpenScope()
         ? SearchScope::AllOpenDocuments : SearchScope::CurrentDocument,
@@ -956,7 +1117,7 @@ void FindReplaceDialog::onFindAll()
     }
 }
 
-void FindReplaceDialog::startAllOpenFindAll()
+void FindOverlay::startAllOpenFindAll()
 {
     if (!m_resultsDock)
         return;
@@ -996,7 +1157,7 @@ void FindReplaceDialog::startAllOpenFindAll()
     });
 }
 
-void FindReplaceDialog::dispatchNextMultiTarget(int generation)
+void FindOverlay::dispatchNextMultiTarget(int generation)
 {
     if (!m_searchSession.isCurrent(generation))
         return;
@@ -1123,7 +1284,7 @@ void FindReplaceDialog::dispatchNextMultiTarget(int generation)
     });
 }
 
-void FindReplaceDialog::finishMultiSearchIfReady(int generation)
+void FindOverlay::finishMultiSearchIfReady(int generation)
 {
     if (!m_searchSession.isCurrent(generation)
         || !m_searchSession.dispatchComplete()
@@ -1148,7 +1309,7 @@ void FindReplaceDialog::finishMultiSearchIfReady(int generation)
     m_searchSession.clearCancelRequest();
 }
 
-void FindReplaceDialog::cancelActiveSearch()
+void FindOverlay::cancelActiveSearch()
 {
     if (!m_l2SearchInProgress)
         return;
@@ -1172,10 +1333,11 @@ void FindReplaceDialog::cancelActiveSearch()
 // ============================================================================
 //  L2 异步搜索 UI 辅助
 // ============================================================================
-void FindReplaceDialog::setL2SearchUiBusy(bool busy, const QString& msg,
+void FindOverlay::setL2SearchUiBusy(bool busy, const QString& msg,
                                           bool allowNavigation)
 {
     m_l2SearchInProgress = busy;
+    m_live->setSuspended(busy);
     m_allowNavigationDuringBusy = busy && allowNavigation;
     m_cancelSearchBtn->setVisible(busy);
     m_cancelSearchBtn->setEnabled(busy);
@@ -1187,7 +1349,7 @@ void FindReplaceDialog::setL2SearchUiBusy(bool busy, const QString& msg,
     }
 }
 
-void FindReplaceDialog::updateNavigationUi(const QString& msg)
+void FindOverlay::updateNavigationUi(const QString& msg)
 {
     updateQueryUi();
     if (!m_statusLabel)
@@ -1198,7 +1360,7 @@ void FindReplaceDialog::updateNavigationUi(const QString& msg)
         m_statusLabel->clear();
 }
 
-void FindReplaceDialog::onL2FindAllProgress(int percent, qint64 done, qint64 total)
+void FindOverlay::onL2FindAllProgress(int percent, qint64 done, qint64 total)
 {
     if (!m_l2SearchInProgress) return;
     const QString msg = searchProgressText(percent, done, total);
@@ -1209,7 +1371,7 @@ void FindReplaceDialog::onL2FindAllProgress(int percent, qint64 done, qint64 tot
     }
 }
 
-void FindReplaceDialog::onL2FindAllFinished(QPointer<SingleFindAllRequest> request,
+void FindOverlay::onL2FindAllFinished(QPointer<SingleFindAllRequest> request,
                                             QPointer<DocumentSearchSurface> target,
                                             SearchResultsModel* model,
                                             const QString& pattern,
@@ -1218,7 +1380,7 @@ void FindReplaceDialog::onL2FindAllFinished(QPointer<SingleFindAllRequest> reque
     if (!request || !request->current(m_searchSession, m_tab, false)
         || m_searchSession.pendingTargets() == 0)
         return;
-    const QPointer<FindReplaceDialog> owner(this);
+    const QPointer<FindOverlay> owner(this);
     const QPointer<SearchResultsModel> heldModel(model);
     auto reclaimUnpublished = qScopeGuard([heldModel] {
         if (heldModel)

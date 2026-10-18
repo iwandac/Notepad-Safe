@@ -1,6 +1,6 @@
 #include "EditorTab.h"
 #include "AppComposition.h"
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
 #include "MainWindow.h"
 #include "SearchResultsDock.h"
 #include "SecureBuffer.h"
@@ -1649,7 +1649,7 @@ private slots:
         QCOMPARE(tabs->count(), 3);
 
         QVERIFY(QMetaObject::invokeMethod(window.get(), "showFindDialog", Qt::DirectConnection));
-        auto *findDialog = window->findChild<FindReplaceDialog *>();
+        auto *findDialog = window->findChild<FindOverlay *>();
         auto *pattern = findDialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
         auto *scope = findDialog->findChild<QComboBox *>(QStringLiteral("searchScopeCombo"));
         auto *findAll = findDialog->findChild<QPushButton *>(QStringLiteral("findAllButton"));

@@ -202,7 +202,7 @@ matcher、全文转码或隐式语义降级冒充支持。
 密集时不报告进度，Previous 也没有把当前 byte boundary 下传，造成任务长期显示 0%。
 
 新增 `tc_fr_034_real_smalltestfile_text_directional_search_progress`，只读使用真实 108,385,159
-字节 fixture，并通过正式 `FindReplaceDialog` 鼠标点击验证 Literal/Regex/Whole Word 的
+字节 fixture，并通过正式 `FindOverlay` 鼠标点击验证 Literal/Regex/Whole Word 的
 Next/Previous、任务进度与正文选区。专项运行结果为 3 passed / 0 failed / 0 skipped；六条路径
 耗时分别为 24/212/192/197/49/39 ms，总用时 2.325 s。视觉证据为
 `build/gui-smalltestfile-text-search-regression.png`，文本选区精确覆盖 source byte range 中的

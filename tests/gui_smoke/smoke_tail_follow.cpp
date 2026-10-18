@@ -41,7 +41,7 @@
 #include "DiskFileVersion.h"
 #include "EditorTab.h"
 #include "VirtualFileView.h"
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
 #include "MainWindow.h"
 #include "OrdinaryReadSource.h"
 #include "SearchResultsDock.h"
@@ -672,7 +672,7 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(document.provider->fileSize(), qint64(document.expected.size()), ObserveTimeout);
         QTRY_VERIFY_WITH_TIMEOUT(!document.provider->characterCountPending(), 15000);
 
-        FindReplaceDialog *dialog = nullptr;
+        FindOverlay *dialog = nullptr;
         QPushButton *next = nullptr;
         SearchResultsDock *dock = nullptr;
         QTreeView *tree = nullptr;
@@ -680,7 +680,7 @@ private slots:
         if (navigation != QStringLiteral("publicGotoApi")) {
             QVERIFY2(document.clickMenu(document.window->findChild<QAction *>(QStringLiteral("search.find"))),
                      qPrintable(document.error));
-            dialog = document.window->findChild<FindReplaceDialog *>();
+            dialog = document.window->findChild<FindOverlay *>();
             QVERIFY(dialog);
             auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
             auto *scope = dialog->findChild<QComboBox *>(QStringLiteral("searchScopeCombo"));

@@ -2,7 +2,7 @@
 #include "SecureDocumentPersistencePort.h"
 #include "EditorTab.h"
 #include "FileContentProbe.h"
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
 #include "SearchResultsDock.h"
 #include "SearchResultsController.h"
 #include "SessionManager.h"
@@ -362,8 +362,8 @@ void MainWindow::showDocumentWorkspace()
     if (leavingAuxiliaryWorkspace && m_searchDockWasVisibleBeforeWorkspace && m_searchDock)
         m_searchDock->show();
     if (auto *tab = currentTab()) {
-        if (m_findDialog)
-            m_findDialog->setActiveTab(tab);
+        if (m_findOverlay)
+            m_findOverlay->setActiveTab(tab);
         tab->setFocusEditor();
     }
     syncCommandStates(currentTab());
@@ -593,8 +593,8 @@ bool MainWindow::showAccountsWorkspace()
         m_workspaceStack->setCurrentWidget(m_accountsPage);
     }
     syncCommandStates(nullptr);
-    if (m_findDialog)
-        m_findDialog->setActiveTab(nullptr);
+    if (m_findOverlay)
+        m_findOverlay->setActiveTab(nullptr);
     showWorkspaceStatus(QStringLiteral("账户"));
     return true;
 }
@@ -624,8 +624,8 @@ bool MainWindow::showSecurityCenterWorkspace()
     }
     refreshSecurityCenter();
     syncCommandStates(nullptr);
-    if (m_findDialog)
-        m_findDialog->setActiveTab(nullptr);
+    if (m_findOverlay)
+        m_findOverlay->setActiveTab(nullptr);
     showWorkspaceStatus(QStringLiteral("安全中心"));
     return true;
 }

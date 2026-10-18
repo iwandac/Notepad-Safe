@@ -21,7 +21,7 @@ flowchart TD
     Tab --> Text["QScintilla<br/>小文本编辑"]
     Tab --> Binary["VirtualFileView + PatchList<br/>小二进制编辑与 Text/Hex 投影"]
     Tab --> Large["WindowedReadOnlyProvider<br/>普通大文件只读 Text/Hex"]
-    Window --> SearchUI["FindReplaceDialog / SearchResultsController"]
+    Window --> SearchUI["FindOverlay / SearchResultsController"]
     SearchUI --> Tab
     Tab --> Search["EditableTextSearch / LargeFileSearch<br/>PCRE2、原字节与显示位置映射"]
     Search --> Read["EditorSearchSource / ReadOnlySearchSource<br/>OrdinaryReadSource / SharedReadOnlyFile"]

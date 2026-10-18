@@ -32,7 +32,7 @@
 #include "AsyncTaskManager.h"
 #include "AsyncTaskPanelDialog.h"
 #include "EditorTab.h"
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
 #include "MainWindow.h"
 #include "SearchResultsDock.h"
 #include "SearchResultsModel.h"
@@ -260,7 +260,7 @@ private slots:
         auto *findAction = window.findChild<QAction *>(QStringLiteral("search.find"));
         QVERIFY(findAction);
         findAction->trigger();
-        auto *dialog = window.findChild<FindReplaceDialog *>();
+        auto *dialog = window.findChild<FindOverlay *>();
         QVERIFY(dialog);
         QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
@@ -510,7 +510,7 @@ private slots:
         auto *dock = window.findChild<SearchResultsDock *>(QStringLiteral("SearchResultsDock"));
         QVERIFY(findAction && dock);
         findAction->trigger();
-        auto *dialog = window.findChild<FindReplaceDialog *>();
+        auto *dialog = window.findChild<FindOverlay *>();
         QVERIFY(dialog);
         QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
@@ -723,7 +723,7 @@ private slots:
         auto *dock = window.findChild<SearchResultsDock *>(QStringLiteral("SearchResultsDock"));
         QVERIFY(findAction && dock);
         findAction->trigger();
-        auto *dialog = window.findChild<FindReplaceDialog *>();
+        auto *dialog = window.findChild<FindOverlay *>();
         QVERIFY(dialog);
         QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
@@ -948,7 +948,7 @@ private slots:
         auto *dock = window.findChild<SearchResultsDock *>(QStringLiteral("SearchResultsDock"));
         QVERIFY(findAction && closeAction && dock);
         findAction->trigger();
-        auto *dialog = window.findChild<FindReplaceDialog *>();
+        auto *dialog = window.findChild<FindOverlay *>();
         QVERIFY(dialog);
         QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));

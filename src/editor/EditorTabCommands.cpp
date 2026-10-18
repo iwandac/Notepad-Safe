@@ -570,6 +570,41 @@ void EditorTab::selectSearchMatch(int line, int index, int length)
     m_editor->setFocus();
 }
 
+DocumentSearchCursor EditorTab::searchCursor() const
+{
+    DocumentSearchCursor cursor;
+    if (isL2Mode() || isHexPresentation())
+        return cursor;
+    cursor.selectionStart = m_editor->SendScintilla(QsciScintillaBase::SCI_GETSELECTIONSTART);
+    cursor.selectionEnd = m_editor->SendScintilla(QsciScintillaBase::SCI_GETSELECTIONEND);
+    cursor.documentBytes = m_editor->length();
+    const QString selected = m_editor->selectedText();
+    if (!selected.isEmpty()) {
+        const bool singleLine = !selected.contains(QLatin1Char('\n'))
+            && !selected.contains(QLatin1Char('\r'));
+        cursor.prefill = singleLine ? selected : QString();
+        return cursor;
+    }
+    const long caret = long(cursor.selectionEnd);
+    const long start = long(m_editor->SendScintilla(
+        QsciScintillaBase::SCI_WORDSTARTPOSITION, caret, true));
+    const long end = long(m_editor->SendScintilla(
+        QsciScintillaBase::SCI_WORDENDPOSITION, caret, true));
+    cursor.prefill = end > start ? m_editor->text(int(start), int(end)) : QString();
+    return cursor;
+}
+
+void EditorTab::selectSearchHit(qint64 byteOffset, qint32 byteLength)
+{
+    if (isL2Mode() || byteOffset < 0)
+        return;
+    m_editor->SendScintilla(QsciScintillaBase::SCI_SETSEL, long(byteOffset),
+                            long(byteOffset + qMax(0, byteLength)));
+    m_editor->ensureLineVisible(int(m_editor->SendScintilla(
+        QsciScintillaBase::SCI_LINEFROMPOSITION, long(byteOffset))));
+    m_editor->ensureCursorVisible();
+}
+
 // ============ 光标 ============
 
 void EditorTab::getCursorPosition(int *line, int *index) const

@@ -38,7 +38,7 @@
 #include "AsyncTaskManager.h"
 #include "AsyncTaskPanelDialog.h"
 #include "EditorTab.h"
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
 #include "LargeFileSearch.h"
 #include "MainWindow.h"
 #include "SearchResultsDock.h"
@@ -404,7 +404,7 @@ bool runChild(const QString &kind, const QString &stopAction,
     auto *findAction = window.findChild<QAction *>(QStringLiteral("search.find"));
     CHILD_CHECK(findAction, QStringLiteral("Missing real Find action"));
     findAction->trigger();
-    auto *dialog = window.findChild<FindReplaceDialog *>();
+    auto *dialog = window.findChild<FindOverlay *>();
     CHILD_CHECK(dialog && waitUntil([&]() { return dialog->isVisible(); }, 2000),
                 QStringLiteral("Find dialog not visible"));
     auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
@@ -1246,7 +1246,7 @@ bool runChild(const QString &kind, const QString &stopAction,
                             && publishPhase("GUARDS_OK", before.id.toString()),
                         QStringLiteral("Phase pipe unavailable"));
 
-            const QPointer<FindReplaceDialog> originalDialog(dialog);
+            const QPointer<FindOverlay> originalDialog(dialog);
             const QPointer<QAbstractItemModel> preview(tree->model());
             CHILD_CHECK(preview && closeFind->isVisible() && closeFind->isEnabled(),
                         QStringLiteral("Active query has no preview or enabled close control"));
@@ -1265,8 +1265,8 @@ bool runChild(const QString &kind, const QString &stopAction,
             CHILD_CHECK(publishPhase("FIND_HIDDEN", QString::number(taskA)), QStringLiteral("Phase pipe unavailable"));
             findAction->trigger();
             CHILD_CHECK(originalDialog && QTest::qWaitForWindowExposed(originalDialog.data())
-                            && window.findChild<FindReplaceDialog *>() == originalDialog.data()
-                            && window.findChildren<FindReplaceDialog *>().size() == 1,
+                            && window.findChild<FindOverlay *>() == originalDialog.data()
+                            && window.findChildren<FindOverlay *>().size() == 1,
                         QStringLiteral("Real Find action did not reopen the same dialog"));
             CHILD_CHECK(sourceGuards() && queuedSearch(taskA) && queryIds.size() == 1
                             && hiddenTaskSubmissions.isEmpty() && aTerminals == 0 && bTerminals == 0,

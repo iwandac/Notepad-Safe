@@ -714,7 +714,6 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
                 QsciScintillaBase::SCI_LINEFROMPOSITION, long(foundOffset)));
             m_editor->ensureLineVisible(line);
             m_editor->ensureCursorVisible();
-            m_editor->setFocus();
             return true;
         }
         if (m_l1SearchCache.isEmpty())
@@ -761,7 +760,6 @@ bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
             QsciScintillaBase::SCI_LINEFROMPOSITION, long(hit.byteOffset)));
         m_editor->ensureLineVisible(line);
         m_editor->ensureCursorVisible();
-        m_editor->setFocus();
         m_lastL1MatchIndex = chosen;
         return true;
     }
@@ -959,7 +957,6 @@ bool EditorTab::findNextL2Async(
                         QsciScintillaBase::SCI_LINEFROMPOSITION, long(result.byteOffset)));
                     that->m_editor->ensureLineVisible(line);
                     that->m_editor->ensureCursorVisible();
-                    that->m_editor->setFocus();
                 }
                 if (context && SearchNavigationRequest::acceptsContext(context, that)
                     && callback) callback(found, result.error);
@@ -1211,6 +1208,9 @@ void EditorTab::resetSearchPosition(bool forward)
         return;
     }
     if (isL2Mode() && m_l2View) {
+        // The hex overlay keeps its own selection; a stale one would count as
+        // the current match and make the next search skip it.
+        m_editor->SendScintilla(QsciScintillaBase::SCI_SETEMPTYSELECTION, 0);
         m_l2View->gotoByteOffset(forward ? 0 : std::numeric_limits<qint64>::max());
         m_l2View->clearSelection();
         // gotoByteOffset emits cursor updates. Assign the search sentinel last

@@ -3,7 +3,7 @@
 //  对应 GUI contract matrix 的查找与替换清单。
 //
 //  覆盖：
-//    TC_FR_001：替换模式能把 FindReplaceDialog 正确 show 出来；主窗口快捷键为 Ctrl+R。
+//    TC_FR_001：替换模式能把 FindOverlay 正确 show 出来；主窗口快捷键为 Ctrl+R。
 //    TC_FR_002：查找下一个跳转正确（连续 10 次，strict offset 递增）
 //    TC_FR_003：单步替换：先 findNext 找到 "__TEST_OLD__" → replaceCurrent 为
 //              "__TEST_NEW__"，断言找到的位置 old 消失 + new 出现（**不是插在旁边**）
@@ -45,7 +45,7 @@
 #include "SmokeTestBase.h"
 #include "EditorTab.h"
 #include "MainWindow.h"
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
 #include "VirtualFileView.h"
 #include "WindowedReadOnlyProvider.h"
 #include "LineIndex.h"
@@ -67,9 +67,9 @@ private slots:
     void cleanupTestCase() {}
 
     // TC_FR_001：替换模式打开（主窗口 Ctrl+R 在命令 smoke 验证）。
-    // 由于我们 smoke 不 link MainWindow，直接测试"实例化 FindReplaceDialog
+    // 由于我们 smoke 不 link MainWindow，直接测试"实例化 FindOverlay
     // + 调 showReplaceMode 后 visible == true + m_findEdit/m_replaceEdit != nullptr"
-    // 这里验证 FindReplaceDialog 自己的真实 GUI buildUi 和模式状态。
+    // 这里验证 FindOverlay 自己的真实 GUI buildUi 和模式状态。
     void tc_fr_001_replace_dialog_opens();
 
     // TC_FR_002：连续查找下一个跳转正确
@@ -261,8 +261,8 @@ void SmokeFindReplace::tc_fr_001_replace_dialog_opens() {
     QVERIFY2(openL2(path, &err), qPrintable(err));
     QVERIFY(tab() != nullptr);
 
-    // 真实实例化 FindReplaceDialog（与 MainWindow::showReplaceDialog 完全一致）
-    FindReplaceDialog dlg(container_);
+    // 真实实例化 FindOverlay（与 MainWindow::showReplaceDialog 完全一致）
+    FindOverlay dlg(container_);
     dlg.setActiveTab(tab());
     dlg.setReplaceMode(true);  // Ctrl+H → 替换模式
     dlg.show();
@@ -271,13 +271,15 @@ void SmokeFindReplace::tc_fr_001_replace_dialog_opens() {
     QVERIFY(dlg.isVisible());
     // 关键：对话框处于替换模式意味着 m_replaceEdit / m_replaceBtn 应该是 visible & enabled
     // 通过 dialog->findChild 间接验证（不依赖 private 字段）
-    auto* findEdit    = dlg.findChild<QLineEdit*>(QString{}, Qt::FindDirectChildrenOnly);
-    QList<QLineEdit*> edits = dlg.findChildren<QLineEdit*>(QString{}, Qt::FindDirectChildrenOnly);
+    auto* findEdit    = dlg.findChild<QLineEdit*>(QStringLiteral("findPatternEdit"));
+    QList<QLineEdit*> edits;
+    for (QLineEdit *edit : dlg.findChildren<QLineEdit*>())
+        if (edit->isVisible()) edits.push_back(edit);
     QVERIFY2(edits.size() >= 2, qPrintable(
-        QStringLiteral("FindReplaceDialog in REPLACE mode 应该至少 2 个 QLineEdit "
+        QStringLiteral("FindOverlay in REPLACE mode 应该至少 2 个 QLineEdit "
                        "(find + replace)，实际只有 %1 个，说明替换页可能根本没显示/没构建")
             .arg(edits.size())));
-    QList<QPushButton*> btns = dlg.findChildren<QPushButton*>(QString{}, Qt::FindDirectChildrenOnly);
+    QList<QPushButton*> btns = dlg.findChildren<QPushButton*>();
     bool hasReplaceBtn = false, hasReplaceAllBtn = false;
     for (QPushButton* b : btns) {
         const QString t = b->text();
@@ -296,7 +298,7 @@ void SmokeFindReplace::tc_fr_002_find_next_jumps_strictly_forward() {
     QString err;
     QVERIFY2(openL2(path, &err), qPrintable(err));
 
-    FindReplaceDialog dlg(container_);
+    FindOverlay dlg(container_);
     dlg.setActiveTab(tab());
     dlg.setReplaceMode(true);
     dlg.show();
@@ -348,7 +350,7 @@ void SmokeFindReplace::tc_fr_003_replace_current_not_appended() {
     // 与 tc002 保持一致：实例化 dlg 并 show，保证子系统 & 事件分发器初始化一致，
     // 避免 LargeFileSearch finished 信号 queued delivery 永远不 dispatch（前两次测试
     // 都走了 dlg.show()，第三次若不 show，在 offscreen/minimal 平台可能被饿死）。
-    FindReplaceDialog dlg(container_);
+    FindOverlay dlg(container_);
     dlg.setActiveTab(tab());
     dlg.setReplaceMode(true);
     dlg.show();
@@ -410,7 +412,7 @@ void SmokeFindReplace::tc_fr_004_replace_all_3_places() {
     QVERIFY2(openL2(path, &err), qPrintable(err));
     auto* v = view();
 
-    FindReplaceDialog dlg(container_);
+    FindOverlay dlg(container_);
     dlg.setActiveTab(tab());
     dlg.setReplaceMode(true);
     dlg.show();
@@ -499,7 +501,7 @@ void SmokeFindReplace::tc_fr_005_unicode_long_line_find_all_and_double_click() {
                 if (target)
                     target->gotoByteOffset(offset, length);
             });
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.setSearchResultsDock(&dock);
     dialog.showFindMode();
@@ -509,7 +511,7 @@ void SmokeFindReplace::tc_fr_005_unicode_long_line_find_all_and_double_click() {
     QVERIFY(pattern && findAll);
     pattern->setText(marker);
     for (QCheckBox *option : dialog.findChildren<QCheckBox *>()) {
-        if (option->text().contains(QStringLiteral("正则")))
+        if (option->objectName() == QStringLiteral("regexSearchCheck"))
             option->setChecked(true);
     }
     QTest::mouseClick(findAll, Qt::LeftButton);
@@ -600,7 +602,7 @@ void SmokeFindReplace::tc_fr_006_live_overlay_search_snapshot_highlight_and_inva
             [&dock, target = tab()] {
                 dock.invalidateResultsFor(target->documentState().id);
             });
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.setSearchResultsDock(&dock);
     dialog.showFindMode();
@@ -721,7 +723,7 @@ void SmokeFindReplace::tc_fr_007_all_open_files_incremental_results_and_target_j
                     dock.invalidateResultsFor(target->documentState().id);
                 });
     }
-    FindReplaceDialog dialog(&workspace);
+    FindOverlay dialog(&workspace);
     dialog.setTabWidget(&workspace);
     dialog.setActiveTab(first);
     dialog.setSearchResultsDock(&dock);
@@ -834,7 +836,7 @@ void SmokeFindReplace::tc_fr_008_multiline_regex_result_and_double_click()
                     target->gotoByteOffset(offset, length);
             });
 
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.setSearchResultsDock(&dock);
     dialog.showFindMode();
@@ -844,7 +846,7 @@ void SmokeFindReplace::tc_fr_008_multiline_regex_result_and_double_click()
     QVERIFY(pattern && findAll);
     pattern->setText(QStringLiteral("BEGIN[^\\r\\n]*\\r?\\nEND[^\\r\\n]*"));
     for (QCheckBox *option : dialog.findChildren<QCheckBox *>()) {
-        if (option->text().contains(QStringLiteral("正则")))
+        if (option->objectName() == QStringLiteral("regexSearchCheck"))
             option->setChecked(true);
     }
     QTest::mouseClick(findAll, Qt::LeftButton);
@@ -910,7 +912,7 @@ void SmokeFindReplace::tc_fr_009_l1_pcre2_find_navigation_replace_and_error()
                 l1.gotoByteOffset(offset, length);
             });
 
-    FindReplaceDialog dialog;
+    FindOverlay dialog;
     dialog.setActiveTab(&l1);
     dialog.setSearchResultsDock(&dock);
     dialog.showFindMode();
@@ -923,7 +925,7 @@ void SmokeFindReplace::tc_fr_009_l1_pcre2_find_navigation_replace_and_error()
         "BEGIN[^\\r\\n]*\\r?\\nEND status=ok");
     pattern->setText(expression);
     for (QCheckBox *option : dialog.findChildren<QCheckBox *>()) {
-        if (option->text().contains(QStringLiteral("正则")))
+        if (option->objectName() == QStringLiteral("regexSearchCheck"))
             option->setChecked(true);
     }
     QTest::mouseClick(findAll, Qt::LeftButton);
@@ -987,7 +989,7 @@ void SmokeFindReplace::tc_fr_010_all_open_cancel_and_rerun()
     dock.resize(1000, 330);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
-    FindReplaceDialog dialog(&workspace);
+    FindOverlay dialog(&workspace);
     dialog.setTabWidget(&workspace);
     dialog.setActiveTab(qobject_cast<EditorTab *>(workspace.currentWidget()));
     dialog.setSearchResultsDock(&dock);
@@ -1086,7 +1088,7 @@ void SmokeFindReplace::tc_fr_011_hex_byte_find_all_highlight_and_double_click()
                     target->gotoByteOffset(offset, length);
             });
 
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.setSearchResultsDock(&dock);
     dialog.showFindMode();
@@ -1180,7 +1182,7 @@ void SmokeFindReplace::tc_fr_013_all_open_navigation_respects_wrap_boundary()
     workspace.show();
     QVERIFY(QTest::qWaitForWindowExposed(&workspace));
 
-    FindReplaceDialog dialog(&workspace);
+    FindOverlay dialog(&workspace);
     dialog.setTabWidget(&workspace);
     dialog.setActiveTab(last);
     connect(&workspace, &QTabWidget::currentChanged, &dialog,
@@ -1267,7 +1269,7 @@ void SmokeFindReplace::tc_fr_014_invalidated_result_rerun_from_dock()
                 dock.invalidateResultsFor(target->documentState().id);
             });
 
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.setSearchResultsDock(&dock);
     dialog.showFindMode();
@@ -1393,7 +1395,7 @@ void SmokeFindReplace::tc_fr_042_queued_result_jump_revalidates_target_revision(
     auto *dock = window.findChild<SearchResultsDock *>(QStringLiteral("SearchResultsDock"));
     QVERIFY(findAction && dock);
     findAction->trigger();
-    auto *dialog = window.findChild<FindReplaceDialog *>();
+    auto *dialog = window.findChild<FindOverlay *>();
     QVERIFY(dialog);
     QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
     auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
@@ -1511,7 +1513,7 @@ void SmokeFindReplace::tc_fr_all_open_scope_is_find_only()
     workspace.show();
     QVERIFY(QTest::qWaitForWindowExposed(&workspace));
 
-    FindReplaceDialog dialog(&workspace);
+    FindOverlay dialog(&workspace);
     dialog.setTabWidget(&workspace);
     dialog.setActiveTab(binary);
     dialog.showReplaceMode();
@@ -1665,7 +1667,7 @@ void SmokeFindReplace::tc_fr_017_regex_toggle_distinguishes_literal_and_regex()
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
 
-    FindReplaceDialog dialog;
+    FindOverlay dialog;
     dialog.setActiveTab(&l1);
     dialog.setSearchResultsDock(&dock);
     dialog.showFindMode();
@@ -1740,7 +1742,7 @@ void SmokeFindReplace::tc_fr_018_regex_contract_model_runs_gui_variants()
         dock.show();
         QVERIFY2(QTest::qWaitForWindowExposed(&dock), variant.id);
 
-        FindReplaceDialog dialog;
+        FindOverlay dialog;
         dialog.setActiveTab(&l1);
         dialog.setSearchResultsDock(&dock);
         dialog.showFindMode();
@@ -1857,7 +1859,7 @@ void SmokeFindReplace::tc_fr_019_query_option_state_machine_exhaustive()
     SearchResultsController resultsController;
 
     SearchResultsDock dock(resultsController);
-    FindReplaceDialog dialog(&workspace);
+    FindOverlay dialog(&workspace);
     dialog.setTabWidget(&workspace);
     dialog.setSearchResultsDock(&dock);
     dialog.setActiveTab(textTab);
@@ -2049,7 +2051,7 @@ void SmokeFindReplace::tc_fr_020_replace_button_uses_current_match_then_advances
     editor.show();
     QVERIFY(QTest::qWaitForWindowExposed(&editor));
 
-    FindReplaceDialog dialog;
+    FindOverlay dialog;
     dialog.setActiveTab(&editor);
     dialog.showReplaceMode();
     QVERIFY(QTest::qWaitForWindowExposed(&dialog));
@@ -2121,7 +2123,7 @@ void SmokeFindReplace::tc_fr_021_text_option_semantics_all_legal_combinations()
         QVERIFY2(QTest::qWaitForWindowExposed(&editor), variant.id);
         SearchResultsController resultsController;
         SearchResultsDock dock(resultsController);
-        FindReplaceDialog dialog;
+        FindOverlay dialog;
         dialog.setActiveTab(&editor);
         dialog.setSearchResultsDock(&dock);
         dialog.showFindMode();
@@ -2233,11 +2235,15 @@ void SmokeFindReplace::tc_fr_022_hex_query_formats_errors_and_navigation()
     SearchResultsController resultsController;
 
     SearchResultsDock dock(resultsController);
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.setSearchResultsDock(&dock);
     dialog.showFindMode();
     QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    // The overlay is a child widget, so showing it no longer spins the event
+    // loop the way a new top-level window did; let the read-only search
+    // source finish its preparation first.
+    QTest::qWait(300);
     auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
     auto *hex = dialog.findChild<QCheckBox *>(QStringLiteral("hexBytesCheck"));
     auto *wrap = dialog.findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
@@ -2322,7 +2328,7 @@ void SmokeFindReplace::tc_fr_023_regex_capture_replacement_gui_contract()
     editor.show();
     QVERIFY(QTest::qWaitForWindowExposed(&editor));
 
-    FindReplaceDialog dialog;
+    FindOverlay dialog;
     dialog.setActiveTab(&editor);
     dialog.showReplaceMode();
     QVERIFY(QTest::qWaitForWindowExposed(&dialog));
@@ -2388,7 +2394,7 @@ void SmokeFindReplace::tc_fr_024_l2_regex_capture_replacement_consistency()
     QString openError;
     QVERIFY2(openL2(path, &openError), qPrintable(openError));
 
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.showReplaceMode();
     QVERIFY(QTest::qWaitForWindowExposed(&dialog));
@@ -2453,7 +2459,7 @@ void SmokeFindReplace::tc_fr_025_replacement_value_contract_and_atomic_failures(
     editor.show();
     QVERIFY(QTest::qWaitForWindowExposed(&editor));
 
-    FindReplaceDialog dialog;
+    FindOverlay dialog;
     dialog.setActiveTab(&editor);
     dialog.showReplaceMode();
     QVERIFY(QTest::qWaitForWindowExposed(&dialog));
@@ -2556,7 +2562,7 @@ void SmokeFindReplace::tc_fr_026_l2_replace_all_over_batch_is_one_undo()
     QString error;
     QVERIFY2(openL2(path, &error), qPrintable(error));
 
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.showReplaceMode();
     QVERIFY(QTest::qWaitForWindowExposed(&dialog));
@@ -2633,7 +2639,7 @@ void SmokeFindReplace::tc_fr_027_real_s3_find_all_dock_double_click()
                     targetTab->gotoByteOffset(offset, length);
             });
 
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.setSearchResultsDock(&dock);
     dialog.showFindMode();
@@ -2727,7 +2733,7 @@ void SmokeFindReplace::tc_fr_028_real_s3_find_next_preparation_and_repeat_bounda
     auto *provider = tab()->windowedReadOnlyProvider();
     QVERIFY(provider);
 
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.showFindMode();
     QVERIFY(QTest::qWaitForWindowExposed(&dialog));
@@ -2842,7 +2848,7 @@ void SmokeFindReplace::tc_fr_029_result_spool_virtual_tail_navigation()
                     targetTab->gotoByteOffset(offset, length);
             });
 
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.setSearchResultsDock(&dock);
     dialog.showFindMode();
@@ -2940,7 +2946,7 @@ void SmokeFindReplace::tc_fr_030_sparse_s3_text_regex_after_two_gib()
                     targetTab->gotoByteOffset(offset, length);
             });
 
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.setSearchResultsDock(&dock);
     dialog.showReplaceMode();
@@ -3053,7 +3059,7 @@ void SmokeFindReplace::tc_fr_031_real_s3_default_literal_is_not_regex()
     auto *provider = tab()->windowedReadOnlyProvider();
     QVERIFY(provider);
 
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.showFindMode();
     QVERIFY(QTest::qWaitForWindowExposed(&dialog));
@@ -3121,10 +3127,14 @@ void SmokeFindReplace::tc_fr_032_invalid_utf8_binary_default_literal_portable()
     auto *provider = tab()->windowedReadOnlyProvider();
     QVERIFY(provider || view());
 
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.showFindMode();
     QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    // The overlay is a child widget, so showing it no longer spins the event
+    // loop the way a new top-level window did; let the read-only search
+    // source finish its preparation first.
+    QTest::qWait(300);
     auto *pattern = dialog.findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
     auto *regex = dialog.findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
     auto *hex = dialog.findChild<QCheckBox *>(QStringLiteral("hexBytesCheck"));
@@ -3210,7 +3220,7 @@ void SmokeFindReplace::tc_fr_033_l1_find_all_and_navigation_are_async_independen
     dock.resize(760, 300);
     dock.show();
     QVERIFY(QTest::qWaitForWindowExposed(&dock));
-    FindReplaceDialog dialog;
+    FindOverlay dialog;
     dialog.setActiveTab(&l1);
     dialog.setSearchResultsDock(&dock);
     dialog.showFindMode();
@@ -3273,7 +3283,7 @@ void SmokeFindReplace::tc_fr_036_small_l1_navigation_uses_inline_first_hit()
     l1.show();
     QVERIFY(QTest::qWaitForWindowExposed(&l1));
 
-    FindReplaceDialog dialog;
+    FindOverlay dialog;
     dialog.setActiveTab(&l1);
     dialog.showFindMode();
     QVERIFY(QTest::qWaitForWindowExposed(&dialog));
@@ -3333,10 +3343,14 @@ void SmokeFindReplace::tc_fr_037_replacement_character_projection_literal_revers
     auto *provider = tab()->windowedReadOnlyProvider();
     QVERIFY(provider || view());
 
-    FindReplaceDialog dialog(container_);
+    FindOverlay dialog(container_);
     dialog.setActiveTab(tab());
     dialog.showFindMode();
     QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+    // The overlay is a child widget, so showing it no longer spins the event
+    // loop the way a new top-level window did; let the read-only search
+    // source finish its preparation first.
+    QTest::qWait(300);
     auto *pattern = dialog.findChild<QLineEdit *>(
         QStringLiteral("findPatternEdit"));
     auto *previous = dialog.findChild<QPushButton *>(

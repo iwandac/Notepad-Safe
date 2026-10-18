@@ -22,7 +22,7 @@
 #include <QtWidgets/QTreeView>
 
 #include "EditorTab.h"
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
 #include "MainWindow.h"
 #include "SearchResultsDock.h"
 #include "SearchResultsModel.h"
@@ -255,7 +255,7 @@ private slots:
         assertSourceUnchanged();
 
         findAction->trigger();
-        auto *dialog = window->findChild<FindReplaceDialog *>();
+        auto *dialog = window->findChild<FindOverlay *>();
         QTRY_VERIFY_WITH_TIMEOUT(dialog && dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
         auto *hex = dialog->findChild<QCheckBox *>(QStringLiteral("hexBytesCheck"));

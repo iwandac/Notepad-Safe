@@ -7,7 +7,7 @@
 //  覆盖（L2 TC §16 组 1 · 6 P0）：
 //    SR02-COMFORT-A：菜单"替换"动作 text 含 (&R)
 //    SR02-COMFORT-B：替换动作 shortcut == QKeySequence("Ctrl+R") 精确（不能是 Ctrl+H）
-//    SR02-COMFORT-C：触发替换动作 → FindReplaceDialog 真实 show 出来 + Replace 模式
+//    SR02-COMFORT-C：触发替换动作 → FindOverlay 真实 show 出来 + Replace 模式
 //    D001：L2 smalltestfile tab 打开后 → sortAsc/sortDesc enabled=false（灰）
 //    D003：L2 Hex 下编码转换/重新打开均禁用；切到 Text 后仅重新打开可用
 //    D007：完整 lifecycle 断言（no-tab → L1 → L2 → L1 → close-all=no-tab）
@@ -98,7 +98,11 @@
 #include "ByteClipboard.h"
 #include "VirtualFileView.h"
 #include "WindowedReadOnlyProvider.h"
-#include "FindReplaceDialog.h"
+#include "FindOverlay.h"
+#include "FindLiveSearch.h"
+#include <QCheckBox>
+#include <QTabBar>
+#include <QTabWidget>
 #include "SearchResultsDock.h"
 #include "SearchResultsModel.h"
 #include "TextEncoding.h"
@@ -151,13 +155,13 @@ static QString stripMnemonicsAndEllipsis(QString s) {
 
 // ---------------------------------------------------------------------------
 // 工具：在 MainWindow 全部 QAction 中筛选**真正挂在主菜单/工具栏体系里的动作**
-//       （排除 FindReplaceDialog / SearchResultsDock 等 child 内部自建的 action）。
+//       （排除 FindOverlay / SearchResultsDock 等 child 内部自建的 action）。
 //   判定规则（白名单）：满足任一即判定来自菜单/工具栏：
 //     a) associatedWidgets() 包含任何 QMenu 或 QToolBar；
-//     b) shortcut() 非空（FindReplaceDialog 内部"替换"按钮 action 从不设 shortcut）；
-//     c) text() 中包含 & 助记符（FindReplaceDialog 按钮 action 无 &）。
+//     b) shortcut() 非空（FindOverlay 内部"替换"按钮 action 从不设 shortcut）；
+//     c) text() 中包含 & 助记符（FindOverlay 按钮 action 无 &）。
 //   这是 SR02 前 3 子断言从 FAIL→PASS 的关键修复（之前全局 findChildren 命中了
-//   FindReplaceDialog 内部的 action，它 shortcut=空 & text="替换" 无 mnemonic，
+//   FindOverlay 内部的 action，它 shortcut=空 & text="替换" 无 mnemonic，
 //   恰好和「菜单替换动作」同 display 文本导致错误匹配）。
 // ---------------------------------------------------------------------------
 static bool isInMenuOrToolbar(QAction* a, const MainWindow* top) {
@@ -606,17 +610,17 @@ private slots:
         QCOMPARE(tabCount(mw_) >= 1, true);
         auto* actReplace = findMenuActionByExactDisplay(mw_, QStringLiteral("替换"));
         QVERIFY(actReplace != nullptr);
-        // FindReplaceDialog is intentionally lazy: an unused search surface must
+        // FindOverlay is intentionally lazy: an unused search surface must
         // not add work before first paint. Existing instances, if any, are hidden.
-        const auto before = mw_->findChildren<FindReplaceDialog*>();
+        const auto before = mw_->findChildren<FindOverlay*>();
         bool anyVisibleBefore = false;
         for (auto* d : before) if (d->isVisible()) { anyVisibleBefore = true; break; }
-        QVERIFY2(!anyVisibleBefore, "触发替换动作前 FindReplaceDialog 已 visible（上一个 case 误 trigger 了 showReplaceDialog）");
+        QVERIFY2(!anyVisibleBefore, "触发替换动作前 FindOverlay 已 visible（上一个 case 误 trigger 了 showReplaceDialog）");
         // 触发动作（等价于用户 Ctrl+R 触发）：trigger() 会经由 MainWindow::showReplaceDialog →
-        // m_findDialog->showReplaceMode() → show() / raise() / activateWindow()
+        // m_findOverlay->showReplaceMode() → show() / raise() / activateWindow()
         actReplace->trigger();
-        QTRY_VERIFY_WITH_TIMEOUT(mw_->findChild<FindReplaceDialog *>() != nullptr, 1000);
-        FindReplaceDialog *expectDlg = mw_->findChild<FindReplaceDialog *>();
+        QTRY_VERIFY_WITH_TIMEOUT(mw_->findChild<FindOverlay *>() != nullptr, 1000);
+        FindOverlay *expectDlg = mw_->findChild<FindOverlay *>();
         // show() → native window 需要事件循环 + 系统 DWM 响应 map，给 2s 容忍度避免环境 flaky
         bool gotVisible = false;
         QElapsedTimer t; t.start();
@@ -626,7 +630,7 @@ private slots:
             QTest::qWait(20);
         }
         QVERIFY2(gotVisible,
-            "trigger(菜单替换动作) 后 2s 内 FindReplaceDialog 仍 !isVisible() → showReplaceMode() 没有被执行（或 currentTab==nullptr 导致 early return）");
+            "trigger(菜单替换动作) 后 2s 内 FindOverlay 仍 !isVisible() → showReplaceMode() 没有被执行（或 currentTab==nullptr 导致 early return）");
         // 关对话框，给下一个用例干净状态
         expectDlg->close();
         QApplication::processEvents(QEventLoop::AllEvents, 80);
@@ -3647,7 +3651,7 @@ private slots:
         QCOMPARE(nextSpy.count(), 1);
 
         QTest::keyClick(tab->editor(), Qt::Key_R, Qt::ControlModifier);
-        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+        auto *dialog = mw_->findChild<FindOverlay *>();
         QTRY_VERIFY_WITH_TIMEOUT(dialog && dialog->isVisible(), 2000);
         auto *replaceEdit = dialog->findChild<QLineEdit *>(QStringLiteral("replaceTextEdit"));
         QVERIFY(replaceEdit && replaceEdit->isVisible());
@@ -3769,7 +3773,7 @@ private slots:
         query->setText(QStringLiteral("查找"));
         QTest::keyClick(query, Qt::Key_Return);
         QTRY_VERIFY(!palette->isVisible());
-        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+        auto *dialog = mw_->findChild<FindOverlay *>();
         QTRY_VERIFY_WITH_TIMEOUT(dialog && dialog->isVisible(), 2000);
         dialog->close();
         closeAllEditorTabs(mw_);
@@ -3878,6 +3882,302 @@ private slots:
         QVERIFY(!dock->isAreaAllowed(Qt::TopDockWidgetArea));
         QVERIFY(dock->isAreaAllowed(Qt::BottomDockWidgetArea));
         QVERIFY(mw_->dockWidgetArea(dock) != Qt::TopDockWidgetArea);
+    }
+
+    EditorTab *openOverlayDocument(const QString &name, const QByteArray &content) {
+        closeAllEditorTabs(mw_);
+        const QString path = tmpDir_.filePath(name);
+        {
+            QFile file(path);
+            if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                return nullptr;
+            file.write(content);
+        }
+        mw_->openFilesFromExternal({path});
+        if (!QTest::qWaitFor([this] { return tabCount(mw_) == 1; }, 3000))
+            return nullptr;
+        EditorTab *tab = currentEditorTab(mw_);
+        if (tab) {
+            mw_->activateWindow();
+            tab->editor()->setFocus();
+        }
+        return tab;
+    }
+
+    FindOverlay *openOverlay(EditorTab *tab) {
+        QTest::keyClick(tab->editor(), Qt::Key_F, Qt::ControlModifier);
+        auto *overlay = mw_->findChild<FindOverlay *>();
+        if (!QTest::qWaitFor([overlay] { return overlay && overlay->isVisible(); }, 2000))
+            return nullptr;
+        return overlay;
+    }
+
+    // The find UI is a panel over the top-right corner of the document area,
+    // under the tab strip, and it follows the area when the window resizes.
+    void overlayFloatsTopRightOfDocumentArea() {
+        EditorTab *tab = openOverlayDocument(QStringLiteral("overlay-pos.txt"), "alpha\n");
+        QVERIFY(tab);
+        FindOverlay *overlay = openOverlay(tab);
+        QVERIFY(overlay);
+        auto *tabs = qobject_cast<QTabWidget *>(overlay->parentWidget());
+        QVERIFY2(tabs, "overlay must be a child of the document tab widget");
+        const auto placedTopRight = [overlay, tabs] {
+            const QRect area = tabs->rect();
+            const QRect box = overlay->geometry();
+            const int right = area.right() - box.right();
+            return right >= 0 && right <= 24
+                && box.top() > tabs->tabBar()->geometry().bottom()
+                && box.left() >= 0;
+        };
+        QVERIFY(placedTopRight());
+        mw_->resize(mw_->width() - 120, mw_->height());
+        QTRY_VERIFY_WITH_TIMEOUT(placedTopRight(), 2000);
+        mw_->resize(mw_->width() + 120, mw_->height());
+        QTRY_VERIFY_WITH_TIMEOUT(placedTopRight(), 2000);
+        overlay->closeOverlay();
+        closeAllEditorTabs(mw_);
+    }
+
+    // Enter / Shift+Enter move between matches, Alt+Enter runs Find All, Esc
+    // closes the panel and gives focus back to the text.
+    void overlayKeysNavigateAndClose() {
+        EditorTab *tab = openOverlayDocument(QStringLiteral("overlay-keys.txt"),
+                                             "one hit\ntwo hit\nthree hit\n");
+        QVERIFY(tab);
+        tab->editor()->setCursorPosition(0, 0);
+        FindOverlay *overlay = openOverlay(tab);
+        QVERIFY(overlay);
+        auto *edit = overlay->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        QVERIFY(edit && edit->hasFocus());
+        edit->setText(QStringLiteral("hit"));
+        const auto selectedLine = [tab] {
+            int lineFrom = -1, indexFrom = -1, lineTo = -1, indexTo = -1;
+            tab->editor()->getSelection(&lineFrom, &indexFrom, &lineTo, &indexTo);
+            return lineFrom;
+        };
+        QTest::keyClick(edit, Qt::Key_Return);
+        QTRY_COMPARE_WITH_TIMEOUT(selectedLine(), 0, 2000);
+        // Typing stays in the panel: Enter again moves on, it never edits.
+        QVERIFY(edit->hasFocus());
+        QTest::keyClick(edit, Qt::Key_Return);
+        QTRY_COMPARE_WITH_TIMEOUT(selectedLine(), 1, 2000);
+        QTest::keyClick(edit, Qt::Key_Return, Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(selectedLine(), 0, 2000);
+        QCOMPARE(tab->editor()->text(), QStringLiteral("one hit\ntwo hit\nthree hit\n"));
+        QTest::keyClick(edit, Qt::Key_Return, Qt::AltModifier);
+        auto *summary = mw_->findChild<QLabel *>(QStringLiteral("searchResultsSummary"));
+        QVERIFY(summary);
+        QTRY_VERIFY_WITH_TIMEOUT(summary->text().contains(QStringLiteral("3")), 3000);
+        QTest::keyClick(edit, Qt::Key_Escape);
+        QTRY_VERIFY(!overlay->isVisible());
+        QTRY_VERIFY(tab->editor()->hasFocus());
+        closeAllEditorTabs(mw_);
+    }
+
+    // Replace and the rarely used options stay folded until asked for; the
+    // byte toggle only exists while the document is shown as hex.
+    void overlayRowsExpandOnDemand() {
+        EditorTab *tab = openOverlayDocument(QStringLiteral("overlay-rows.txt"), "rows\n");
+        QVERIFY(tab);
+        FindOverlay *overlay = openOverlay(tab);
+        QVERIFY(overlay);
+        auto *replace = overlay->findChild<QLineEdit *>(QStringLiteral("replaceTextEdit"));
+        auto *replaceToggle = overlay->findChild<QPushButton *>(QStringLiteral("replaceToggleButton"));
+        auto *optionsToggle = overlay->findChild<QPushButton *>(QStringLiteral("findOptionsToggle"));
+        auto *wrap = overlay->findChild<QCheckBox *>(QStringLiteral("wrapSearchCheck"));
+        auto *hex = overlay->findChild<QCheckBox *>(QStringLiteral("hexBytesCheck"));
+        QVERIFY(replace && replaceToggle && optionsToggle && wrap && hex);
+        QVERIFY(!replace->isVisible());
+        QVERIFY(!wrap->isVisible());
+        QVERIFY(!hex->isVisible());
+        replaceToggle->click();
+        QVERIFY(replace->isVisible());
+        replaceToggle->click();
+        QVERIFY(!replace->isVisible());
+        optionsToggle->click();
+        QVERIFY(wrap->isVisible() && wrap->isChecked());
+        overlay->closeOverlay();
+        overlay->showReplaceMode();
+        QVERIFY(replace->isVisible());
+        overlay->closeOverlay();
+        closeAllEditorTabs(mw_);
+    }
+
+    // Ctrl+F starts from what the user is looking at: the selected text, or
+    // the word under the caret; a multi-line selection keeps the last query.
+    void ctrlFPrefillsSelectionOrWord() {
+        EditorTab *tab = openOverlayDocument(QStringLiteral("overlay-prefill.txt"),
+                                             "alpha beta\ngamma delta\n");
+        QVERIFY(tab);
+        tab->editor()->setSelection(0, 6, 0, 10);
+        FindOverlay *overlay = openOverlay(tab);
+        QVERIFY(overlay);
+        auto *edit = overlay->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        QVERIFY(edit);
+        QCOMPARE(edit->text(), QStringLiteral("beta"));
+        QCOMPARE(edit->selectedText(), QStringLiteral("beta"));
+        overlay->closeOverlay();
+
+        tab->editor()->setCursorPosition(1, 2);
+        QVERIFY(openOverlay(tab));
+        QCOMPARE(edit->text(), QStringLiteral("gamma"));
+        overlay->closeOverlay();
+
+        tab->editor()->setSelection(0, 0, 1, 5);
+        QVERIFY(openOverlay(tab));
+        QCOMPARE(edit->text(), QStringLiteral("gamma"));
+        overlay->closeOverlay();
+        closeAllEditorTabs(mw_);
+    }
+
+    // The panel can select a match while the user keeps typing in it.
+    void selectSearchHitKeepsFocus() {
+        EditorTab *tab = openOverlayDocument(QStringLiteral("overlay-hit.txt"),
+                                             "one two three\n");
+        QVERIFY(tab);
+        FindOverlay *overlay = openOverlay(tab);
+        QVERIFY(overlay);
+        auto *edit = overlay->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        QVERIFY(edit && edit->hasFocus());
+        tab->selectSearchHit(4, 3);
+        QCOMPARE(tab->editor()->selectedText(), QStringLiteral("two"));
+        QVERIFY(edit->hasFocus());
+        const DocumentSearchCursor cursor = tab->searchCursor();
+        QCOMPARE(cursor.selectionStart, qint64(4));
+        QCOMPARE(cursor.selectionEnd, qint64(7));
+        QCOMPARE(cursor.documentBytes, qint64(14));
+        overlay->closeOverlay();
+        closeAllEditorTabs(mw_);
+    }
+
+    // Typing in an ordinary file highlights every hit, selects the first one
+    // after the caret and keeps "match i of n" current; focus stays put.
+    void liveSearchHighlightsAndCountsInNormalFile() {
+        EditorTab *tab = openOverlayDocument(QStringLiteral("live-count.txt"),
+            "timeout a\nok\ntimeout b\ntimeout c\nok\ntimeout d\n");
+        QVERIFY(tab);
+        tab->editor()->setCursorPosition(1, 0);
+        FindOverlay *overlay = openOverlay(tab);
+        QVERIFY(overlay);
+        auto *edit = overlay->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        auto *status = overlay->findChild<QLabel *>(QStringLiteral("regexQueryHint"));
+        QVERIFY(edit && status);
+        edit->setText(QStringLiteral("timeout"));
+        QTRY_COMPARE_WITH_TIMEOUT(status->text(), QStringLiteral("第 2 / 4 处"), 3000);
+        int lineFrom = -1, indexFrom = -1, lineTo = -1, indexTo = -1;
+        tab->editor()->getSelection(&lineFrom, &indexFrom, &lineTo, &indexTo);
+        QCOMPARE(lineFrom, 2);
+        QVERIFY(edit->hasFocus());
+        QTest::keyClick(edit, Qt::Key_Return);
+        QTRY_COMPARE_WITH_TIMEOUT(status->text(), QStringLiteral("第 3 / 4 处"), 3000);
+        edit->setText(QStringLiteral("nothing-here"));
+        QTRY_COMPARE_WITH_TIMEOUT(status->text(), QStringLiteral("未找到匹配"), 3000);
+        overlay->closeOverlay();
+        closeAllEditorTabs(mw_);
+    }
+
+    // Big editable files search on Enter only: typing starts no scan.
+    void liveSearchSkipsLargeDocuments() {
+        QByteArray content;
+        const QByteArray line("filler line without the word\n");
+        while (content.size() < 5 * 1024 * 1024)
+            content += line;
+        content += "needle\n";
+        EditorTab *tab = openOverlayDocument(QStringLiteral("live-large.txt"), content);
+        QVERIFY(tab);
+        QVERIFY(!tab->isL2Mode());
+        tab->editor()->setCursorPosition(0, 0);
+        FindOverlay *overlay = openOverlay(tab);
+        QVERIFY(overlay);
+        auto *edit = overlay->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        auto *status = overlay->findChild<QLabel *>(QStringLiteral("regexQueryHint"));
+        edit->setText(QStringLiteral("needle"));
+        QTest::qWait(600);
+        QVERIFY(!tab->editor()->hasSelectedText());
+        QVERIFY(!status->text().contains(QStringLiteral("处")));
+        QTest::keyClick(edit, Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(tab->editor()->selectedText() == QStringLiteral("needle"), 5000);
+        overlay->closeOverlay();
+        closeAllEditorTabs(mw_);
+    }
+
+    // Find All right after typing takes over the document's background
+    // search instead of failing to start.
+    void findAllAfterTypingStartsCleanly() {
+        EditorTab *tab = openOverlayDocument(QStringLiteral("live-findall.txt"),
+                                             "x hit\ny hit\n");
+        QVERIFY(tab);
+        FindOverlay *overlay = openOverlay(tab);
+        QVERIFY(overlay);
+        auto *edit = overlay->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        auto *status = overlay->findChild<QLabel *>(QStringLiteral("findStatusLabel"));
+        auto *summary = mw_->findChild<QLabel *>(QStringLiteral("searchResultsSummary"));
+        QVERIFY(edit && status && summary);
+        edit->setText(QStringLiteral("hit"));
+        QTest::qWait(FindLiveSearch::DebounceMs + 5);
+        QTest::keyClick(edit, Qt::Key_Return, Qt::AltModifier);
+        QTRY_VERIFY_WITH_TIMEOUT(summary->text().contains(QStringLiteral("2")), 3000);
+        QVERIFY(!status->text().contains(QStringLiteral("未能")));
+        overlay->closeOverlay();
+        closeAllEditorTabs(mw_);
+    }
+
+    // A result that arrives after the user moved to another tab is dropped.
+    void staleLiveResultIsDropped() {
+        closeAllEditorTabs(mw_);
+        const QString first = tmpDir_.filePath(QStringLiteral("live-a.txt"));
+        const QString second = tmpDir_.filePath(QStringLiteral("live-b.txt"));
+        for (const QString &path : {first, second}) {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write("keep keep keep\n");
+        }
+        mw_->openFilesFromExternal({first, second});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 2, 3000);
+        auto *tabs = mw_->findChild<QTabWidget *>();
+        QVERIFY(tabs);
+        tabs->setCurrentIndex(0);
+        EditorTab *a = currentEditorTab(mw_);
+        a->editor()->setFocus();
+        FindOverlay *overlay = openOverlay(a);
+        QVERIFY(overlay);
+        auto *edit = overlay->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        edit->setText(QStringLiteral("keep"));
+        tabs->setCurrentIndex(1);
+        EditorTab *b = currentEditorTab(mw_);
+        QVERIFY(b && b != a);
+        b->editor()->setCursorPosition(0, 2);
+        QTest::qWait(600);
+        QVERIFY(!a->editor()->hasSelectedText());
+        overlay->closeOverlay();
+        closeAllEditorTabs(mw_);
+    }
+
+    // An unusable regex says why in the panel's muted hint line and blocks
+    // Find All; nothing pops up.
+    void invalidRegexIsQuietAndBlocksFindAll() {
+        EditorTab *tab = openOverlayDocument(QStringLiteral("quiet-regex.txt"), "a(b\n");
+        QVERIFY(tab);
+        FindOverlay *overlay = openOverlay(tab);
+        QVERIFY(overlay);
+        auto *edit = overlay->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        auto *regex = overlay->findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
+        auto *hint = overlay->findChild<QLabel *>(QStringLiteral("regexQueryHint"));
+        auto *findAll = overlay->findChild<QPushButton *>(QStringLiteral("findAllButton"));
+        QVERIFY(edit && regex && hint && findAll);
+        regex->setChecked(true);
+        edit->setText(QStringLiteral("a(b"));
+        QTRY_VERIFY_WITH_TIMEOUT(!hint->text().isEmpty()
+                                 && !hint->text().contains(QStringLiteral("处")), 2000);
+        QVERIFY(!hint->toolTip().isEmpty());
+        QVERIFY(!findAll->isEnabled());
+        QTest::qWait(300);
+        QVERIFY(!QApplication::activeModalWidget());
+        edit->setText(QStringLiteral("a\\(b"));
+        QTRY_VERIFY_WITH_TIMEOUT(findAll->isEnabled(), 2000);
+        regex->setChecked(false);
+        overlay->closeOverlay();
+        closeAllEditorTabs(mw_);
     }
 
     // 转置当前行 was removed; QScintilla's own Ctrl+T binding must not
@@ -4173,8 +4473,8 @@ private slots:
         QCOMPARE(previousAction->shortcut(), QKeySequence(QStringLiteral("Shift+F3")));
 
         findAction->trigger();
-        QTRY_VERIFY_WITH_TIMEOUT(mw_->findChild<FindReplaceDialog *>() != nullptr, 1000);
-        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+        QTRY_VERIFY_WITH_TIMEOUT(mw_->findChild<FindOverlay *>() != nullptr, 1000);
+        auto *dialog = mw_->findChild<FindOverlay *>();
         QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
         auto *scope = dialog->findChild<QComboBox *>(QStringLiteral("searchScopeCombo"));
@@ -4269,8 +4569,8 @@ private slots:
         QCOMPARE(second->encoding(), TextEncoding::Utf16LE);
 
         findAction->trigger();
-        QTRY_VERIFY_WITH_TIMEOUT(mw_->findChild<FindReplaceDialog *>() != nullptr, 1000);
-        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+        QTRY_VERIFY_WITH_TIMEOUT(mw_->findChild<FindOverlay *>() != nullptr, 1000);
+        auto *dialog = mw_->findChild<FindOverlay *>();
         QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
         auto *scope = dialog->findChild<QComboBox *>(QStringLiteral("searchScopeCombo"));
@@ -4378,8 +4678,8 @@ private slots:
         QVERIFY(findAction && dock);
         findAction->trigger();
         QTRY_VERIFY_WITH_TIMEOUT(
-            mw_->findChild<FindReplaceDialog *>() != nullptr, 1000);
-        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+            mw_->findChild<FindOverlay *>() != nullptr, 1000);
+        auto *dialog = mw_->findChild<FindOverlay *>();
         QTRY_VERIFY_WITH_TIMEOUT(dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(
             QStringLiteral("findPatternEdit"));
@@ -4798,7 +5098,7 @@ private slots:
         auto *findAction = mw_->findChild<QAction *>(QStringLiteral("search.find"));
         QVERIFY(findAction != nullptr);
         findAction->trigger();
-        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+        auto *dialog = mw_->findChild<FindOverlay *>();
         QTRY_VERIFY_WITH_TIMEOUT(dialog && dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
         auto *toggle = dialog->findChild<QPushButton *>(QStringLiteral("regexAssistantToggle"));
@@ -4891,7 +5191,7 @@ private slots:
         provider->editor()->setFocus();
         QTRY_VERIFY_WITH_TIMEOUT(provider->editor()->hasFocus(), 1000);
         QTest::keyClick(provider->editor(), Qt::Key_F, Qt::ControlModifier);
-        auto *dialog = mw_->findChild<FindReplaceDialog *>();
+        auto *dialog = mw_->findChild<FindOverlay *>();
         QTRY_VERIFY_WITH_TIMEOUT(dialog && dialog->isVisible(), 2000);
         auto *pattern = dialog->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
         auto *regex = dialog->findChild<QCheckBox *>(QStringLiteral("regexSearchCheck"));
@@ -4918,7 +5218,7 @@ private slots:
             QTest::mouseClick(regex, Qt::LeftButton);
         QVERIFY(regex->isChecked());
         QTRY_VERIFY_WITH_TIMEOUT(
-            hint->text().contains(QStringLiteral("正则有效")), 1000);
+            hint->text().contains(QStringLiteral("GB18030 子集")), 1000);
 
         QElapsedTimer searchElapsed;
         searchElapsed.start();
