@@ -4,13 +4,19 @@
 
 ## 当前状态
 
-- **候选**：分支 `feat/simplify-and-shell`，构建 `build-final/notepad-safe.exe`，33,217,024 字节，SHA-256 `2B5AD58F1A760FC4B5D743D369A2E6557E978DC5A97A01C21059E5FAED878F8B`，基于 `1af4384`，Release / KDBX ON / Qt 6.11.1 静态链接。
+- **候选**：分支 `feat/simplify-and-shell`，构建 `build-final/notepad-safe.exe`，33,251,328 字节，SHA-256 `493F8303532E5A17C57C7DDE01B416EEC5D8DE3D2DC269976A5150F971255980`，基于 `f2ed716`，Release / KDBX ON / Qt 6.11.1 静态链接。
 - **核心测试**：17 组全部通过。
-- **GUI 套件**（真实 Windows 平台插件，串行）：smallfixes 78/78、findreplace 41/41、recovery_issue 16/16、document_product_language 24/24、tail_follow 21/21、startup_shell 7/7、secure_documents 14/14、large_readonly 25/25；hex_accessibility 需要设置 `NOTEPADSAFE_EXPECTED_DPR`，未运行（受阻）。
+- **GUI 套件**（真实 Windows 平台插件，串行，2026-10-18 查找浮层完成后）：findreplace 43/43、smallfixes 90/90、secure_documents 14/14、large_readonly 25/25、tail_follow 21/21、tail_presentation 4/4、l2_queued_cancel_process 25/25、search_lifecycle 7/7、search_external_changes 9/9、search_capacity 12/12、search_real_failure 3/3、hex_readonly_search 3/3、readonly_search_source 3/3、hex_recovery 13/13、recovery_issue 16/16、recovery_intent 5/5、recovery_preservation 9/9、document_product_language 24/24、startup_shell 7/7、coord 7/7、read_admission_open 4/4、task_product_language 7/7、task_real_errors 4/4、vault 8/8、windowed_hex_mouse 4/4；hex_accessibility 需要设置 `NOTEPADSAFE_EXPECTED_DPR`，未运行（受阻）。
 - **启动时间（J1）**：启动轨迹探针 30 次冷启动，进程创建到首次绘制中位 183 ms、P95 194 ms；正式启动探针（经 ≡ 主菜单打开文件菜单）单次有效。
 - **下一步**：合并到 main。
 
 ## 当前执行证据
+
+### 2026-10-18：查找浮层
+
+- 旧的查找 / 替换窗口换成文档区右上角的查找浮层；普通文件边输入边查找（高亮、“第 i / n 处”）；全部打开文件的结果按标签顺序预建分组并显示各文件状态；结果面板有“最近搜索”。设计见 [查找浮层设计](superpowers/specs/2026-10-18-find-overlay-design.md)，现状见 [搜索功能现状](SEARCH_CURRENT_STATE.md)。
+- 全分支独立评审的 3 项重要问题已修并有测试：边输入只在焦点位于浮层时选中命中；等待中的文件被编辑后结果不再标为失效；最近搜索整体恢复条件后再重跑。
+- 顺带修正：从浮层导航时焦点留在查找框（编辑区查找不再自行抢焦点）；十六进制视图重置查找位置时清除叠加层残留选区；hex_recovery 的两条用例改为检查保存失败提示条（此前已从弹窗改为提示条）。
 
 ### 2026-10-17：问题修复与启动优化
 
