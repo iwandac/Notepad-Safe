@@ -557,7 +557,7 @@ install(FILES
     DESTINATION metadata
 )
 install(FILES
-    docs/TARGET_EXPERIENCE.md
+    docs/PRODUCT_GOALS.md
     docs/SUPPLY_CHAIN.md
     DESTINATION docs
 )

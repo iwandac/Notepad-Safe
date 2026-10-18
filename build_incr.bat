@@ -67,6 +67,13 @@ echo Build directory: %BUILD_DIR%
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 pushd "%BUILD_DIR%"
 
+REM An existing build directory keeps its own generator and cached options
+REM (for example an NMake tree configured with tests on); only a new
+REM directory is configured with Ninja and the defaults above.
+if exist "%BUILD_DIR%\CMakeCache.txt" (
+    "%VS_CMAKE%" "%SOURCE_DIR%"
+    goto configured
+)
 "%VS_CMAKE%" -G Ninja ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DCMAKE_MAKE_PROGRAM="%VS_NINJA%" ^
@@ -75,6 +82,7 @@ pushd "%BUILD_DIR%"
     -DNOTEPADSAFE_ENABLE_ASAN="%NOTEPADSAFE_ENABLE_ASAN%" ^
     -DNOTEPADSAFE_ENABLE_KDBX_BACKEND="%NOTEPADSAFE_WITH_KDBX%" ^
     "%SOURCE_DIR%"
+:configured
 set "CONFIGURE_RC=!errorlevel!"
 if not "!CONFIGURE_RC!"=="0" (
     popd

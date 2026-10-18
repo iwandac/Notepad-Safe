@@ -1,10 +1,10 @@
 # Notepad Safe 当前架构
 
-> 核对日期：2026-10-02。依据当前工作树源码，包括尚未提交的保存、恢复和关闭修改。
-> 本文描述已经存在的结构和实现边界，不把接口、测试名称或历史通过记录视为当前功能验收。
-> 本轮仅做源码与文档核对，没有构建、运行测试或启动客户端。
+> 核对日期：2026-10-17。本文描述已经存在的结构和实现边界，不把接口、测试名称或历史通过记录视为当前功能验收。
 
-本文中的模式限制属于实现现状；轻快、离线安全与只读共有阅读体验一致性的目标和判据见 [回归方法](TARGET_EXPERIENCE.md) 与 [详细清单](REGRESSION_CHECKLIST.md)，不能由现状自动推导验收通过。
+本文中的模式限制属于实现现状；目标和必须跑通的旅程见 [产品目标](PRODUCT_GOALS.md)，各功能的当前行为见对应的现状文档。
+
+界面外壳在 `src/shell/`：设计令牌与样式（`ThemeTokens`、`ThemeStyle`）、无边框窗口与标题栏（`WindowChrome`、`TitleBar`）、主菜单与 Alt 键（`MainMenu`、`AltMenuTracker`）、绘制的文档标签（`DocumentTabBar`）、状态栏分段（`StatusSegments`）、命令面板（`CommandPaletteModel`、`CommandPalette`）、提示条（`NoticeBar`）和绘制图标（`ShellGlyphs`）。外壳只依赖 Qt 和 `src/app` 的命令类型，不包含编辑器、窗口或保险库的头文件（`tools/check_architecture.ps1` 检查）；`MainWindow` 只负责接线。
 
 ## 1. 总体结构
 

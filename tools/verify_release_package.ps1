@@ -56,7 +56,7 @@ try {
         "$root/THIRD_PARTY_NOTICES.md",
         "$root/metadata/dependencies.lock.json",
         "$root/metadata/notepad-safe.spdx.json",
-        "$root/docs/TARGET_EXPERIENCE.md",
+        "$root/docs/PRODUCT_GOALS.md",
         "$root/docs/SUPPLY_CHAIN.md"
     ) | Sort-Object
     $actual = @($files.FullName | Sort-Object)

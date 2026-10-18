@@ -1,13 +1,13 @@
 # 搜索与替换细粒度契约矩阵
 
-> 2026-10-02 范围校准：这是既有测试 ID 与语义索引，历史通过记录只适用于当时版本；当前规则见 [回归方法](../../docs/TARGET_EXPERIENCE.md) 和 [正则专项](../../docs/REGEX_ENGINE_EXPLORATION.md)。S2/S3 同为只读，2 GiB 不是功能门槛；下文 ADR-022 是历史方案编号，现行语义以正则专项和源码为准。
+> 2026-10-02 范围校准：这是既有测试 ID 与语义索引，历史通过记录只适用于当时版本；当前行为见 [搜索现状](../../docs/SEARCH_CURRENT_STATE.md) 和 [正则语义](../../docs/REGEX_SEMANTICS.md)。S2/S3 同为只读，2 GiB 不是功能门槛；下文 ADR-022 是历史方案编号，现行语义以正则语义文档和源码为准。
 
 > 2026-10-17 功能删除（见 [功能取舍](../../docs/FEATURE_DECISIONS.md)）：全部打开文件范围只查找，不再有跨文件全部替换和字节搜索；二进制没有文本呈现。已删除的用例：`tc_fr_015_all_open_replace_transaction_and_skip_summary`、`tc_fr_012_hex_byte_all_open_filters_text_targets`、`tc_fr_034_real_smalltestfile_text_directional_search_progress`、`tc_fr_038_real_tinytestfile_replacement_literal_user_flow`（依赖已删除的二进制文本呈现）、整个 `gui_smoke_search_malformed_encoding` 套件。新增 `tc_fr_all_open_scope_is_find_only`；`tc_fr_019` 的 all-open-mixed 上下文改为无字节模式、无全部替换。
 
 本文件是搜索/替换专项的可执行边界，不是抽样用户旅程。每次修复必须选择对应 `SR-*`
 契约，以判别语料、明确 byte range 和真实 GUI 操作验证；不能只证明函数返回值。
 
-本版具体执行ID见[详细清单](../../docs/REGRESSION_CHECKLIST.md)的SR与PAR组，本文下方旧SR契约号按文件名区分，不与新主用例ID混计。必须记录真实打开路由；强制windowed的小Text测试不能替代原生T或大文件RT验收。
+本文下方的 SR 契约号按文件名区分。必须记录真实打开路由；强制windowed的小Text测试不能替代原生T或大文件RT验收。
 
 ## 1. 查询状态机
 
@@ -191,7 +191,7 @@ S1 解码后编辑空间的导航；当时未覆盖的原编码 source-byte、S2
 - 非 GUI CTest 11/11 通过，包括 PCRE2、原编码 LargeFileSearch、编码、会话、KDBX、安全身份和
   供应链；E2E 2/2 通过；全目标构建与 `check_async_threading.ps1` 通过。
 
-当前产品支持边界以 `docs/REGEX_ENGINE_EXPLORATION.md` 为准：UTF 路径使用完整 PCRE2 Unicode
+当前产品支持边界以 `docs/REGEX_SEMANTICS.md` 为准：UTF 路径使用完整 PCRE2 Unicode
 模式；非 UTF 原始 subject 只启用登记的日志正则子集，超出子集在扫描前短错误拒绝，不以第二
 matcher、全文转码或隐式语义降级冒充支持。
 

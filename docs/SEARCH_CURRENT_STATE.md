@@ -1,6 +1,6 @@
 # 搜索功能现状
 
-更新：2026-10-17。本页按当前源码逐项记录搜索、替换与结果面板的实际行为，作为新界面和架构评估的依据。它描述“现在是什么”，不是验收结论；测试是否通过见 [执行账本](DAILY_USE_CLOSEOUT.md)。主要来源：[`FindReplaceDialog.cpp`](../src/search/FindReplaceDialog.cpp)、[`MainWindowCommands.cpp`](../src/window/MainWindowCommands.cpp)、[`EditorTabSearch.cpp`](../src/editor/EditorTabSearch.cpp)、[`Pcre2Regex.cpp`](../src/search/Pcre2Regex.cpp)、[`SearchResultsDock.cpp`](../src/search/SearchResultsDock.cpp)、[`SearchResultsModel.cpp`](../src/search/SearchResultsModel.cpp)、[`DynamicThresholds.cpp`](../src/editor/DynamicThresholds.cpp)，语义合同见 [正则专项](REGEX_ENGINE_EXPLORATION.md) 与 [搜索契约矩阵](../tests/gui_smoke/SEARCH_REPLACE_CONTRACT_MATRIX.md)。
+更新：2026-10-17。本页按当前源码逐项记录搜索、替换与结果面板的实际行为，作为新界面和架构评估的依据。它描述“现在是什么”，不是验收结论；测试是否通过见 [执行账本](DAILY_USE_CLOSEOUT.md)。主要来源：[`FindReplaceDialog.cpp`](../src/search/FindReplaceDialog.cpp)、[`MainWindowCommands.cpp`](../src/window/MainWindowCommands.cpp)、[`EditorTabSearch.cpp`](../src/editor/EditorTabSearch.cpp)、[`Pcre2Regex.cpp`](../src/search/Pcre2Regex.cpp)、[`SearchResultsDock.cpp`](../src/search/SearchResultsDock.cpp)、[`SearchResultsModel.cpp`](../src/search/SearchResultsModel.cpp)、[`DynamicThresholds.cpp`](../src/editor/DynamicThresholds.cpp)，语义合同见 [正则语义](REGEX_SEMANTICS.md) 与 [搜索契约矩阵](../tests/gui_smoke/SEARCH_REPLACE_CONTRACT_MATRIX.md)。
 
 ## 1. 入口
 

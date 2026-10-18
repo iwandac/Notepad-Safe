@@ -1,6 +1,6 @@
 # 正则搜索语义与边界
 
-2026-10-02：保留当前 PCRE2/EncodedRegexCompiler 的专项语义，文件名沿用历史。本文的验收条目是需要验证的合同，不代表本轮已执行。文中 S2/S3 都指同一窗口化只读能力，2 GiB 不区分功能；当前功能状态见 [FEATURE_LEDGER.md](FEATURE_LEDGER.md)。
+2026-10-02：保留当前 PCRE2/EncodedRegexCompiler 的专项语义。本文的验收条目是需要验证的合同，不代表本轮已执行。文中 S2/S3 都指同一窗口化只读能力，2 GiB 不区分功能；当前搜索行为见 [搜索现状](SEARCH_CURRENT_STATE.md)。
 
 ## 1. 结论
 

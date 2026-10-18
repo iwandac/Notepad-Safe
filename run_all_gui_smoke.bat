@@ -1,7 +1,7 @@
 @echo off
 REM ============================================================================
 REM  notepad-safe GUI smoke test runner (Windows / PowerShell).
-REM  Governed by QUALITY_ASSURANCE_AND_GUI_TESTING.md section 2.
+REM  Opens real windows on the desktop; see README.md "测试" before running.
 REM
 REM  Usage:
 REM    cd /d ^<repository-root^>

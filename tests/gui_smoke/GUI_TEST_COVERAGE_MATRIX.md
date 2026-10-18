@@ -1,10 +1,10 @@
 # GUI 全功能测试矩阵
 
-> 2026-10-02 范围校准：本文件是既有测试 ID 与专项契约索引，历史记录不代表当前候选通过；本版组合与证据规则见 [回归方法](../../docs/TARGET_EXPERIENCE.md)。S2/S3、B2/B3 都是同一窗口化只读能力，2 GiB 样本只验证偏移/资源边界，不构成功能门槛。
+> 2026-10-02 范围校准：本文件是既有测试 ID 与专项契约索引，历史记录不代表当前候选通过；目标与核心旅程见 [产品目标](../../docs/PRODUCT_GOALS.md)。S2/S3、B2/B3 都是同一窗口化只读能力，2 GiB 样本只验证偏移/资源边界，不构成功能门槛。
 
 > 2026-10-17 功能删除（见 [功能取舍](../../docs/FEATURE_DECISIONS.md)）：分屏、同一标签内的文本/十六进制切换与二进制的文本呈现、全部打开文件的全部替换与字节搜索、转置当前行、按窗口宽度拆分选中行、主工具栏已删除，本文中涉及它们的契约不再适用。已删除的用例：`tc_s1_split_view_shares_document_and_keeps_independent_viewports`、`tc_binary_text_presentation_survives_session_restore`、`binaryTextReadonlyExplainsCapabilitiesAndNoCharacterTotal`、`tc_2b1_binary_text_encoding_clean_restore`、`partialBatchCancellationSurvivesDockReopenAndFreshQuery`、整个 `gui_smoke_search_malformed_encoding` 套件。新增：`removedCommandsAreAbsent`、`windowedTextReopensAsHexAndRestoresAcrossSession`、`plainBinarySaveAsOffersNoSecureType`、`existingSecureBinaryStillSavesAndExports`。
 
-本文件保留既有功能 ID 和历史缺陷索引。本次具体执行按[详细验证清单](../../docs/REGRESSION_CHECKLIST.md)的稳定步骤、夹具、独立判据和参数子例登记；已有测试名或旧限制不等于新体验目标通过。小修按影响选择复测，固定候选按完整适用清单执行。
+本文件保留既有功能 ID 和历史缺陷索引。执行结果统一记在 [执行账本](../../docs/DAILY_USE_CLOSEOUT.md)；已有测试名或旧限制不等于新体验目标通过。小修按影响选择复测，固定候选按完整适用清单执行。
 
 ## 1. 测试原则
 

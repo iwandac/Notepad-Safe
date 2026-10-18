@@ -1,26 +1,26 @@
 # Notepad Safe
 
-Windows 本地文本编辑器、二进制查看/编辑器与 KDBX 账号保险箱。基于 C++17、Qt 6.11.1 静态库和 QScintilla。版本 0.3.1，当前仍为待完整回归的开发候选。
+Windows 本地的轻量记事本，带离线加密文档和 KDBX 账号库。用 C++17、Qt 6.11.1 静态库（/MT）和 QScintilla 构建，单个 exe 运行，不联网。版本 0.3.1，开发中。
 
-本版目标：个人日用编辑与恢复、只读大日志定位、账号取用与锁定。冻结新功能，延期 AI、代码可视化和 Hex 扩展；安装、签名、发布和分发不在范围内。
+先读 **[产品目标与核心旅程](docs/PRODUCT_GOALS.md)**：不变的目标、边界和 12 条必须跑通的核心旅程。其余文档见 [文档索引](docs/README.md)。
 
-产品目标、不变边界和必须跑通的 12 条核心旅程见 **[产品目标与核心旅程](docs/PRODUCT_GOALS.md)**，这是验收入口；细化子例见[详细验证清单](docs/REGRESSION_CHECKLIST.md)。下列能力是源码现状，不能自动作为体验差异的验收豁免。
+## 能做什么
 
-## 当前能力
+- **编辑**：Notepad++ 式的文本编辑——行操作、多选、语法高亮、折叠、书签、标尺；查找替换支持普通、PCRE2 正则（捕获组替换）和十六进制字节三种模式，可在当前文件或全部打开文件中查找（替换只作用于当前文件）。
+- **编码与换行**：自动识别 UTF-8/UTF-16/GBK/GB18030/Big5/Shift-JIS/Windows-1252，可按其他编码显示或转换另存；CRLF/LF/CR 可切换。
+- **二进制**：小于 32 MiB 的二进制文件以可编辑的十六进制视图打开（插入/覆盖、剪贴板、撤销）。
+- **大文件**：32 MiB 及以上的文件以窗口化只读视图打开，可浏览、复制、查找、跟随文件末尾；大文本可在标签右键切换为十六进制查看。
+- **加密文档**：新建默认是离线加密文档（`.nsafe`，KDBX 格式），自动写回、锁定后遮蔽内容；本机会话 7 天，可立即锁定。
+- **账号库**：标题、用户名、密码、网址、标签、备注和动态验证码（TOTP）；复制的用户名、密码和验证码 30 秒后从剪贴板清除。
+- **保存与恢复**：原子保存；未保存的修改以加密草稿保存，崩溃或重启后恢复。
 
-- 普通小文本：完整编辑、查找替换、编码/行尾、语法高亮、书签和分屏。
-- 小型二进制：字节编辑、Text/Hex 表示、撤销重做；其 Text 投影不能套用普通文本全部编辑能力。
-- 普通文件达到 32 MiB 后统一窗口化只读：浏览、搜索、定位、复制；不编辑、不普通保存/另存、不启用自动换行。只读普通 Text 仍可转换编码并输出新文件，这是独立操作。
-- **2 GiB 不是功能门槛**。源码残留的大小枚举不产生另一套能力。
-- KDBX 后端开启时，新建默认安全草稿，安全正文载荷严格小于 32 MiB。关闭后端的构建可新建普通草稿，不能提供安全存储。
-- 安全文档与账号共用底层 KDBX 能力，但账号秘密不进入普通文档编辑/搜索路径。
-- AI 只有接口和注册表，没有接通的推理产品功能。
+界面：无边框窗口与标题栏，≡ 主菜单（Alt / F10 打开），Ctrl+K 命令面板，可点击的状态栏（编码、换行符、语言、缩放、安全状态），浅色/深色外观，Windows 高对比度下跟随系统配色。
 
-以上表示源码已有路径，不代表完整客户端回归通过。适用模式和限制见[功能清单](docs/FEATURE_LEDGER.md)。
+各功能的详细现状见 `docs/*_CURRENT_STATE.md`。
 
-## 构建与运行
+## 构建
 
-需要 MSVC x64 C++ 工具链、CMake ≥3.22、Ninja、Python 3，以及精确 Qt 6.11.1 静态 /MT 工具链。应用依赖源码由仓库锁定并离线构建；不是仅 clone 即可运行。
+需要 MSVC x64 工具链（Visual Studio 2026）、CMake ≥ 3.22、Python 3，以及**精确版本的 Qt 6.11.1 静态 /MT 构建**（必须保持静态链接）。依赖源码已锁定在 `third_party/src`，离线构建。
 
 ```bat
 set NOTEPADSAFE_QT6_DIR=你的Qt静态库目录\msvc2026_64
@@ -28,14 +28,26 @@ build.bat
 build\notepad-safe.exe
 ```
 
-`build.bat` 会重建 build 目录，默认 KDBX=ON、Tests/Diagnostics=OFF。已有构建增量使用 `build_incr.bat notepad-safe`，可用 NOTEPADSAFE_BUILD_DIR 指定既有目录。NOTEPADSAFE_WITH_KDBX=OFF 可构建普通编辑器。详见[供应链规程](docs/SUPPLY_CHAIN.md)。
+- `build.bat`：先运行 `prepare_dependencies.bat`（离线校验并构建 QScintilla、PCRE2、Botan 到 `.deps`，首次较慢），再重建 `build` 目录（Ninja，KDBX 开启，测试关闭）。
+- `build_incr.bat [目标...]`：增量构建。用 `NOTEPADSAFE_BUILD_DIR` 指定已有目录时沿用该目录的生成器和缓存选项；新目录用 Ninja。
+- `NOTEPADSAFE_WITH_KDBX=OFF` 构建不含加密后端的普通编辑器。
 
-测试入口为 run_tests.bat 和 run_all_gui_smoke.bat。前者虽然标为 non-GUI，仍包含使用 QApplication 的测试，**不能视为不占桌面的白名单**。执行前按[回归方法](docs/TARGET_EXPERIENCE.md)核对入口与隔离方式。
+依赖锁定与更新规程见 [供应链规程](docs/SUPPLY_CHAIN.md)。
 
-## 数据与当前状态
+## 测试
 
-数据根由 src/domain/AppDataLocation.cpp 决定：绝对路径环境变量 NOTEPADSAFE_DATADIR 优先，否则为 Qt GenericDataLocation/NotepadSafe。测试使用隔离 profile 和合成数据，不复用个人资料。
+- `run_tests.bat`：构建并运行核心测试（不含 `gui_smoke_*`）。其中部分测试仍会创建 Qt 应用对象。
+- `run_all_gui_smoke.bat`：构建并运行 GUI 测试，**会在桌面上弹出真实窗口**，运行期间不要操作桌面，否则焦点相关用例可能失败。
+- 静态 Qt 只带 Windows 平台插件，不要设置 `QT_QPA_PLATFORM=offscreen`。
+- 每次运行都用独立的 `NOTEPADSAFE_DATADIR`（以及 `TEMP`/`TMP`），不要碰个人资料。
+- 构建时自动运行 `tools/check_architecture.ps1` 和 `tools/check_async_threading.ps1`，违反依赖规则或复杂度预算即构建失败。
 
-普通修改稿由 DraftStore 使用 Windows DPAPI 保存；安全文档由安全持久化路径保存。恢复与原子保存存在失败边界，不能承诺任何崩溃或并发写入下绝不丢失。损坏会话清单保全流程及候选证据见[收尾记录](docs/DAILY_USE_CLOSEOUT.md)。
+当前构建身份、测试结果和尚未关闭的问题见 [执行账本](docs/DAILY_USE_CLOSEOUT.md)。
 
-当前[源码架构](docs/DESIGN.md)、[收尾计划](docs/ITERATION_ROADMAP.md)、[文档索引](docs/README.md)。许可证和依赖归属见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 及仓库许可证文件。
+## 数据位置
+
+数据目录：环境变量 `NOTEPADSAFE_DATADIR`（绝对路径）优先，否则为 Qt GenericDataLocation 下的 `NotepadSafe`。普通文档的未保存修改用 Windows DPAPI 加密保存为草稿；加密文档和账号库以 KDBX 格式保存。
+
+## 许可证
+
+见仓库许可证文件；第三方依赖的许可与归属见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
