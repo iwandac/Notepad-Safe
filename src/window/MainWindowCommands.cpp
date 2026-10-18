@@ -695,7 +695,11 @@ void themeTabEditors(EditorTab *tab, bool highContrast, const ThemeTokens &t)
             applyEditorSurfacePalette(surface, qApp->palette());
         else
             applyEditorTheme(surface, t, tab->isSecureDocument());
+        // Highlights already on screen take the current hit color too.
+        surface->SendScintilla(QsciScintillaBase::SCI_INDICSETFORE, 8UL,
+                               scintillaColor(searchHitColor()));
     }
+    tab->setProperty("themedSecure", tab->isSecureDocument());
 }
 
 void themeTabBar(QTabWidget *tabs, const ThemeTokens &t)
@@ -714,6 +718,13 @@ void themeNewEditorTab(EditorTab *tab, bool highContrast, bool dark)
         themeTabEditors(tab, highContrast, dark ? ThemeTokens::dark() : ThemeTokens::light());
 }
 
+void refreshTabSecurityCue(EditorTab *tab, bool highContrast, bool dark)
+{
+    // Only a change of security class re-themes (the secure gutter tint).
+    if (tab && tab->property("themedSecure").toBool() != tab->isSecureDocument())
+        themeNewEditorTab(tab, highContrast, dark);
+}
+
 void MainWindow::applyDarkMode(bool dark)
 {
     if (!m_highContrastMode) {
@@ -727,6 +738,7 @@ void MainWindow::applyDarkMode(bool dark)
     qApp->setStyleSheet(QString());
     if (m_titleBar)
         m_titleBar->setTokens(ThemeTokens::light(), false);
+    m_noticeBar->setTokens(ThemeTokens::light(), false);
     themeTabBar(m_tabs, tokensFromPalette(pal));
     searchHitColor() = pal.color(QPalette::Highlight);
     for (int i = 0; i < m_tabs->count(); ++i) {
@@ -742,7 +754,8 @@ void MainWindow::showCommandPalette()
     if (!m_commandPalette)
         m_commandPalette = new CommandPalette(this);
     m_commandPalette->setTokens(m_highContrastMode ? tokensFromPalette(qApp->palette())
-                                : m_darkMode ? ThemeTokens::dark() : ThemeTokens::light());
+                                : m_darkMode ? ThemeTokens::dark() : ThemeTokens::light(),
+                                !m_highContrastMode);
     QVector<PaletteEntry> entries;
     for (int i = 0; i < m_tabs->count(); ++i) {
         QPointer<QWidget> page = m_tabs->widget(i);
@@ -754,26 +767,8 @@ void MainWindow::showCommandPalette()
                            locked || !tab ? QString() : tab->filePath(), {}, true,
                            [this, page] { if (page) m_tabs->setCurrentWidget(page); }});
     }
-    QSet<QString> seen;
-    for (QAction *action : findChildren<QAction *>()) {
-        const QString id = action->objectName();
-        if (id.isEmpty() || action->menu() || action->isSeparator() || seen.contains(id)
-            || id.startsWith(QLatin1String("tabContext.")) || id == QLatin1String("view.commandPalette"))
-            continue;
-        seen.insert(id);
-        QPointer<QAction> target = action;
-        entries.push_back({PaletteEntry::Group::Command, action->text(), {},
-                           action->shortcut().toString(QKeySequence::NativeText),
-                           action->isEnabled(), [target] { if (target) target->trigger(); }});
-    }
-    for (QAction *action : m_recentMenu ? m_recentMenu->actions() : QList<QAction *>()) {
-        const QString path = action->data().toString();
-        if (path.isEmpty())
-            continue;
-        QPointer<QAction> target = action;
-        entries.push_back({PaletteEntry::Group::Recent, QFileInfo(path).fileName(), path, {},
-                           true, [target] { if (target) target->trigger(); }});
-    }
+    entries += commandPaletteEntries(this);
+    entries += recentFileEntries(m_recentMenu);
     m_commandPalette->open(std::move(entries));
 }
 
@@ -1011,7 +1006,8 @@ void MainWindow::showTabContextMenu(const QPoint &position)
         QAction *switchView = menu->addAction(showingHex
             ? QStringLiteral("以文本查看") : QStringLiteral("以十六进制查看"));
         switchView->setObjectName(QStringLiteral("tabContext.switchPresentation"));
-        connect(switchView, &QAction::triggered, this, [this, tab, showingHex]() {
+        connect(switchView, &QAction::triggered, this,
+                [this, tab = QPointer<EditorTab>(tab), showingHex]() {
             if (!tab || !tab->canSwitchWindowedPresentation())
                 return;
             QString error;
@@ -1275,6 +1271,7 @@ void MainWindow::updateStatusBar()
     if (m_statusPos) m_statusPos->show();
     if (m_statusEncoding) m_statusEncoding->show();
     if (m_statusSyntax) m_statusSyntax->show();
+    m_statusSyntax->setEnabled(true);
     m_statusZoom->show();
     if (m_statusSize) m_statusSize->show();
     if (m_statusCharacters) m_statusCharacters->show();
@@ -1363,6 +1360,8 @@ void MainWindow::showWorkspaceStatus(const QString &workspaceName)
     m_statusEol->hide();
     m_statusZoom->hide();
     m_statusSecurity->hide();
+    // A workspace name is not a language: no language menu here.
+    m_statusSyntax->setEnabled(false);
     if (m_statusSyntax) {
         m_statusSyntax->setText(workspaceName);
         m_statusSyntax->show();

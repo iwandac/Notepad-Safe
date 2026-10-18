@@ -26,6 +26,8 @@ class TitleBar;
 // Applies the current appearance to one new tab's editors without
 // re-applying the application style sheet.
 void themeNewEditorTab(EditorTab *tab, bool highContrast, bool dark);
+// Re-themes a tab only when it became or stopped being secure.
+void refreshTabSecurityCue(EditorTab *tab, bool highContrast, bool dark);
 class StatusSegment;
 class NoticeBar;
 class CommandPalette;

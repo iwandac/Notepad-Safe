@@ -1,6 +1,11 @@
 #include "CommandPalette.h"
 
+#include <QAction>
+#include <QFileInfo>
 #include <QKeyEvent>
+#include <QMenu>
+#include <QPointer>
+#include <QSet>
 #include <QLineEdit>
 #include <QListView>
 #include <QPainter>
@@ -84,6 +89,40 @@ private:
 };
 } // namespace
 
+QVector<PaletteEntry> commandPaletteEntries(QWidget *window)
+{
+    QVector<PaletteEntry> entries;
+    QSet<QString> seen;
+    for (QAction *action : window->findChildren<QAction *>()) {
+        const QString id = action->objectName();
+        const bool listed = !id.isEmpty() && !action->menu() && !action->isSeparator()
+            && action->isVisible() && !id.startsWith(QLatin1String("tabContext."))
+            && id != QLatin1String("view.commandPalette") && !seen.contains(id);
+        if (!listed)
+            continue;
+        seen.insert(id);
+        QPointer<QAction> target = action;
+        entries.push_back({PaletteEntry::Group::Command, action->text(), {},
+                           action->shortcut().toString(QKeySequence::NativeText),
+                           action->isEnabled(), [target] { if (target) target->trigger(); }});
+    }
+    return entries;
+}
+
+QVector<PaletteEntry> recentFileEntries(QMenu *recentMenu)
+{
+    QVector<PaletteEntry> entries;
+    for (QAction *action : recentMenu ? recentMenu->actions() : QList<QAction *>()) {
+        const QString path = action->data().toString();
+        if (path.isEmpty())
+            continue;
+        QPointer<QAction> target = action;
+        entries.push_back({PaletteEntry::Group::Recent, QFileInfo(path).fileName(), path, {},
+                           true, [target] { if (target) target->trigger(); }});
+    }
+    return entries;
+}
+
 CommandPalette::CommandPalette(QWidget *window)
     : QFrame(window, Qt::Popup | Qt::FramelessWindowHint), m_window(window)
 {
@@ -124,9 +163,10 @@ CommandPalette::CommandPalette(QWidget *window)
     applyStyle();
 }
 
-void CommandPalette::setTokens(const ThemeTokens &tokens)
+void CommandPalette::setTokens(const ThemeTokens &tokens, bool styled)
 {
     m_tokens = tokens;
+    m_styled = styled;
     applyStyle();
 }
 
@@ -184,6 +224,10 @@ bool CommandPalette::eventFilter(QObject *watched, QEvent *event)
 
 void CommandPalette::applyStyle()
 {
+    if (!m_styled) {
+        setStyleSheet(QString());
+        return;
+    }
     const ThemeTokens &t = m_tokens;
     setStyleSheet(QStringLiteral(
         "#commandPalette { background:%1; border:1px solid %2; border-radius:%3px; }"

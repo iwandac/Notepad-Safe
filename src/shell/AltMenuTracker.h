@@ -9,7 +9,7 @@
 class QWidget;
 
 // Keeps Alt working once the menu bar is hidden: tapping Alt alone opens the
-// main menu, Alt+letter opens the submenu with that mnemonic. Any other key
+// main menu (so does F10), Alt+letter opens the submenu with that mnemonic. Any other key
 // or a mouse click while Alt is down cancels the tap.
 class AltMenuTracker final {
 public:

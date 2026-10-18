@@ -28,7 +28,8 @@ class NoticeBar final : public QFrame {
 public:
     explicit NoticeBar(QWidget *parent = nullptr);
 
-    void setTokens(const ThemeTokens &tokens);
+    // Without styling (Windows high contrast) the bar uses the platform palette.
+    void setTokens(const ThemeTokens &tokens, bool styled = true);
     void showNotice(NoticeKind kind, const QString &text,
                     QVector<NoticeAction> actions = {}, int autoHideMs = 0);
     void dismiss();
@@ -38,6 +39,7 @@ private:
 
     ThemeTokens m_tokens = ThemeTokens::light();
     NoticeKind m_kind = NoticeKind::Info;
+    bool m_styled = true;
     QLabel *m_text = nullptr;
     QHBoxLayout *m_actions = nullptr;
     QToolButton *m_dismiss = nullptr;

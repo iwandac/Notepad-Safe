@@ -357,6 +357,12 @@ EditorTab *MainWindow::addNewTab(OpenPresentationPolicy presentation, int recove
     // QScintilla keeps its own colors outside the QWidget palette. Apply the
     // resolved appearance to newly created/restored tabs as well as existing ones.
     themeNewEditorTab(tab, m_highContrastMode, m_darkMode);
+    const auto refreshSecurityCue = [this, tab] {
+        refreshTabSecurityCue(tab, m_highContrastMode, m_darkMode);
+        m_tabs->tabBar()->update();
+    };
+    connect(tab, &EditorTab::commandCapabilitiesChanged, this, refreshSecurityCue);
+    connect(tab, &EditorTab::titleChanged, this, refreshSecurityCue);
 
     if (auto *bar = qobject_cast<DocumentTabBar *>(m_tabs->tabBar()))
         connect(tab, &EditorTab::modificationChanged, bar, &DocumentTabBar::refresh);
@@ -1144,6 +1150,8 @@ bool MainWindow::saveFile()
             reason = QStringLiteral("无法写入 %1").arg(QFileInfo(tab->filePath()).fileName());
         const QPointer<EditorTab> target(tab);
         const auto focusTarget = [this, target] {
+            // 重试 may be clicked from the accounts or security workspace.
+            showDocumentWorkspace();
             if (target)
                 m_tabs->setCurrentWidget(target);
             return bool(target);
@@ -1156,6 +1164,8 @@ bool MainWindow::saveFile()
         return false;
     }
     m_session->discardRecovery(tab);
+    // An earlier failure notice no longer applies.
+    m_noticeBar->dismiss();
     return true;
 }
 

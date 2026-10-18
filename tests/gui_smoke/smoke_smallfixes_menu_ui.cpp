@@ -3880,6 +3880,83 @@ private slots:
         QVERIFY(mw_->dockWidgetArea(dock) != Qt::TopDockWidgetArea);
     }
 
+    // 转置当前行 was removed; QScintilla's own Ctrl+T binding must not
+    // bring it back.
+    void ctrlTDoesNotTransposeLines() {
+        closeAllEditorTabs(mw_);
+        const QString path = tmpDir_.filePath(QStringLiteral("no-transpose.txt"));
+        {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write("first\nsecond\n");
+        }
+        mw_->openFilesFromExternal({path});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab);
+        tab->editor()->setFocus();
+        tab->editor()->setCursorPosition(1, 0);
+        QTest::keyClick(tab->editor(), Qt::Key_T, Qt::ControlModifier);
+        QCOMPARE(tab->editor()->text(), QStringLiteral("first\nsecond\n"));
+        closeAllEditorTabs(mw_);
+    }
+
+    // The line-number margin is tinted only while a document is secure.
+    void secureGutterFollowsSecurityState() {
+        closeAllEditorTabs(mw_);
+        const QString path = tmpDir_.filePath(QStringLiteral("gutter.txt"));
+        {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write("gutter\n");
+        }
+        mw_->openFilesFromExternal({path});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab && !tab->isSecureDocument());
+        const auto marginBack = [tab] {
+            const long bgr = tab->editor()->SendScintilla(
+                QsciScintillaBase::SCI_STYLEGETBACK, QsciScintillaBase::STYLE_LINENUMBER);
+            return QColor(int(bgr & 0xff), int((bgr >> 8) & 0xff), int((bgr >> 16) & 0xff));
+        };
+        const bool dark = qApp->styleSheet().contains(ThemeTokens::dark().paper.name(),
+                                                      Qt::CaseInsensitive);
+        const ThemeTokens tokens = dark ? ThemeTokens::dark() : ThemeTokens::light();
+        QCOMPARE(marginBack(), tokens.chrome);
+        tab->initializeSecureDocument(QUuid::createUuid(), QStringLiteral("gutter"),
+                                      QStringLiteral("gutter\n"));
+        QTRY_COMPARE(marginBack(), tokens.sealSoft);
+        tab->convertToPlainDocument({});
+        QTRY_COMPARE(marginBack(), tokens.chrome);
+        closeAllEditorTabs(mw_);
+    }
+
+    // A failure notice must not outlive a later successful save.
+    void successfulSaveClearsFailureNotice() {
+        closeAllEditorTabs(mw_);
+        const QString path = tmpDir_.filePath(QStringLiteral("notice-clears.txt"));
+        {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write("original\n");
+        }
+        mw_->openFilesFromExternal({path});
+        QTRY_COMPARE_WITH_TIMEOUT(tabCount(mw_), 1, 3000);
+        EditorTab *tab = currentEditorTab(mw_);
+        QVERIFY(tab);
+        tab->editor()->setText(QStringLiteral("edited\n"));
+        QVERIFY(QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::ReadUser));
+        QVERIFY(QMetaObject::invokeMethod(mw_, "saveFile", Qt::DirectConnection));
+        auto *notice = mw_->findChild<QWidget *>(QStringLiteral("noticeBar"));
+        QTRY_VERIFY(notice && notice->isVisible());
+        QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                                        | QFileDevice::ReadUser | QFileDevice::WriteUser);
+        QVERIFY(QMetaObject::invokeMethod(mw_, "saveFile", Qt::DirectConnection));
+        QTRY_VERIFY(!tab->isModified());
+        QVERIFY(!notice->isVisible());
+        closeAllEditorTabs(mw_);
+    }
+
     void tc_system_high_contrast_keeps_platform_palette() {
         const QString dataDir = tmpDir_.filePath(QStringLiteral("high-contrast-settings"));
         QDir().mkpath(dataDir);

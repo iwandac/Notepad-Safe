@@ -14,6 +14,8 @@ AltMenuTracker::Outcome AltMenuTracker::keyPress(int key, Qt::KeyboardModifiers 
         return {};
     }
     m_armed = false;
+    if (key == Qt::Key_F10 && (modifiers & ~Qt::KeypadModifier) == Qt::NoModifier)
+        return {Result::OpenMainMenu, {}};
     if (modifiers.testFlag(Qt::AltModifier) && others == Qt::NoModifier
         && key >= Qt::Key_A && key <= Qt::Key_Z) {
         return {Result::OpenSubmenu, QChar(u'A' + (key - Qt::Key_A))};

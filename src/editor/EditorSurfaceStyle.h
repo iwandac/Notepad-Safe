@@ -77,6 +77,9 @@ inline void applySharedEditorSurfaceStyle(QsciScintilla *editor)
     editor->setWrapVisualFlags(QsciScintilla::WrapFlagByText);
     editor->setWrapIndentMode(QsciScintilla::WrapIndentSame);
     editor->setBraceMatching(QsciScintilla::SloppyBraceMatch);
+    // 转置当前行 was removed; drop Scintilla's built-in Ctrl+T line transpose.
+    editor->SendScintilla(QsciScintillaBase::SCI_CLEARCMDKEY,
+                          static_cast<unsigned long>('T' + (QsciScintillaBase::SCMOD_CTRL << 16)));
 }
 
 // QScintilla and QPlainTextEdit calculate leading differently even when they

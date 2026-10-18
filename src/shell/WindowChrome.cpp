@@ -5,8 +5,10 @@
 #ifdef Q_OS_WIN
 #include <Windows.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 #include <windowsx.h>
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "shell32.lib")
 #endif
 
 ChromeHit WindowChrome::hitTest(QPoint local, QSize window, int resizeBorder,
@@ -106,12 +108,17 @@ bool WindowChrome::handleNativeEvent(QWidget *window, void *message, qintptr *re
         if (IsZoomed(msg->hwnd)) {
             auto *params = reinterpret_cast<NCCALCSIZE_PARAMS *>(msg->lParam);
             const UINT dpi = GetDpiForWindow(msg->hwnd);
-            const int frame = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi)
-                + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-            params->rgrc[0].left += frame;
-            params->rgrc[0].top += frame;
-            params->rgrc[0].right -= frame;
-            params->rgrc[0].bottom -= frame;
+            const int padded = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+            const int frameX = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + padded;
+            const int frameY = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + padded;
+            params->rgrc[0].left += frameX;
+            params->rgrc[0].top += frameY;
+            params->rgrc[0].right -= frameX;
+            params->rgrc[0].bottom -= frameY;
+            // Leave one pixel so an auto-hide taskbar can still be revealed.
+            APPBARDATA appBar{sizeof(APPBARDATA)};
+            if (SHAppBarMessage(ABM_GETSTATE, &appBar) & ABS_AUTOHIDE)
+                params->rgrc[0].bottom -= 1;
         }
         *result = 0;
         return true;

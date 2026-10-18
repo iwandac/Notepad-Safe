@@ -77,7 +77,7 @@ void TestCommandPaletteModel::mnemonicIsIgnored()
     model.setEntries({entry(Group::Command, QStringLiteral("保存(&S)")),
                       entry(Group::Command, QStringLiteral("&Find..."))});
     model.setQuery(QStringLiteral("保存"));
-    QCOMPARE(titles(model), QStringList{QStringLiteral("保存(S)")});
+    QCOMPARE(titles(model), QStringList{QStringLiteral("保存")});
     model.setQuery(QStringLiteral("find"));
     QCOMPARE(titles(model), QStringList{QStringLiteral("Find...")});
 }

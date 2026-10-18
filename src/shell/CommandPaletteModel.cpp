@@ -1,13 +1,17 @@
 #include "CommandPaletteModel.h"
 
+#include <QRegularExpression>
+
 #include <algorithm>
 
 namespace {
 constexpr int EmptyQueryPerGroup = 5;
 
-// "保存(&S)" -> "保存(S)"; "&&" stays a literal ampersand.
-QString withoutMnemonic(const QString &text)
+// "保存(&S)" -> "保存", "&Find" -> "Find"; "&&" stays a literal ampersand.
+QString withoutMnemonic(const QString &input)
 {
+    static const QRegularExpression suffix(QStringLiteral("\\(&[^&)]\\)"));
+    const QString text = QString(input).remove(suffix);
     QString result;
     result.reserve(text.size());
     for (int i = 0; i < text.size(); ++i) {

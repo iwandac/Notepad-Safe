@@ -38,9 +38,10 @@ NoticeBar::NoticeBar(QWidget *parent) : QFrame(parent)
     applyStyle();
 }
 
-void NoticeBar::setTokens(const ThemeTokens &tokens)
+void NoticeBar::setTokens(const ThemeTokens &tokens, bool styled)
 {
     m_tokens = tokens;
+    m_styled = styled;
     applyStyle();
 }
 
@@ -81,6 +82,10 @@ void NoticeBar::dismiss()
 
 void NoticeBar::applyStyle()
 {
+    if (!m_styled) {
+        setStyleSheet(QString());
+        return;
+    }
     const ThemeTokens &t = m_tokens;
     const bool error = m_kind == NoticeKind::Error;
     setStyleSheet(QStringLiteral(

@@ -17,6 +17,7 @@ private slots:
     void altTapOpensMainMenu();
     void altLetterOpensSubmenu();
     void altCombinationsDoNothing();
+    void f10OpensMainMenu();
     void tabPaintSpecRules();
 };
 
@@ -191,6 +192,16 @@ void TestShellLogic::tabPaintSpecRules()
     QCOMPARE(spec.icon, t.muted);
     spec = tabPaintSpec({Kind::Recovery, false, false}, true, false, t);
     QCOMPARE(spec.icon, t.danger);
+}
+
+void TestShellLogic::f10OpensMainMenu()
+{
+    AltMenuTracker tracker;
+    QCOMPARE(tracker.keyPress(Qt::Key_F10, Qt::NoModifier).result,
+             AltMenuTracker::Result::OpenMainMenu);
+    // Shift+F10 is the context-menu key; leave it alone.
+    QCOMPARE(tracker.keyPress(Qt::Key_F10, Qt::ShiftModifier).result,
+             AltMenuTracker::Result::None);
 }
 
 QTEST_GUILESS_MAIN(TestShellLogic)
