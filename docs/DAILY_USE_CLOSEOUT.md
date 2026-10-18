@@ -8,7 +8,7 @@
 - **核心测试**：17 组全部通过。
 - **GUI 套件**（真实 Windows 平台插件，串行）：smallfixes 78/78、findreplace 41/41、recovery_issue 16/16、document_product_language 24/24、tail_follow 21/21、startup_shell 7/7、secure_documents 14/14、large_readonly 25/25；hex_accessibility 需要设置 `NOTEPADSAFE_EXPECTED_DPR`，未运行（受阻）。
 - **启动时间（J1）**：启动轨迹探针 30 次冷启动，进程创建到首次绘制中位 183 ms、P95 194 ms；正式启动探针（经 ≡ 主菜单打开文件菜单）单次有效。
-- **下一步**：替换旧的查找/替换窗口为新界面的查找浮层，然后合并到 main。
+- **下一步**：合并到 main。
 
 ## 当前执行证据
 
@@ -61,5 +61,4 @@
 
 - 普通保存仍不是文件系统级 compare-and-swap，最后一次检查到原子替换之间仍有极小并发窗口（见上）。
 - 窗口拖动、贴靠布局、边缘缩放、Win+方向键和不同 DPI 之间切换未逐项人工验证；hex_accessibility 需要在设置了 `NOTEPADSAFE_EXPECTED_DPR` 的环境中运行。
-- 查找/替换仍是旧窗口，新界面的查找浮层尚未实现。
 - 未运行 KDBX=OFF、ASAN 构建。

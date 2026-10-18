@@ -29,4 +29,4 @@
 
 测试索引在 `tests/gui_smoke`：[GUI 矩阵](../tests/gui_smoke/GUI_TEST_COVERAGE_MATRIX.md)、[十六进制契约](../tests/gui_smoke/HEX_EDITOR_CONTRACT_MATRIX.md)、[搜索契约](../tests/gui_smoke/SEARCH_REPLACE_CONTRACT_MATRIX.md)。列出用例不表示已运行；运行结果见执行账本。
 
-早期的验收轮次记录、128 项回归清单、迭代路线和已完成的实施计划已移除，可在 Git 历史中找回。
+查找浮层的设计依据见 [查找浮层设计](superpowers/specs/2026-10-18-find-overlay-design.md)。早期的验收轮次记录、128 项回归清单、迭代路线和已完成的实施计划已移除，可在 Git 历史中找回。

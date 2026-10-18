@@ -1396,6 +1396,8 @@ void FindOverlay::setL2SearchUiBusy(bool busy, const QString& msg,
     m_l2SearchInProgress = busy;
     m_live->setSuspended(busy);
     m_allowNavigationDuringBusy = busy && allowNavigation;
+    // Cancel takes Find All's place while a search runs.
+    m_findAllBtn->setVisible(!busy);
     m_cancelSearchBtn->setVisible(busy);
     m_cancelSearchBtn->setEnabled(busy);
     if (m_statusLabel) m_statusLabel->setText(busy ? msg : QString());
