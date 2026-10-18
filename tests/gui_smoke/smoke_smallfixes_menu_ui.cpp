@@ -4394,18 +4394,30 @@ private slots:
         auto *summary = dock->findChild<QLabel *>(
             QStringLiteral("searchResultsSummary"));
         QVERIFY(pattern && scope && findAll && cancel && tree && summary);
-        QSignalSpy clearSpy(dock,
-                            &SearchResultsDock::clearSearchHighlightsRequested);
         pattern->setText(QStringLiteral("TOKEN"));
         scope->setCurrentIndex(scope->findData(1));
         QTest::mouseClick(findAll, Qt::LeftButton);
         QVERIFY(cancel->isVisible() && cancel->isEnabled());
+        // Starting the search clears an earlier search's highlights; only
+        // what the external open does afterwards is under test.
+        QSignalSpy clearSpy(dock,
+                            &SearchResultsDock::clearSearchHighlightsRequested);
         QAbstractItemModel *const frozenModel = tree->model();
         QVERIFY(frozenModel);
 
         mw_->openFilesFromExternal({externalPath});
         QCOMPARE(tabCount(mw_), 3);
-        QCOMPARE(clearSpy.count(), 0);
+        QStringList clearedTabs;
+        for (const QList<QVariant> &call : std::as_const(clearSpy)) {
+            QString name = call.at(0).toUuid().toString();
+            for (int i = 0; i < tabs->count(); ++i) {
+                if (auto *t = qobject_cast<EditorTab *>(tabs->widget(i));
+                    t && t->documentState().id == call.at(0).toUuid())
+                    name = t->fileName();
+            }
+            clearedTabs << name;
+        }
+        QVERIFY2(clearSpy.count() == 0, qPrintable(clearedTabs.join(QLatin1Char(','))));
         QVERIFY2(cancel->isVisible(),
                  "external open cancelled the active all-open search");
         QCOMPARE(tabs->indexOf(dirty) >= 0, true);

@@ -39,6 +39,7 @@ class QsciLexer;
 class VirtualFileView;
 class WindowedReadOnlyProvider;
 class EditorSearchSource;
+class LargeFileSearch;
 bool ownsWindowedReadOnlyInputObject(const WindowedReadOnlyProvider *provider,
                                      const QObject *object);
 class QStackedWidget;
@@ -215,6 +216,9 @@ public:
     QsciScintilla *editor() const;
     // Every editor surface this tab owns, for theming.
     QList<QsciScintilla *> themedEditors() const;
+    // The search engine of the current large-document source (editable or
+    // windowed read-only); null for small documents.
+    LargeFileSearch *searchEngine() const;
     qint64 currentByteOffset() const;
 
     // 语法

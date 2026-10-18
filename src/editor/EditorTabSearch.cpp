@@ -571,6 +571,11 @@ void EditorTab::cancelFindAllL2()
     cancelPendingL2SearchForContentChange();
 }
 
+LargeFileSearch *EditorTab::searchEngine() const
+{
+    return m_searchSource ? m_searchSource->engine() : nullptr;
+}
+
 bool EditorTab::findNext(const QString &pattern, bool regex, bool caseSensitive,
                          bool wholeWord, bool forward, bool wrap,
                          bool hexBytes)

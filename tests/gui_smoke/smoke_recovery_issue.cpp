@@ -530,8 +530,9 @@ private slots:
         const QJsonObject record{
             {QStringLiteral("filePath"), path},
             {QStringLiteral("modified"), true},
-            {QStringLiteral("secureDocument"), false},
-            {QStringLiteral("autosavePath"), QDir(root).filePath(QStringLiteral("unmanaged-missing.ndraft"))}};
+            {QStringLiteral("secureDocument"), false}};
+        // A modified tab whose draft is gone. (A draft path outside the managed
+        // autosave folder makes the whole manifest invalid, by design.)
         QVERIFY(writeAll(manager.sessionFilePath(), QJsonDocument(QJsonObject{
             {QStringLiteral("version"), 2}, {QStringLiteral("activeTab"), 0},
             {QStringLiteral("tabs"), QJsonArray{record}}}).toJson()));

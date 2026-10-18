@@ -752,8 +752,8 @@ private slots:
             }));
         QTRY_VERIFY_WITH_TIMEOUT(prepared, 10000);
         QVERIFY2(found && preparationError.isEmpty(), qPrintable(preparationError));
-        QVERIFY(tab->l2View() && tab->l2View()->isOpen());
-        LargeFileSearch *engine = tab->l2View()->searchEngine();
+        // A 256 MiB read-only binary opens in the windowed read-only source.
+        LargeFileSearch *engine = tab->searchEngine();
         QVERIFY(engine);
 
         bool cancelledAfterDomainProgress = false;
