@@ -621,6 +621,9 @@ AsyncTaskType::EncodingConversion, AsyncTaskPriority::Highest,
                 QStringLiteral("编码转换未完成。请检查目标位置和所选编码，查看技术详情后重试。"),
                 QMessageBox::Ok, this);
             failure.setTextFormat(Qt::PlainText);
+            // The reason (e.g. the byte that does not fit the encoding) is
+            // what the user needs; keep it visible, not only in the details.
+            failure.setInformativeText(error);
             failure.setDetailedText(error);
             localizeProductMessageBox(failure);
             failure.exec();

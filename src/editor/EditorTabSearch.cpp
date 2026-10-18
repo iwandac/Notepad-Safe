@@ -1426,6 +1426,9 @@ bool EditorTab::replaceCurrentSearchMatch(
                 bytes, error)) {
             return false;
         }
+        // The caret now sits after the replacement; the next search starts
+        // there, not at the end of the old, longer or shorter match.
+        m_lastL2Byte = start + bytes.size();
     } else {
         return false;
     }

@@ -782,8 +782,10 @@ void FindReplaceDialog::onReplace()
                 m_statusLabel->setText(replaceError);
             return;
         }
-        m_tab->findNext(pattern, regex, caseSensitive, wholeWord,
-                        true, m_wrapCheck->isChecked());
+        // Advance the way Find Next does: large documents search
+        // asynchronously, and the synchronous path finds nothing right
+        // after their content changed.
+        findAcrossTabs(true);
     }
 }
 
