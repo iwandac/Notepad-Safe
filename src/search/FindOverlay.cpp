@@ -62,6 +62,9 @@ QString compactSearchMessage(QString message, qsizetype limit = 72)
 void FindOverlay::clearSensitiveState()
 {
     m_live->reset();
+    m_recentQueries.clear();
+    if (m_resultsDock)
+        m_resultsDock->setRecentSearches({});
     if (m_navigationRequest) m_navigationRequest->retire();
     if (m_l2SearchInProgress) {
         m_searchSession.requestCancel();
@@ -501,8 +504,11 @@ void FindOverlay::finishSingleSearch()
 void FindOverlay::setSearchResultsDock(SearchResultsDock *dock)
 {
     QObject::disconnect(m_rerunConnection);
+    QObject::disconnect(m_recentConnection);
     m_resultsDock = dock;
     if (m_resultsDock) {
+        m_recentConnection = connect(m_resultsDock, &SearchResultsDock::recentSearchChosen,
+                                     this, &FindOverlay::rerunRecentQuery);
         m_rerunConnection = connect(
             m_resultsDock, &SearchResultsDock::rerunRequested,
             this, &FindOverlay::rerunInvalidatedSearch);
@@ -540,6 +546,47 @@ void FindOverlay::rerunInvalidatedSearch(
         showFindMode();
         return;
     }
+    onFindAll();
+}
+
+void FindOverlay::rememberQuery(const SearchQuery &query)
+{
+    const auto same = [&query](const SearchQuery &other) {
+        return other.pattern == query.pattern && other.scope == query.scope
+            && other.regex == query.regex && other.caseSensitive == query.caseSensitive
+            && other.wholeWord == query.wholeWord && other.hexBytes == query.hexBytes;
+    };
+    m_recentQueries.erase(std::remove_if(m_recentQueries.begin(), m_recentQueries.end(), same),
+                          m_recentQueries.end());
+    m_recentQueries.prepend(query);
+    m_recentQueries.resize(qMin<qsizetype>(m_recentQueries.size(), 5));
+    QStringList labels;
+    for (const SearchQuery &recent : std::as_const(m_recentQueries)) {
+        QStringList parts{QStringLiteral("“%1”").arg(compactSearchMessage(recent.pattern, 40))};
+        if (recent.regex) parts << QStringLiteral("正则");
+        if (recent.hexBytes) parts << QStringLiteral("字节");
+        if (recent.caseSensitive) parts << QStringLiteral("区分大小写");
+        if (recent.wholeWord) parts << QStringLiteral("整词");
+        parts << (recent.scope == SearchScope::AllOpenDocuments
+                      ? QStringLiteral("全部打开文件") : QStringLiteral("当前文件"));
+        labels << parts.join(QStringLiteral(" · "));
+    }
+    if (m_resultsDock)
+        m_resultsDock->setRecentSearches(labels);
+}
+
+void FindOverlay::rerunRecentQuery(int index)
+{
+    if (index < 0 || index >= m_recentQueries.size() || m_l2SearchInProgress)
+        return;
+    const SearchQuery query = m_recentQueries.at(index);
+    m_hexBytesCheck->setChecked(query.hexBytes);
+    m_regexCheck->setChecked(query.regex);
+    m_caseCheck->setChecked(query.caseSensitive);
+    m_wordCheck->setChecked(query.wholeWord);
+    m_scopeCombo->setCurrentIndex(m_scopeCombo->findData(
+        query.scope == SearchScope::AllOpenDocuments ? 1 : 0));
+    m_findEdit->setText(query.pattern);
     onFindAll();
 }
 
@@ -1028,6 +1075,7 @@ void FindOverlay::onFindAll()
             m_statusLabel->setText(validationError);
         return;
     }
+    rememberQuery(query);
     m_resultsDock->clearResults();
     if (!owner || !target || (single && (!request || !request->current(m_searchSession, m_tab, false))))
         return;
@@ -1139,15 +1187,20 @@ void FindOverlay::startAllOpenFindAll()
     m_multiConnections.clear();
     m_multiTabs.clear();
     m_multiTabs.reserve(rawTabs.size());
+    QVector<SearchResultTarget> searchable;
+    QVector<SearchResultTarget> locked;
     for (DocumentSearchSurface *tab : rawTabs) {
         if (!isSearchableDocument(tab)) {
             m_searchSession.skipLockedTarget();
+            locked.push_back(resultTarget(tab));
             continue;
         }
         m_multiTabs.push_back(tab);
+        searchable.push_back(resultTarget(tab));
     }
     m_multiNextIndex = 0;
     m_resultsDock->beginMultiFileResults(pattern, m_multiTabs.size());
+    m_resultsDock->reserveMultiFileTargets(searchable, locked);
     const QString startStatus = QStringLiteral(
         "正在搜索 %1 个打开文件；已跳过锁定文档 %2 个…")
         .arg(m_multiTabs.size()).arg(m_searchSession.skippedLockedTargets());
@@ -1206,7 +1259,11 @@ void FindOverlay::dispatchNextMultiTarget(int generation)
         auto settled = QSharedPointer<bool>::create(false);
         m_multiConnections.push_back(connect(tab, &DocumentSearchSurface::findAllL2Progress,
             this, [this, target, generation, settled](int percent, qint64 done, qint64 total) {
-                if (m_searchSession.isCurrent(generation) && !*settled && target && target == m_tab)
+                if (!m_searchSession.isCurrent(generation) || *settled || !target)
+                    return;
+                if (m_resultsDock)
+                    m_resultsDock->setMultiFileTargetProgress(resultTarget(target), percent);
+                if (target == m_tab)
                     onL2FindAllProgress(percent, done, total);
             }));
         const auto partialConnection = connect(

@@ -7,6 +7,8 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QVBoxLayout>
+#include <QMenu>
+#include <QToolButton>
 
 QString searchProgressText(int percent, qint64 done, qint64 total)
 {
@@ -55,6 +57,17 @@ SearchResultsFeedback::SearchResultsFeedback(QWidget *parent)
     rerunButton_->setObjectName(QStringLiteral("searchResultsRerunButton"));
     rerunButton_->setToolTip(QStringLiteral("使用当前查找条件重新生成有效结果"));
     rerunButton_->hide();
+    historyButton_ = new QToolButton(this);
+    historyButton_->setObjectName(QStringLiteral("searchHistoryButton"));
+    historyButton_->setText(QStringLiteral("↶ 最近搜索"));
+    historyButton_->setToolTip(QStringLiteral("用最近的查找条件重新查找全部"));
+    historyButton_->setPopupMode(QToolButton::InstantPopup);
+    historyButton_->setAutoRaise(true);
+    historyMenu_ = new QMenu(historyButton_);
+    historyMenu_->setObjectName(QStringLiteral("searchHistoryMenu"));
+    historyButton_->setMenu(historyMenu_);
+    historyButton_->hide();
+    summaryRow->addWidget(historyButton_);
     summaryRow->addWidget(summary_, 1);
     summaryRow->addWidget(rerunButton_);
     detailsToggle_ = new QPushButton(QStringLiteral("技术详情"), this);
@@ -119,4 +132,14 @@ QStringList searchResultDiagnostics(const SearchResultsModel *single,
         details << single->incompleteReason();
     }
     return details;
+}
+
+void SearchResultsFeedback::setRecentSearches(const QStringList &labels)
+{
+    historyMenu_->clear();
+    for (int i = 0; i < labels.size(); ++i) {
+        QAction *action = historyMenu_->addAction(labels.at(i));
+        connect(action, &QAction::triggered, this, [this, i] { emit recentSearchChosen(i); });
+    }
+    historyButton_->setVisible(!labels.isEmpty());
 }

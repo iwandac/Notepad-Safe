@@ -99,6 +99,8 @@
 #include "VirtualFileView.h"
 #include "WindowedReadOnlyProvider.h"
 #include "FindOverlay.h"
+#include <QMenu>
+#include <QToolButton>
 #include "FindLiveSearch.h"
 #include <QCheckBox>
 #include <QTabBar>
@@ -4177,6 +4179,45 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(findAll->isEnabled(), 2000);
         regex->setChecked(false);
         overlay->closeOverlay();
+        closeAllEditorTabs(mw_);
+    }
+
+    // A new Find All replaces the results; the last few queries stay one
+    // click away, newest first, without duplicates, and are forgotten on lock.
+    void recentSearchRerunsQuery() {
+        EditorTab *tab = openOverlayDocument(QStringLiteral("recent.txt"),
+                                             "alpha\nbeta\nbeta\n");
+        QVERIFY(tab);
+        FindOverlay *overlay = openOverlay(tab);
+        QVERIFY(overlay);
+        auto *edit = overlay->findChild<QLineEdit *>(QStringLiteral("findPatternEdit"));
+        auto *findAll = overlay->findChild<QPushButton *>(QStringLiteral("findAllButton"));
+        auto *summary = mw_->findChild<QLabel *>(QStringLiteral("searchResultsSummary"));
+        auto *history = mw_->findChild<QToolButton *>(QStringLiteral("searchHistoryButton"));
+        auto *menu = mw_->findChild<QMenu *>(QStringLiteral("searchHistoryMenu"));
+        QVERIFY(edit && findAll && summary && history && menu);
+        const auto runFindAll = [&](const QString &query, const QString &expected) {
+            edit->setText(query);
+            QTRY_VERIFY_WITH_TIMEOUT(findAll->isEnabled(), 2000);
+            findAll->click();
+            QTRY_VERIFY_WITH_TIMEOUT(summary->text().contains(expected), 3000);
+        };
+        runFindAll(QStringLiteral("alpha"), QStringLiteral("alpha"));
+        runFindAll(QStringLiteral("beta"), QStringLiteral("beta"));
+        runFindAll(QStringLiteral("alpha"), QStringLiteral("alpha"));
+        QVERIFY(history->isVisible());
+        QCOMPARE(menu->actions().size(), 2);
+        QVERIFY(menu->actions().at(0)->text().contains(QStringLiteral("alpha")));
+        QVERIFY(menu->actions().at(1)->text().contains(QStringLiteral("beta")));
+
+        menu->actions().at(1)->trigger();
+        QCOMPARE(edit->text(), QStringLiteral("beta"));
+        QTRY_VERIFY_WITH_TIMEOUT(summary->text().contains(QStringLiteral("beta"))
+                                 && summary->text().contains(QStringLiteral("2")), 3000);
+
+        overlay->clearSensitiveState();
+        QVERIFY(menu->actions().isEmpty());
+        QVERIFY(!history->isVisible());
         closeAllEditorTabs(mw_);
     }
 

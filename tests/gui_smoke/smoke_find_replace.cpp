@@ -203,6 +203,7 @@ private slots:
     // Delegate 只绘制单行时，行高契约也必须是单行；长字节上下文不得因
     // QTreeView 的隐式自动换行在不同搜索模式下撑满整个 Dock。
     void tc_fr_041_search_dock_rows_remain_compact_across_modes();
+    void tc_fr_042_all_open_groups_keep_tab_order_and_state();
 
     // Real MainWindow queues the result jump. An edit after the request but
     // before that queued turn must invalidate it without applying old offsets.
@@ -3767,6 +3768,72 @@ void SmokeFindReplace::tc_fr_041_search_dock_rows_remain_compact_across_modes()
              qPrintable(QStringLiteral("multi-file child row height=%1, compact max=%2")
                             .arg(childHeight).arg(compactMaximum)));
     QCOMPARE(childHeight, lineModeHeight);
+}
+
+// All-open results: every group exists from the start in tab order and says
+// how far that file is; a file that finishes first does not jump ahead.
+void SmokeFindReplace::tc_fr_042_all_open_groups_keep_tab_order_and_state()
+{
+    SearchResultsController resultsController;
+    SearchResultsDock dock(resultsController);
+    dock.resize(900, 320);
+    dock.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&dock));
+    auto *tree = dock.findChild<QTreeView *>(QStringLiteral("searchResultsTree"));
+    auto *summary = dock.findChild<QLabel *>(QStringLiteral("searchResultsSummary"));
+    QVERIFY(tree && summary);
+
+    const auto target = [](const char *name) {
+        return SearchResultTarget{QUuid::createUuid(), 1, QString::fromLatin1(name)};
+    };
+    const SearchResultTarget big = target("big.log");
+    const SearchResultTarget quick = target("small.txt");
+    const SearchResultTarget other = target("other.txt");
+    const SearchResultTarget secret = target("secret.nsafe");
+    dock.beginMultiFileResults(QStringLiteral("hit"), 3);
+    dock.reserveMultiFileTargets({big, quick, other}, {secret});
+
+    QAbstractItemModel *model = tree->model();
+    QVERIFY(model);
+    const auto name = [model](int row) { return model->index(row, 0).data().toString(); };
+    const auto state = [model](int row) {
+        return model->index(row, SearchResultsModel::COL_CONTEXT).data().toString();
+    };
+    QCOMPARE(model->rowCount(), 4);
+    QCOMPARE(name(0), QStringLiteral("big.log"));
+    QCOMPARE(name(3), QStringLiteral("secret.nsafe"));
+    QCOMPARE(state(0), QStringLiteral("等待"));
+    QCOMPARE(state(3), QStringLiteral("已跳过：已锁定"));
+
+    dock.beginMultiFileTarget(big, TextEncoding::Utf8, false);
+    dock.setMultiFileTargetProgress(big, 46);
+    QCOMPARE(state(0), QStringLiteral("搜索中 46%"));
+
+    SearchMatch hit;
+    hit.line = 0;
+    hit.index = 0;
+    hit.length = 3;
+    hit.text = QStringLiteral("hit");
+    hit.context = QStringLiteral("hit");
+    hit.byteOffset = 0;
+    hit.byteLength = 3;
+    dock.appendMultiFileResults(quick, QVector<SearchMatch>{hit, hit});
+    QCOMPARE(model->rowCount(), 4);
+    QCOMPARE(name(1), QStringLiteral("small.txt"));
+    QCOMPARE(state(1), QString());
+    QCOMPARE(model->index(1, SearchResultsModel::COL_MATCHCOUNT).data().toLongLong(), 2);
+    QVERIFY2(summary->text().contains(QStringLiteral("已完成 1/3 个文件")),
+             qPrintable(summary->text()));
+    QCOMPARE(model->rowCount(model->index(3, 0)), 0);
+
+    dock.appendMultiFileResults(other, QVector<SearchMatch>{});
+    auto *bigModel = new SearchResultsModel(&dock);
+    bigModel->setResults(QVector<LargeFileSearchMatch>{}, {}, 0);
+    dock.appendMultiFileResults(big, bigModel);
+    dock.finishMultiFileResults(false);
+    QCOMPARE(name(0), QStringLiteral("big.log"));
+    QCOMPARE(state(0), QString());
+    QVERIFY2(summary->text().contains(QStringLiteral("找到 2 处")), qPrintable(summary->text()));
 }
 
 QTEST_MAIN(SmokeFindReplace)

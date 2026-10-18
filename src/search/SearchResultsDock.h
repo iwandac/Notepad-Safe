@@ -39,6 +39,11 @@ public:
                                  const QVector<LargeFileSearchMatch> &batch,
                                  TextEncoding encoding, bool bytePositionMode);
     void beginMultiFileResults(const QString &pattern, int targetCount);
+    // Creates every group in tab order before any file finishes; locked
+    // documents get a group that says they were skipped.
+    void reserveMultiFileTargets(const QVector<SearchResultTarget> &searchable,
+                                 const QVector<SearchResultTarget> &locked);
+    void setMultiFileTargetProgress(const SearchResultTarget &target, int percent);
     void beginMultiFileTarget(const SearchResultTarget &target,
                               TextEncoding encoding,
                               bool bytePositionMode);
@@ -53,6 +58,7 @@ public:
                                 SearchResultsModel *model);
     void finishMultiFileResults(bool cancelled = false);
     void clearResults();
+    void setRecentSearches(const QStringList &labels);
     void invalidateResultsFor(const QUuid &documentId);
     void closeResultsFor(const QUuid &documentId);
     void decorateResultsFor(const QUuid &documentId, const LineIndex &lineIndex);
@@ -61,6 +67,7 @@ signals:
     void rerunRequested(const QUuid &preferredDocumentId,
                         quint64 expectedRevision);
     void clearSearchHighlightsRequested(const QUuid &documentId);
+    void recentSearchChosen(int index);
     // All result rows use source byte offsets as the navigation authority.
     void jumpToByteOffset(qint64 byteOffset, int length);
     void jumpToDocumentByteOffset(const QUuid &documentId,
@@ -86,6 +93,10 @@ private:
     int m_lastHitRow = -1;
     SearchResultsController *m_controller = nullptr; // application-owned
     QVector<LargeFileSearchMatch> m_singlePreviewMatches;
+    int m_multiTargetCount = 0;
+    int m_multiFinishedCount = 0;
+    void updateMultiProgressSummary();
+    void expandMultiGroup(const QString &targetId);
 
     void updateSummary(const QString &pattern, const QString &fileName,
                        qint64 totalMatches);

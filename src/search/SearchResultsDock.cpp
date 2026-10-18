@@ -14,6 +14,7 @@
 #include <QMouseEvent>
 #include <QHoverEvent>
 #include <QUuid>
+#include <QLocale>
 #include <limits>
 #include <utility>
 
@@ -60,11 +61,19 @@ SearchResultsDock::SearchResultsDock(SearchResultsController &controller,
         emit rerunRequested(target.documentId, target.expectedRevision);
     });
 
+    connect(m_feedback, &SearchResultsFeedback::recentSearchChosen,
+            this, &SearchResultsDock::recentSearchChosen);
+
     // 关键：安装事件过滤器到 m_treeView viewport，以捕获 context 列内的点击位置
     //   —— 用于按"点击的匹配词"精准跳转（而非仅跳到第一个）
     m_treeView->viewport()->installEventFilter(this);
 }
 SearchResultsDock::~SearchResultsDock() = default;
+
+void SearchResultsDock::setRecentSearches(const QStringList &labels)
+{
+    m_feedback->setRecentSearches(labels);
+}
 
 void SearchResultsDock::updateTechnicalDetails()
 {
@@ -280,6 +289,8 @@ void SearchResultsDock::beginMultiFileResults(const QString &pattern, int target
     setRerunAvailable(false);
     m_feedback->resetTechnicalDetails();
     m_controller->beginMulti(pattern);
+    m_multiTargetCount = 0;
+    m_multiFinishedCount = 0;
     m_stack->setCurrentIndex(0);
     SearchResultsViewPolicy::bindModel(m_treeView, nullptr, false);
     delete m_multiModel;
@@ -289,6 +300,49 @@ void SearchResultsDock::beginMultiFileResults(const QString &pattern, int target
                            .arg(targetCount).arg(pattern));
     show();
     raise();
+}
+
+void SearchResultsDock::reserveMultiFileTargets(
+    const QVector<SearchResultTarget> &searchable,
+    const QVector<SearchResultTarget> &locked)
+{
+    if (!m_controller->isMultiFile() || !m_multiModel) return;
+    m_multiTargetCount = searchable.size();
+    m_multiFinishedCount = 0;
+    for (const SearchResultTarget &target : searchable) {
+        m_controller->ensureMultiTarget(target);
+        m_multiModel->reserve(target, QStringLiteral("等待"));
+    }
+    for (const SearchResultTarget &target : locked)
+        m_multiModel->reserve(target, QStringLiteral("已跳过：已锁定"));
+}
+
+void SearchResultsDock::setMultiFileTargetProgress(const SearchResultTarget &target,
+                                                   int percent)
+{
+    if (!m_controller->isMultiFile() || !m_multiModel || !target.isValid()) return;
+    m_multiModel->setState(m_controller->ensureMultiTarget(target),
+                           QStringLiteral("搜索中 %1%").arg(qBound(0, percent, 100)));
+}
+
+void SearchResultsDock::expandMultiGroup(const QString &targetId)
+{
+    for (int row = 0; row < m_multiModel->rowCount(); ++row) {
+        const QModelIndex group = m_multiModel->index(row, 0);
+        if (group.data(TargetRole).toString() == targetId) {
+            m_treeView->expand(group);
+            return;
+        }
+    }
+}
+
+void SearchResultsDock::updateMultiProgressSummary()
+{
+    ++m_multiFinishedCount;
+    if (m_multiFinishedCount >= m_multiTargetCount) return;
+    m_feedback->setSummaryText(QStringLiteral("已完成 %1/%2 个文件 · 已找到至少 %3 处")
+        .arg(m_multiFinishedCount).arg(m_multiTargetCount)
+        .arg(QLocale().toString(m_controller->matchCount())));
 }
 
 void SearchResultsDock::beginMultiFileTarget(const SearchResultTarget &target,
@@ -324,10 +378,10 @@ void SearchResultsDock::appendMultiFileResults(const SearchResultTarget &target,
 {
     if (!m_controller->isMultiFile() || !target.isValid())
         return;
-    m_controller->ensureMultiTarget(target);
+    const QString targetId = m_controller->ensureMultiTarget(target);
     if (m_multiModel) {
         m_multiModel->addL1(target, matches, incomplete);
-        m_treeView->expand(m_multiModel->index(m_multiModel->rowCount() - 1, 0));
+        expandMultiGroup(targetId);
     }
     if (incomplete)
         m_controller->markIncomplete();
@@ -338,6 +392,7 @@ void SearchResultsDock::appendMultiFileResults(const SearchResultTarget &target,
               .arg(m_controller->pattern()).arg(m_controller->matchCount()).arg(m_controller->incompleteCount())
         : QStringLiteral("在全部打开文件中搜索 “%1”：已找到 %2 处")
               .arg(m_controller->pattern()).arg(m_controller->matchCount()));
+    updateMultiProgressSummary();
 }
 
 void SearchResultsDock::appendMultiFileResults(const SearchResultTarget &target,
@@ -349,13 +404,7 @@ void SearchResultsDock::appendMultiFileResults(const SearchResultTarget &target,
     if (m_multiModel) {
         if (!m_multiModel->finish(targetId, model))
             m_multiModel->addModel(target, model);
-        for (int row = 0; row < m_multiModel->rowCount(); ++row) {
-            const QModelIndex group = m_multiModel->index(row, 0);
-            if (group.data(TargetRole).toString() == targetId) {
-                m_treeView->expand(group);
-                break;
-            }
-        }
+        expandMultiGroup(targetId);
     }
     if (model->isIncomplete())
         m_controller->markIncomplete();
@@ -366,6 +415,7 @@ void SearchResultsDock::appendMultiFileResults(const SearchResultTarget &target,
               .arg(m_controller->pattern()).arg(m_controller->matchCount()).arg(m_controller->incompleteCount())
         : QStringLiteral("在全部打开文件中搜索 “%1”：已找到 %2 处")
               .arg(m_controller->pattern()).arg(m_controller->matchCount()));
+    updateMultiProgressSummary();
 }
 
 void SearchResultsDock::finishMultiFileResults(bool cancelled)

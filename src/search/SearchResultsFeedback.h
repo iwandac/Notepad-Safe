@@ -5,6 +5,8 @@
 
 class QLabel;
 class QPushButton;
+class QToolButton;
+class QMenu;
 class QPlainTextEdit;
 class SearchResultsModel;
 class MultiSearchResultsModel;
@@ -19,13 +21,18 @@ public:
     void setRerunAvailable(bool available);
     void setTechnicalDetails(const QStringList &details);
     void resetTechnicalDetails();
+    // Newest first; an empty list hides the button.
+    void setRecentSearches(const QStringList &labels);
 
 signals:
     void rerunRequested();
+    void recentSearchChosen(int index);
 
 private:
     QLabel *summary_ = nullptr;
     QPushButton *rerunButton_ = nullptr;
+    QToolButton *historyButton_ = nullptr;
+    QMenu *historyMenu_ = nullptr;
     QPushButton *detailsToggle_ = nullptr;
     QPlainTextEdit *technicalDetails_ = nullptr;
 };

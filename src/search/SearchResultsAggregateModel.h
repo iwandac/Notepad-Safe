@@ -49,6 +49,7 @@ public:
         qint64 totalMatches = 0;
         QString incompleteReason;
         QString incompleteUserReason;
+        QString state;   // 等待 / 搜索中 46% / 已跳过：已锁定; empty once settled
         bool stale = false;
     };
 
@@ -137,10 +138,11 @@ public:
             if (index.column() == SearchResultsModel::COL_CONTEXT)
                 return group->stale
                     ? QStringLiteral("结果已失效，请重新搜索此文件")
+                    : !group->state.isEmpty() ? group->state
                     : (group->incompleteReason.isEmpty()
                         ? QString() : group->incompleteUserReason);
             if (index.column() == SearchResultsModel::COL_MATCHCOUNT)
-                return group->totalMatches;
+                return group->results ? QVariant(group->totalMatches) : QVariant();
             return {};
         }
 
@@ -163,9 +165,37 @@ public:
         addModel(target, model);
     }
 
-    void addModel(const SearchResultTarget &target,
-                  SearchResultsModel *model)
+    // Groups are created up front in tab order and filled as files finish,
+    // so results already on screen never move.
+    void reserve(const SearchResultTarget &target, const QString &state)
     {
+        if (findGroup(target.key())) return;
+        auto *group = new Group;
+        group->target = target;
+        group->state = state;
+        const int row = groups_.size();
+        beginInsertRows({}, row, row);
+        groups_.append(group);
+        endInsertRows();
+    }
+
+    bool setState(const QString &targetId, const QString &state)
+    {
+        Group *group = findGroup(targetId);
+        if (!group || group->stale || group->state == state) return false;
+        group->state = state;
+        const int row = groups_.indexOf(group);
+        emit dataChanged(index(row, 0), index(row, SearchResultsModel::COL_COUNT - 1));
+        return true;
+    }
+
+    void addModel(const SearchResultTarget &target,
+                  SearchResultsModel *model, const QString &state = {})
+    {
+        if (Group *reserved = findGroup(target.key()); reserved && !reserved->results) {
+            fill(reserved, model, state);
+            return;
+        }
         auto *group = new Group;
         group->target = target;
         group->results = model;
@@ -182,7 +212,7 @@ public:
     void addPreview(const SearchResultTarget &target,
                     SearchResultsModel *model)
     {
-        addModel(target, model);
+        addModel(target, model, QStringLiteral("搜索中…"));
     }
 
     bool appendPreview(const QString &targetId,
@@ -211,14 +241,8 @@ public:
         Group *group = findGroup(targetId);
         if (!group || !model) return false;
         SearchResultsModel *oldModel = group->results;
-        beginResetModel();
-        group->results = model;
         group->preview.clear();
-        group->totalMatches = model->totalMatches();
-        group->incompleteReason = model->incompleteReason();
-        group->incompleteUserReason = model->incompleteUserReason();
-        model->setParent(this);
-        endResetModel();
+        fill(group, model, {});
         if (oldModel && oldModel != model) delete oldModel;
         return true;
     }
@@ -264,6 +288,26 @@ public:
 
 private:
     QVector<Group *> groups_;
+    // Swaps a group's rows with row signals, so other groups keep their
+    // expansion and scroll position.
+    void fill(Group *group, SearchResultsModel *model, const QString &state)
+    {
+        const QModelIndex groupIndex = index(groups_.indexOf(group), 0);
+        const int oldCount = childCount(group);
+        if (oldCount > 0) beginRemoveRows(groupIndex, 0, oldCount - 1);
+        group->results = nullptr;
+        if (oldCount > 0) endRemoveRows();
+        if (model) model->setParent(this);
+        const int newCount = model ? model->groupedCount() : 0;
+        if (newCount > 0) beginInsertRows(groupIndex, 0, newCount - 1);
+        group->results = model;
+        group->totalMatches = model ? model->totalMatches() : 0;
+        group->incompleteReason = model ? model->incompleteReason() : QString();
+        group->incompleteUserReason = model ? model->incompleteUserReason() : QString();
+        group->state = state;
+        if (newCount > 0) endInsertRows();
+        emit dataChanged(groupIndex, index(groupIndex.row(), SearchResultsModel::COL_COUNT - 1));
+    }
     Group *findGroup(const QString &targetId) const
     {
         for (Group *group : groups_) {

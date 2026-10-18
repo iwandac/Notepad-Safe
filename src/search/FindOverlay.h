@@ -100,12 +100,16 @@ private:
     SearchSession m_searchSession;
     QVector<QMetaObject::Connection> m_multiConnections;
     QVector<QPointer<DocumentSearchSurface>> m_multiTabs;
+    QVector<SearchQuery> m_recentQueries;  // memory only, newest first
+    QMetaObject::Connection m_recentConnection;
     int m_multiNextIndex = 0;
 
     void buildUi();
     void reposition();
     void prefillFromDocument();
     void scheduleLive();
+    void rememberQuery(const SearchQuery &query);
+    void rerunRecentQuery(int index);
     void setReplaceRowVisible(bool visible);
     void disconnectSingleSearch();
     void finishSingleSearch();
